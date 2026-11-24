@@ -425,7 +425,75 @@ class TelephonyReader @Inject constructor(
         val subId: Int?,
         val textBody: String,
         val attachments: List<MmsPartImport>,
+        /**
+         * Round 50 — the thread's full recipient set, as resolved by
+         * [readThreadRecipients] during [readMmsBatched] (same value for
+         * every row of the thread). Empty when the thread is a 1:1 or
+         * when the lookup failed — the importer falls back to the
+         * single-sender filing, and the one-shot repair pass retries
+         * the lookup later.
+         */
+        val threadRecipients: List<String> = emptyList(),
     )
+
+    /**
+     * Round 50 — the recipient set of one system thread, as Android
+     * itself keys it.
+     *
+     * `content://mms-sms/conversations/{threadId}` carries `recipient_ids`
+     * (space-separated ids into `canonical-addresses`); resolving them
+     * yields the addresses the provider groups under this thread. The
+     * provider keys a thread by its recipient set EXCLUDING ourselves,
+     * so the result is exactly the conversation's member list — with no
+     * own-number lookup needed, unlike the per-message `addr` table,
+     * whose TO list includes us (and whose FROM is only one member).
+     *
+     * `null` = the provider could not be read (query failed or threw) —
+     * distinct from "thread has no recipients" (empty set: the thread
+     * is gone or degenerate, nothing to repair). Callers treat `null`
+     * as fail-soft: file 1:1 for now, retry the lookup later.
+     */
+    fun readThreadRecipients(threadId: Long): Set<String>? {
+        // Local: the thread's canonical-address ids, or null when the
+        // provider could not be read. An empty list means the thread
+        // row is gone (or degenerate) — distinct from a failed query,
+        // so the caller can tell "retry later" from "nothing here".
+        fun threadRecipientIds(): List<Long>? {
+            if (threadId <= 0L) return emptyList()
+            val cursor = runCatching {
+                resolver.query(
+                    Uri.parse("content://mms-sms/conversations/$threadId"),
+                    arrayOf("recipient_ids"),
+                    null,
+                    null,
+                    null,
+                )
+            }.getOrNull() ?: return null
+            val raw = cursor.use { c -> if (!c.moveToFirst()) null else c.getString(0) }
+            return raw?.split(' ')?.mapNotNull { it.toLongOrNull() }?.distinct().orEmpty()
+        }
+        val ids = threadRecipientIds() ?: return null
+        if (ids.isEmpty()) return emptySet()
+        val placeholders = ids.joinToString(",") { "?" }
+        val args = Array(ids.size) { ids[it].toString() }
+        val addrCursor = runCatching {
+            resolver.query(
+                Uri.parse("content://mms-sms/canonical-addresses"),
+                arrayOf("address"),
+                "_id IN ($placeholders)",
+                args,
+                null,
+            )
+        }.getOrNull() ?: return null
+        val out = HashSet<String>()
+        addrCursor.use { c ->
+            while (c.moveToNext()) {
+                val addr = c.getString(0)
+                if (!addr.isNullOrBlank() && addr != "insert-address-token") out += addr
+            }
+        }
+        return out
+    }
 
     /** One attachment part of an MMS — referenced by its `content://mms/part/{id}` URI. */
     data class MmsPartImport(
@@ -467,6 +535,12 @@ class TelephonyReader @Inject constructor(
         // `mid IN (…)` et on dispatche les parts en mémoire. Gain mesuré : 200 queries Telephony
         // → 3 queries par chunk de 200 MMS (~5 s économisées sur premier import 500 MMS S9).
         val pending = ArrayList<PendingMms>(pageSize)
+        // Round 50 — thread recipient sets, resolved once per thread for
+        // the whole import (a thread spans pages; re-querying per page
+        // would repeat the same two provider queries). A failed lookup
+        // caches as an empty list: best-effort enrichment, re-tried by
+        // the one-shot repair pass — never a reason to fail the import.
+        val recipientsByThread = HashMap<Long, List<String>>()
         val mainCursor = resolver.query(
             Uri.parse("content://mms"),
             arrayOf("_id", "thread_id", "date", "read", "msg_box", "sub_id"),
@@ -528,13 +602,13 @@ class TelephonyReader @Inject constructor(
                     subId = subId,
                 )
                 if (pending.size >= pageSize) {
-                    if (!flushPending(pending, onPage)) complete = false
+                    if (!flushPending(pending, recipientsByThread, onPage)) complete = false
                     pending.clear()
                 }
             }
         }
         if (pending.isNotEmpty()) {
-            if (!flushPending(pending, onPage)) complete = false
+            if (!flushPending(pending, recipientsByThread, onPage)) complete = false
         }
         return complete
     }
@@ -550,16 +624,30 @@ class TelephonyReader @Inject constructor(
      */
     private suspend fun flushPending(
         pending: List<PendingMms>,
+        recipientsByThread: MutableMap<Long, List<String>>,
         onPage: suspend (List<MmsImportRow>) -> Unit,
     ): Boolean {
         val partsByMid = readMmsPartsBatched(pending.map { it.telephonyId })
-        onPage(flushPendingWithBatchedParts(pending, partsByMid ?: emptyMap()))
+        // Round 50 — resolve this page's thread recipient sets (cached
+        // across pages in `recipientsByThread`). A `null` lookup caches
+        // as empty: the rows still import (filed 1:1) and the repair
+        // pass re-reads the set later. Deliberately NOT part of the
+        // completeness flag — recipients are enrichment, not content.
+        for (threadId in pending.map { it.threadId }.distinct()) {
+            if (!recipientsByThread.containsKey(threadId)) {
+                recipientsByThread[threadId] =
+                    runCatching { readThreadRecipients(threadId) }.getOrNull()
+                        ?.toList().orEmpty()
+            }
+        }
+        onPage(flushPendingWithBatchedParts(pending, partsByMid ?: emptyMap(), recipientsByThread))
         return partsByMid != null
     }
 
     private fun flushPendingWithBatchedParts(
         pending: List<PendingMms>,
         partsByMid: Map<Long, Pair<String, List<MmsPartImport>>>,
+        recipientsByThread: Map<Long, List<String>> = emptyMap(),
     ): List<MmsImportRow> {
         if (pending.isEmpty()) return emptyList()
         val out = ArrayList<MmsImportRow>(pending.size)
@@ -577,6 +665,7 @@ class TelephonyReader @Inject constructor(
                 subId = p.subId,
                 textBody = textBody,
                 attachments = attachments,
+                threadRecipients = recipientsByThread[p.threadId].orEmpty(),
             )
         }
         return out

@@ -471,6 +471,8 @@ class SettingsRepository(
                 emptyConversationsPurgedV1272 = p[K.emptyConversationsPurgedV1272] ?: false,
                 stickyCategoryBackfilledV20 = p[K.stickyCategoryBackfilledV20] ?: false,
                 stickyCategoryBackfilledV22 = p[K.stickyCategoryBackfilledV22] ?: false,
+                stickyCategoryBackfilledPostImport = p[K.stickyCategoryBackfilledPostImport] ?: false,
+                groupConversationsRepairedV24 = p[K.groupConversationsRepairedV24] ?: false,
             ),
         )
     }
@@ -609,6 +611,8 @@ class SettingsRepository(
         this[K.emptyConversationsPurgedV1272] = s.advanced.emptyConversationsPurgedV1272
         this[K.stickyCategoryBackfilledV20] = s.advanced.stickyCategoryBackfilledV20
         this[K.stickyCategoryBackfilledV22] = s.advanced.stickyCategoryBackfilledV22
+        this[K.stickyCategoryBackfilledPostImport] = s.advanced.stickyCategoryBackfilledPostImport
+        this[K.groupConversationsRepairedV24] = s.advanced.groupConversationsRepairedV24
     }
 
     private inline fun <reified E : Enum<E>> enumOr(p: Preferences, key: Preferences.Key<String>, def: E, valueOf: (String) -> E): E =
@@ -850,5 +854,13 @@ class SettingsRepository(
         /** Spam follow-up (schema v22) — second passe du backfill one-shot. */
         val stickyCategoryBackfilledV22 =
             booleanPreferencesKey("advanced.stickyCategoryBackfilledV22")
+
+        /** Round 50 — backfill one-shot APRES import (voir AppSettings). */
+        val stickyCategoryBackfilledPostImport =
+            booleanPreferencesKey("advanced.stickyCategoryBackfilledPostImport")
+
+        /** Round 50 — reparation one-shot des conversations de groupe mal classees. */
+        val groupConversationsRepairedV24 =
+            booleanPreferencesKey("advanced.groupConversationsRepairedV24")
     }
 }

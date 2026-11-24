@@ -128,6 +128,83 @@ object IncomingReactionDecoder {
     private const val MAX_DECODE_INPUT_LENGTH: Int = 400
 
     /**
+     * Wire prefixes a reaction text can start with (the six tapback verbs,
+     * `Reacted …`, `Removed …`, the French `Réagi …` / `J'ai réagi …` forms) —
+     * the word-prefix arm of [looksLikeReactionText] and of
+     * `MessageDao.findReactionCandidates`.
+     */
+    private val REACTION_TEXT_PREFIXES = listOf(
+        "Reacted ",
+        "Loved ",
+        "Liked ",
+        "Disliked ",
+        "Laughed at ",
+        "Emphasized ",
+        "Questioned ",
+        "Removed ",
+        "Réagi ",
+        "J'ai réagi ",
+        "J’ai réagi ",
+    )
+
+    /**
+     * Round 50 — cheap pre-filter for the import fold and the retroactive
+     * reparse: `true` when [body] is shaped like a reaction, so the full
+     * [decode] only runs on candidates. A SUPERSET of what [decode] (and
+     * [decodeGoogleFormat]) can match — false positives are harmless
+     * because `decode()` re-validates strictly, but a false negative loses
+     * a reaction forever, so when in doubt a shape is included.
+     *
+     * Lives next to the decoder (moved here from `ConversationMirror`,
+     * where it drifted out of sync): every arm below names the decode
+     * step it covers, so a new wire format updates both in one place.
+     *
+     * Audit of every decode arm (round 50):
+     *   - word prefixes — Tapback (`Reacted …`), the six iOS verbs, the
+     *     `Removed …` forms, the French `Réagi …` / `J'ai réagi …` forms
+     *     (steps: [decodeIosTapback], [decodeGenericRemoval], the
+     *     `TAPBACK_*` and `READABLE_FR*` regexes);
+     *   - ` a réagi par ` — the named French form, whose wire text starts
+     *     with an arbitrary sender name (`READABLE_FR_NAMED_*`);
+     *   - `»` / `«` — any guillemet-quoted form, including a truncated
+     *     emoji+quote body whose closing guillemet never arrived
+     *     ([decodeEmojiWithQuote]);
+     *   - emoji-first token + straight quote — the `👍 to "…"` /
+     *     `👍 "…"` shape ([decodeEmojiWithQuote] with the ASCII fallback
+     *     quote). THE round-50 gap: the old gate only knew word prefixes
+     *     and `»`, so an imported `👍 to "…"` went to `plainRows` and
+     *     `decode` never ran. The first token must start with an emoji
+     *     char, so a sentence like `Hello "world"` does not qualify;
+     *   - leading U+200A — Google Messages framing
+     *     ([decodeGoogleFormat]);
+     *   - [Kind.EmojiOnly] is deliberately NOT covered: a bare-emoji body
+     *     is only ever folded within a 5-minute window anchored at "now",
+     *     and both the import fold and the reparse skip it — admitting it
+     *     here would only send every bare-emoji message through `decode`
+     *     for nothing.
+     *
+     * Mirrored in SQL by `MessageDao.findReactionCandidates` — keep the
+     * two in sync (the SQL arms are the LIKE translation of these checks).
+     */
+    fun looksLikeReactionText(body: String): Boolean {
+        // Emoji + straight-quote form: the first token starts with an
+        // emoji char and a `"` follows it (an optional `to` sits between
+        // them in the iPhone rendering). The quote need not sit right
+        // after the token — `decode()` re-validates strictly, so a
+        // looser gate only costs a wasted decode, never a lost reaction.
+        // `firstSpace > 0` guards the `body[0]` read on an empty body.
+        val firstSpace = body.indexOf(' ')
+        val emojiQuote = firstSpace > 0 && isLikelyEmojiChar(body[0]) &&
+            body.indexOf('"', startIndex = firstSpace) > 0
+        val wordOrQuote = REACTION_TEXT_PREFIXES.any { body.startsWith(it) } ||
+            body.contains(" a réagi par ") ||
+            body.contains('»') || body.contains('«') ||
+            body.startsWith(GOOGLE_FRAME) ||
+            emojiQuote
+        return body.isNotEmpty() && wordOrQuote
+    }
+
+    /**
      * Tries to decode [body] as a reaction-back. Returns `null` when [body] is plain
      * text — caller falls back to the regular "store as incoming SMS" path.
      *
@@ -309,7 +386,11 @@ object IncomingReactionDecoder {
      * non-greedy pattern backtracks on pathological input).
      */
     private fun decodeEmojiWithQuote(trimmed: String): DecodeAttempt {
-        if (!trimmed.contains('»') && trimmed.lastIndexOf('"') <= 0) {
+        // Round 50 — the opening guillemet counts too: a truncated body
+        // (`👍 «See you at`, closing `»` never arrived) carries only `«`,
+        // and the old fast-path rejected it before the regex — whose
+        // closing quote is optional — ever ran.
+        if (!trimmed.contains('»') && !trimmed.contains('«') && trimmed.lastIndexOf('"') <= 0) {
             return DecodeAttempt.NotMatched
         }
         return EMOJI_WITH_QUOTE_REGEX.matchEntire(trimmed)?.let { m ->

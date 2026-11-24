@@ -13,6 +13,7 @@ import android.os.Build
 import androidx.core.content.ContextCompat
 import androidx.room.withTransaction
 import com.relay.sms.data.blocking.BlockedNumberSystem
+import com.relay.sms.data.categories.StickyCategoryStore
 import com.relay.sms.data.local.datastore.SettingsRepository
 import com.relay.sms.data.local.db.AppDatabase
 import com.relay.sms.data.local.db.SQLITE_HOST_PARAM_LIMIT
@@ -92,6 +93,12 @@ class TelephonySyncManager @Inject constructor(
      * rapide (~50 ms typique d'après doc `MainApplication.kt`).
      */
     private val blockedNumbersImporter: com.relay.sms.data.blocking.BlockedNumbersImporter,
+    // Round 50 — the post-import sticky backfill (Part 3): the startup
+    // backfill runs BEFORE the first import on a fresh install, so it
+    // files nothing there. This store re-files once, after a sync in
+    // which both imports are complete (see
+    // [backfillStickyCategoriesPostImport]).
+    private val stickyCategories: StickyCategoryStore,
     @ApplicationScope private val appScope: CoroutineScope,
     @IoDispatcher private val io: CoroutineDispatcher,
 ) {
@@ -395,8 +402,45 @@ class TelephonySyncManager @Inject constructor(
                 Timber.i("runSync(%s) done; no new rows (skipped(blocked)=%d)", reason, skipped)
             }
             reconcileDeletions()
+            // Round 50 — post-import sticky backfill (Part 3). A failure
+            // here must not fail the sync: the flag stays unset and the
+            // pass retries at the next sync.
+            runCatching { backfillStickyCategoriesPostImport() }
+                .onFailure { Timber.w(it, "runSync(%s) post-import sticky backfill failed", reason) }
             _state.value = State.Idle
         }
+    }
+
+    /**
+     * Round 50 (Part 3) — one-shot sticky-category backfill AFTER the
+     * imports are complete.
+     *
+     * The startup backfill (`StartupMigrations.backfillStickyCategories`)
+     * runs at cold start, BEFORE the MigrationScreen import on a fresh
+     * install, so it files nothing there and never runs again — imported
+     * spam stayed unfiled. This pass runs once, at the end of a sync in
+     * which the MMS import has completed (`mmsImportCompleted` — the SMS
+     * delta ran in this very sync, just above, so both imports are done
+     * by the time this is reached). On a fresh install that is the first
+     * full sync; on an existing install it files the conversations the
+     * import already mirrored. The flag is set only after a complete
+     * pass, so a failure retries at the next sync.
+     *
+     * The per-thread hook inside the bulk importers (which files the
+     * newest incoming message per thread) is the first line; this
+     * backfill is the second — it examines up to 10 recent incoming
+     * messages per conversation, so a thread whose newest message is a
+     * plain follow-up but whose older one is promotional still files.
+     */
+    private suspend fun backfillStickyCategoriesPostImport() {
+        val advanced = settings.flow.first().advanced
+        if (advanced.stickyCategoryBackfilledPostImport) return
+        if (!advanced.mmsImportCompleted) return
+        val stored = stickyCategories.backfill()
+        settings.update { s ->
+            s.copy(advanced = s.advanced.copy(stickyCategoryBackfilledPostImport = true))
+        }
+        if (stored > 0) Timber.i("post-import sticky backfill: %d conversation(s) filed", stored)
     }
 
     /**

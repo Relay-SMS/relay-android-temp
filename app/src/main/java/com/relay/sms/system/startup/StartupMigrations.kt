@@ -13,6 +13,7 @@ import com.relay.sms.data.local.db.dao.AttachmentDao
 import com.relay.sms.data.local.db.dao.ConversationDao
 import com.relay.sms.data.local.db.dao.MessageDao
 import com.relay.sms.data.repository.ConversationMirror
+import com.relay.sms.data.repository.GroupConversationRepair
 import com.relay.sms.di.IoDispatcher
 import com.relay.sms.domain.settings.AdvancedSettings
 import dagger.Lazy
@@ -56,6 +57,7 @@ class StartupMigrations @Inject constructor(
     private val attachmentDao: Lazy<AttachmentDao>,
     private val conversationMirror: Lazy<ConversationMirror>,
     private val stickyCategories: Lazy<StickyCategoryStore>,
+    private val groupRepair: Lazy<GroupConversationRepair>,
     @ApplicationContext private val context: Context,
     @IoDispatcher private val io: CoroutineDispatcher,
 ) {
@@ -132,6 +134,15 @@ class StartupMigrations @Inject constructor(
         // nouveaux signaux depuis la première passe.
         runCatching { backfillStickyCategories(advanced) }
             .onFailure { Timber.w(it, "sticky category backfill failed") }
+
+        // Round 50 — one-shot repair of group threads the pre-round-50
+        // import filed as 1:1s. Same placement (BEFORE the
+        // short-circuit) for the same reason: the installs it targets
+        // already have every old flag set. The flag is set only after
+        // a complete pass (a provider read failure retries at the next
+        // cold start); an exception here must not block startup.
+        runCatching { repairGroupConversations(advanced) }
+            .onFailure { Timber.w(it, "group conversation repair failed") }
 
         // Global short-circuit: an up-to-date install does no migration work and never opens the
         // database. This is the whole point of the consolidation.
@@ -252,6 +263,30 @@ class StartupMigrations @Inject constructor(
             )
         }
         if (stored > 0) Timber.i("sticky category backfill: %d conversation(s) filed", stored)
+    }
+
+    /**
+     * Round 50 — re-files the group threads the pre-round-50 MMS import
+     * filed as 1:1s (see [GroupConversationRepair]). The flag is set
+     * only when the pass completed: a provider read failure leaves it
+     * unset so the pass retries at the next cold start.
+     */
+    private suspend fun repairGroupConversations(advanced: AdvancedSettings) {
+        if (advanced.groupConversationsRepairedV24) return
+        val result = groupRepair.get().repair()
+        if (result.complete) {
+            settings.update { s ->
+                s.copy(advanced = s.advanced.copy(groupConversationsRepairedV24 = true))
+            }
+        }
+        if (result.repaired > 0 || result.merged > 0) {
+            Timber.i(
+                "group conversation repair: %d re-filed, %d merged (complete=%b)",
+                result.repaired,
+                result.merged,
+                result.complete,
+            )
+        }
     }
 
     /**

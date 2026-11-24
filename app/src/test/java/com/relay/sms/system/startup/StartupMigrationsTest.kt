@@ -14,6 +14,7 @@ import com.relay.sms.data.local.db.dao.AttachmentDao
 import com.relay.sms.data.local.db.dao.ConversationDao
 import com.relay.sms.data.local.db.dao.MessageDao
 import com.relay.sms.data.repository.ConversationMirror
+import com.relay.sms.data.repository.GroupConversationRepair
 import com.relay.sms.domain.settings.AppSettings
 import io.mockk.clearMocks
 import io.mockk.coEvery
@@ -50,6 +51,7 @@ class StartupMigrationsTest {
     }
     private val mirror = mockk<ConversationMirror>()
     private val stickyCategories = mockk<StickyCategoryStore>(relaxed = true)
+    private val groupRepair = mockk<GroupConversationRepair>()
 
     /**
      * 🔴 v1.27.2 — SANS CECI, LES COMPTES DE MOCK S ACCUMULENT ENTRE LES TESTS.
@@ -64,8 +66,9 @@ class StartupMigrationsTest {
      */
     @BeforeEach
     fun resetMocks() {
-        clearMocks(messageDao, conversationDao, attachmentDao, mirror, stickyCategories, answers = false)
+        clearMocks(messageDao, conversationDao, attachmentDao, mirror, stickyCategories, groupRepair, answers = false)
         coEvery { attachmentDao.findByLocalUriPrefix(any()) } returns emptyList()
+        coEvery { groupRepair.repair() } returns GroupConversationRepair.Result(0, 0, true)
     }
 
     private fun context(): Context = mockk {
@@ -93,6 +96,7 @@ class StartupMigrationsTest {
         attachmentDao = dagger.Lazy { attachmentDao },
         conversationMirror = dagger.Lazy { mirror },
         stickyCategories = dagger.Lazy { stickyCategories },
+        groupRepair = dagger.Lazy { groupRepair },
         context = context(),
         io = Dispatchers.Unconfined,
     )
@@ -323,5 +327,73 @@ class StartupMigrationsTest {
         coVerify(exactly = 1) { stickyCategories.backfill() }
         assertThat(state.first().advanced.stickyCategoryBackfilledV20).isTrue()
         assertThat(state.first().advanced.stickyCategoryBackfilledV22).isTrue()
+    }
+
+    // ──────── Round 50 — group conversation repair ────────
+
+    @Test
+    fun groupRepairRunsOnce_andRecordsItsFlagOnACompletePass() = runTest {
+        coEvery { mirror.dedupeSameNumberConversations() } returns false
+        coEvery { groupRepair.repair() } returns GroupConversationRepair.Result(2, 1, true)
+        val (settings, state) = fakeSettings(AppSettings())
+
+        migrations(settings).run()
+
+        coVerify(exactly = 1) { groupRepair.repair() }
+        assertThat(state.first().advanced.groupConversationsRepairedV24).isTrue()
+    }
+
+    @Test
+    fun groupRepairIncomplete_doesNotRecordItsFlag_soItRetriesNextColdStart() = runTest {
+        coEvery { mirror.dedupeSameNumberConversations() } returns false
+        coEvery { groupRepair.repair() } returns GroupConversationRepair.Result(0, 0, false)
+        val (settings, state) = fakeSettings(AppSettings())
+
+        migrations(settings).run()
+
+        coVerify(exactly = 1) { groupRepair.repair() }
+        assertThat(state.first().advanced.groupConversationsRepairedV24).isFalse()
+    }
+
+    @Test
+    fun groupRepairAlreadyDone_isNotReRun() = runTest {
+        coEvery { mirror.dedupeSameNumberConversations() } returns false
+        val (settings, _) = fakeSettings(
+            AppSettings().copy(
+                advanced = AppSettings().advanced.copy(groupConversationsRepairedV24 = true),
+            ),
+        )
+
+        migrations(settings).run()
+
+        coVerify(exactly = 0) { groupRepair.repair() }
+    }
+
+    /**
+     * Round 50 — the repair lives BEFORE the global short-circuit, like
+     * the v1.27.2 repairs and the backfill: the fleet it targets (group
+     * threads misfiled as 1:1s by the old import) already has every
+     * legacy flag set. This test fails if it is moved behind the guard.
+     */
+    @Test
+    fun groupRepairRunsEvenWhenGlobalGuardSet() = runTest {
+        coEvery { mirror.dedupeSameNumberConversations() } returns false
+        coEvery { groupRepair.repair() } returns GroupConversationRepair.Result(1, 0, true)
+        val (settings, state) = fakeSettings(
+            AppSettings().copy(
+                advanced = AppSettings().advanced.copy(
+                    startupDbMigrationsDone = true,
+                    unreadResetV180 = true,
+                    attachmentsMovedToFilesDirV147 = true,
+                    dedupSameNumberV1230 = true,
+                    staleConversationPreviewsRepairedV1240 = true,
+                ),
+            ),
+        )
+
+        migrations(settings).run()
+
+        coVerify(exactly = 1) { groupRepair.repair() }
+        assertThat(state.first().advanced.groupConversationsRepairedV24).isTrue()
     }
 }

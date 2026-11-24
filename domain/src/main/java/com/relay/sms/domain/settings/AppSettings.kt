@@ -673,6 +673,31 @@ data class AdvancedSettings(
      */
     val stickyCategoryBackfilledV22: Boolean = false,
     /**
+     * Round 50 — the post-import sticky-category backfill has run.
+     * The startup backfills above run at cold start, BEFORE the
+     * MigrationScreen import on a fresh install, so they file nothing
+     * there and never run again — imported spam stayed unfiled. This
+     * pass runs once from `TelephonySyncManager` AFTER a sync in which
+     * both imports are complete (SMS cursor advanced + MMS marker set),
+     * so it files conversations the bulk import just mirrored, on a
+     * fresh install and on an existing one alike. Set only after a
+     * complete pass; independent of [startupDbMigrationsDone].
+     */
+    val stickyCategoryBackfilledPostImport: Boolean = false,
+    /**
+     * Round 50 — the one-shot group-conversation repair has run: 1:1
+     * conversations whose system thread actually carries several
+     * recipients (filed 1:1 by the pre-round-50 MMS import, which only
+     * kept the first message's sender) were re-filed as groups from
+     * the provider's thread recipient set, or merged into the group
+     * conversation that already existed for those members. Set only
+     * after a complete pass (a provider read failure leaves it unset
+     * so the pass retries at the next cold start). Independent of
+     * [startupDbMigrationsDone]: the installs it targets already have
+     * that flag set.
+     */
+    val groupConversationsRepairedV24: Boolean = false,
+    /**
      * v1.3.10 — **opt-in** : démarre [com.relay.sms.system.service.KeepAliveService]
      * qui maintient le processus Relay vivant via une notification persistante
      * discrète (canal `IMPORTANCE_MIN`, ne fait ni son ni vibration). Indispensable pour
@@ -709,10 +734,14 @@ data class AdvancedSettings(
          * Current reparse version (see [reactionReparseVersion]): 1 folded
          * incoming reaction texts; 2 also folds our own outgoing tapbacks;
          * 3 also normalizes stored multi-emoji reactions (a legacy
-         * multi-react value like "👍😂😅") down to their first emoji.
+         * multi-react value like "👍😂😅") down to their first emoji;
+         * 4 also folds emoji-form tapbacks (`👍 to "…"` / `👍 "…"`) and
+         * Google-framed reactions, which the v3 gate and candidate query
+         * never matched — installs that already ran v3 re-run once so
+         * already-imported rows of those shapes fold retroactively.
          * Bump when the reparse learns a new shape, so existing installs
          * re-run it exactly once.
          */
-        const val REACTION_REPARSE_CURRENT_VERSION = 3
+        const val REACTION_REPARSE_CURRENT_VERSION = 4
     }
 }

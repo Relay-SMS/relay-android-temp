@@ -8,6 +8,7 @@ package com.relay.sms.data.repository
 
 import androidx.room.withTransaction
 import com.relay.sms.core.ext.blockKey
+import com.relay.sms.core.ext.canonicalPhone
 import com.relay.sms.core.ext.stripMmsAddressSuffix
 import com.relay.sms.data.categories.StickyCategoryStore
 import com.relay.sms.data.local.db.AppDatabase
@@ -563,10 +564,12 @@ class ConversationMirror @Inject constructor(
      *     `System.currentTimeMillis()` in [findReactionTarget], so a bare-emoji
      *     row from last month would mis-attach to a message sent minutes ago.
      *     A bare "❤️" stays a text bubble — the safe choice.
-     *   - Google Messages reactions are UNRECOVERABLE: the receiver strips
-     *     the U+200B framing before storing, so the stored body carries no
-     *     signal at all. Only Tapback / iOS / French / emoji+quote formats
-     *     survive in stored bodies.
+     *   - Google Messages reactions are UNRECOVERABLE when Relay stored
+     *     the row itself: the receiver strips the U+200B framing before
+     *     storing, so the stored body carries no signal at all. Rows
+     *     IMPORTED from the provider keep their raw body — framing
+     *     included — so the reparse tries `decodeGoogleFormat` too
+     *     (round 50) and folds those.
      *   - A row with no `telephonyUri` keeps its text (badge still set): with
      *     no sentinel to write, deleting it would let the next sync sweep
      *     re-import the carrier text as a bubble.
@@ -590,7 +593,11 @@ class ConversationMirror @Inject constructor(
         var skipped = 0
         for (row in messageDao.findReactionCandidates()) {
             scanned++
+            // Round 50 — the Google fallback: an imported row still
+            // carries the provider's raw body, framing included (see
+            // the header note above).
             val decoded = IncomingReactionDecoder.decode(row.body)
+                ?: IncomingReactionDecoder.decodeGoogleFormat(row.body)
             if (decoded == null || decoded.kind == Kind.EmojiOnly) {
                 skipped++
                 continue
@@ -1419,9 +1426,23 @@ class ConversationMirror @Inject constructor(
             val attachmentsBuf = ArrayList<AttachmentEntity>(32)
             for ((_, group) in byThread) {
                 val first = group.first()
+                // Round 50 — group filing: the reader resolved the
+                // thread's full recipient set (see
+                // `TelephonyReader.readThreadRecipients`). More than one
+                // recipient = a group. The old code filed every thread
+                // as a 1:1 with only the first message's sender, so
+                // group threads came back as 1:1s after a reinstall.
+                // An empty set (a 1:1 thread, or a failed lookup) keeps
+                // the old behaviour — the one-shot repair pass re-reads
+                // the set later.
+                val recipients = first.threadRecipients
                 val convId = ensureConversationByThread(
                     systemThreadId = first.threadId,
-                    addresses = listOf(PhoneAddress.of(first.address)),
+                    addresses = if (recipients.size > 1) {
+                        recipients.map { PhoneAddress.of(it) }
+                    } else {
+                        listOf(PhoneAddress.of(first.address))
+                    },
                 )
                 // Round 48 — media encryption is 1:1 only: a group
                 // thread's encrypted-looking part stays plain. The
@@ -1433,8 +1454,16 @@ class ConversationMirror @Inject constructor(
                 var maxDate = 0L
                 var lastPreview = ""
                 var unreadDelta = 0
+                // Round 50 — the newest INSERTED incoming row, for the
+                // sticky-classification hook below (its full body is
+                // what the classifier reads).
+                var newestIncoming: com.relay.sms.data.sms.TelephonyReader.MmsImportRow? = null
                 attachmentsBuf.clear()
-                for (row in group) {
+                // Local (not a member): this class is at its Detekt
+                // function-count limit. Shared by the plain pass and
+                // the tapback fallback below, so a tapback that fails
+                // to fold inserts exactly like a plain row.
+                suspend fun insertPlainRow(row: com.relay.sms.data.sms.TelephonyReader.MmsImportRow) {
                     // Round 48 — an encrypted-media part in a 1:1
                     // import: the ciphertext stays in the system
                     // store (it is encrypted — any app with MMS
@@ -1473,7 +1502,7 @@ class ConversationMirror @Inject constructor(
                     )
                     val insertedId = messageDao.insert(msg)
                     // Insert id < 0 → conflict, row already mirrored; skip part insertion.
-                    if (insertedId <= 0L) continue
+                    if (insertedId <= 0L) return
                     for (part in row.attachments) {
                         attachmentsBuf += AttachmentEntity(
                             messageId = insertedId,
@@ -1494,11 +1523,60 @@ class ConversationMirror @Inject constructor(
                         lastPreview = row.textBody.ifBlank { firstAttachmentPreviewLabel(row.attachments) }
                     }
                     if (row.direction == MessageDirection.INCOMING && !row.read) unreadDelta++
+                    if (row.direction == MessageDirection.INCOMING &&
+                        (newestIncoming == null || row.dateMs > newestIncoming!!.dateMs)
+                    ) {
+                        newestIncoming = row
+                    }
+                }
+                // Round 50 — reaction fold, the SMS path's twin: rows
+                // shaped like a tapback are decoded and folded onto
+                // their target instead of importing as text bubbles
+                // (before this round the MMS import never decoded
+                // reactions at all, so a tapback in a group/MMS thread
+                // always surfaced as a stray bubble). The fold runs
+                // AFTER the plain insert so a target sitting in the
+                // same batch is already in Room — MMS rows arrive
+                // newest-first, so a tapback otherwise precedes its
+                // target. A row that fails to fold falls back to a
+                // plain bubble, like the live receiver — nothing is
+                // silently lost.
+                val tapbackRows = ArrayList<com.relay.sms.data.sms.TelephonyReader.MmsImportRow>()
+                for (row in group) {
+                    if (row.textBody.isNotBlank() &&
+                        IncomingReactionDecoder.looksLikeReactionText(row.textBody)
+                    ) {
+                        tapbackRows += row
+                    } else {
+                        insertPlainRow(row)
+                    }
+                }
+                for (row in tapbackRows) {
+                    val folded = foldImportedTapback(
+                        address = row.address,
+                        body = row.textBody,
+                        date = row.dateMs,
+                        direction = row.direction,
+                        telephonyUri = "content://mms/${row.telephonyId}",
+                    )
+                    if (!folded) insertPlainRow(row)
                 }
                 if (attachmentsBuf.isNotEmpty()) {
                     // v1.2.7 audit P4 — batch insert des parts pour ce group avant de passer
                     // au suivant. Buffer réutilisé via `.clear()` en début de boucle group.
                     attachmentDao.insertAll(attachmentsBuf)
+                }
+                // Round 50 — sticky filing (Part 3), BEFORE the touch:
+                // the store's newest-wins guard compares against the
+                // pre-touch `lastMessageAt`. The store itself skips
+                // groups and contacts.
+                newestIncoming?.let { incoming ->
+                    stickyCategories.onIncomingMessage(
+                        convId,
+                        incoming.textBody,
+                        PhoneAddress.of(incoming.address),
+                        incoming.dateMs,
+                    )
                 }
                 if (maxDate > 0L) {
                     touchConversation(convId, maxDate, lastPreview, deltaUnread = unreadDelta)
@@ -1574,54 +1652,26 @@ class ConversationMirror @Inject constructor(
                 it.body.startsWith(E2E_FRAGMENT_PREFIX) || it.body.startsWith(E2E_HANDSHAKE_PREFIX)
             }
             if (rows.isEmpty()) return
-            // Local: only this importer folds rows. Decodes the body, and on a
-            // Tapback match applies it to its target and writes the sentinel —
-            // the text row itself is never inserted. Returns `true` when the row
-            // was folded (caller must not insert it); `false` means "plain
-            // bubble" (caller inserts the row as-is). EmojiOnly is never folded
-            // here: its 5-minute window is anchored at "now", so an old
-            // bare-emoji row would mis-attach to a message sent minutes ago.
-            // Same rule as [reparseStoredReactions]. Outgoing rows (our own
-            // reactions, from the sent box) fold onto their incoming target
-            // first, then onto one of our own outgoing messages when no
-            // incoming matches (a reaction to one of our own texts) — with
-            // no bump either way. See [applyIncomingReaction].
-            suspend fun foldImportedTapback(row: MessageEntity): Boolean {
-                val decoded = IncomingReactionDecoder.decode(row.body) ?: return false
-                if (decoded.kind == Kind.EmojiOnly) return false
-                val applied = try {
-                    applyIncomingReaction(
-                        address = row.address,
-                        emoji = decoded.emoji,
-                        bodyPrefix = decoded.previewPrefix,
-                        kind = decoded.kind,
-                        wasTruncated = decoded.wasTruncated,
-                        isRemoval = decoded.isRemoval,
-                        reactionDateMs = row.date,
-                        isOwnReaction = row.direction == MessageDirection.OUTGOING,
-                    )
-                } catch (ce: kotlinx.coroutines.CancellationException) {
-                    throw ce
-                } catch (t: Throwable) {
-                    Timber.w(t, "foldImportedTapback: fold failed for ${row.telephonyUri}")
-                    null
-                }
-                if (applied == null) return false
-                // Sentinel takes the tapback's telephonyUri so the next sweep sees
-                // the UNIQUE constraint taken and skips the re-import — the same
-                // poison-pill the live receiver writes.
-                upsertReactionSentinel(
-                    address = row.address,
-                    telephonyUri = row.telephonyUri,
-                    date = row.date,
-                )
-                return true
-            }
-
             val first = rows.first()
+            // Round 50 — SMS group threads exist: with group-MMS off, a
+            // sent group SMS lands one row per recipient in the SHARED
+            // group thread (each row carries one member's address), so
+            // the thread's member set is the union of its rows'
+            // addresses. A 1:1 thread's rows all carry the same address,
+            // so the union is 1 there and nothing changes. Dedup is by
+            // `canonicalPhone()` so one member spelled two ways (E.164
+            // vs national) does not fake a group. (An SMS row's address
+            // is never ourselves — incoming rows carry the sender,
+            // outgoing rows the recipient — so no self-stripping is
+            // needed, unlike the MMS `addr` table.)
+            val addresses = rows.map { it.address }
+                .filter { it.isNotBlank() }
+                .distinctBy { it.canonicalPhone() }
+                .map { PhoneAddress.of(it) }
+                .ifEmpty { listOf(PhoneAddress.of(first.address)) }
             val convId = ensureConversationByThread(
                 systemThreadId = systemThreadId,
-                addresses = listOf(PhoneAddress.of(first.address)),
+                addresses = addresses,
             )
             val withConv = rows.map { it.copy(conversationId = convId) }
             val tapbackRows = ArrayList<MessageEntity>()
@@ -1631,7 +1681,7 @@ class ConversationMirror @Inject constructor(
                 // outgoing one is OUR OWN (imported from the sent box —
                 // the sending app mirrors it with an empty body, but the
                 // full text is what the provider holds).
-                if (looksLikeReactionText(row.body)) {
+                if (IncomingReactionDecoder.looksLikeReactionText(row.body)) {
                     tapbackRows += row
                 } else {
                     plainRows += row
@@ -1659,7 +1709,26 @@ class ConversationMirror @Inject constructor(
             }
             val foldedUris = HashSet<String>()
             for (row in tapbackRows) {
-                if (foldImportedTapback(row)) {
+                // Shared fold (file scope below): decodes the body, and
+                // on a Tapback match applies it to its target and writes
+                // the sentinel — the text row itself is never inserted.
+                // EmojiOnly is never folded here: its 5-minute window is
+                // anchored at "now", so an old bare-emoji row would
+                // mis-attach to a message sent minutes ago. Same rule as
+                // [reparseStoredReactions]. Outgoing rows (our own
+                // reactions, from the sent box) fold onto their incoming
+                // target first, then onto one of our own outgoing
+                // messages when no incoming matches (a reaction to one
+                // of our own texts) — with no bump either way. See
+                // [applyIncomingReaction].
+                val folded = foldImportedTapback(
+                    address = row.address,
+                    body = row.body,
+                    date = row.date,
+                    direction = row.direction,
+                    telephonyUri = row.telephonyUri,
+                )
+                if (folded) {
                     row.telephonyUri?.let { foldedUris += it }
                 } else {
                     val insertedId = messageDao.insert(row)
@@ -1679,6 +1748,25 @@ class ConversationMirror @Inject constructor(
             val last = withConv
                 .filter { it.telephonyUri !in foldedUris }
                 .maxByOrNull { it.date }
+            // Round 50 — sticky filing (Part 3), BEFORE the touch: the
+            // store's newest-wins guard compares against the pre-touch
+            // `lastMessageAt`. The newest incoming NON-folded row — a
+            // folded tapback's raw text must never feed the classifier.
+            // The store itself skips groups and contacts.
+            val newestIncoming = withConv
+                .filter {
+                    it.telephonyUri !in foldedUris &&
+                        it.direction == MessageDirection.INCOMING
+                }
+                .maxByOrNull { it.date }
+            newestIncoming?.let { incoming ->
+                stickyCategories.onIncomingMessage(
+                    convId,
+                    incoming.body,
+                    PhoneAddress.of(incoming.address),
+                    incoming.date,
+                )
+            }
             if (last != null) {
                 touchConversation(convId, last.date, last.body, deltaUnread = unreadDelta)
             }
@@ -2647,38 +2735,62 @@ class ConversationMirror @Inject constructor(
 internal const val CONV_MATCH_MIN_DIGITS = 8
 
 /**
- * Wire prefixes a reaction text can start with (the six tapback verbs,
- * `Reacted …`, `Removed …`, the French `Réagi …` / `J'ai réagi …` forms) —
- * the prefix arms of `MessageDao.findReactionCandidates`, for the cheap
- * pre-filter in [looksLikeReactionText]. A superset of what the decoder
- * matches; `decode()` re-validates strictly. File scope (not a class
- * member): the check is pure, and `ConversationMirror` is already at its
- * function-count limit.
+ * Round 50 — shared import fold for the SMS and MMS bulk importers.
+ * Decodes [body], and on a Tapback match applies it to its target and
+ * writes the sentinel — the text row itself is never inserted. Returns
+ * `true` when the row was folded (caller must not insert it); `false`
+ * means "plain bubble" (caller inserts the row as-is). EmojiOnly is
+ * never folded: its 5-minute window is anchored at "now", so an old
+ * bare-emoji row would mis-attach to a message sent minutes ago.
+ *
+ * Tries [IncomingReactionDecoder.decodeGoogleFormat] after [decode]:
+ * an imported row still carries the provider's raw body, Google
+ * framing included (unlike a row Relay stored, whose framing the
+ * receiver stripped before storing).
+ *
+ * File scope (not a member): `ConversationMirror` is already at its
+ * function-count limit. An extension so it can call the mirror's
+ * public [ConversationMirror.applyIncomingReaction] /
+ * [ConversationMirror.upsertReactionSentinel].
  */
-private val REACTION_TEXT_PREFIXES = listOf(
-    "Reacted ",
-    "Loved ",
-    "Liked ",
-    "Disliked ",
-    "Laughed at ",
-    "Emphasized ",
-    "Questioned ",
-    "Removed ",
-    "Réagi ",
-    "J'ai réagi ",
-    "J’ai réagi ",
-)
-
-/**
- * Cheap pre-filter for the import fold: mirrors the LIKE arms of
- * `MessageDao.findReactionCandidates` (a superset of what the decoder can
- * match) so the full decode only runs on bodies shaped like a reaction.
- * False positives are harmless — `decode()` re-validates strictly.
- */
-private fun looksLikeReactionText(body: String): Boolean {
-    if (body.isEmpty()) return false
-    if (REACTION_TEXT_PREFIXES.any { body.startsWith(it) }) return true
-    return body.contains(" a réagi par ") || body.contains('»')
+internal suspend fun ConversationMirror.foldImportedTapback(
+    address: String,
+    body: String,
+    date: Long,
+    direction: MessageDirection,
+    telephonyUri: String?,
+): Boolean {
+    val decoded = IncomingReactionDecoder.decode(body)
+        ?: IncomingReactionDecoder.decodeGoogleFormat(body)
+        ?: return false
+    if (decoded.kind == Kind.EmojiOnly) return false
+    val applied = try {
+        applyIncomingReaction(
+            address = address,
+            emoji = decoded.emoji,
+            bodyPrefix = decoded.previewPrefix,
+            kind = decoded.kind,
+            wasTruncated = decoded.wasTruncated,
+            isRemoval = decoded.isRemoval,
+            reactionDateMs = date,
+            isOwnReaction = direction == MessageDirection.OUTGOING,
+        )
+    } catch (ce: kotlinx.coroutines.CancellationException) {
+        throw ce
+    } catch (t: Throwable) {
+        Timber.w(t, "foldImportedTapback: fold failed for $telephonyUri")
+        null
+    }
+    if (applied == null) return false
+    // Sentinel takes the tapback's telephonyUri so the next sweep sees
+    // the UNIQUE constraint taken and skips the re-import — the same
+    // poison-pill the live receiver writes.
+    upsertReactionSentinel(
+        address = address,
+        telephonyUri = telephonyUri,
+        date = date,
+    )
+    return true
 }
 
 /**

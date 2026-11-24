@@ -758,6 +758,16 @@ interface MessageDao {
      * each candidate strictly in Kotlin. False negatives would lose a reaction
      * forever, so when in doubt a shape is included.
      *
+     * Round 50 — three more arms, mirroring the widened
+     * `IncomingReactionDecoder.looksLikeReactionText` (keep the two in
+     * sync): any straight double-quote (the `👍 to "…"` emoji+quote
+     * form, which has no word prefix and no guillemet — the shape the
+     * old gate missed), any opening guillemet `«` (a truncated
+     * emoji+quote body whose closing `»` never arrived), and a leading
+     * U+200A hair space (8202 — Google Messages framing, still present
+     * in rows imported from the provider, which the live receiver
+     * never stripped).
+     *
      * Deliberately NOT paged: the leading-wildcard arms (`% a réagi par %`,
      * `%»%`) would force a full-table scan per page. One scan returning the
      * (rare) candidates is cheaper than N scans, and the list stays small —
@@ -788,7 +798,10 @@ interface MessageDao {
             body LIKE 'J''ai réagi %' OR
             body LIKE 'J’ai réagi %' OR
             body LIKE '% a réagi par %' OR
-            body LIKE '%»%'
+            body LIKE '%»%' OR
+            body LIKE '%«%' OR
+            body LIKE '%"%' OR
+            substr(body, 1, 1) = char(8202)
           )
         ORDER BY id ASC
         """
