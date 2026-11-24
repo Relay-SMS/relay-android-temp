@@ -1,0 +1,1421 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools" tools:locale="en">
+
+    <!-- Core -->
+    <string name="app_name">Relay</string>
+
+    <!-- v1.3.7 — First-launch splash screen (animated logo + tagline). -->
+    <string name="splash_tagline">The app that doesn\'t read your messages and respects your privacy.</string>
+    <string name="splash_logo_content_description">Relay logo</string>
+    <string name="splash_skip_hint">Tap anywhere to continue</string>
+    <string name="splash_skip_label">Skip splash</string>
+
+    <!-- v1.3.10 — Foreground KeepAliveService (opt-in mode for aggressive OEM ROMs). -->
+    <string name="keep_alive_notification_title">Relay is active</string>
+    <string name="keep_alive_notification_text">Required to receive SMS / MMS reliably on your phone.</string>
+    <string name="settings_keep_alive_title">Resistant mode (Xiaomi / Huawei…)</string>
+    <string name="settings_keep_alive_desc">Keeps Relay alive in the background via a permanent notification in the status bar (mandatory Android contract for any foreground service — it cannot be dismissed while the toggle is ON). Useful on aggressive ROMs (Xiaomi MIUI/HyperOS, Huawei EMUI/HarmonyOS, Honor MagicOS, Oppo/Realme/OnePlus ColorOS, Vivo/iQOO FunTouch, Meizu Flyme, ASUS Zen UI) which otherwise kill third-party SMS apps and block MMS/notifications. Useless on Pixel, Samsung Galaxy, Sony, Fairphone, Motorola, Nokia, Nothing Phone — leave OFF on these.</string>
+
+
+    <!-- Common -->
+    <string name="action_send">Send</string>
+    <string name="action_cancel">Cancel</string>
+    <string name="action_confirm">Confirm</string>
+    <string name="action_reset">Reset</string>
+    <string name="action_save">Save</string>
+    <string name="action_delete">Delete</string>
+    <string name="action_archive">Archive</string>
+    <string name="action_unarchive">Unarchive</string>
+    <string name="action_pin">Pin</string>
+    <string name="action_unpin">Unpin</string>
+    <string name="action_mute">Mute</string>
+    <string name="action_unmute">Unmute</string>
+    <string name="action_mark_read">Mark read</string>
+    <string name="action_mark_unread">Mark unread</string>
+    <string name="action_block">Block</string>
+    <string name="action_unblock">Unblock</string>
+    <string name="action_more">More</string>
+    <string name="action_message_actions">Message actions</string>
+    <string name="action_reply">Reply</string>
+    <string name="action_translate">Translate</string>
+    <!-- v1.3.11 (F3) — `action_copy` / `action_forward` already defined below (line 91-92);
+         only the toast string is new. -->
+    <string name="toast_copied">Message copied</string>
+    <string name="toast_code_copied">Code copied</string>
+    <string name="otp_copy_code">Copy verification code</string>
+    <!-- v1.3.11 (F4) — phone number actions dialog -->
+    <string name="phone_action_subtitle">Choose an action for this phone number.</string>
+    <string name="phone_action_call">Call</string>
+    <string name="phone_action_add_contact">Add to contacts</string>
+    <string name="phone_action_no_dialer">No phone app available on this device.</string>
+    <string name="phone_action_no_contacts">No Contacts app available on this device.</string>
+    <!-- v1.3.11 (F5) — forward sheet -->
+    <string name="forward_sheet_title">Forward to…</string>
+    <string name="forward_search_placeholder">Search a conversation</string>
+    <string name="forward_new_contact">New recipient</string>
+    <string name="forward_existing_conversation">Existing conversations</string>
+    <string name="forward_no_conversation">No other conversation to forward to.</string>
+    <string name="thread_reply_deleted">Original message deleted</string>
+    <string name="action_cancel_reply">Cancel reply</string>
+    <string name="chat_you">You</string>
+    <string name="attach_photo">Photo</string>
+    <string name="attach_video">Video</string>
+    <string name="attach_file">File</string>
+    <string name="attach_contact">Contact</string>
+    <string name="attach_sheet_title">Add to your message</string>
+    <string name="attach_sheet_subtitle">Sent as an MMS</string>
+    <string name="voice_confirm_title">Send this voice message?</string>
+    <string name="voice_confirm_body">Recorded clip will be sent as an MMS to the recipient.</string>
+    <plurals name="thread_confirm_attachments_body">
+        <item quantity="one">%1$d attachment will be sent as an MMS.</item>
+        <item quantity="other">%1$d attachments will be sent as a single MMS.</item>
+    </plurals>
+    <string name="settings_app_lock">App lock</string>
+    <string name="lock_mode_off">None</string>
+    <string name="lock_mode_pin">PIN</string>
+    <string name="pin_setup_title">Set a PIN</string>
+    <string name="pin_setup_field">PIN (4 to 12 digits)</string>
+    <string name="pin_setup_confirm">Confirm PIN</string>
+    <string name="pin_setup_mismatch">PINs do not match</string>
+    <string name="pin_setup_too_short">Minimum 4 digits</string>
+    <string name="pin_setup_digits_only">Digits only</string>
+    <string name="lock_mode_dialog_title">Choose lock mode</string>
+    <string name="conversation_actions_title">Conversation actions</string>
+    <!-- v1.25.3 — blocking no longer deletes anything. The dialog used to promise blocking only
+         while the action ALSO wiped the conversation from Room and from the system SMS database;
+         the deletion has been removed rather than merely documented. -->
+    <string name="conversation_block_confirm_title">Block this conversation?</string>
+    <string name="conversation_block_confirm_body">Every number in this conversation will be blocked. The conversation stays in your list, marked as blocked, and nothing is deleted. You can unblock it at any time.</string>
+    <string name="conversations_section_blocked">Blocked</string>
+    <string name="conversations_section_messages">Messages</string>
+    <string name="conversation_blocked_label">Blocked</string>
+    <string name="settings_purge_blocked">Purge blocked conversations</string>
+    <string name="settings_purge_blocked_desc">Permanently delete every conversation whose participants are all on the system blocklist.</string>
+    <string name="settings_purge_blocked_result">Purged %1$d conversation(s)</string>
+    <string name="settings_purge_blocked_none">No blocked conversation to purge</string>
+    <string name="lock_mode_biometric">Biometric + PIN fallback</string>
+    <string name="lock_biometric_title">Unlock Relay</string>
+    <string name="lock_biometric_subtitle">Use your fingerprint or face</string>
+    <string name="lock_use_pin">Use PIN</string>
+    <string name="lock_biometric_unavailable">Biometric not available on this device — set a PIN first</string>
+    <string name="sort_section">Sort conversations</string>
+    <string name="sort_date">Most recent first</string>
+    <string name="sort_unread">Unread first</string>
+    <string name="action_back">Back</string>
+    <string name="action_backspace">Backspace</string>
+    <string name="action_copy">Copy</string>
+    <string name="action_forward">Forward</string>
+    <string name="action_retry">Retry</string>
+    <string name="action_resume">Resume</string>
+    <string name="action_close">Close</string>
+    <string name="action_continue">Continue</string>
+    <string name="action_export_pdf">Export to PDF</string>
+    <string name="action_attach">Attach</string>
+    <string name="action_schedule">Schedule</string>
+    <string name="action_new_message">New message</string>
+    <!-- v1.28.3 — named groups -->
+    <string name="action_new_group">New group</string>
+    <string name="action_rename_group">Rename the group…</string>
+    <string name="rename_group_title">Group name</string>
+    <string name="rename_group_placeholder">Family, hiking…</string>
+    <string name="rename_group_hint">This name stays on this phone. Members still see your number.</string>
+    <string name="group_renamed">Group renamed</string>
+    <string name="group_avatar_cd">Group</string>
+    <string name="action_call">Call</string>
+    <string name="conversations_search_hint">Search a number, a contact, a message…</string>
+    <string name="conversations_section_pinned">Pinned</string>
+    <string name="conversations_section_chats">Chats</string>
+    <string name="conversations_search_short">Search</string>
+    <string name="conversations_no_match">No matching conversation.</string>
+    <string name="conversations_contacts_banner_text">To show contact names and photos, Relay needs access to your contacts.</string>
+    <string name="conversations_contacts_banner_action">Allow access</string>
+    <string name="conversations_contacts_banner_dismiss">Dismiss</string>
+    <string name="thread_create_contact">Create a contact</string>
+    <string name="thread_update_contact">Update a contact</string>
+    <string name="action_create_contact">Create contact</string>
+    <string name="action_create_group">Create a group</string>
+
+    <!-- Details side panel -->
+    <string name="details_panel_title">Details</string>
+    <string name="details_schedule">Schedule</string>
+    <string name="details_add_to_contacts">Add to contacts</string>
+    <string name="details_edit_contact">Edit contact</string>
+    <string name="details_member_count">%1$d members</string>
+    <string name="details_change_photo">Change contact photo</string>
+    <string name="details_tab_photos">Photos</string>
+    <string name="details_tab_videos">Videos</string>
+    <string name="details_tab_files">Files</string>
+    <string name="details_empty_photos">Photos shared in this conversation will show here.</string>
+    <string name="details_empty_videos">Videos shared in this conversation will show here.</string>
+    <string name="details_empty_files">Files shared in this conversation will show here.</string>
+    <string name="details_file_saved">Saved</string>
+    <string name="details_file_save_failed">Couldn\'t save the file</string>
+    <string name="details_save_copy">Save a copy</string>
+    <string name="viewer_picker_title">Open with</string>
+    <string name="viewer_just_once">Just once</string>
+    <string name="viewer_always">Always</string>
+    <string name="viewer_kind_images">Images</string>
+    <string name="viewer_kind_videos">Videos</string>
+    <string name="viewer_kind_audio">Audio</string>
+
+    <!-- Tabs / sections -->
+    <string name="tab_archived">Archived</string>
+    <string name="tab_vault">Vault</string>
+
+
+    <!-- Conversations list -->
+    <string name="conversations_empty_title">No conversations yet</string>
+    <string name="conversations_empty_body">Once you receive or send a message, it will appear here.</string>
+    <string name="conversations_archived_empty">No archived conversations</string>
+    <string name="conversations_archived_empty_body">Keep your inbox tidy by moving conversations out of the main list without deleting them. Access them anytime in Archive.</string>
+    <string name="conversations_importing_title">Importing your messages</string>
+    <string name="conversations_importing_body">Reading your existing SMS — this happens only once.</string>
+    <string name="conversations_importing_count">%1$d messages imported…</string>
+    <string name="conversations_delete_confirm_title">Delete this conversation?</string>
+    <string name="conversations_delete_confirm_body">All messages in this conversation will be permanently removed from this device. Other conversations are not affected.</string>
+    <!-- v1.28.9 — une conversation du coffre n'est plus supprimee si sa copie systeme resiste : elle reviendrait hors du coffre. -->
+    <string name="conversations_delete_vault_kept_system">This vault conversation was not deleted: its copy in the phone’s message store could not be removed, and it would have come back outside the vault at the next sync. Make Relay your default SMS app, then try again. If it keeps failing, move the conversation out of the vault first: it may then come back in the main list.</string>
+    <string name="conversations_delete_kept_local">The conversation was not deleted: part of it could not be removed from this phone. Try again.</string>
+    <string name="conversations_draft_prefix">Draft: %1$s</string>
+    <string name="conversations_preview_attachment">Attachment</string>
+    <string name="invite_friends">Invite friends</string>
+    <string name="invite_friends_settings">Invite your friends</string>
+
+    <!-- Thread -->
+    <string name="thread_compose_placeholder">Message</string>
+    <string name="thread_compose_placeholder_encrypted">Relay message</string>
+
+    <!-- End-to-end encryption -->
+    <string name="e2e_too_long">Too long to send encrypted</string>
+    <string name="e2e_notice_activated">Messages are now end-to-end encrypted.</string>
+    <string name="e2e_notice_key_changed">%1$s\'s security code changed. Messages are still end-to-end encrypted.</string>
+    <string name="e2e_notice_key_changed_verified">%1$s\'s security code changed. %1$s was verified — compare the safety number again to confirm it\'s still them.</string>
+    <string name="e2e_notice_deactivated">Encryption ended — %1$s no longer uses Relay</string>
+    <string name="e2e_notice_group_activated">Messages in this group are now end-to-end encrypted.</string>
+    <string name="e2e_notice_group_deactivated">Encryption ended in this group — %1$s no longer uses Relay</string>
+    <string name="e2e_notice_group_key_changed">%1$s\'s security code changed. Messages in this group are still end-to-end encrypted.</string>
+    <string name="e2e_notice_group_key_changed_verified">%1$s\'s security code changed. %1$s was verified — compare the safety number again to confirm it\'s still them.</string>
+    <string name="e2e_decrypt_failed">This message couldn\'t be decrypted.</string>
+    <string name="e2e_media_decrypt_pending">Waiting to decrypt…</string>
+    <string name="e2e_encryption">Encryption</string>
+    <string name="e2e_details_encrypted">End-to-end encrypted</string>
+    <string name="e2e_details_verify_tap">Tap to verify safety number</string>
+    <string name="e2e_details_verified">Verified ✓</string>
+    <string name="e2e_details_setting_up">Checking if %1$s uses Relay…</string>
+    <string name="e2e_details_not_encrypted">Not encrypted</string>
+    <string name="e2e_details_group_every_member">Every member uses Relay</string>
+    <string name="e2e_details_group_checking">Checking if everyone uses Relay…</string>
+    <string name="e2e_details_group_not_relay">%1$s doesn\'t use Relay yet</string>
+    <string name="e2e_details_group_not_relay_more">%1$s doesn\'t use Relay yet, and %2$d others</string>
+    <string name="e2e_details_group_not_capable">%1$s\'s Relay is out of date</string>
+    <string name="e2e_details_group_blocked">%1$s is blocked</string>
+    <string name="e2e_details_auto_start">Encryption starts automatically when %1$s uses Relay</string>
+    <string name="e2e_details_retry_encryption">Retry encryption</string>
+    <string name="e2e_details_retry_via_sms">Retry another way</string>
+    <string name="e2e_details_retrying">Retrying…</string>
+    <string name="e2e_details_view_safety_number">View safety number</string>
+    <string name="e2e_verify_title">Safety number</string>
+    <string name="e2e_verify_explainer">Compare this number with %1$s in person or over another channel — a call, or another app. If the numbers match, you\'re talking to each other and no one in between.</string>
+    <string name="e2e_verify_mark">Mark as verified</string>
+    <string name="e2e_verify_remove">Remove verification</string>
+    <string name="e2e_verify_verified">Verified</string>
+    <string name="e2e_verify_copy">Copy</string>
+    <string name="e2e_verify_load_failed">Couldn\'t load the safety number.</string>
+    <string name="e2e_settings_explainer">Relay to Relay auto-encrypts. When both people use Relay, your 1:1 texts are end-to-end encrypted automatically — no setup needed. Messages to anyone without Relay, and photos and files in groups, are sent as plain SMS/MMS. A group encrypts only when every member uses Relay. Encrypted messages use a few more text segments than plain messages.</string>
+    <string name="e2e_settings_status_subtitle">Automatic when both people use Relay</string>
+    <string name="e2e_settings_fingerprint">Your fingerprint</string>
+    <string name="e2e_settings_unavailable">Encryption unavailable</string>
+    <string name="e2e_settings_fingerprint_hint">Share this with a contact so they can check it\'s really you.</string>
+    <string name="e2e_settings_verified_contacts">Verified contacts</string>
+    <string name="e2e_settings_auto_discover_title">Find Relay contacts automatically</string>
+    <string name="e2e_settings_auto_discover_subtitle">Sends a short invisible message when you open a conversation to see if the other person uses Relay, at most 3 per contact per month.</string>
+    <string name="e2e_settings_verified_count">%1$d contacts</string>
+    <string name="e2e_settings_no_verified">No verified contacts yet</string>
+    <string name="e2e_settings_attribution">Relay\'s end-to-end encryption uses vodozemac, the open-source encryption library from Matrix, independently audited by Least Authority in 2022.</string>
+    <string name="thread_compose_emoji">Emoji</string>
+    <string name="thread_status_pending">Sending…</string>
+    <string name="thread_status_sent">Sent</string>
+    <string name="thread_status_delivered">Delivered</string>
+    <string name="thread_status_failed">Failed — tap to retry</string>
+    <string name="thread_status_failed_mms">Not sent</string>
+    <string name="thread_status_refused_by_carrier">Refused by the carrier (code %1$s)</string>
+    <string name="date_today">Today</string>
+    <string name="date_yesterday">Yesterday</string>
+    <string name="date_this_week">This week</string>
+    <string name="date_this_month">This month</string>
+    <string name="date_older">Older</string>
+    <string name="thread_confirm_delete_message">Delete this message? This cannot be undone.</string>
+    <string name="thread_confirm_unpin_message">Remove the pin from this message?</string>
+    <string name="thread_export_success">PDF saved (%1$d pages)</string>
+
+    <!-- Voice MMS composer -->
+    <string name="voice_action_record">Record voice message</string>
+    <string name="voice_action_stop">Stop recording</string>
+    <string name="voice_action_cancel">Cancel recording</string>
+    <string name="voice_action_discard">Discard recording</string>
+    <string name="voice_action_send">Send voice message</string>
+    <string name="voice_action_play">Play</string>
+    <string name="voice_action_pause">Pause</string>
+    <string name="voice_permission_denied">Microphone permission denied. Open Settings to enable it.</string>
+
+    <!-- Compose -->
+    <string name="compose_to_label">To:</string>
+    <string name="compose_search_contact">Contact or phone number</string>
+    <string name="compose_use_this_number">Use this number</string>
+    <string name="compose_add_to_group">Add to the group</string>
+    <string name="compose_add_contact">Add contact</string>
+    <string name="compose_select_contact">Select contact</string>
+    <string name="compose_name_your_group">Name your group</string>
+    <string name="compose_group_name_placeholder">Group name</string>
+    <string name="compose_group_members">Members</string>
+    <string name="compose_remove_member">Remove member</string>
+    <string name="compose_contacts_refused_title">No access to contacts</string>
+    <string name="compose_contacts_refused_desc">Type a number above, or tap here to allow Contacts in the app\'s Android settings.</string>
+
+    <!-- Blocked numbers -->
+    <string name="blocked_title">Blocked numbers</string>
+    <string name="blocked_empty">No blocked number.</string>
+    <string name="blocked_add">Add a number</string>
+
+    <!-- Vault -->
+    <string name="vault_title">Secure vault</string>
+    <string name="vault_empty">The vault is empty</string>
+    <string name="vault_empty_body">Vault messages are protected by AES-256 encryption using SQLCipher, with the encryption key securely stored in Android Keystore. Access your Vault with your PIN, password or biometrics.</string>
+    <string name="vault_move_in">Move to vault</string>
+    <string name="vault_move_out">Move out of vault</string>
+    <!-- v1.11.0 — feedback snackbar (Vault polish) -->
+    <string name="vault_move_in_done">Conversation moved to the vault</string>
+    <string name="vault_move_in_failed">Could not move this conversation</string>
+    <string name="vault_move_out_done">Conversation moved out of the vault</string>
+    <string name="vault_move_out_failed">Could not move this conversation</string>
+    <!-- v1.13.0 — multi-selection bulk move to/from vault -->
+    <string name="bulk_vault_move_in">Move to vault</string>
+    <string name="bulk_vault_move_out">Move out of vault</string>
+    <string name="selected">Selected</string>
+    <!-- v1.13.1 — entry from long-press ActionsSheet into multi-selection mode -->
+    <string name="bulk_select_multiple">Select multiple</string>
+    <!-- v1.14.0 — emergency call behavior + outcomes -->
+    <string name="emergency_call_permission_denied">Call permission denied. Falling back to dialer.</string>
+    <string name="emergency_call_os_error">Unable to place the call.</string>
+    <!-- v1.14.0 — kill-switch "Je vais bien" (false-alarm reset) -->
+    <string name="emergency_i_am_ok_body">False alert. I am OK. Please do not worry, no action needed.</string>
+    <string name="emergency_i_am_ok_chip_title">Emergency triggered recently</string>
+    <string name="emergency_i_am_ok_chip_action">I am OK</string>
+    <string name="emergency_i_am_ok_confirm_title">Send the "I am OK" message?</string>
+    <string name="emergency_i_am_ok_confirm_body">This will reset the emergency cooldown and (optionally) send a short SMS to your safety-call contacts so they know it was a false alert. You can disable the SMS in Settings.</string>
+    <string name="emergency_i_am_ok_done">"I am OK" message sent.</string>
+    <string name="emergency_i_am_ok_reset_only">Cooldown reset. No SMS sent.</string>
+    <string name="emergency_i_am_ok_send_failed">Cooldown reset, but no contact received the SMS. Try again or contact them manually.</string>
+    <string name="settings_send_i_am_ok_sms_title">Send "I am OK" SMS on reset</string>
+    <string name="settings_send_i_am_ok_sms_desc">When you tap "I am OK" after a false-alarm trigger, also send a short SMS to your safety-call contacts saying it was a false alert.</string>
+    <!-- v1.14.5 — strings emergency_dry_run_* removed (button "Test without sending" deleted). -->
+    <!-- v1.14.5 — Settings → Mode urgence : ToggleRow direct accès GPS opt-in -->
+    <string name="settings_emergency_include_location_title">Include GPS in emergency SMS</string>
+    <string name="settings_emergency_include_location_desc">Adds a Google Maps link with your current location to the emergency SMS body. Requires location permission. If refused, the SMS is sent without coordinates.</string>
+    <string name="settings_emergency_include_location_denied">Location permission denied. GPS inclusion disabled.</string>
+    <!-- v1.14.7 — string emergency_topbar_warning_cd retirée (orpheline, prévue pour un indicateur visuel jamais branché). -->
+    <!-- v1.14.1 — full-page emergency redesign : 4 colored call tiles + disable + open-from-notif -->
+    <!-- v1.28.12 — one label per SERVICE, not per number. The same service is 17 in France,
+         110 in Germany, 091 in Spain, and the tile already shows the number itself. -->
+    <string name="emergency_call_eu_label">European emergency</string>
+    <string name="emergency_call_national_label">National emergency</string>
+    <string name="emergency_call_police_label">Police</string>
+    <string name="emergency_call_fire_label">Fire brigade</string>
+    <string name="emergency_call_medical_label">Medical emergency</string>
+    <string name="emergency_section_call_title">Call directly</string>
+    <string name="emergency_section_sms_title">Send SOS SMS</string>
+    <string name="emergency_section_other_title">Other actions</string>
+    <string name="emergency_disable_button">Disable emergency mode</string>
+    <string name="emergency_disable_confirm_title">Disable emergency mode?</string>
+    <string name="emergency_disable_confirm_body">The big EMERGENCY button and the lock-screen shortcut will stop working until you reactivate them in Settings. You can always come back to this page later.</string>
+    <string name="emergency_disable_done">Emergency mode disabled.</string>
+    <string name="emergency_call_close_label">Call a relative</string>
+    <string name="emergency_call_close_picker_title">Which relative do you want to call?</string>
+    <!-- v1.13.0 — distinct vault PIN/pass (second-factor) -->
+    <string name="pin_entry_label">PIN or password</string>
+    <string name="pin_error_invalid">Incorrect PIN or password</string>
+    <string name="vault_pin_dialog_title">Vault second-factor</string>
+    <string name="vault_pin_dialog_subtitle">Enter the PIN or password that protects the vault. You can also use biometrics if available.</string>
+    <string name="vault_pin_dialog_unlock">Unlock</string>
+    <string name="vault_use_biometric">Use biometrics</string>
+    <string name="settings_vault_pin_title">Distinct PIN or password for the vault</string>
+    <string name="settings_vault_pin_desc">When ON, opening the vault asks for a dedicated PIN/password (and optionally biometrics) even if the app is already unlocked. The credential is hashed separately from the app PIN.</string>
+    <string name="settings_vault_pin_set_title">Set the vault PIN</string>
+    <string name="settings_vault_pin_set_subtitle">Pick a PIN that is different from your app PIN.</string>
+    <string name="settings_vault_pin_confirm_title">Confirm the vault PIN</string>
+    <string name="settings_vault_pin_change">Change the vault PIN</string>
+    <string name="settings_vault_pin_mismatch">PINs do not match. Try again.</string>
+    <string name="settings_vault_pin_too_short">PIN must be at least 4 characters.</string>
+    <string name="settings_vault_pin_same_as_app">Choose a PIN that is different from your app PIN.</string>
+    <string name="settings_vault_pin_saved">Vault PIN saved.</string>
+    <string name="settings_vault_pin_cleared">Vault PIN removed.</string>
+    <!-- v1.25.3 (audit M24) — the confirm dialog reused the feature description as its body. -->
+    <!-- v1.27.10 (external review !38458) — removing the vault PIN now requires the vault PIN. -->
+    <string name="settings_vault_pin_clear_confirm_title">Remove the vault PIN?</string>
+    <string name="settings_vault_pin_clear_confirm_body">Enter the vault PIN to remove it. The vault will then open as soon as the app itself is unlocked. Its conversations are kept, and stay hidden from the main list.</string>
+    <!-- v1.27.10 — vault PIN replacement now asks for the one in place. -->
+    <string name="settings_vault_pin_current_label">Current vault PIN</string>
+    <string name="settings_vault_pin_new_label">New PIN or password</string>
+    <!-- v1.27.10 — the way out when the vault PIN is lost. It destroys, on purpose: a way out
+         that asked for nothing more than the app PIN would be the very bypass we closed. -->
+    <string name="settings_vault_pin_forgot_title">Forgotten vault PIN?</string>
+    <string name="settings_vault_pin_forgot_desc">Empties the vault and removes its PIN. The only way back in without the PIN — and it destroys what it opens.</string>
+    <string name="settings_vault_pin_forgot_confirm_title">Empty the vault and remove its PIN?</string>
+    <string name="settings_vault_pin_forgot_confirm_body">Every conversation in the vault is deleted, messages included, on this phone and from the system SMS store. Nothing is recovered — this is the price of getting back in without the PIN. Conversations outside the vault are untouched. This cannot be undone.</string>
+    <string name="settings_vault_pin_forgot_confirm_action">Empty and remove</string>
+    <string name="settings_vault_pin_forgot_done">Vault emptied: %1$d conversation(s) deleted. Its PIN is removed.</string>
+    <string name="settings_vault_pin_forgot_incomplete">Purge incomplete: %1$d conversation(s) deleted, %2$d left. The vault PIN was NOT removed. Make Relay your default SMS app, then try again.</string>
+    <!-- v1.28.3 — echec LOCAL : pas de sortie forcee, et la raison est dite. -->
+    <string name="settings_vault_pin_forgot_local_failure">%1$d conversation(s) deleted, but %2$d could not be removed from this phone. The PIN stays in place: removing it would open a vault that is still full. Free up some storage and try again.</string>
+    <string name="settings_vault_pin_forgot_residue">Vault emptied and PIN removed. But %2$d conversation(s) left their copy in the phone’s SMS store: they stay readable by another messaging app. %1$d conversation(s) were deleted in full.</string>
+    <string name="settings_vault_pin_force_title">Empty it anyway?</string>
+    <string name="settings_vault_pin_force_body">The copy of %1$d conversation(s) could not be removed from the phone’s SMS store, and trying again will give the same result. Relay can empty the vault and remove the PIN regardless: you get access back, but those copies stay on the phone and remain readable by another messaging app. This cannot be undone.</string>
+    <string name="settings_vault_pin_force_action">Empty and remove the PIN</string>
+    <!-- v1.25.3 (audit M23) — turning the app lock off used to happen on a single tap. -->
+    <string name="settings_lock_clear_confirm_title">Turn off app lock?</string>
+    <string name="settings_lock_clear_confirm_body">Your PIN will be deleted and Relay will open without asking for anything. Biometric unlock is turned off too. This cannot be undone.</string>
+    <string name="settings_lock_clear_confirm_action">Turn off</string>
+    <string name="action_disable">Disable</string>
+    <string name="vault_actions_title">Vault actions</string>
+    <string name="vault_biometric_title">Unlock the vault</string>
+    <string name="vault_biometric_unavailable_title">Vault unavailable</string>
+    <string name="vault_biometric_unavailable_body">Biometrics is the only second factor set for this vault, and it is currently unavailable. Set a separate vault code in Settings to open the vault without biometrics.</string>
+    <string name="vault_biometric_subtitle">Confirm your identity to open the private folder.</string>
+    <string name="vault_biometric_pending">Waiting for fingerprint…</string>
+    <!-- v1.11.0 — Sujet 5 apparence par contact -->
+    <string name="appearance_dialog_title">Chat colors</string>
+    <string name="appearance_section_bubble_color">Outgoing bubble color</string>
+    <string name="appearance_pick_avatar">Choose from gallery</string>
+    <string name="appearance_reset_avatar">Use default avatar</string>
+    <string name="appearance_saved">Appearance updated</string>
+    <!-- v1.11.0 — Sujet 3 anti-smishing -->
+    <string name="settings_smishing_detection">Scam detection (offline)</string>
+    <string name="settings_smishing_detection_desc">Flags suspicious incoming SMS (shortened URLs, urgency wording, premium-rate numbers, lookalike domains). It covers France, Germany, Italy, Spain, the United Kingdom and Ireland. 100% local, no cloud. May produce false positives.</string>
+    <string name="smishing_banner_title">⚠️ Possibly fraudulent</string>
+    <string name="smishing_banner_subtitle">Tap to see why</string>
+    <string name="smishing_dialog_title">Why this warning?</string>
+    <string name="smishing_dialog_intro">Relay detected the following suspicious signals in this message. No SMS content was sent anywhere — everything is computed locally.</string>
+    <string name="smishing_reason_url_shortener">Shortened URL (bit.ly, t.co, tinyurl…). Shorteners can hide the real destination — verify before tapping.</string>
+    <string name="smishing_reason_urgency">Urgency or pressure wording (urgent, expires, click here…). A common social-engineering tactic to trigger panic.</string>
+    <string name="smishing_reason_premium">Premium-rate phone number (3xxx or 0899 in France, 0900 in Germany, 899 in Italy, 806 in Spain…). Calling these numbers is expensive and often part of a scam.</string>
+    <string name="smishing_reason_typosquatting">Look-alike domain (e.g. "paypa1.com" instead of "paypal.com"). The watched sites are the official ones of France, Germany, Italy, Spain, the United Kingdom and Ireland. Always type official addresses by hand.</string>
+    <string name="smishing_dialog_dismiss">OK</string>
+    <!-- v1.11.0 — Noms de couleurs de la palette d'apparence (a11y TalkBack) -->
+    <string name="appearance_color_brand_blue">Brand blue (default)</string>
+    <string name="appearance_color_navy">Navy blue</string>
+    <string name="appearance_color_sky_blue">Sky blue</string>
+    <string name="appearance_color_deep_indigo">Deep indigo</string>
+    <!-- v1.19.0 — mauve (ProtonMail-like) + raspberry added; greens/brown/dupes removed -->
+    <string name="appearance_color_mauve">Mauve</string>
+    <string name="appearance_color_deep_purple">Deep purple</string>
+    <string name="appearance_color_framboise">Raspberry</string>
+    <string name="appearance_color_brand_red">Brand red</string>
+    <string name="appearance_color_burnt_orange">Burnt orange</string>
+    <string name="appearance_color_slate_blue_grey">Slate blue-grey</string>
+    <string name="appearance_color_selected">selected</string>
+    <!-- v1.12.0 — vault move with locked session -->
+    <string name="error_session_locked">Unlock the app to move this conversation</string>
+    <!-- v1.12.0 — Emergency shortcut (lock-screen persistent notification) -->
+    <string name="channel_emergency_shortcut_label">Emergency shortcut</string>
+    <!-- v1.14.8 audit P2 — texte mis à jour : depuis v1.14.2 l'action "URGENCE" en un tap a été retirée (risque de déclenchement accidentel). Seules les actions 112/17 restent. -->
+    <!-- v1.28.12 - the police number changes from country to country: neither description names it. -->
+    <string name="channel_emergency_shortcut_desc">Silent persistent notification with quick-dial actions (112 and, where there is one, the emergency number for your country). Tap the body to open the Emergency screen, then hold 3 s to send the alert.</string>
+    <string name="emergency_shortcut_notif_title">Relay — emergency shortcut</string>
+    <string name="emergency_shortcut_notif_text">Tap to open the emergency page, or dial 112.</string>
+    <!-- v1.28.12 — one label for both quick actions: the police number changes from country to
+         country, so it can no longer be written into the string. -->
+    <string name="emergency_shortcut_action_dial">Dial %1$s</string>
+    <string name="settings_emergency_shortcut_title">Lock-screen shortcut</string>
+    <string name="emergency_saved_enabled">Emergency mode enabled</string>
+    <string name="emergency_saved_disabled">Emergency mode disabled</string>
+    <string name="emergency_setup_unsaved_body">Emergency mode is not saved yet. Leaving now would keep it in its previous state.</string>
+    <!-- v1.14.8 audit P2 — texte mis à jour pour refléter v1.14.2 (action URGENCE retirée de la notif). -->
+    <string name="settings_emergency_shortcut_desc">Show a persistent notification with quick-dial actions (112 and, where there is one, the emergency number for your country) accessible without unlocking. Tap the body to open the Emergency screen. Off by default.</string>
+    <string name="emergency_shortcut_no_app_to_dial">No app installed to place the call</string>
+    <string name="settings_emergency_call_police_title">Local emergency number in lock-screen notif</string>
+    <string name="settings_emergency_call_police_desc">Add the emergency number for your country as a second quick action on the persistent lock-screen notification: the police in most countries, the general emergency line in the UK and Ireland. It is left out where the country has no number of its own. The in-app Emergency page always shows every number regardless of this setting. Off by default.</string>
+
+    <!-- Backup / restore dialogs -->
+    <string name="backup_explainer">Encrypted backup uses AES-256-GCM with PBKDF2-HMAC-SHA512 key derivation. Pick a strong passphrase — without it the file cannot be recovered.</string>
+    <string name="backup_passphrase_title">Backup passphrase</string>
+    <string name="backup_passphrase_explain">Choose a passphrase to encrypt the backup. At least 8 characters. Keep it safe — there is no recovery.</string>
+    <string name="backup_passphrase">Passphrase</string>
+    <string name="backup_passphrase_repeat">Repeat passphrase</string>
+    <string name="backup_passphrase_mismatch">Passphrases do not match.</string>
+    <string name="backup_export_success">Backup saved.</string>
+    <string name="backup_export_failed">Backup failed.</string>
+    <string name="backup_export_vault_locked">Vault locked — open the vault first so the backup can include it.</string>
+    <string name="backup_vault_pin_title">Vault PIN required</string>
+    <string name="backup_vault_pin_body">A backup includes your vault, so it asks for the vault PIN before it is created.</string>
+    <string name="backup_vault_biometric_title">Vault PIN required for backup</string>
+    <string name="backup_vault_biometric_body">Your vault is protected by biometrics only, which cannot be requested from this screen. Set a vault PIN in Settings — Security, then the backup will ask for it here.</string>
+
+    <!-- Migration -->
+    <string name="migration_title">Import existing SMS</string>
+    <string name="migration_body">Reads from the system SMS provider and mirrors messages into the encrypted database. Relay must already be the default SMS app.</string>
+    <string name="migration_run">Start import</string>
+    <string name="migration_rerun">Re-run</string>
+    <string name="migration_imported">Imported: %1$d</string>
+    <!-- v1.25.3 (audit M10) — an import failure used to leave a progress bar spinning forever. -->
+    <string name="migration_failed">The import stopped on an error. Messages already imported were kept — you can run it again.</string>
+
+    <!-- About -->
+    <string name="about_easter_egg">✨ Thanks to those who care about their privacy. ✨</string>
+
+    <!-- Lock screen -->
+    <string name="lock_title">Relay is locked</string>
+    <string name="lock_pin_hint">Enter your PIN</string>
+    <string name="lock_lockout_message">Too many attempts. Try again in %1$d s.</string>
+
+    <!-- Settings -->
+    <string name="settings_title">Settings</string>
+    <string name="settings_app_subtitle">Relay – SMS &amp; MMS Messenger</string>
+
+    <string name="settings_section_appearance">Appearance</string>
+    <string name="settings_section_general">General</string>
+    <string name="settings_theme_system">System</string>
+    <string name="settings_theme_light">Light</string>
+    <string name="settings_theme_dark">Dark</string>
+    <string name="settings_theme_dark_tech">Dark Tech</string>
+    <string name="settings_theme_dark_tech_desc">Developer-friendly dark palette. Overrides dynamic colors and AMOLED.</string>
+    <string name="settings_dynamic_colors">Dynamic colors</string>
+    <string name="settings_amoled">AMOLED true black</string>
+    <string name="settings_text_scale">Message text size</string>
+    <string name="settings_text_scale_desc">%1$s · messages, typing field and conversation list. Comes on top of Android\'s font size.</string>
+    <string name="settings_text_scale_hint">Makes the text of your conversations larger or smaller: the messages, the field where you type, the conversation list and the search results. It comes on top of the font size chosen in Android\'s settings.</string>
+    <string name="text_scale_xs">Extra small</string>
+    <string name="text_scale_s">Small</string>
+    <string name="text_scale_medium">Default</string>
+    <string name="text_scale_l">Large</string>
+    <string name="text_scale_xl">Extra large</string>
+    <string name="text_scale_xxl">Largest</string>
+
+    <string name="settings_section_locale">Language &amp; region</string>
+    <string name="settings_language">App language</string>
+    <string name="settings_language_desc">Opens the Android per-app language screen. Relay follows your system language unless you pick one here.</string>
+
+    <string name="settings_section_conversations">Conversations</string>
+    <string name="settings_show_avatars">Show avatars</string>
+    <string name="settings_show_duplicate_number">Show number under duplicate names</string>
+    <string name="settings_show_duplicate_number_subtitle">When two conversations share a name, show the number underneath.</string>
+    <string name="settings_show_categories">Show categories</string>
+    <string name="settings_show_categories_subtitle">When off, filtering is off too and all conversations show in one list.</string>
+    <string name="settings_signature">Automatic signature</string>
+
+    <string name="settings_section_sending">Sending</string>
+    <string name="settings_default_region_title">Default country</string>
+    <string name="settings_default_region_auto">Automatic (SIM country)</string>
+    <string name="settings_default_region_auto_hint">Uses the SIM\'s country to convert national numbers (06…) to international format before sending. Pick a country if your contacts are saved in another country\'s national format — e.g. French 06… numbers on a foreign SIM won\'t be delivered otherwise.</string>
+    <string name="settings_confirm_broadcast">Confirm before sending</string>
+    <string name="settings_confirm_send_title">Send this message?</string>
+    <string name="settings_delivery_reports">Delivery reports</string>
+    <string name="settings_group_mms">Group MMS</string>
+    <string name="settings_group_mms_hint">One MMS to everyone, and every reply comes back to the group. Messages sent from a group then always go as MMS, text included. Set \"My phone number\" so received group messages can leave you out of the member list.</string>
+    <string name="settings_my_number">My phone number</string>
+    <string name="settings_my_number_dialog_title">Your phone number</string>
+    <string name="settings_my_number_dialog_body">Optional. If set, this number replaces the AOSP placeholder \"insert-address-token\" in the sender address of outgoing MMS, so other SMS apps display you correctly.</string>
+    <string name="settings_my_number_placeholder">+44 7XXX XXX XXX</string>
+    <string name="settings_my_number_detect">Auto-detect from SIM</string>
+    <string name="settings_my_number_not_set">Not set</string>
+    <string name="settings_my_number_detect_failed">Cannot read the SIM number — enter it manually</string>
+    <string name="settings_my_number_detect_no_perm">Phone-numbers permission not granted — enter it manually</string>
+    <string name="settings_my_number_invalid">Must be a valid phone number (+ and digits)</string>
+
+    <string name="settings_auto_delete_title">History cleanup</string>
+    <string name="settings_auto_delete_desc">Deletes SMS, MMS and voice messages older than the chosen age. Automatic cleanup runs at most once a month; you can also trigger a manual cleanup at any time. Starred messages are never deleted.</string>
+    <string name="settings_auto_delete_explainer">Auto runs once a month. Starred messages are never deleted.</string>
+    <string name="settings_auto_delete_off">Off — delete nothing</string>
+    <string name="settings_auto_delete_30">Delete messages older than 30 days</string>
+    <string name="settings_auto_delete_60">Delete messages older than 60 days</string>
+    <string name="settings_auto_delete_180">Delete messages older than 180 days</string>
+    <string name="settings_auto_delete_status_off">Off</string>
+    <string name="settings_auto_delete_status_30">Deletes messages older than 30 days</string>
+    <string name="settings_auto_delete_status_60">Deletes messages older than 60 days</string>
+    <string name="settings_auto_delete_status_180">Deletes messages older than 180 days</string>
+    <string name="settings_auto_delete_status_n_days">Deletes messages older than %1$d days</string>
+    <string name="settings_auto_delete_purge_now">Clean up now</string>
+    <string name="settings_auto_delete_purge_now_disabled">Pick a duration to enable</string>
+    <string name="settings_auto_delete_purge_confirm_title">Confirm cleanup</string>
+    <string name="settings_auto_delete_purge_confirm_zero">No messages to delete for this duration.</string>
+    <string name="settings_auto_delete_purge_confirm_body">%1$d message(s) older than %2$d days will be deleted from the phone, not just from Relay. Starred messages are kept. This cannot be undone.</string>
+    <string name="settings_auto_delete_purge_done">%1$d message(s) deleted.</string>
+    <string name="action_delete_now">Delete</string>
+    <string name="settings_resync_title">Resync from phone</string>
+    <string name="settings_resync_desc">Re-imports all SMS from the Android system. Useful when messages present on the phone are missing from the app. It does not bring back what you deleted: deleting also removes the phone\'s copy. No duplicates.</string>
+    <string name="settings_resync_started">Resync started in background.</string>
+    <string name="settings_reset_encryption_timing">Reset encryption timing</string>
+    <string name="settings_reset_encryption_timing_done">Encryption timing reset</string>
+    <string name="settings_send_reactions_title">Send reactions</string>
+    <string name="settings_row_info">More info</string>
+    <string name="settings_send_reactions_desc">When you post an emoji reaction (heart, thumbs-up…), a SMS containing only the emoji is sent to the recipient. Counts as a normal SMS at your plan\'s rate. Changing a reaction sends a new SMS with the new emoji; removing one sends a removal SMS.</string>
+    <!-- v1.8.0 — bug 5 fix : 3 options at a glance.
+         Title kept (was already pointing to "reaction format"). Desc legacy kept for downgrade. -->
+    <string name="settings_reaction_format_title">Reaction format</string>
+    <string name="settings_reaction_format_fr">Readable French</string>
+    <string name="settings_reaction_format_fr_hint">"Réagi par ❤️ à votre message : «preview»". Natural and understandable for any French-speaking Android recipient. Decoded by Relay as a native reaction badge.</string>
+    <string name="settings_reaction_format_en">Tapback (iMessage compat)</string>
+    <string name="settings_reaction_format_en_hint">"Reacted ❤️ to «preview»". Detected automatically by iMessage (iPhone) and recent Google Messages as a native reaction bubble. Less natural for French recipients.</string>
+    <string name="settings_reaction_format_emoji">Emoji only</string>
+    <string name="settings_reaction_format_emoji_hint">"❤️" alone. Cleaner on older SMS apps, but the recipient loses all context — they can\'t tell which message you reacted to.</string>
+    <!-- v1.9.0 — compact emoji + quote -->
+    <string name="settings_reaction_format_emoji_quote">Emoji + quote</string>
+    <string name="settings_reaction_format_emoji_quote_hint">"❤️ «your message»". Compact and context-preserving. Recipient sees emoji followed by the quoted original message.</string>
+    <string name="settings_reaction_format_ios">iPhone reactions (default)</string>
+    <string name="settings_reaction_format_ios_hint">\"Liked \"your message\"\". Understood by iPhone, Google Messages and Relay as a native reaction — and readable as plain text anywhere else.</string>
+    <!-- v1.8.1 — sender display name -->
+    <string name="settings_sender_name_title">Your display name</string>
+    <string name="settings_sender_name_desc">Included in outgoing reaction SMS to help the recipient identify the author. Leave empty to use your Android profile name (or fall back to anonymous "Réagi par ❤️…").</string>
+    <string name="settings_sender_name_label">Display name (max 40)</string>
+    <string name="settings_sender_name_auto">Auto-detect from Android profile</string>
+
+    <!-- v1.9.0 — Safety call -->
+    <string name="settings_section_safety_call">Safety call</string>
+    <string name="settings_safety_call_title">Safety call</string>
+    <string name="settings_safety_call_desc">Send an automatic SMS to your emergency contacts if you don\'t open Relay for a configured duration. Designed for solo travel, isolated living, professions at risk.</string>
+    <string name="settings_safety_call_disabled">Disabled</string>
+    <string name="settings_safety_call_disabled_after_alert">Disabled — an alert was triggered</string>
+    <string name="settings_safety_call_im_ok_snack">Timer reset.</string>
+    <!-- v1.9.0 — armed recap card (visible only when Safety call is enabled) -->
+    <string name="settings_safety_call_armed_chip">Enabled</string>
+    <string name="settings_safety_call_armed_started">Timer started: %1$s at %2$s</string>
+    <string name="settings_safety_call_im_ok_stops_relances">Safety call turned off. No further message will be sent.</string>
+    <plurals name="settings_safety_call_triggered_state">
+        <item quantity="one">Alert sent — %1$d message of %2$d</item>
+        <item quantity="other">Alert sent — %1$d messages of %2$d</item>
+    </plurals>
+    <string name="settings_safety_call_triggered_hint">Follow-ups are sent every 15 minutes. Tap “I’m OK” to stop them.</string>
+    <string name="settings_safety_call_triggered_state_sending">Sending alert…</string>
+    <string name="settings_safety_call_triggered_hint_done">Sequence complete: Safety call turned itself off. Turn it back on to be protected again.</string>
+    <string name="settings_safety_call_armed_duration">Duration: %1$s</string>
+    <string name="settings_safety_call_armed_remaining">Remaining: %1$s before trigger</string>
+    <string name="settings_safety_call_armed_remaining_imminent">Less than 2 h before trigger</string>
+    <string name="settings_safety_call_armed_contacts_one">Contact: %1$s</string>
+    <string name="settings_safety_call_armed_contacts_many">Contacts: %1$s (+%2$d others)</string>
+    <string name="settings_safety_call_armed_template">Template: %1$s</string>
+    <string name="settings_safety_call_armed_modify">Modify</string>
+    <string name="settings_safety_call_armed_actions_hint">“I\'m OK” resets the timer: the countdown restarts from the full duration, and no message is sent. “Modify” opens the settings (duration, contacts, message).</string>
+    <string name="settings_safety_call_armed_im_ok_short">I\'m OK</string>
+    <string name="safety_call_setup_title">Safety call</string>
+    <string name="safety_call_setup_section_status">Status</string>
+    <string name="safety_call_setup_section_duration">Duration</string>
+    <string name="safety_call_setup_section_contacts">Emergency contacts (max 4)</string>
+    <string name="safety_call_setup_section_template">Message</string>
+    <string name="safety_call_setup_toggle_enable">Enable Safety call</string>
+    <string name="safety_call_setup_toggle_desc">When enabled, opening Relay resets the timer. If you don\'t open it within the chosen duration, your contacts receive an automatic SMS.</string>
+    <string name="safety_call_setup_duration_24h">24 hours</string>
+    <string name="safety_call_setup_duration_48h">48 hours</string>
+    <string name="safety_call_setup_duration_72h">72 hours</string>
+    <string name="safety_call_setup_duration_custom">Custom</string>
+    <string name="attachment_generic_name">Attachment</string>
+    <string name="safety_call_setup_duration_approx">%1$s ≈ %2$s</string>
+    <string name="safety_call_setup_duration_custom_hint">In hours · 168 h = 1 week · max 720 h (30 days)</string>
+    <string name="safety_call_setup_add_contact">Add a contact</string>
+    <string name="safety_call_setup_contact_name_label">Name (optional)</string>
+    <string name="safety_call_setup_contact_phone_label">Phone number</string>
+    <string name="safety_call_setup_contact_invalid">Invalid phone number.</string>
+    <string name="safety_call_setup_contact_max_reached">Maximum 4 contacts.</string>
+    <string name="safety_call_setup_remove_contact">Remove</string>
+    <string name="safety_call_setup_template_check_in">Check-in (default)</string>
+    <string name="safety_call_setup_template_urgent">Urgent</string>
+    <string name="safety_call_setup_template_follow_up">Follow-up</string>
+    <string name="safety_call_setup_template_custom">Custom</string>
+    <string name="safety_call_setup_template_custom_label">Your message (max 140 chars)</string>
+    <string name="safety_call_setup_template_preview">Preview</string>
+    <string name="safety_call_setup_save">Save</string>
+    <string name="safety_call_setup_save_validation_no_contacts">Add at least one contact before enabling.</string>
+    <string name="safety_call_setup_shared_with_emergency">These contacts are also used by Emergency mode, which is still armed. Emptying the list would leave it with no one to alert. Turn Emergency mode off first, or keep at least one contact.</string>
+    <string name="safety_call_setup_save_validation_custom_empty">Custom message cannot be empty.</string>
+    <string name="safety_call_warning_title">Relay — confirm you\'re OK</string>
+    <string name="safety_call_warning_body_hours">Safety call will trigger in about %1$d hours. Tap to reset the timer.</string>
+    <string name="safety_call_warning_body_imminent">Safety call will trigger in less than 2 hours. Tap to reset now.</string>
+    <string name="safety_call_cannot_send_title">Safety call cannot send</string>
+    <string name="safety_call_cannot_send_body">Relay is not your default SMS app, so the alert would not be sent. Your contacts will not be warned. Tap to fix it.</string>
+    <string name="safety_role_missing_title">This protection cannot send</string>
+    <string name="safety_role_missing_body">Relay is not your default SMS app. You can arm this, but nothing will be sent when it fires, and no one will be warned.</string>
+    <string name="safety_call_sequence_title">Relay — alert sent</string>
+    <plurals name="safety_call_sequence_body">
+        <item quantity="one">%1$d of %2$d message sent to your contacts. Tap if you\'re OK: the follow-ups will stop.</item>
+        <item quantity="other">%1$d of %2$d messages sent to your contacts. Tap if you\'re OK: the follow-ups will stop.</item>
+    </plurals>
+    <string name="safety_call_sequence_title_sending">Relay — sending alert</string>
+    <string name="safety_call_sequence_body_sending">The alert is being sent to your contacts. Tap if you\'re OK: sending will stop.</string>
+    <string name="safety_call_sequence_title_done">Relay — alert sent, Safety call off</string>
+    <plurals name="safety_call_sequence_body_done">
+        <item quantity="one">%1$d of %2$d message was sent to your contacts. Safety call is now off — tap “Turn back on” to arm it again.</item>
+        <item quantity="other">All %1$d messages were sent to your contacts. Safety call is now off — tap “Turn back on” to arm it again.</item>
+    </plurals>
+    <string name="safety_call_notif_action_rearm">Turn back on</string>
+    <!-- v1.27.4 — confirmation shown after the “Turn back on” action of the receipt notification.
+         The two other confirmations reuse the Settings wording (settings_safety_call_im_ok_snack /
+         settings_safety_call_im_ok_stops_relances) on purpose: the same gesture must read the same
+         way wherever it is made. -->
+    <string name="safety_call_ack_rearmed">Safety call is back on. The timer starts over.</string>
+    <string name="safety_call_reset_warning_title">The timer restarts when you open Relay</string>
+    <string name="safety_call_reset_warning_body">Once Safety call is on, the timer restarts as soon as you open this app and unlock it. Using your phone for anything else makes no difference: if you do not open Relay within the chosen delay, the alert goes out to your contacts.</string>
+    <string name="safety_call_history_title">Trigger history</string>
+    <string name="safety_call_history_empty">No trigger recorded.</string>
+    <plurals name="safety_call_history_count">
+        <item quantity="one">%1$d of %2$d message sent</item>
+        <item quantity="other">%1$d of %2$d messages sent</item>
+    </plurals>
+    <string name="safety_call_history_recipients">Addressed to: %1$s</string>
+    <string name="safety_call_history_stopped">Sequence stopped — you confirmed you were OK.</string>
+    <!-- v1.10.0 — Emergency mode (active, user-triggered hold-3s SMS to safety contacts) -->
+    <string name="settings_section_emergency">Emergency mode</string>
+    <string name="settings_emergency_title">Emergency mode</string>
+    <string name="settings_emergency_desc">A hold-3s button sends an SMS to your emergency contacts, with your current location if you enabled it and it is available. Distinct from Safety call (which is automatic on inactivity). Disabled by default.</string>
+    <string name="settings_emergency_disabled">Disabled</string>
+    <!-- v1.10.0+ — Emergency armed recap (mirrors safety_call_armed_*) -->
+    <string name="settings_emergency_armed_chip">Enabled</string>
+    <string name="settings_emergency_armed_template">Template: %1$s</string>
+    <string name="settings_emergency_armed_location">GPS location included</string>
+    <string name="settings_emergency_armed_no_location">No GPS location</string>
+    <string name="settings_emergency_armed_location_approximate">Approximate location included (about 2 km)</string>
+    <string name="settings_emergency_armed_location_denied">Location NOT sent: location permission not granted</string>
+    <string name="settings_emergency_armed_contacts_one">Contacts: %1$s</string>
+    <string name="settings_emergency_armed_contacts_many">Contacts: %1$s +%2$d more</string>
+    <string name="settings_emergency_armed_no_contacts">No contacts configured</string>
+    <string name="settings_emergency_armed_modify">Edit</string>
+    <string name="settings_emergency_armed_open">Open</string>
+    <string name="emergency_title">Emergency mode</string>
+    <string name="emergency_setup_title">Emergency mode setup</string>
+    <string name="emergency_button_label">EMERGENCY</string>
+    <string name="emergency_button_hint_hold_3s">Emergency — hold 3 seconds to send</string>
+    <string name="emergency_preview_title">Message that will be sent</string>
+    <string name="emergency_status_disabled">Emergency mode is disabled. Turn it on in settings.</string>
+    <string name="emergency_status_no_contacts">No emergency contacts configured. Add some in Safety call settings.</string>
+    <string name="emergency_status_cooldown">Just sent. Available again in a minute.</string>
+    <string name="emergency_status_ready">Hold the button 3 seconds to alert your contacts.</string>
+    <string name="emergency_triggered_ok">Emergency sent to %1$d contact(s).</string>
+    <string name="emergency_triggered_no_location">Emergency sent to %1$d contact(s) — location unavailable.</string>
+    <string name="emergency_triggered_all_failed">Emergency send failed (%1$d). Check your default SMS app.</string>
+    <string name="emergency_setup_enable_title">Enable emergency mode</string>
+    <string name="emergency_setup_enable_desc">When on, an emergency button appears in the dedicated screen. Hold 3s to send an SMS to your emergency contacts, with your location if enabled and available.</string>
+    <string name="emergency_setup_template_title">Message template</string>
+    <string name="emergency_setup_template_need_help">I need help</string>
+    <string name="emergency_setup_template_danger">Danger</string>
+    <string name="emergency_setup_template_discreet">Discreet</string>
+    <string name="emergency_setup_location_title">Include location</string>
+    <string name="emergency_setup_location_desc">Adds a Google Maps URL to the SMS. Requires Location permission. If turned off (or permission denied), the SMS is sent without coordinates.</string>
+    <string name="emergency_setup_location_permission_warning">Location permission not granted. The emergency SMS will be sent without coordinates. Grant the permission in Android settings to fix this.</string>
+    <string name="emergency_setup_contacts_title">Emergency contacts</string>
+    <string name="emergency_setup_contacts_empty">No contacts configured.</string>
+    <string name="emergency_setup_contacts_count">%1$d contact(s) configured.</string>
+    <string name="emergency_setup_contacts_cta">Manage contacts</string>
+    <string name="action_edit">Edit</string>
+    <string name="snack_generic_error">Something went wrong.</string>
+    <string name="attachment_image_label">Image</string>
+    <string name="attachment_video_label">Video</string>
+    <string name="media_gallery_title">Photos and videos</string>
+    <string name="media_gallery_empty">No photos or videos in this conversation.</string>
+    <string name="attachment_file_label">File</string>
+    <string name="bubble_mms_parts_missing">Attachment not restored</string>
+    <string name="bubble_sender_self">You</string>
+    <string name="attachment_remove_label">Remove attachment</string>
+
+    <string name="action_react">React</string>
+    <string name="settings_auto_lock_delay">Auto-lock delay</string>
+    <string name="settings_auto_lock_delay_dialog_title">Lock the app after…</string>
+    <string name="auto_lock_immediate">Immediately</string>
+    <string name="auto_lock_15s">15 seconds</string>
+    <string name="auto_lock_1m">1 minute</string>
+    <string name="auto_lock_5m">5 minutes</string>
+    <string name="auto_lock_next_launch">Next launch only</string>
+    <string name="settings_signature_none">Not set</string>
+    <string name="settings_signature_dialog_body">Appended to every SMS you send, after a separator line. Keep it short: a long signature can split the message into several SMS, each billed separately.</string>
+    <string name="settings_signature_placeholder">e.g. Pat</string>
+    <string name="action_star">Star</string>
+    <string name="action_unstar">Remove from starred</string>
+    <string name="reaction_picker_other">Other emoji</string>
+    <!-- v1.5.0 — multi-emoji picker validate button -->
+    <!-- v1.6.0 — a11y reaction badge (TalkBack) -->
+    <string name="reaction_badge_content_description">Reaction %1$s</string>
+    <!-- Round 21 — badge tap removes the reaction again (also the picker sheet's empty-selection button) -->
+    <string name="reaction_badge_remove_action">Remove reaction</string>
+    <!-- v1.6.1 — body of the system notification fired when someone reacts to our message -->
+    <string name="reaction_notif_body_with_preview">Reacted %1$s to: %2$s</string>
+    <string name="reaction_notif_body_no_preview">Reacted %1$s to your message</string>
+    <!-- E2E: notification body for an undecryptable message (the raw ciphertext is never shown). -->
+    <string name="e2e_decrypt_failed_notif">This message couldn\'t be decrypted.</string>
+    <!-- v1.6.1 — snackbar shown when PDF export fails (audit QUAL-07 i18n fix) -->
+    <string name="snack_pdf_export_failed">PDF export failed</string>
+
+    <!-- v1.8.0 — confirmation dialogs + "Mark all read" action in overflow menu -->
+    <string name="action_mark_all_read">Mark all read</string>
+    <string name="mark_all_read_confirm_body">All current unread badges will be cleared. New incoming messages will display badges normally afterwards.</string>
+    <string name="settings_resync_confirm_title">Resync from phone?</string>
+    <string name="settings_resync_confirm_body">Re-imports messages from the system SMS/MMS provider. Existing messages stay (deduped via unique ID); previously deleted messages may reappear if they still exist in the system database. Continue?</string>
+    <string name="settings_reset_encryption_timing_confirm_title">Reset encryption timing?</string>
+    <string name="settings_reset_encryption_timing_confirm_body">Clears probe counts and reply limits for all contacts so you can test again right away. Your encryption keys and verified contacts are not affected.</string>
+    <string name="settings_reset_all_confirm_title">Reset all settings?</string>
+    <string name="settings_reset_all_confirm_body">All your preferences (theme, notifications, sending, etc.) will return to default. Your conversations, your messages and your security settings (lock, vault PIN, decoy PIN) are NOT affected.</string>
+    <string name="settings_purge_blocked_confirm_title">Purge blocked conversations?</string>
+    <string name="settings_purge_blocked_confirm_body">Deletes every conversation whose participants are entirely in the blocklist. This also removes them from the system SMS provider. Irreversible.</string>
+
+    <string name="settings_section_notifications">Notifications</string>
+    <string name="settings_notifications_enabled">Enable notifications</string>
+    <string name="settings_inline_reply">Reply from notification</string>
+
+    <!-- Round 11 — category tabs: labels + per-category mute subtitle -->
+    <string name="category_all">All</string>
+    <string name="category_personal">Personal</string>
+    <string name="category_otp">OTP</string>
+    <string name="category_promotional">Promotional</string>
+    <string name="category_transactions">Transactions</string>
+    <string name="category_other">Other</string>
+    <string name="category_mute_subtitle">Turn off notifications for this category</string>
+
+    <!-- v1.8.0 — bug 3 fix: exposes PreviewMode + NotificationStyle in the UI. -->
+    <string name="settings_notif_preview">Lock-screen preview</string>
+    <string name="settings_notif_preview_always">Always show name and content</string>
+    <string name="settings_notif_preview_unlocked">Only after unlock</string>
+    <string name="settings_notif_preview_unlocked_hint">Sender name and a redacted body show on the lock screen; the full content appears once unlocked.</string>
+    <string name="settings_notif_preview_never">Never on lock screen</string>
+    <string name="settings_notif_preview_never_hint">Plays the sound but nothing appears on the lock screen — fully invisible until you unlock and open the app.</string>
+    <string name="settings_notif_style">Notification style</string>
+    <string name="settings_notif_style_heads_up">Heads-up (default)</string>
+    <string name="settings_notif_style_heads_up_hint">Banner pops over the current screen with sound, then docks in the shade.</string>
+    <string name="settings_notif_style_banner">Banner only</string>
+    <string name="settings_notif_style_banner_hint">No pop-up, no sound. Just an icon in the shade.</string>
+    <string name="settings_notif_style_silent">Silent</string>
+    <string name="settings_notif_style_silent_hint">Routed to a low-importance channel. The system masks sound and the heads-up pop-up.</string>
+    <string name="settings_notif_open_system">Notification settings</string>
+    <string name="settings_notif_open_system_desc">Check or fix permissions, channels, and sound at the OS level.</string>
+    <string name="notifications_off_title">Notifications are off</string>
+    <string name="notifications_off_fix">Allow in Android settings</string>
+    <string name="notifications_off_safety_call">Safety call cannot warn you before it sends the alert, nor let you stop it from a notification.</string>
+    <string name="notifications_off_emergency_shortcut">The emergency shortcut cannot appear on the lock screen.</string>
+    <string name="notifications_off_messages">New messages arrive without a notification.</string>
+
+    <string name="settings_section_security">Security &amp; privacy</string>
+    <string name="settings_flag_secure">Private screen</string>
+    <string name="settings_flag_secure_desc">Hides the conversation thumbnail in the system task switcher and blocks screenshots / screen recording while the app is open.</string>
+    <string name="settings_lock_vault_on_leave">Lock vault on leave</string>
+    <string name="settings_lock_vault_on_leave_desc">Automatically locks the encrypted vault as soon as the app goes to the background. You will need to unlock again on return.</string>
+    <string name="settings_panic_code">Decoy PIN (panic mode)</string>
+
+    <string name="settings_section_blocking">Blocking</string>
+    <string name="settings_block_unknown">Block unknown numbers</string>
+    <string name="settings_block_unknown_no_contacts">Without access to your contacts, unknown numbers are not blocked. Your list of blocked numbers stays active. Allow Contacts in Android settings.</string>
+    <string name="settings_block_unknown_desc">Messages from numbers that are not in your contacts are deleted as soon as they arrive: no notification, no copy, no way to get them back. This also applies to senders shown as a name (bank, delivery service) and to verification codes.</string>
+    <string name="attach_contact_needs_permission">Attaching a contact card requires access to your contacts. Allow Contacts in Android settings.</string>
+    <string name="settings_manage_blocked">Manage blocked list</string>
+
+    <string name="settings_section_backup">Backup</string>
+    <string name="settings_backup_now">Back up now</string>
+    <string name="settings_restore">Restore from file</string>
+
+    <string name="settings_section_advanced">Advanced</string>
+    <string name="settings_default_sms_app">Default SMS app</string>
+    <string name="settings_set_default">Set as default</string>
+    <string name="settings_is_default">Relay is the default SMS app.</string>
+    <string name="settings_reset_all">Reset all settings</string>
+    <string name="settings_viewer_title">Saved app choices</string>
+    <string name="settings_viewer_none">No saved choices</string>
+    <string name="settings_viewer_cleared">Saved app choices cleared</string>
+    <string name="settings_nuke_data">Delete all my data</string>
+    <string name="settings_nuke_confirm">All conversations will be erased in Relay AND in the phone’s message store, along with attachments, scheduled sends and every setting. The vault is erased too. This cannot be undone, and nothing comes back at the next sync.</string>
+    <string name="settings_nuke_confirm_not_default">⚠️ Relay is not your default SMS app: the system will refuse to delete the phone’s messages. They will stay in place and come back at the next sync. Only Relay’s own data will be erased.</string>
+    <string name="settings_nuke_done_title">Data erased</string>
+    <string name="settings_nuke_done_body">Conversations and settings have been erased, both in Relay and in the phone’s message store. Nothing will come back at the next sync. Relay is about to restart.</string>
+    <string name="settings_nuke_residue_title">Incomplete deletion</string>
+    <plurals name="settings_nuke_residue_body">
+        <item quantity="one">%1$d conversation stayed in the phone’s message store: the system refused to delete it, and it will come back at the next sync. The usual cause is that Relay is not the default SMS app.</item>
+        <item quantity="other">%1$d conversations stayed in the phone’s message store: the system refused to delete them, and they will come back at the next sync. The usual cause is that Relay is not the default SMS app.</item>
+    </plurals>
+    <!-- v1.28.9 (septieme note d'Andrew, constat 2) — ne pas savoir n'est pas « rien a effacer ». -->
+    <string name="settings_nuke_list_unreadable">The conversation list could not be read: their copies in the phone’s message store were not deleted and will come back at the next sync.</string>
+    <string name="settings_nuke_local_failure">Some of Relay’s own data could not be erased from this phone. Run “Delete all my data” again.</string>
+
+    <!-- About -->
+    <string name="about_title">About</string>
+    <string name="about_tagline_short">Modern, private SMS &amp; MMS for Android.</string>
+    <!-- v1.25.3 (audit C7) — section titles were hardcoded in French in AboutScreen.kt. -->
+    <string name="about_section_privacy">Privacy</string>
+    <string name="about_section_features">Features</string>
+    <string name="about_section_help">Quick help</string>
+    <string name="help_title">Help</string>
+    <string name="about_section_links">Links</string>
+    <string name="about_check_updates">View updates</string>
+    <string name="about_privacy_headline">100% private — zero tracking</string>
+    <!-- v1.25.3 (audit H20) — permission rationales were hardcoded in English. The permission
+         names themselves stay untranslated: they are the Android identifiers, verbatim. -->
+    <string name="about_perm_sms">Required for any SMS app.</string>
+    <string name="about_perm_mms">Receive incoming MMS.</string>
+    <string name="about_perm_contacts">Show contact names instead of bare numbers.</string>
+    <string name="about_perm_phone_state">Multi-SIM support (sending from the correct SIM).</string>
+    <string name="about_perm_notifications">Show new-message notifications.</string>
+    <string name="about_perm_biometric">Optional biometric unlock.</string>
+    <string name="about_perm_record_audio">Record audio messages attached to outgoing MMS.</string>
+    <string name="about_perm_internet">GIF search (Klipy), link previews, and device syncing. The app works without it.</string>
+    <string name="about_perm_foreground_service">Long-running migration / backup.</string>
+    <string name="about_perm_location">Emergency mode only, if you turn it on: one position at the moment of the alert, precise or approximate.</string>
+    <string name="about_perm_call_phone">Emergency call tiles: call directly. Refused, they open the dialer instead.</string>
+    <string name="about_permissions_title">Permissions we use</string>
+    <string name="about_security_title">Security &amp; limits</string>
+    <string name="about_security_body">SMS and MMS travel unencrypted across the carrier network — this is a protocol limitation, not a choice. Relay only protects what is stored on your device. For end-to-end encrypted messaging, use Matrix.</string>
+    <string name="about_credits_body">Based on SMS Tech by %1$s. Built with Kotlin, Compose, Hilt, Room and SQLCipher.</string>
+    <string name="about_ui_copyright">Relay UI © 2026 Relay Messaging</string>
+    <string name="about_legal_body">© %1$s %2$s. Released under the Apache License 2.0.</string>
+    <string name="about_source_code">Source code</string>
+    <string name="about_report_issue">Report an issue</string>
+    <string name="about_website">Website</string>
+    <string name="about_contact_support">Contact support</string>
+    <string name="about_license">License</string>
+    <string name="license_notice_heading">© 2026 Relay. All rights reserved.</string>
+    <string name="license_notice_body">The original application interface, user experience design, visual assets, branding, and original design implementations are the intellectual property of Relay and its respective copyright holder.\n\nThese original works may not be copied, reproduced, redistributed, or used in another product without prior written permission, except where otherwise permitted by applicable law.\n\nThis application incorporates portions of SMS Tech, Copyright © Patrice Haltaya, licensed under the Apache License, Version 2.0.\n\nSee the accompanying license and third-party notices for additional information.</string>
+    <string name="twemoji_attribution">Emoji and sticker artwork: Twemoji (jdecked/twemoji fork), Copyright Twitter, Inc. and contributors, licensed under CC-BY 4.0. Source: https://github.com/jdecked/twemoji</string>
+    <string name="about_privacy">Privacy policy</string>
+    <string name="about_terms">Terms of use</string>
+
+    <!-- Notification channels -->
+    <string name="channel_incoming_label">Incoming messages</string>
+    <string name="channel_incoming_desc">Notifications for SMS and MMS you receive.</string>
+    <!-- v1.8.0 — silent channel for NotificationStyle.SILENT -->
+    <string name="channel_incoming_silent_label">Incoming messages (silent)</string>
+    <string name="channel_incoming_silent_desc">Notifications when Relay is set to "Silent" mode. No heads-up, no sound.</string>
+    <string name="channel_sent_label">Sent messages</string>
+    <string name="channel_sent_desc">Status of messages you sent.</string>
+    <string name="channel_failed_label">Failed messages</string>
+    <string name="channel_failed_desc">Errors and retry suggestions.</string>
+    <string name="channel_keep_alive_label">Resistant mode</string>
+    <string name="channel_keep_alive_desc">Keeps Relay running on phones whose manufacturer shuts down background apps.</string>
+    <string name="channel_safety_call_warning_label">Safety call warning</string>
+    <string name="channel_safety_call_warning_desc">Reminder before automatic SMS to your emergency contacts.</string>
+    <string name="channel_safety_call_receipt_label">Safety call alert finished</string>
+    <string name="channel_safety_call_receipt_desc">Silent record of an alert already sent. Makes no sound.</string>
+
+    <!-- Notification actions -->
+    <string name="notif_reply_label">Reply</string>
+    <string name="notif_mark_read_label">Mark as read</string>
+    <string name="notif_copy_code_label">Copy code</string>
+    <string name="notif_code_copied">Code copied</string>
+    <string name="notif_preview_hidden_content">New message</string>
+
+    <!-- PDF export -->
+    <string name="pdf_header_subtitle">Exported %1$s • %2$d participant(s)</string>
+    <string name="pdf_footer">Page %1$d — Relay</string>
+
+    <!-- Errors -->
+    <string name="error_log_title">Error log</string>
+    <string name="error_log_info">Crash reports stay on this device. Send one to us only if you choose to.</string>
+    <string name="error_log_toggle_title">Save error log</string>
+    <string name="error_log_toggle_desc">Saves crash reports on this device so you can share them if something goes wrong. Nothing is ever sent anywhere.</string>
+    <string name="error_log_empty">No crash reports yet.</string>
+    <string name="error_log_share">Share</string>
+    <string name="error_log_clear_all">Clear all</string>
+    <string name="error_log_copied">Report copied</string>
+    <string name="error_log_cleared">Error log cleared</string>
+    <string name="error_log_clear_confirm_title">Clear the error log?</string>
+    <string name="error_log_clear_confirm_body">All saved crash reports will be deleted. This cannot be undone.</string>
+    <string name="error_log_unexpected_stop">App stopped unexpectedly (no crash recorded)</string>
+    <string name="error_not_default_app">Relay is not the default SMS app yet.</string>
+    <string name="error_send_failed">Failed to send the message.</string>
+    <!-- v1.28.3 — un SMS sortant qui echoue le disait a personne. -->
+    <string name="send_failure_notification_title">Message not sent</string>
+    <string name="send_failure_notification_body">Your message to %1$s could not be sent.</string>
+    <string name="send_failure_notification_unknown_recipient">a contact</string>
+    <!-- v1.28.3 — la sauvegarde ne transporte aucune piece jointe ; on le dit au lieu de le taire. -->
+    <string name="backup_restore_without_attachments">%1$d of them came back without their attachment, which backups do not carry.</string>
+    <!-- v1.28.5 — vault conversations restored on a device with no second factor. -->
+    <string name="backup_restore_vault_without_factor">Vault conversations were restored, but no vault code or biometrics is set up here: set one in Settings to protect them.</string>
+    <!-- v1.28.3 (F07) — abaisser le verrouillage retirerait le seul second facteur du coffre. -->
+    <string name="settings_lock_downgrade_vault_refused">Biometrics is currently the only second factor protecting your vault. Set a vault code first, then you can change this.</string>
+    <!-- v1.28.5 — the vault state could not be read: the guard refuses rather than assume. -->
+    <string name="settings_lock_downgrade_vault_unverifiable">The vault state could not be checked right now. The lock is kept, please try again in a moment.</string>
+    <string name="error_send_recipient_blocked">Not sent: you have blocked this number. Unblock it to send again.</string>
+    <!-- Group-send own-number fix — fail-fast when a group send has no own number on file. -->
+    <string name="error_send_own_number_missing">Not sent: set your phone number in Settings → Sending to send group messages.</string>
+    <!-- Client mode C3 -->
+    <string name="error_send_client_offline">Couldn\'t reach your phone — check you\'re on the same Wi-Fi and try again.</string>
+    <string name="error_send_client_media">Photos, videos and voice messages can\'t be scheduled from a linked device yet.</string>
+    <string name="error_send_client_photo_prepare">This photo couldn\'t be prepared.</string>
+    <!-- Client mode C5 — the download tile / gallery badge for an attachment whose bytes have not landed yet. -->
+    <string name="client_attachment_empty">This file is empty.</string>
+    <string name="client_attachment_tap_download">Tap to download</string>
+    <string name="client_attachment_downloading">Downloading…</string>
+    <string name="client_attachment_failed">Couldn\'t download. Tap to retry.</string>
+    <string name="error_create_conversation_failed">Couldn\'t create the conversation. Try again.</string>
+    <string name="error_retry_group_echo">This is the copy kept in the group. Resend from each member\'s conversation.</string>
+    <string name="error_retry_mms_unsupported">This MMS can\'t be resent from here. Send it again from the composer.</string>
+    <!-- v1.28.3 (F21) — envoi partiel : quelque chose est parti, mais pas tout. -->
+    <string name="send_partial">Sent to %1$d recipient(s); %2$d could not be reached.</string>
+    <string name="send_partial_blocked">Sent to %1$d recipient(s); %2$d skipped because you blocked them.</string>
+
+    <!-- v1.14.8 ARCH-M2 — thread snackbars (i18n) — extracted from hardcoded VM strings. -->
+    <string name="snack_thread_max_duration">Limit reached: %1$d s</string>
+    <string name="snack_thread_attach_sent">Attachment sent</string>
+    <string name="snack_thread_attach_copy_failed">Cannot read attachment</string>
+    <string name="snack_thread_attach_cap_reached">MMS limit reached (280 KB). Remove an attachment or shorten the text.</string>
+    <string name="snack_thread_voice_sent">Voice message sent</string>
+    <string name="snack_thread_numbers_blocked">Number(s) blocked</string>
+    <!-- v1.25.3 (audit M21) — the trash icon used to unblock instantly on a single tap. -->
+    <string name="blocked_unblock_confirm_title">Unblock this number?</string>
+    <string name="blocked_unblock_confirm_body">%1$s will be able to text you again. You can block it again at any time.</string>
+    <!-- v1.25.3 (audit H15/H16) — blocking used to report success even when it had failed. -->
+    <string name="snack_block_failed">Blocking failed — the number was not blocked. The conversation was kept.</string>
+    <!-- v1.25.3 (audit SEC3) — a partial block used to be reported as a full success, and the
+         conversation was deleted even though one participant could still reach the user. -->
+    <string name="snack_block_partial">Only %1$d of %2$d numbers could be blocked. The conversation was kept so you do not lose it.</string>
+
+    <!-- v1.15.2 — Common a11y + UX strings for passphrase fields. -->
+    <string name="action_show_password">Show passphrase</string>
+    <string name="action_hide_password">Hide passphrase</string>
+    <string name="backup_passphrase_min_length">Minimum %1$d characters</string>
+
+    <!-- v1.15.2 — Backup restore (encrypted .smsbk). -->
+    <string name="backup_restore_explainer">Pick a .smsbk file then enter its passphrase. Conversations with the same recipients are merged with your current ones; existing messages are kept (no duplicates).</string>
+    <string name="backup_restore_pick_file">Pick a .smsbk file</string>
+    <string name="backup_restore_passphrase_title">Restore passphrase</string>
+    <string name="backup_restore_passphrase_field">Passphrase</string>
+    <string name="backup_restore_action">Restore</string>
+    <string name="backup_restore_in_progress">Restoring…</string>
+    <string name="backup_restore_success">%1$d conversations (%2$d new), %3$d messages imported (%4$d already present)</string>
+    <string name="backup_restore_failed_wrong_pass">Wrong passphrase or corrupted file</string>
+    <string name="backup_restore_failed_format">Not a valid Relay backup file</string>
+    <string name="backup_restore_failed_storage">Could not read the file</string>
+
+    <!-- v1.15.1 — Scheduled messages screen + Thread schedule flow. -->
+    <string name="settings_section_scheduled">Scheduled messages</string>
+    <string name="scheduled_title">Scheduled messages</string>
+    <string name="scheduled_empty">No scheduled messages</string>
+    <!-- v1.15.1 — Inline how-to shown alongside the empty state, so the user discovers
+         the entry point even before reading AboutScreen. -->
+    <string name="scheduled_empty_explainer">To schedule an SMS: type your message, then ⋮ → Schedule, or long press ➤. The SMS will be sent automatically at that time, even if the app is closed.</string>
+    <string name="scheduled_to">To: %1$s</string>
+    <string name="scheduled_when">Scheduled for: %1$s</string>
+    <string name="scheduled_cancel_confirm_title">Cancel this scheduled message?</string>
+    <string name="scheduled_cancel_confirm_body">It will not be sent. This action cannot be undone.</string>
+    <string name="scheduled_cancel_confirm_action">Cancel sending</string>
+    <!-- v1.25.3 (audit H6) — failed sends were dropped from the list entirely. -->
+    <string name="scheduled_section_pending">Waiting to be sent</string>
+    <string name="scheduled_section_failed">Failed</string>
+    <string name="scheduled_failed_explainer">Sending failed after several attempts. Retry it, or remove it from this list.</string>
+    <string name="scheduled_failed_when">Was due: %1$s</string>
+    <string name="scheduled_delete_confirm_title">Remove this message?</string>
+    <string name="scheduled_delete_confirm_body">It will be removed from this list and will not be sent. This action cannot be undone.</string>
+    <string name="scheduled_retried">Sending again…</string>
+    <!-- v1.28.3 (F20) — un envoi revendiqué puis abandonné : issue réellement inconnue. -->
+    <string name="scheduled_section_failed_or_interrupted">Failed or interrupted</string>
+    <string name="scheduled_interrupted_explainer">An interrupted message may or may not have been sent — there is no way to know. Sending it again could deliver it twice.</string>
+    <string name="scheduled_interrupted_when">Sending interrupted, was due: %1$s</string>
+    <string name="scheduled_cancel_too_late">Too late to cancel: this message is already being sent.</string>
+    <string name="settings_scheduled_messages">Scheduled messages</string>
+    <string name="settings_scheduled_messages_desc">View and manage scheduled SMS</string>
+    <string name="thread_schedule_action">Schedule…</string>
+    <string name="thread_schedule_message_title">Schedule a message</string>
+    <string name="thread_schedule_message_hint">Type a message…</string>
+    <string name="thread_schedule_date_title">Pick a date</string>
+    <string name="thread_schedule_time_title">Pick a time</string>
+    <string name="thread_schedule_invalid_past">The chosen date is in the past</string>
+    <string name="thread_schedule_empty_body">Type a message before scheduling</string>
+    <string name="thread_schedule_success">Message scheduled</string>
+    <string name="thread_schedule_failed">Failed to schedule the message</string>
+    <string name="date_tomorrow">Tomorrow</string>
+    <string name="schedule_preset_in_1_hour">In 1 hour · %1$s</string>
+    <string name="schedule_preset_day_time">%1$s, %2$s</string>
+    <string name="schedule_pick_date_time">Pick date and time</string>
+    <string name="schedule_preset_title">Send time</string>
+    <string name="emoji_picker_search_emoji">Search emoji</string>
+    <string name="emoji_picker_search_gif">Search KLIPY</string>
+    <string name="emoji_picker_search_sticker">Search sticker</string>
+    <string name="thread_search_hint">Search in this conversation</string>
+    <string name="thread_search_match_count">%1$d of %2$d</string>
+    <string name="thread_search_no_results">No results</string>
+    <string name="thread_search_previous">Previous match</string>
+    <string name="thread_search_next">Next match</string>
+
+    <!-- v1.14.9 audit I18N-M3 — AboutScreen strings extracted from hardcoded FR to support EN locale. -->
+
+    <!-- Privacy badges (4) -->
+    <string name="about_badge_no_ads">No ads</string>
+    <string name="about_badge_no_tracker">No tracker</string>
+    <string name="about_badge_no_collection">No data collected</string>
+    <string name="about_badge_no_sharing">Zero sharing</string>
+    <string name="about_badge_no_google">No Google services</string>
+
+    <!-- Features (15) -->
+    <string name="about_feat_sms_label">SMS &amp; MMS</string>
+    <string name="about_feat_sms_desc">Default SMS app for Android 8 → 15+. Full history import, no duplicates.</string>
+    <string name="about_feat_voice_label">Voice messages</string>
+    <string name="about_feat_voice_desc">Push-to-talk over MMS. Capped at 120 s / 280 KB for compatibility with all French carriers.</string>
+    <string name="about_feat_vault_label">Encrypted vault</string>
+    <string name="about_feat_vault_desc">Sensitive conversations in a SQLCipher vault, key wrapped in the Android Keystore.</string>
+    <string name="about_feat_panic_label">Decoy PIN</string>
+    <string name="about_feat_panic_desc">A second PIN opens the app in decoy mode — vault invisible and inaccessible.</string>
+    <string name="about_feat_emergency_label">Emergency mode</string>
+    <string name="about_feat_emergency_desc">Hold the button 3 s on the Emergency page → alert SMS to your Safety call contacts with optional GPS; the ⚠️ prefix is on every template except the discreet one. Quick access to the emergency numbers of the country you are in + lockscreen notification shortcuts.</string>
+    <string name="about_feat_biometric_label">Biometrics</string>
+    <string name="about_feat_biometric_desc">Fingerprint or face to unlock, with a mandatory fallback PIN.</string>
+    <string name="about_feat_reply_label">Contextual reply</string>
+    <string name="about_feat_reply_desc">Mini-card above the composer + reply bubble with quote in the thread.</string>
+    <string name="about_feat_translate_label">Delegated translation</string>
+    <string name="about_feat_translate_desc">Long-press → \"Translate\" delegates to your installed translation app (Google Translate, DeepL, Aves Translate FLOSS …) via system Intent. No model bundled.</string>
+    <string name="about_feat_block_label">Synchronized blocking</string>
+    <string name="about_feat_block_desc">Auto-import of Phone / Samsung Messages blocked numbers. Retroactive purge.</string>
+    <string name="about_feat_search_label">FTS search</string>
+    <string name="about_feat_search_desc">SQLite FTS4 full-text search over bodies, numbers, and contact names.</string>
+    <string name="about_feat_pdf_label">PDF export</string>
+    <string name="about_feat_pdf_desc">Export a conversation to PDF (date, sender, body) for archive or proof.</string>
+    <string name="about_feat_backup_label">Encrypted backup</string>
+    <string name="about_feat_backup_desc">Local AES-256-GCM backup with a passphrase distinct from the PIN.</string>
+    <string name="about_feat_themes_label">Themes</string>
+    <string name="about_feat_themes_desc">Light, dark, AMOLED, Dark Tech (slate-blue + blue accent). Customizable rounded corners.</string>
+    <string name="about_feat_ui_label">Smooth UI</string>
+    <string name="about_feat_ui_desc">Compose + per-bubble isolated recomposition. Conversation sorting in the 3-dot menu.</string>
+    <string name="about_feat_noads_label">Zero ads, zero trackers</string>
+    <string name="about_feat_noads_desc">No analytics, no Google services. Internet is used only for GIF search (Klipy), link previews, and device syncing; MMS are carried by Android\'s own MMS service.</string>
+
+    <!-- Help recipes (7 titles + steps) -->
+    <string name="about_help_default_title">Set as default SMS app</string>
+    <string name="about_help_default_step1">Blue button \"Set as default\" at the top of the conversation list</string>
+    <string name="about_help_default_step2">Or Android Settings → Default apps → SMS → Relay</string>
+    <string name="about_help_voice_title">Send a voice message</string>
+    <string name="about_help_voice_step1">Long-press the mic to the right of the composer</string>
+    <string name="about_help_voice_step2">Speak, then release to send (slide left = cancel)</string>
+    <string name="about_help_voice_step3">Cap 120 s — recording stops automatically beyond that</string>
+    <string name="about_help_vault_title">Move a conversation to the vault</string>
+    <string name="about_help_vault_step1">Long-press the conversation in the list → \"Vault\"</string>
+    <string name="about_help_vault_step2">Unlock: PIN, passphrase or biometrics depending on your setting</string>
+    <string name="about_help_vault_step3">Settings → Security to configure the vault</string>
+    <string name="about_help_block_title">Block a number</string>
+    <string name="about_help_block_step1">In a conversation: menu ⋮ → Block (= blocks every number; the conversation is kept, under \"Blocked\")</string>
+    <string name="about_help_block_step2">Long-press a conversation in the list → Block (keeps history)</string>
+    <string name="about_help_block_step3">The number is added to the system blocklist, shared with the Phone app</string>
+    <string name="about_help_translate_title">Translate a received message</string>
+    <string name="about_help_translate_step1">Long-press the bubble → \"Translate\"</string>
+    <string name="about_help_translate_step2">A picker opens with all installed translation apps</string>
+    <string name="about_help_translate_step3">Choose Google Translate, DeepL, Aves Translate (FLOSS) or another</string>
+    <string name="about_help_translate_step4">If none is installed, a message invites you to install one</string>
+    <string name="about_help_emergency_title">Use Emergency mode</string>
+    <string name="about_help_emergency_step1">Settings → Emergency mode: enable + add at least one Safety call contact</string>
+    <string name="about_help_emergency_step2">Emergency page: direct calls to your country\'s emergency numbers; red button held 3 s → SMS to relatives</string>
+    <string name="about_help_emergency_step3">Lockscreen notification (opt-in): shortcuts to 112 and, where there is one, to the emergency number for your country, without unlocking</string>
+    <string name="about_help_emergency_step4">\"I am OK\" in the conversation list resets the cooldown and, unless you turned the SMS off, tells your contacts it was a false alert</string>
+    <string name="about_help_update_title">Check for an update</string>
+    <string name="about_help_update_step1">\"View updates\" button at the top of this page</string>
+    <string name="about_help_update_step2">Opens the Relay GitHub Releases page</string>
+    <string name="about_help_update_step3">The app never attempts to auto-update without your consent</string>
+    <string name="about_help_schedule_title">Schedule a message</string>
+    <string name="about_help_schedule_step1">In a conversation, type your message, then long-press the send button</string>
+    <string name="about_help_schedule_step2">Pick a preset time, or choose your own date and time</string>
+    <string name="about_help_schedule_step3">The message is sent automatically at that time, even if the app is closed</string>
+    <string name="about_help_schedule_step4">Main screen menu ⋮ → \"Scheduled messages\" to see or cancel a scheduled send</string>
+    <string name="about_help_categories_title">Use the category tabs</string>
+    <string name="about_help_categories_step1">Conversations are sorted into tabs: All, Personal, OTP, Promotional, Transactions, Other</string>
+    <string name="about_help_categories_step2">Long-press a tab (or use Settings) to turn off notifications for that category</string>
+    <string name="about_help_categories_step3">Settings → Appearance → \"Show categories\" hides the tabs entirely</string>
+    <string name="about_help_pin_title">Pin a message</string>
+    <string name="about_help_pin_step1">Tap a bubble → \"Pin\" (long-press works too)</string>
+    <string name="about_help_pin_step2">The pinned message shows in a banner under the thread header</string>
+    <string name="about_help_pin_step3">Tap the banner to jump to the message; tap the X to unpin it</string>
+    <string name="about_help_pin_step4">One pin per conversation for now</string>
+    <string name="about_help_reactions_title">React to a message</string>
+    <string name="about_help_reactions_step1">Tap a bubble: your recent emojis pop up — tap one to send it right away</string>
+    <string name="about_help_reactions_step2">Tap + in that row for the full emoji picker</string>
+    <string name="about_help_reactions_step3">Long-press a bubble for the full menu (React, Copy, Pin, Delete)</string>
+    <string name="about_help_reactions_step4">Settings → Sending → \"Reaction format\"; to iPhone friends a reaction arrives as a text line, since SMS has no real reaction</string>
+    <string name="about_help_group_title">Create a group conversation</string>
+    <string name="about_help_group_step1">New message → \"Create a group\", then tap contacts to pick them</string>
+    <string name="about_help_group_step2">Tap Continue to name the group (leave it blank for no name)</string>
+    <string name="about_help_group_step3">Tap the X next to a member to remove them</string>
+    <string name="about_help_group_step4">Tap Continue to open the group conversation</string>
+
+    <!-- v1.14.8 R1/R2 — incoming MMS failure notification (size cap or MMSC error). -->
+    <string name="mms_failure_notification_title">MMS not received</string>
+    <string name="mms_failure_notification_body_too_large">Message from %1$s too large (%2$d KB). Tap to open MMS settings.</string>
+    <string name="mms_failure_notification_body_download_failed">Failed to download MMS from %1$s. Check signal coverage and retry.</string>
+    <string name="mms_failure_notification_body_unknown_sender">an unknown contact</string>
+
+    <!-- v1.14.8 R3 — confirmation before retrying a watchdog-timed-out message (potential duplicate). -->
+    <string name="thread_retry_watchdog_title">Resend this message?</string>
+    <string name="thread_retry_watchdog_body">The previous attempt may have already reached the recipient. Resending could create a duplicate.</string>
+    <string name="thread_retry_watchdog_confirm">Resend anyway</string>
+    <string name="thread_retry_watchdog_cancel">Cancel</string>
+
+    <!-- v1.14.8 R4 — floating chip shown when new messages arrive while scrolled up. -->
+    <plurals name="thread_unseen_messages">
+        <item quantity="one">↓ %d new message</item>
+        <item quantity="other">↓ %d new messages</item>
+    </plurals>
+
+    <!-- v1.13.0 — plurals for multi-selection counts -->
+    <plurals name="conversations_selection_count">
+        <item quantity="one">%d selected</item>
+        <item quantity="other">%d selected</item>
+    </plurals>
+    <plurals name="vault_bulk_move_in_done">
+        <item quantity="one">%d conversation moved to the vault</item>
+        <item quantity="other">%d conversations moved to the vault</item>
+    </plurals>
+    <plurals name="vault_bulk_move_out_done">
+        <item quantity="one">%d conversation moved out of the vault</item>
+        <item quantity="other">%d conversations moved out of the vault</item>
+    </plurals>
+    <!-- v1.24.0 sliding window: head-of-thread control to widen the loaded window -->
+    <string name="thread_load_older">Load older messages</string>
+    <string name="thread_load_older_remaining">Load older messages (%1$d)</string>
+    <string name="thread_loading_older">Loading messages</string>
+    <string name="thread_pinned_label">Pinned · %1$s at %2$s</string>
+    <string name="thread_pinned_voice">Voice message</string>
+    <string name="thread_pinned_attachment">Attachment</string>
+    <string name="thread_pinned_latest">Latest</string>
+    <!-- v1.24.0 : ecran de recuperation quand la base ne peut pas etre ouverte -->
+    <string name="db_recovery_title">Relay cannot open its database</string>
+    <string name="db_recovery_body">Your messages are still on this device — Android keeps its own copy, and Relay has not deleted anything. Only Relay’s own encrypted database is unreadable right now.</string>
+    <string name="db_recovery_hint">This usually happens after the screen lock is changed or the device is restored, which invalidates the key that protects the database. Restarting the phone is worth trying first. If this screen keeps appearing, reinstalling Relay will rebuild its database from the messages Android already holds.</string>
+    <string name="action_add">Add</string>
+    <string name="action_discard">Discard</string>
+    <string name="safety_call_saved_enabled">Safety call enabled</string>
+    <string name="safety_call_saved_disabled">Safety call disabled</string>
+    <string name="safety_call_contact_added">Contact added</string>
+    <string name="safety_call_contact_removed">Contact removed</string>
+    <string name="safety_call_setup_state_label">State:</string>
+    <string name="safety_call_setup_state_on">Enabled</string>
+    <string name="safety_call_setup_state_off">Disabled</string>
+    <string name="safety_call_setup_state_unsaved">Unsaved changes — tap Save to apply them.</string>
+    <string name="safety_call_setup_disabled_now">Safety call disabled immediately.</string>
+    <string name="safety_call_setup_unsaved_title">Unsaved changes</string>
+    <string name="safety_call_setup_unsaved_body">Adding a contact is not enough: it must be saved to be kept. Leaving now would lose it.</string>
+    <string name="emergency_location_grant">Allow location</string>
+    <string name="emergency_location_approximate">Approximate location: the emergency SMS will give an area of about 2 km. Allow precise location for an exact position.</string>
+    <string name="emergency_location_grant_precise">Allow precise location</string>
+    <string name="settings_panic_code_desc">A second PIN that opens the app in decoy mode: vault and emergency mode hidden.</string>
+    <string name="settings_panic_code_set">Configured. Tap to remove it.</string>
+    <string name="settings_panic_code_clear_title">Remove the decoy PIN?</string>
+    <string name="settings_panic_code_clear_body">Decoy mode will no longer be reachable. Your main PIN and your data are unchanged.</string>
+    <string name="settings_panic_code_clear_action">Remove</string>
+    <string name="settings_panic_code_saved">Decoy PIN saved</string>
+    <string name="settings_panic_code_removed">Decoy PIN removed</string>
+    <string name="settings_panic_code_same_as_pin">This PIN is the same as your main PIN. Choose another one, otherwise the app would always open in decoy mode.</string>
+    <string name="settings_panic_code_no_pin">Set up an app lock first.</string>
+    <string name="settings_pin_same_as_panic_code">This PIN is the same as your decoy PIN. Choose another one, otherwise the app would always open in decoy mode and you could no longer reach your own session.</string>
+    <string name="lock_wrong_code">Incorrect code</string>
+
+    <!-- ====================================================================================
+         v1.28.12 — THE TEXT THAT IS ACTUALLY SENT.
+
+         These are not screen labels. They are the SMS that leave the phone when someone holds
+         the emergency button for three seconds, or when Safety call decides nobody has touched
+         the phone for long enough. Until now they were hardcoded in French and went out in
+         French to everyone, English users included.
+
+         Rules that are not style, and that hold in EVERY language:
+          - keep them short. 160 characters in GSM-7, 70 in UCS-2, and the Maps URL counts
+            against that budget;
+          - no em dash (U+2014). It switches the whole message to UCS-2, which halves the
+            segment size and risks losing the second part in weak coverage — precisely the
+            situation these messages exist for. A plain ASCII hyphen is enough;
+          - %1$s in the emergency bodies is the location, or an explicit mention when it is not
+            available, so the recipient knows the absence is deliberate and not a bug.
+         ==================================================================================== -->
+    <string name="safety_sms_emergency_need_help">⚠️ EMERGENCY - I need help. My location: %1$s</string>
+    <string name="safety_sms_emergency_danger">⚠️ DANGER - critical situation, contact me or come. Location: %1$s</string>
+    <!-- No ⚠️ on this one, deliberately: DISCREET exists to signal trouble without alarming, and
+         without giving the situation away to someone glancing at the screen. -->
+    <string name="safety_sms_emergency_discreet">Can you call me? I need help. Location: %1$s</string>
+    <string name="safety_sms_location_unavailable">(location unavailable)</string>
+
+    <string name="safety_sms_check_in">Hello. I have not used my phone for %1$s. Could you call me or come by to check that all is well? Thank you.</string>
+    <string name="safety_sms_urgent">If you get this SMS, I have not been able to use my phone for %1$s. To be sure all is well, please call me.</string>
+    <string name="safety_sms_follow_up">Automatic message: no activity on my phone for %1$s. Could you call me to make sure all is well? Thank you.</string>
+
+    <!-- Follow-ups. Each one names the app and stands on its own: the first message may never
+         have arrived, and an unsigned SMS in the middle of the night reads as phishing and gets
+         ignored. The last one says that it is the last, so that nobody waits for a message that
+         will never come instead of acting.
+
+         Lint flags "%1$d minutes" as a plural candidate here, and these are deliberately NOT
+         plurals: the value is the follow-up interval times the index, so 15, 30 or 45 — never 1.
+         Making them plurals would ask every translator to write a singular form that can never
+         appear on screen. -->
+    <string name="safety_sms_relance_first">Relay automatic alert: still no activity on my phone, %1$d minutes later. Please try to reach me.</string>
+    <string name="safety_sms_relance_middle">Relay automatic alert: %1$d minutes with no activity from me. If you cannot reach me, please tell someone close to me.</string>
+    <string name="safety_sms_relance_last">Last Relay automatic alert: %1$d minutes with no activity. No further message will follow. Please check that I am all right.</string>
+
+    <string name="safety_duration_less_than_hour">less than an hour</string>
+    <plurals name="safety_duration_hours">
+        <item quantity="one">%1$d hour</item>
+        <item quantity="other">%1$d hours</item>
+    </plurals>
+    <plurals name="safety_duration_days">
+        <item quantity="one">%1$d day</item>
+        <item quantity="other">%1$d days</item>
+    </plurals>
+    <string name="duration_days_hours">%1$d d %2$d h</string>
+    <string name="gif_search_unavailable">GIF search isn\'t available right now. Please try again later.</string>
+    <string name="emoji_section_smileys">Smileys</string>
+    <string name="emoji_section_people">People</string>
+    <string name="emoji_section_families">Families</string>
+    <string name="emoji_section_couples">Couples</string>
+    <string name="emoji_section_professions">Professions</string>
+    <string name="emoji_section_hands">Hands</string>
+    <string name="emoji_section_hearts">Hearts</string>
+    <string name="emoji_section_animals">Animals</string>
+    <string name="emoji_section_food">Food</string>
+    <string name="emoji_section_activities">Activities</string>
+    <string name="emoji_section_objects">Objects</string>
+    <string name="emoji_section_nature">Nature</string>
+    <string name="emoji_section_symbols">Symbols</string>
+    <string name="emoji_section_flags">Flags</string>
+    <!-- Slice 1 — Linked devices (LAN server + QR pairing) -->
+    <string name="linked_devices_title">Linked devices</string>
+    <string name="settings_section_linked_devices">Linked devices</string>
+    <string name="linked_devices_section_server">Server</string>
+    <string name="linked_devices_section_devices">Devices</string>
+    <string name="linked_devices_server_title">Enable server</string>
+    <string name="linked_devices_server_subtitle">Allow other devices to connect to this device.</string>
+    <string name="linked_devices_server_hint">Other devices can discover this device on your local network. Your data stays on your Wi-Fi network.</string>
+    <string name="linked_devices_encryption_title">End-to-end encrypted</string>
+    <string name="linked_devices_encryption_subtitle">Sync between your devices uses TLS with a pinned certificate and Ed25519 device keys.</string>
+    <string name="linked_devices_contacts_write_title">Contact photo changes</string>
+    <string name="linked_devices_contacts_write_subtitle">Let a linked device set a contact\'s photo. Tap to allow.</string>
+    <string name="linked_devices_calls_title">Calls on linked devices</string>
+    <string name="linked_devices_calls_subtitle">Let a linked device show incoming calls and place calls from this phone. Tap to allow.</string>
+    <string name="linked_devices_start_error_title">The server couldn\'t start</string>
+    <string name="linked_devices_start_error_bind_hint">Another Relay app on this phone is already using the link port — stop its server first, then try again.</string>
+    <string name="linked_devices_link_action">Link a device</string>
+    <string name="linked_devices_empty_title">No linked devices yet</string>
+    <string name="linked_devices_empty_body">Link your device from here by scanning its pairing code.</string>
+    <string name="linked_devices_kind_desktop">Computer</string>
+    <string name="linked_devices_kind_phone">Phone</string>
+    <string name="linked_devices_kind_tablet">Tablet</string>
+    <string name="linked_devices_connected">Connected now</string>
+    <string name="linked_devices_linked_on">Linked %1$s</string>
+    <string name="linked_devices_confirm_title">Link this device?</string>
+    <string name="linked_devices_confirm_body">Link %1$s (%2$s) to this phone? It will be able to connect whenever both are on the same Wi-Fi network.</string>
+    <string name="linked_devices_confirm_action">Link</string>
+    <string name="linked_devices_remove_title">Remove %1$s?</string>
+    <string name="linked_devices_remove_body">This device will no longer be able to connect to this phone. You can link it again later.</string>
+    <string name="linked_devices_remove_action">Remove</string>
+    <string name="linked_devices_remove_content_desc">Remove device</string>
+    <string name="linked_devices_linked">%1$s linked</string>
+    <string name="linked_devices_removed">%1$s removed</string>
+    <string name="linked_devices_scan_title">Scan the pairing code</string>
+    <string name="linked_devices_scan_hint">Point the camera at the QR code shown on the other device.</string>
+    <string name="linked_devices_scan_camera_needed">Camera access is needed to scan the pairing code.</string>
+    <string name="linked_devices_scan_allow_camera">Allow camera</string>
+    <string name="linked_devices_scan_camera_error">Couldn\'t open the camera. Try again.</string>
+    <string name="linked_devices_scan_invalid">This QR code isn\'t a Relay pairing code.</string>
+    <string name="linked_devices_scan_unsupported">This pairing code needs a newer version of Relay.</string>
+    <string name="linked_devices_scan_damaged">This pairing code is incomplete or damaged. Show it again on the other device.</string>
+    <string name="sync_channel_label">Linked devices</string>
+    <string name="sync_channel_desc">Shows while the phone is reachable by linked devices on the local network.</string>
+    <string name="sync_notification_title">Relay</string>
+    <string name="sync_notification_text">Ready for linked devices on this Wi-Fi network.</string>
+    <!-- Client mode — the linked-device branch of the Linked devices screen, the pairing QR,
+         the mode switch, the no-SIM nudge, and the client foreground service. -->
+    <string name="client_mode_section">Client</string>
+    <string name="client_this_device_section">This device</string>
+    <string name="client_link_section">Your phone</string>
+    <string name="client_mode_link_title">Link to another device</string>
+    <string name="client_mode_link_subtitle">Connect this device to another phone acting as a server.</string>
+    <string name="client_mode_switch_back_title">Use this device as a phone</string>
+    <string name="client_mode_switch_title">Switch device mode</string>
+    <string name="client_mode_switch_to_client_body">Switching clears the messages stored on this device. Nothing is deleted from your phone.</string>
+    <string name="client_mode_switch_to_hub_body">Switching clears the messages synced to this device. Nothing is deleted from your phone.</string>
+    <string name="client_mode_switch_action">Switch</string>
+    <string name="client_link_status_connected">Connected</string>
+    <string name="client_link_status_reconnecting">Reconnecting…</string>
+    <string name="client_link_status_offline">Offline</string>
+    <string name="client_link_status_not_linked">Not linked</string>
+    <string name="client_link_status_removed">This device was removed from your phone</string>
+    <string name="client_link_qr_title">Link to your phone</string>
+    <string name="client_link_qr_hint">On your phone: Settings → Linked devices → Link a device, then scan this code.</string>
+    <string name="client_link_qr_error">Couldn\'t prepare the pairing code.</string>
+    <string name="client_qr_content_desc">Pairing code for your phone to scan</string>
+    <string name="client_link_hint">Messages sync from your phone over your Wi-Fi network.</string>
+    <string name="client_autolink_scanning">Looking for your phone…</string>
+    <string name="client_autolink_no_phones">No phone found yet — looking again…</string>
+    <string name="client_autolink_connecting">Found %1$s, connecting…</string>
+    <string name="client_autolink_connecting_generic">Connecting…</string>
+    <string name="client_autolink_waiting">Waiting for the scan…</string>
+    <string name="client_autolink_error">Couldn\'t connect — retrying…</string>
+    <string name="client_unlink_row">Unlink</string>
+    <string name="client_unlink_title">Unlink this device?</string>
+    <string name="client_unlink_body">This device will stop syncing with your phone, and the messages stored here will be cleared. Nothing is deleted from your phone.</string>
+    <string name="client_unlink_action">Unlink</string>
+    <string name="client_nudge_no_sim">This device has no SIM. Link it to your phone to send and receive messages here.</string>
+    <string name="client_sync_channel_label">Linked device sync</string>
+    <string name="client_sync_channel_desc">Keeps the link to your phone alive so messages stay in sync</string>
+    <string name="client_notification_title">Relay link</string>
+    <string name="client_notification_connected">Connected to %1$s</string>
+    <string name="client_notification_reconnecting">Reconnecting…</string>
+    <string name="client_notification_offline">Offline</string>
+    <!-- Client mode C2 — the sync-mode choice, re-sync, and the conversation-list sync states. -->
+    <string name="client_sync_mode_title">How much should sync?</string>
+    <string name="client_sync_mode_full_title">Full sync</string>
+    <string name="client_sync_mode_full_body">Your entire message history comes over, every conversation, every message.</string>
+    <string name="client_sync_mode_new_title">Just sync</string>
+    <string name="client_sync_mode_new_body">Only new messages from now on. Your conversation list will come over, with threads starting empty.</string>
+    <string name="client_sync_mode_footer">You can change this later in Settings → Linked devices → Re-sync messages.</string>
+    <string name="client_resync_row">Re-sync messages</string>
+    <string name="client_resync_subtitle">Clears the messages stored on this device and syncs them again from your phone.</string>
+    <string name="client_resync_title">Re-sync messages?</string>
+    <string name="client_resync_body">This clears the messages stored on this device and asks how much to sync again. Nothing is deleted from your phone.</string>
+    <string name="client_resync_action">Re-sync</string>
+    <string name="client_hub_not_default">Relay on your phone isn\'t your default messaging app, so new messages won\'t reach this device. Set Relay as the default on your phone to turn on live sync.</string>
+    <string name="client_sync_progress">Syncing messages…</string>
+    <string name="client_sync_count">%1$d of %2$d</string>
+    <string name="client_sync_error_title">Couldn\'t sync messages</string>
+    <string name="client_sync_error_default">Your phone couldn\'t sync messages right now.</string>
+    <string name="client_sync_error_not_connected">Not connected to your phone. Check that both devices are on the same Wi-Fi network.</string>
+    <string name="client_sync_offline">Offline — waiting for your phone.</string>
+    <string name="client_call_incoming">Incoming call</string>
+    <string name="client_call_unknown_number">Unknown number</string>
+    <string name="client_call_chat">Open conversation</string>
+    <string name="client_call_dialing">Calling…</string>
+    <string name="client_call_active">On call</string>
+    <string name="client_call_dial_failed">Couldn\'t place the call</string>
+    <string name="client_call_dial_no_permission">Your phone needs the Phone permission to place calls</string>
+    <string name="client_call_dial_offline">Not connected to your phone</string>
+    <string name="client_call_open_failed">Couldn\'t open the conversation</string>
+    <string name="client_sync_paused_title">Sync paused</string>
+    <string name="client_sync_paused_asleep">This device went to sleep.</string>
+    <string name="client_sync_paused_no_response">No response from your phone.</string>
+    <string name="client_sync_prompt_action">Choose how much to sync</string>
+    <string name="client_notif_media_photo">Photo</string>
+    <string name="client_notif_media_video">Video</string>
+    <string name="client_notif_media_voice">Voice message</string>
+    <string name="client_notif_media_audio">Audio</string>
+    <string name="client_notif_media_file">File</string>
+    <string name="client_notif_media_gif">GIF</string>
+    <string name="client_contacts_error_title">Couldn\'t sync contacts</string>
+    <string name="client_contacts_error_no_access">Your phone can\'t access its contacts. Allow contacts access on your phone, then retry.</string>
+    <string name="client_contacts_error_default">Your phone couldn\'t sync contacts right now.</string>
+    <string name="backup_notes_export_title">Notes backup</string>
+    <string name="backup_notes_export_explainer">Back up your notes — including photos and files — into one encrypted file. Pick a strong passphrase — without it the file cannot be recovered.</string>
+    <string name="backup_notes_export_button">Back up notes</string>
+    <string name="backup_notes_export_success">Notes backup saved.</string>
+    <string name="backup_notes_export_failed">Notes backup failed.</string>
+    <string name="backup_notes_restore_title">Restore notes</string>
+    <string name="backup_notes_restore_explainer">Pick a .notebk file then enter its passphrase. Notes already on this device are merged with your current ones; existing entries are kept (no duplicates).</string>
+    <string name="backup_notes_restore_pick_file">Pick a .notebk file</string>
+    <string name="backup_notes_restore_in_progress">Restoring notes…</string>
+    <string name="backup_notes_restore_success">%1$d notes (%2$d new), %3$d entries imported (%4$d already present)</string>
+
+    <!-- Notes — the note feature's strings (phase 1: phone notes). -->
+    <string name="action_new_note">New note</string>
+    <string name="note_name_title">Name your note</string>
+    <string name="note_name_placeholder">Note name</string>
+    <string name="note_explainer">Notes stay on this device and are never sent over the internet. They are encrypted, and they live in Relay — if you remove the app, your notes go with it. Back them up anytime from Settings → Backups.</string>
+    <string name="note_empty_title">Nothing here yet</string>
+    <string name="note_empty_body">Write your first entry below.</string>
+    <string name="note_delete_title">Delete note?</string>
+    <string name="note_delete_body">This note and all its entries will be permanently deleted.</string>
+    <string name="note_delete_message_title">Delete entry?</string>
+    <string name="note_delete_message_body">This entry will be permanently deleted.</string>
+    <string name="note_rename_title">Rename note</string>
+    <string name="note_rename_placeholder">Note name</string>
+    <string name="note_edit_entry_title">Edit entry</string>
+    <string name="note_message_edited">Edited</string>
+    <string name="note_save_failed">Couldn\'t save this entry</string>
+    <string name="note_attachment_failed">Couldn\'t add this attachment</string>
+    <string name="note_open_failed">Couldn\'t open this file</string>
+    <string name="note_compose_placeholder">Write a note</string>
+    <string name="note_attach_sheet_subtitle">Photos, videos and files are stored encrypted in this note.</string>
+    <string name="note_pdf_header_subtitle">Exported %1$s</string>
+    <string name="note_empty_photos">Photos saved in this note will show here.</string>
+    <string name="note_empty_videos">Videos saved in this note will show here.</string>
+    <string name="note_empty_files">Files saved in this note will show here.</string>
+</resources>

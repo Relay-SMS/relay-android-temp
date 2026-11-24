@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!-- Base app theme (Compose uses MaterialTheme; this is only for the splash window) -->
+    <style name="Theme.Relay" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/md_theme_light_background</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+
+    <!-- Splash screen (androidx.core.splashscreen compat for API 26-30) -->
+    <!--
+        Round 41 — the splash shows just the logo, centred, on the theme
+        background (no blue fill): the mark is brand blue in light mode
+        and white in dark mode (drawable-night). The Android 12 splash
+        masks the icon to a 192dp circle (2/3 of the 288dp icon), so the
+        mark in ic_splash_logo is sized to fit inside it. Replaces the
+        v1.14.7 transparent icon (splash_transparent.xml, now unused).
+    -->
+    <style name="Theme.Relay.Splash" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@color/md_theme_light_background</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/ic_splash_logo</item>
+        <item name="postSplashScreenTheme">@style/Theme.Relay</item>
+        <item name="android:windowLightStatusBar" tools:targetApi="m">true</item>
+    </style>
+</resources>

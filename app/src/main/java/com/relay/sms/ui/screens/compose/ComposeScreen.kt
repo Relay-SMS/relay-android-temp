@@ -1,0 +1,939 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.ui.screens.compose
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.ArrowBack
+import androidx.compose.material.icons.outlined.Close
+import androidx.compose.material.icons.outlined.PersonOff
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.painter.Painter
+import androidx.compose.ui.graphics.vector.rememberVectorPainter
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.relay.sms.R
+import com.relay.sms.core.ext.formatPhoneNumberForDisplay
+import com.relay.sms.core.result.AppError
+import com.relay.sms.domain.model.Contact
+import com.relay.sms.domain.model.NOTE_TITLE_MAX_LENGTH
+import com.relay.sms.domain.model.PhoneAddress
+import com.relay.sms.system.settings.ouvrirLaFicheDeLApplication
+import com.relay.sms.ui.components.ContactIntents
+import com.relay.sms.ui.components.RelayAvatar
+import com.relay.sms.ui.components.RelayPrimaryButton
+import com.relay.sms.ui.components.RelaySnackbarHost
+import com.relay.sms.ui.components.showError
+import com.relay.sms.ui.theme.RelayColors
+import com.relay.sms.ui.theme.RelayText
+import com.relay.sms.ui.theme.textFieldCursorColor
+import kotlinx.coroutines.launch
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ComposeScreen(
+    initialAddress: String?,
+    /** v1.28.3 — mode groupe : chaque ligne ajoute une puce, rien n'ouvre de fil avant « Continuer ». */
+    groupe: Boolean = false,
+    onBack: () -> Unit,
+    onConversationCreated: (Long) -> Unit,
+    /** Notes — a created note opens its thread (AppRoot pops compose first). */
+    onNoteCreated: (Long) -> Unit = {},
+    viewModel: ComposeViewModel = hiltViewModel(),
+) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    val filtered by viewModel.filtered.collectAsStateWithLifecycle()
+    // Client mode C3 — the create-contact row is hidden on a linked
+    // device (no contact frames until C4).
+    val isClientMode by viewModel.isClientMode.collectAsStateWithLifecycle()
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val snackbarHost = remember { SnackbarHostState() }
+    // Group picking, entered from the "Create a group" row on the new-message
+    // screen (the navigation `groupe` mode is the same picking behaviour,
+    // reached from the list). `rememberSaveable` so a rotation does not drop
+    // the mode mid-pick; tapping the row again leaves the mode.
+    var groupPicking by rememberSaveable { mutableStateOf(false) }
+    // Either group entry point: rows show a selection circle and a tap
+    // toggles the recipient instead of opening the thread.
+    val picking = groupe || groupPicking
+    // Round 13 — the "Name your group" step, shown in-flow (same
+    // ComposeViewModel, so the picked recipients survive) when Continue is
+    // tapped in group mode. Its back arrow returns to picking; it never
+    // exits compose. The typed group name, kept across rotation.
+    var namingGroup by rememberSaveable { mutableStateOf(false) }
+    var groupName by rememberSaveable { mutableStateOf("") }
+    // Notes — the "Name your note" step, mirroring the group naming
+    // step above: its own header, the name pill, the explainer text,
+    // and Continue creates the note. Back returns to compose.
+    var namingNote by rememberSaveable { mutableStateOf(false) }
+    var noteName by rememberSaveable { mutableStateOf("") }
+    // Normalized numbers already picked, for the circles' filled state.
+    val selectedNumbers = remember(state.recipients) {
+        state.recipients.map { it.normalized }.toSet()
+    }
+    LaunchedEffect(Unit) {
+        viewModel.events.collect { e ->
+            when (e) {
+                is ComposeViewModel.Event.ConversationCreated -> onConversationCreated(e.id)
+                // Notes — the note is created: open its thread.
+                is ComposeViewModel.Event.NoteCreated -> onNoteCreated(e.id)
+                // Client mode C3 — the hub refused the create (or
+                // could not be reached): say so, instead of a
+                // silent nothing.
+                is ComposeViewModel.Event.CreateFailed -> snackbarHost.showError(
+                    context.getString(
+                        when (e.error) {
+                            is AppError.ClientOffline -> R.string.error_send_client_offline
+                            else -> R.string.error_create_conversation_failed
+                        },
+                    ),
+                )
+            }
+        }
+    }
+    // v1.28.13 — relit les contacts au retour au premier plan tant que l'accès manque : on revient
+    // le plus souvent de la fiche Android où l'on vient de l'accorder.
+    val cycleDeVie = LocalLifecycleOwner.current.lifecycle
+    val accesRefuse by rememberUpdatedState(state.contactsRefused)
+    DisposableEffect(cycleDeVie) {
+        val observateur = LifecycleEventObserver { _, evenement ->
+            if (evenement == Lifecycle.Event.ON_RESUME && accesRefuse) viewModel.chargerContacts()
+        }
+        cycleDeVie.addObserver(observateur)
+        onDispose { cycleDeVie.removeObserver(observateur) }
+    }
+
+    Scaffold(
+        snackbarHost = { RelaySnackbarHost(snackbarHost) },
+        topBar = {
+            // Round 13 — the "Name your group" step has its own header
+            // (back arrow returns to picking, it does not exit compose);
+            // it takes precedence over both the group and new-message
+            // headers while it is showing.
+            when {
+                namingGroup -> TopAppBar(
+                    title = {
+                        Text(stringResource(R.string.compose_name_your_group))
+                    },
+                    navigationIcon = {
+                        IconButton(onClick = { namingGroup = false }) {
+                            Icon(Icons.AutoMirrored.Outlined.ArrowBack, contentDescription = stringResource(R.string.action_back))
+                        }
+                    },
+                )
+                // Notes — the "Name your note" header: back returns to
+                // compose, it does not exit (same as the group step).
+                namingNote -> TopAppBar(
+                    title = {
+                        Text(stringResource(R.string.note_name_title))
+                    },
+                    navigationIcon = {
+                        IconButton(onClick = { namingNote = false }) {
+                            Icon(Icons.AutoMirrored.Outlined.ArrowBack, contentDescription = stringResource(R.string.action_back))
+                        }
+                    },
+                )
+                groupe -> ComposeGroupHeader(onBack = onBack)
+                else -> TopAppBar(
+                    title = {
+                        Text(stringResource(R.string.action_new_message))
+                    },
+                    navigationIcon = {
+                        IconButton(onClick = onBack) {
+                            Icon(Icons.AutoMirrored.Outlined.ArrowBack, contentDescription = stringResource(R.string.action_back))
+                        }
+                    },
+                )
+            }
+        },
+    ) { padding ->
+        // v1.28.3 (audit global, X-07 — mesuré sur le S9) — la liste RÉSERVE la place du clavier.
+        //
+        // Sans `imePadding`, la colonne gardait la hauteur de l'écran entier et le clavier en
+        // recouvrait le bas ; quand les résultats tenaient dans cette hauteur, rien ne défilait,
+        // et les contacts sous le clavier — le plus souvent celui qu'on cherchait, en bas de la
+        // liste courte — étaient inatteignables. Le fil et la feuille de transfert le faisaient
+        // déjà ; cet écran, non.
+        Column(modifier = Modifier.fillMaxSize().padding(padding).imePadding()) {
+            if (namingGroup) {
+                // Round 13 — the "Name your group" step: name pill, member
+                // list with remove buttons, Continue creates the group.
+                // Same ComposeViewModel, so the picked recipients survive.
+                GroupNameContent(
+                    groupName = groupName,
+                    onGroupNameChange = { groupName = it },
+                    recipients = state.recipients,
+                    contacts = state.results,
+                    onRemoveRecipient = viewModel::removeRecipient,
+                    onContinue = { viewModel.createConversation(groupName) },
+                    modifier = Modifier.weight(1f),
+                )
+            } else if (namingNote) {
+                // Notes — the "Name your note" step: name pill, the
+                // explainer text, Continue creates the note. No member
+                // list (notes have no members), and the name is
+                // REQUIRED — Continue stays disabled while blank.
+                NoteNameContent(
+                    noteName = noteName,
+                    onNoteNameChange = { noteName = it },
+                    onContinue = { viewModel.createNote(noteName) },
+                    modifier = Modifier.weight(1f),
+                )
+            } else {
+                RecipientField(
+                    query = viewModel.searchInput,
+                    onQueryChange = viewModel::setQuery,
+                    placeholder = stringResource(R.string.compose_search_contact),
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+                )
+                // The picked recipients live OUTSIDE the search pill, as their
+                // own wrapping row directly under it: chips inside the pill
+                // made the box grow taller with every pick, which read as weird.
+                // The search pill stays a fixed single line; the pills row only
+                // shows while there is at least one recipient.
+                if (state.recipients.isNotEmpty()) {
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp).padding(bottom = 8.dp),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        state.recipients.forEach { addr ->
+                            RecipientChip(
+                                address = addr.raw,
+                                onRemove = { viewModel.removeRecipient(addr) },
+                            )
+                        }
+                    }
+                }
+                LazyColumn(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                    // "Create a group" sits above "Create contact": tapping it
+                    // enters group-picking mode (a selection circle appears on
+                    // each row and a tap toggles that contact), tapping it again
+                    // leaves the mode. Same [ContactActionRow] as "Create
+                    // contact" so both lines restyle together later. Hidden in
+                    // the navigation group mode, which already is group picking.
+                    if (!groupe) {
+                        item(key = "create-group") {
+                            ContactActionRow(
+                                title = stringResource(R.string.action_create_group),
+                                subtitle = null,
+                                icon = painterResource(R.drawable.ic_new_group),
+                                active = groupPicking,
+                                onClick = { groupPicking = !groupPicking },
+                            )
+                        }
+                    }
+                    // Notes — "New note" sits directly below "Create a
+                    // group" (same [ContactActionRow], the note glyph):
+                    // tapping it enters the naming step. Hidden in the
+                    // navigation group mode (which is group picking).
+                    // Round 36 phase 2 — no longer hidden in client
+                    // mode: creation goes through the `create_note`
+                    // frame now ([ComposeViewModel.createNote]).
+                    if (!groupe) {
+                        item(key = "new-note") {
+                            ContactActionRow(
+                                title = stringResource(R.string.action_new_note),
+                                subtitle = null,
+                                icon = painterResource(R.drawable.ic_note),
+                                onClick = { namingNote = true },
+                            )
+                        }
+                    }
+                    // Entrée persistante en tête de liste : ouvre l'éditeur de contacts du
+                    // système sur un formulaire vierge (choix produit : toujours vierge,
+                    // indépendamment de la recherche saisie). Placée au-dessus des résultats
+                    // pour rester atteignable même quand la liste est longue.
+                    // Client mode C3 — hidden on a linked device (no
+                    // contact frames until C4).
+                    if (!isClientMode) {
+                        item(key = "create-contact") {
+                            // Lint (LocalContextGetResourceValueCall) — the
+                            // message is read with stringResource in
+                            // composition, not via LocalContext.getString
+                            // inside the click handler, so a configuration
+                            // change (e.g. language) picks up the new text.
+                            val noContactsText =
+                                stringResource(R.string.phone_action_no_contacts)
+                            ContactActionRow(
+                                title = stringResource(R.string.compose_add_contact),
+                                subtitle = null,
+                                icon = painterResource(R.drawable.ic_add_contact),
+                                onClick = {
+                                    if (!ContactIntents.createContact(context)) {
+                                        scope.launch {
+                                            snackbarHost.showError(noContactsText)
+                                        }
+                                    }
+                                },
+                            )
+                        }
+                    }
+                    // v1.28.13 (MR F-Droid !38458) — sans `READ_CONTACTS`, la liste est vide parce
+                    // qu'on n'a pas pu la lire, pas parce qu'il n'y a personne : l'écran le dit, et
+                    // mène à la fiche Android de l'application. La fiche plutôt que la boîte de
+                    // dialogue système : après deux refus, Android ne l'affiche plus, et la ligne ne
+                    // ferait alors RIEN. La liste est relue au retour, cf. l'observateur ci-dessus.
+                    if (state.contactsRefused) {
+                        item(key = "contacts-refused") {
+                            ContactActionRow(
+                                title = stringResource(R.string.compose_contacts_refused_title),
+                                subtitle = stringResource(R.string.compose_contacts_refused_desc),
+                                icon = rememberVectorPainter(Icons.Outlined.PersonOff),
+                                onClick = { ouvrirLaFicheDeLApplication(context) },
+                            )
+                        }
+                    }
+                    // Free-entry row: lets the user pick a raw number (or anything they typed) when
+                    // it doesn't match any saved contact. Audit Q-BUG-1: previously the modifier ran
+                    // `.let { mod -> mod.also { /* clickable */ } }` — a no-op that left the row
+                    // visually clickable-looking but inert, breaking the whole new-conversation flow.
+                    // v1.27.9 — la saisie est capturée UNE fois : la ligne affiche, teste et
+                    // sélectionne la même valeur. À relire `viewModel.searchInput` dans le lambda
+                    // `.clickable`, un tap arrivé après une frappe aurait envoyé un numéro autre
+                    // que celui affiché sur la ligne.
+                    val input = viewModel.searchInput
+                    // X-06 — un nom tapé n'est pas une adresse : la ligne n'apparaît que pour un
+                    // numéro composable, cf. [ComposeViewModel.estComposable].
+                    if (ComposeViewModel.estComposable(input) && filtered.none { c -> c.firstPhone?.raw == input }) {
+                        item {
+                            ContactRow(
+                                name = input,
+                                detail = stringResource(
+                                    if (state.recipients.isEmpty() && !groupe) R.string.compose_use_this_number
+                                    else R.string.compose_add_to_group
+                                ),
+                                photoUri = null,
+                                showSelection = picking,
+                                selected = selectedNumbers.contains(PhoneAddress.of(input).normalized),
+                                onClick = {
+                                    if (picking) {
+                                        viewModel.toggleRecipient(input)
+                                    } else {
+                                        viewModel.pickRecipient(input)
+                                    }
+                                    viewModel.setQuery("")
+                                },
+                            )
+                        }
+                    }
+                    // Section label over the contact list, like the reference
+                    // screen: only while there are contacts to pick from.
+                    // Round 12 — same format as the main screen's section
+                    // headers ("Pinned", "Today", ...). Round 13 — NOT
+                    // uppercased: those headers render the text as-is.
+                    if (filtered.isNotEmpty()) {
+                        item(key = "select-contact-label") {
+                            ComposeSectionLabel(stringResource(R.string.compose_select_contact))
+                        }
+                    }
+                    items(filtered, key = { it.id ?: it.hashCode().toLong() }) { contact ->
+                        val number = contact.firstPhone?.raw.orEmpty()
+                        // Display-only formatting, same as the thread header:
+                        // the reference screen shows (xxx) xxx-xxxx numbers.
+                        val displayNumber = number.formatPhoneNumberForDisplay()
+                        ContactRow(
+                            name = contact.displayName ?: displayNumber,
+                            detail = displayNumber,
+                            photoUri = contact.photoUri,
+                            showSelection = picking,
+                            selected = selectedNumbers.contains(PhoneAddress.of(number).normalized),
+                            onClick = {
+                                if (picking) {
+                                    viewModel.toggleRecipient(number)
+                                } else {
+                                    viewModel.pickRecipient(number)
+                                }
+                                viewModel.setQuery("")
+                            },
+                            enabled = number.isNotBlank(),
+                        )
+                    }
+                }
+                // Round 13 — the bottom bar only exists in group-picking
+                // mode: in 1:1 mode there is no bar at all (a tap opens
+                // the thread). Continue goes to the "Name your group" step.
+                if (picking) {
+                    RelayPrimaryButton(
+                        text = stringResource(R.string.action_continue),
+                        onClick = { namingGroup = true },
+                        enabled = state.recipients.isNotEmpty(),
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Section label, same format as the main screen's section headers
+ * ("Pinned", "Today", ...): SectionHeader style, sentence case (NOT
+ * uppercased — those headers render the text as-is), onSurfaceVariant,
+ * 16dp sides, 20dp top. The bottom is 20dp, not 4dp: on the main screen
+ * the list adds 16dp between items (Arrangement.spacedBy(16.dp)), so a
+ * header there has 4dp + 16dp = 20dp below it — this screen's list has
+ * no item spacing, so the label carries the full 20dp itself. Shared
+ * by "Select contact" and the "Members" header on the "Name your
+ * group" step.
+ */
+@Composable
+private fun ComposeSectionLabel(text: String, modifier: Modifier = Modifier) {
+    Text(
+        text = text,
+        style = RelayText.SectionHeader,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = modifier.fillMaxWidth().padding(
+            start = 16.dp,
+            end = 16.dp,
+            top = 20.dp,
+            bottom = 20.dp,
+        ),
+    )
+}
+
+/**
+ * Round 13 — the "Name your group" step of group creation, shown in-flow
+ * after Continue is tapped in group mode (same ComposeViewModel, so the
+ * picked recipients survive). A name pill up top, the member list with a
+ * remove button per member, and Continue at the bottom: it creates the
+ * group conversation (with the typed name, when non-blank) and opens the
+ * thread. Removing every member disables Continue — no empty group.
+ */
+@Composable
+private fun GroupNameContent(
+    groupName: String,
+    onGroupNameChange: (String) -> Unit,
+    recipients: List<PhoneAddress>,
+    contacts: List<Contact>,
+    onRemoveRecipient: (PhoneAddress) -> Unit,
+    onContinue: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(modifier = modifier.fillMaxSize()) {
+        RecipientField(
+            query = groupName,
+            onQueryChange = onGroupNameChange,
+            placeholder = stringResource(R.string.compose_group_name_placeholder),
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+        )
+        if (recipients.isNotEmpty()) {
+            ComposeSectionLabel(stringResource(R.string.compose_group_members))
+        }
+        LazyColumn(modifier = Modifier.weight(1f).fillMaxWidth()) {
+            items(recipients, key = { it.normalized }) { addr ->
+                GroupMemberRow(
+                    address = addr,
+                    name = contacts.displayNameFor(addr),
+                    onRemove = { onRemoveRecipient(addr) },
+                )
+            }
+        }
+        RelayPrimaryButton(
+            text = stringResource(R.string.action_continue),
+            onClick = onContinue,
+            enabled = recipients.isNotEmpty(),
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+        )
+    }
+}
+
+/**
+ * Notes — the "Name your note" step: the [RecipientField] pill
+ * reused as the name input, the explainer text BELOW the field, and
+ * the same Continue button as the group step. The name is REQUIRED:
+ * Continue stays disabled while blank. No member list — a note has
+ * no members.
+ */
+@Composable
+private fun NoteNameContent(
+    noteName: String,
+    onNoteNameChange: (String) -> Unit,
+    onContinue: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(modifier = modifier.fillMaxSize()) {
+        RecipientField(
+            query = noteName,
+            onQueryChange = { onNoteNameChange(it.take(NOTE_TITLE_MAX_LENGTH)) },
+            placeholder = stringResource(R.string.note_name_placeholder),
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 12.dp),
+        )
+        // Round 36 — the explainer sits a size down (13sp, not 15sp)
+        // with air between it and the input box: at 15sp it read as
+        // a second heading, not a quiet caption.
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            text = stringResource(R.string.note_explainer),
+            style = RelayText.SystemNote,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 16.dp),
+        )
+        Spacer(modifier = Modifier.weight(1f))
+        RelayPrimaryButton(
+            text = stringResource(R.string.action_continue),
+            onClick = onContinue,
+            enabled = noteName.isNotBlank(),
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+        )
+    }
+}
+
+/**
+ * One member of the group being named: the contact avatar with initials
+ * (same 48dp [RelayAvatar] as the compose list rows), name over the
+ * display-formatted number, and Kristin's close-circle X on the right
+ * to remove the member. The name comes from the loaded contacts when
+ * the number matches one; otherwise the number itself is the name.
+ */
+@Composable
+private fun GroupMemberRow(
+    address: PhoneAddress,
+    name: String?,
+    onRemove: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val cs = MaterialTheme.colorScheme
+    val displayNumber = address.raw.formatPhoneNumberForDisplay()
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(72.dp)
+            .padding(horizontal = 16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        RelayAvatar(label = name ?: displayNumber, size = 48.dp)
+        Spacer(Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = name ?: displayNumber,
+                style = RelayText.ConvoName,
+                color = cs.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Spacer(Modifier.size(3.dp))
+            Text(
+                text = displayNumber,
+                style = RelayText.Preview,
+                color = cs.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Spacer(Modifier.width(12.dp))
+        // Kristin's close-circle disc: the X is a cutout, so the disc
+        // tint decides the look. Dark mode gets a WHITE disc, so the
+        // cutout shows the dark row background as a dark X — her
+        // screenshot; light mode flips to onSurfaceVariant, so the
+        // cutout shows the light background as a light X.
+        val surface = cs.surface
+        val surfaceLuma = 0.2126f * surface.red + 0.7152f * surface.green +
+            0.0722f * surface.blue
+        IconButton(onClick = onRemove) {
+            Icon(
+                painterResource(R.drawable.ic_close_circle),
+                contentDescription = stringResource(R.string.compose_remove_member),
+                tint = if (surfaceLuma < 0.5f) Color.White else cs.onSurfaceVariant,
+                modifier = Modifier.size(28.dp),
+            )
+        }
+    }
+}
+
+/**
+ * The display name of the contact owning [addr], or null when the number
+ * is not in the loaded contacts. Matches by normalized number, like the
+ * selection circles in the picking list.
+ */
+private fun List<Contact>.displayNameFor(addr: PhoneAddress): String? =
+    firstOrNull { contact ->
+        contact.phones.any { it.normalized == addr.normalized }
+    }?.displayName
+
+/**
+ * Group-mode header, same geometry as the thread header: 44dp row, back chevron 22dp in
+ * the brand blue, 32dp group avatar, title 17sp/600. No divider below it — the
+ * header reads clean against the search pill.
+ */
+@Composable
+private fun ComposeGroupHeader(onBack: () -> Unit) {
+    val cs = MaterialTheme.colorScheme
+    Column(
+        modifier = Modifier
+            .statusBarsPadding()
+            .background(cs.surface),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(44.dp)
+                .padding(horizontal = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(44.dp)
+                    .clip(CircleShape)
+                    .clickable(onClick = onBack)
+                    .semantics { role = Role.Button },
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    Icons.AutoMirrored.Outlined.ArrowBack,
+                    contentDescription = stringResource(R.string.action_back),
+                    tint = cs.primary,
+                    modifier = Modifier.size(22.dp),
+                )
+            }
+            RelayAvatar(
+                label = stringResource(R.string.action_new_group),
+                size = 32.dp,
+                isGroup = true,
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                text = stringResource(R.string.action_new_group),
+                style = RelayText.ThreadTitle,
+                color = cs.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+        }
+    }
+}
+
+/**
+ * The search pill of the new-message screen: one fixed 48dp single-line pill
+ * holding only the search input. The picked recipients deliberately do NOT
+ * live here — they render as their own row below the pill (see
+ * [ComposeScreen]), because chips inside the pill made the box grow taller
+ * with every pick. Tapping anywhere in the pill focuses the input. The input
+ * still reads [ComposeViewModel.searchInput] directly so the typed value
+ * comes back in the same recomposition (see [ComposeViewModel.searchInput]).
+ *
+ * Round 13 — the same pill shape serves the group-name input on the "Name
+ * your group" step, so the placeholder is a parameter now.
+ */
+@Composable
+private fun RecipientField(
+    query: String,
+    onQueryChange: (String) -> Unit,
+    placeholder: String,
+    modifier: Modifier = Modifier,
+) {
+    val cs = MaterialTheme.colorScheme
+    val focusRequester = remember { FocusRequester() }
+    val pillInteraction = remember { MutableInteractionSource() }
+    Box(
+        modifier = modifier
+            // Feedback round 9 — the search field matches the search and
+            // composer boxes: 48dp fixed height and a 24dp pill radius, with
+            // the same 16dp horizontal padding. The height constraint sits
+            // BEFORE the padding: measuring the content alone rendered the
+            // box 48dp + 20dp of padding = 68dp tall and the 24dp radius
+            // read as semi-rounded instead of a pill. Fixed height now —
+            // the field never grows.
+            .clip(RoundedCornerShape(24.dp))
+            .background(cs.surfaceVariant)
+            .clickable(
+                interactionSource = pillInteraction,
+                indication = null,
+                onClick = { focusRequester.requestFocus() },
+            )
+            .height(48.dp)
+            .padding(horizontal = 16.dp),
+        contentAlignment = Alignment.CenterStart,
+    ) {
+        BasicTextField(
+            value = query,
+            onValueChange = onQueryChange,
+            modifier = Modifier
+                .fillMaxWidth()
+                .focusRequester(focusRequester),
+            textStyle = RelayText.MessageBody.copy(color = cs.onSurface),
+            singleLine = true,
+            // Cursor in `textFieldCursorColor`, not the fixed brand blue: the
+            // fixed blue is near-invisible on the dark field background
+            // (2.16:1); dark mode uses white, light mode the brand blue.
+            cursorBrush = SolidColor(textFieldCursorColor(cs)),
+            decorationBox = { innerTextField ->
+                Box {
+                    if (query.isEmpty()) {
+                        Text(
+                            text = placeholder,
+                            style = RelayText.MessageBody,
+                            color = RelayColors.TextTertiary,
+                            maxLines = 1,
+                        )
+                    }
+                    innerTextField()
+                }
+            },
+        )
+    }
+}
+
+/**
+ * One recipient, as a large full pill below the search pill: the address and
+ * a close glyph. Tapping it removes the recipient.
+ *
+ * Colours match the "Set as default" button in [DefaultAppBanner] (same dark/light
+ * split from the surface luminance): dark mode gets the light `#E5EAFD`
+ * background with dark-navy text, light mode the brand primary with white text.
+ */
+@Composable
+private fun RecipientChip(address: String, onRemove: () -> Unit) {
+    val cs = MaterialTheme.colorScheme
+    val surface = cs.surface
+    val surfaceLuma = 0.2126f * surface.red + 0.7152f * surface.green +
+        0.0722f * surface.blue
+    val isDark = surfaceLuma < 0.5f
+    val containerColor = if (isDark) Color(0xFFE5EAFD) else cs.primary
+    val contentColor = if (isDark) Color(0xFF001A40) else cs.onPrimary
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(50))
+            .background(containerColor)
+            .clickable(onClick = onRemove)
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                text = address,
+                style = RelayText.MessageBody,
+                color = contentColor,
+                maxLines = 1,
+            )
+            Icon(
+                Icons.Outlined.Close,
+                contentDescription = null,
+                tint = contentColor,
+                modifier = Modifier.size(16.dp),
+            )
+        }
+    }
+}
+
+/**
+ * One contact row, in the conversation-list geometry: 72dp row, 16dp horizontal inset,
+ * 48dp [RelayAvatar] leading, 12dp gap, name 17sp/500 over the number 15sp/400 in the
+ * secondary colour. Tapping the row picks the contact (see the call sites: in group
+ * picking it toggles the recipient instead). In group picking ([showSelection]) a
+ * [SelectionCircle] sits at the trailing end, filled when the number is already a
+ * recipient — the old trailing +person icon is gone, the row tap is the affordance.
+ */
+@Composable
+private fun ContactRow(
+    name: String,
+    detail: String,
+    photoUri: String?,
+    onClick: () -> Unit,
+    showSelection: Boolean = false,
+    selected: Boolean = false,
+    enabled: Boolean = true,
+    modifier: Modifier = Modifier,
+) {
+    val cs = MaterialTheme.colorScheme
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .clickable(enabled = enabled, onClick = onClick)
+            .height(72.dp)
+            .padding(horizontal = 16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        RelayAvatar(label = name, size = 48.dp, customUri = photoUri)
+        Spacer(Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = name,
+                style = RelayText.ConvoName,
+                color = cs.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Spacer(Modifier.size(3.dp))
+            Text(
+                text = detail,
+                style = RelayText.Preview,
+                color = cs.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (showSelection) {
+            Spacer(Modifier.width(12.dp))
+            SelectionCircle(selected = selected)
+        }
+    }
+}
+
+/**
+ * Group-picking selection circle: a 24dp ring when unselected, Kristin's
+ * check-mark disc when selected. The disc is tinted from the surface
+ * luminance (like [RecipientChip]): dark mode gets a WHITE disc, so the
+ * check cutout shows the dark row background through it — exactly her
+ * reference screenshot; light mode flips to a BRAND-PRIMARY disc, so the
+ * cutout shows the light background as a white check. Display-only — the
+ * row tap toggles it (see [ComposeViewModel.toggleRecipient]).
+ */
+@Composable
+private fun SelectionCircle(selected: Boolean, modifier: Modifier = Modifier) {
+    val cs = MaterialTheme.colorScheme
+    Box(
+        modifier = modifier.size(24.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (selected) {
+            val surface = cs.surface
+            val surfaceLuma = 0.2126f * surface.red + 0.7152f * surface.green +
+                0.0722f * surface.blue
+            Icon(
+                painterResource(R.drawable.ic_check_circle),
+                contentDescription = null,
+                tint = if (surfaceLuma < 0.5f) Color.White else cs.primary,
+                modifier = Modifier.size(24.dp),
+            )
+        } else {
+            Box(
+                modifier = Modifier
+                    .size(24.dp)
+                    .border(2.dp, cs.onSurfaceVariant, CircleShape),
+            )
+        }
+    }
+}
+
+/**
+ * One action row (create a contact, create a group, or the contacts-permission
+ * notice): same 72dp geometry as [ContactRow], with the glyph in a 48dp circle
+ * on the surfaceVariant background (dark grey in dark mode, light grey in
+ * light mode — the reference screen's icon discs) tinted onSurfaceVariant,
+ * and an optional second line. [active] tints the glyph in the brand primary
+ * (used by "Create a group" while group picking is on). The icon is a [Painter]
+ * so Kristin's own drawables can be used alongside Material icons (via
+ * [rememberVectorPainter]). Both action lines go through this one component
+ * so they restyle together.
+ */
+@Composable
+private fun ContactActionRow(
+    title: String,
+    subtitle: String?,
+    icon: Painter,
+    onClick: () -> Unit,
+    active: Boolean = false,
+    modifier: Modifier = Modifier,
+) {
+    val cs = MaterialTheme.colorScheme
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .height(72.dp)
+            .padding(horizontal = 16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            modifier = Modifier
+                .size(48.dp)
+                .clip(CircleShape)
+                .background(cs.surfaceVariant),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                icon,
+                contentDescription = null,
+                tint = if (active) cs.primary else cs.onSurfaceVariant,
+                modifier = Modifier.size(22.dp),
+            )
+        }
+        Spacer(Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                style = RelayText.ConvoName,
+                color = cs.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (subtitle != null) {
+                Spacer(Modifier.size(3.dp))
+                Text(
+                    text = subtitle,
+                    style = RelayText.Preview,
+                    color = cs.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+    }
+}

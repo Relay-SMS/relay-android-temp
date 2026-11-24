@@ -1,0 +1,361 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.system.scheduler
+
+import android.content.Context
+import android.os.Build
+import androidx.hilt.work.HiltWorker
+import androidx.work.Constraints
+import androidx.work.CoroutineWorker
+import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.ExistingWorkPolicy
+import androidx.work.NetworkType
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.PeriodicWorkRequestBuilder
+import androidx.work.WorkManager
+import androidx.work.WorkerParameters
+import com.relay.sms.data.blocking.BlockedNumberSystem
+import com.relay.sms.data.local.datastore.SettingsRepository
+import com.relay.sms.data.local.db.dao.MessageDao
+import com.relay.sms.data.mms.MmsSystemWriteback
+import com.relay.sms.data.repository.ConversationMirror
+import com.relay.sms.data.sms.TelephonyReader
+import com.relay.sms.data.voice.VoiceRecorder
+import com.relay.sms.domain.purge.MS_PER_DAY
+import com.relay.sms.domain.purge.SAFETY_NET_DAYS
+import com.relay.sms.domain.purge.purgeCutoffMs
+import com.relay.sms.domain.repository.BlockedNumberRepository
+import com.relay.sms.e2e.E2eFragmentStore
+import com.relay.sms.e2e.E2eMediaPrune
+import dagger.assisted.Assisted
+import dagger.assisted.AssistedInject
+import kotlinx.coroutines.flow.first
+import timber.log.Timber
+import java.io.File
+import java.util.concurrent.TimeUnit
+
+/**
+ * Safety-net worker that drives SMS sync periodically (every 12 h) and on demand (boot,
+ * fresh install, manual refresh). It covers:
+ *
+ *  - First-run import (cold install): `lastSyncedSmsId == 0`, full back-scan of `content://sms`.
+ *  - Steady-state delta: `lastSyncedSmsId > 0`, stream only rows with `_ID > sinceId`.
+ *  - Force-killed process recovery: if the broadcast-receiver path missed deliveries, the
+ *    next worker tick converges.
+ *
+ * v1.1.1 note: the rich `TelephonySyncManager` (ContentObserver + reconciliation) is stubbed
+ * to unblock a KSP regression; until it is restored, this worker is the **single import path**
+ * for non-live messages. The receiver path (`SmsDeliverReceiver`) still handles live arrival.
+ */
+@HiltWorker
+class TelephonySyncWorker @AssistedInject constructor(
+    @Assisted appContext: Context,
+    @Assisted params: WorkerParameters,
+    private val reader: TelephonyReader,
+    private val mirror: ConversationMirror,
+    private val settings: SettingsRepository,
+    private val voiceRecorder: VoiceRecorder,
+    private val messageDao: MessageDao,
+    private val blockedRepo: BlockedNumberRepository,
+    private val blockedSystem: BlockedNumberSystem,
+    private val phoneIdentity: com.relay.sms.data.sms.PhoneIdentity,
+    private val mmsSystemWriteback: MmsSystemWriteback,
+    private val eraser: com.relay.sms.data.repository.ConversationEraser,
+    // v1.26.1 (audit H9) — nécessaire pour rendre la purge automatique atomique, cf. plus bas.
+    // v1.28.9 (F17) — pour replanifier la reprise des PDU gardés, cf. plus bas.
+    private val pdusEnAttente: com.relay.sms.data.mms.PdusEnAttente,
+    // E2E (schema v22) — prune les fragments de chiffré incomplets de plus de 24 h.
+    private val e2eFragmentStore: E2eFragmentStore,
+    // E2E media (schema v23, round 48) — expire les clés média de
+    // plus de 24 h et marque en échec les messages en attente
+    // restés sans clé. Hub only (les clés vivent sur le hub).
+    private val e2eMediaPrune: E2eMediaPrune,
+) : CoroutineWorker(appContext, params) {
+
+    override suspend fun doWork(): Result {
+        return try {
+            // v1.6.1 (audit PERF-08) — snapshot unique des settings en début de
+            // `doWork()` et passé aux helpers qui en ont besoin. Avant : 2 lectures
+            // DataStore séparées (`first()` au début de runImport + au début de la
+            // purge auto) = 2× IO + 2× désérialisation proto. Worker s'exécute toutes
+            // les 12 h donc impact absolu faible, mais le pattern est aligné avec
+            // PERF-01 dans le reste du code.
+            // v1.27.2 — lecture SUSPENDUE, comme [SafetyCallWorker]. Même défaut, même cause :
+            // `settings.state` démarre sur `AppSettings()` et s'hydrate depuis DataStore de façon
+            // asynchrone. Un worker réveillé par WorkManager tourne le plus souvent sur un
+            // processus qui vient de démarrer — il lisait donc les valeurs PAR DÉFAUT.
+            //
+            // Ici la conséquence n'est pas une alerte manquée mais un `lastSyncedSmsId = 0`, soit
+            // une réimportation complète prise pour un premier lancement : les messages importés
+            // y sont marqués comme LUS (cf. `isFirstRun` dans `TelephonySyncManager`), et le
+            // curseur est réécrit derrière. Coûteux et faux, dans le silence.
+            //
+            // Le gain de latence invoqué (audit H3) n'a aucun sens sur une tâche qui s'exécute
+            // toutes les 12 h.
+            val snapshot = settings.flow.first()
+            runImport(snapshot)
+            // Audit M-6: opportunistic housekeeping. Outbound MMS / voice caches accumulate when
+            // the `SmsSentReceiver` never fires (process force-killed, OS skips the broadcast);
+            // we prune anything older than 24 h here. Inbound caches are intentionally **not**
+            // touched — they back [AttachmentEntity.localUri] and dropping them would surface
+            // broken audio bubbles in old threads. A future orphan-scan can address those.
+            pruneStaleOutboundCaches(applicationContext)
+            // v1.28.9 (F17) — le filet de la reprise des PDU gardés. Le receveur la planifie dès qu'il garde
+            // un PDU ; ce passage la replanifie s'il en reste un à reprendre — processus tué avant la
+            // planification, travail perdu. APRÈS le balayage : un PDU de plus de 24 h ne se reprend plus.
+            runCatching { if (pdusEnAttente.aReprendre()) RepriseMmsWorker.planifier(applicationContext) }
+                .onFailure { Timber.w(it, "Reprise MMS: planification echouee") }
+            // Voice-recorder drafts have their own pruner; we just trigger it on the same cadence.
+            runCatching { voiceRecorder.pruneOld() }
+                .onFailure { Timber.w(it, "VoiceRecorder.pruneOld failed") }
+            // E2E (schema v22) — fragment sets that never completed (a lost SMS) expire
+            // after 24 h; the sender already saw Delivered, so nothing can complete them.
+            runCatching {
+                val pruned = e2eFragmentStore.pruneExpired()
+                if (pruned > 0) Timber.i("E2E: %d expired fragments pruned", pruned)
+            }.onFailure { Timber.w(it, "E2E fragment prune failed") }
+            // E2E media (schema v23, round 48) — media keys older
+            // than 24 h expire, and pending media messages left
+            // without a key are marked failed (they can never
+            // decrypt — the thread must not wait forever). Same
+            // 12-hour cadence as the fragment prune above.
+            runCatching {
+                val result = e2eMediaPrune.prune()
+                if (result.keysDeleted > 0 || result.messagesFailed > 0) {
+                    Timber.i(
+                        "E2E media: %d expired keys pruned, %d pending messages failed",
+                        result.keysDeleted,
+                        result.messagesFailed,
+                    )
+                }
+            }.onFailure { Timber.w(it, "E2E media prune failed") }
+            // Audit M-5: stalls-watchdog. Promote outgoing messages stuck in PENDING past 15 min
+            // to FAILED so the UI stops showing the "Sending…" spinner indefinitely. The 15 min
+            // threshold is loose on purpose — a real-world carrier roundtrip is usually < 30 s,
+            // anything past 15 min is almost certainly the result of a missed sent-broadcast.
+            runCatching {
+                val cutoff = System.currentTimeMillis() - PENDING_TIMEOUT_MS
+                val promoted = messageDao.timeoutStalePending(cutoff)
+                if (promoted > 0) Timber.i("Watchdog: %d stale PENDING -> FAILED", promoted)
+            }.onFailure { Timber.w(it, "PENDING watchdog failed") }
+            // v1.2.2 audit F1: companion watchdog for the system-provider OUTBOX. The local
+            // PENDING watchdog above flips our Room mirror, but a row inserted by
+            // MmsSystemWriteback whose MmsSentReceiver never fired (process killed, force-stop,
+            // Doze + reboot) would remain `msg_box = 4` in `content://mms` forever — polluting
+            // the conversation in other SMS apps AND coming back as a phantom MMS at the next
+            // reimport. Same 15 min threshold for symmetry.
+            runCatching {
+                // v1.28.3 (F18) — la purge ne porte plus que sur les lignes DONT NOUS AVONS LA
+                // PREUVE qu'elles sont les notres. Sans cette liste, le selecteur ne connaissait
+                // que l'etat et l'age, et detruisait aussi les MMS en echec d'autres
+                // applications SMS installees sur l'appareil.
+                val owned = messageDao.ownedMmsSystemIds()
+                val deleted = mmsSystemWriteback.purgeStaleOutbox(PENDING_TIMEOUT_MS, owned)
+                if (deleted > 0) Timber.i("Watchdog: %d stale system OUTBOX rows purged", deleted)
+            }.onFailure { Timber.w(it, "OUTBOX system watchdog failed") }
+            // v1.3.0 — auto-nettoyage de l'historique, cadence mensuelle. Le worker
+            // s'exécute toutes les 12 h pour d'autres raisons (sync SMS, watchdogs) ; on
+            // gate la purge sur `now - lastAutoPurgeAt >= AUTO_PURGE_INTERVAL_MS` pour
+            // qu'elle ne tourne qu'une fois par mois. `safetyNet` côté Kotlin protège
+            // toujours les 5 derniers jours (anti-misconfig) ; pour les rétentions exposées
+            // (30/60/180 j) il est strictement plus large donc neutre. Favoris (starred=1)
+            // épargnés au niveau du DAO.
+            runCatching {
+                val sec = snapshot.security
+                val days = sec.autoDeleteOlderThanDays
+                if (days != null && days > 0) {
+                    val now = System.currentTimeMillis()
+                    val last = sec.lastAutoPurgeAt
+                    if (last == null) {
+                        // FIX critique : à la première activation par l'utilisateur, `last` est
+                        // null. Sans ce garde, `now - 0 >= 30 j` est vrai → purge déclenchée
+                        // IMMÉDIATEMENT, ce qui n'est pas l'attente utilisateur ("1 fois par
+                        // mois"). On ancre `lastAutoPurgeAt = now` au tout premier passage et
+                        // on attend l'intervalle réel avant de purger pour la première fois.
+                        settings.update {
+                            it.copy(security = it.security.copy(lastAutoPurgeAt = now))
+                        }
+                        Timber.i("Auto-purge: first run, anchor set; first purge in %d days", AUTO_PURGE_INTERVAL_MS / MS_PER_DAY)
+                    } else if (now - last >= AUTO_PURGE_INTERVAL_MS) {
+                        // v1.6.1 (audit QUAL-01) — `purgeCutoffMs` est la source unique
+                        // partagée avec [ConversationRepositoryImpl] ; les constantes
+                        // SAFETY_NET_DAYS et MS_PER_DAY viennent de [PurgePolicy].
+                        val cutoff = purgeCutoffMs(days, now)
+                        // v1.28.1 — ce bloc REECRIVAIT la recette de
+                        // [ConversationRepositoryImpl.purgeHistoryNow] : meme transaction, meme
+                        // `purgeOlderThan`, meme rafraichissement d'apercus. Son propre
+                        // commentaire disait « comme le jumeau ». Or le jumeau ne propageait pas
+                        // au fournisseur du systeme, et l'audit de coherence du 2026-09-08 l'a
+                        // trouve ; corriger l'un sans l'autre aurait laisse la purge AUTOMATIQUE
+                        // — celle qui tourne sans que personne ne regarde — avec le defaut.
+                        // Une seule recette, desormais : [ConversationEraser.purgeHistory].
+                        val purged = eraser.purgeHistory(cutoff)
+                        settings.update {
+                            it.copy(security = it.security.copy(lastAutoPurgeAt = now))
+                        }
+                        Timber.i(
+                            "Auto-purge: %d messages older than %d days (safety net %d d, next in %d d)",
+                            purged, days, SAFETY_NET_DAYS, AUTO_PURGE_INTERVAL_MS / MS_PER_DAY,
+                        )
+                    } else {
+                        val nextInDays = (AUTO_PURGE_INTERVAL_MS - (now - last)) / MS_PER_DAY
+                        Timber.d("Auto-purge: skipped (next in ~%d days)", nextInDays)
+                    }
+                }
+            }.onFailure { Timber.w(it, "Auto-purge failed") }
+            Result.success()
+        } catch (t: Throwable) {
+            Timber.w(t, "TelephonySyncWorker failed")
+            Result.retry()
+        }
+    }
+
+    /**
+     * Reads the persisted cursor, fingerprints the system provider, and imports the delta in
+     * 500-row pages via [ConversationMirror.bulkImportFromTelephony]. Idempotent: the
+     * `telephony_uri` UNIQUE index + `OnConflictStrategy.IGNORE` make re-runs safe.
+     */
+    private suspend fun runImport(snapshot: com.relay.sms.domain.settings.AppSettings) {
+        val sinceId = snapshot.advanced.lastSyncedSmsId
+        val fp = runCatching { reader.snapshotSmsFingerprint() }.getOrNull()
+        if (fp == null) {
+            Timber.w("Sync: fingerprint query failed (READ_SMS revoked?) — skipping import pass")
+            return
+        }
+        if (fp.maxId <= sinceId) {
+            Timber.d("Sync: no new SMS (provider maxId=%d, cursor=%d)", fp.maxId, sinceId)
+            return
+        }
+        Timber.i("Sync: starting (cursor=%d, provider maxId=%d, count=%d)", sinceId, fp.maxId, fp.count)
+        // Snapshot the blocklist ONCE — re-reading on every page would be a needless N×M.
+        // We union TWO sources to avoid the boot-time race between `BlockedNumbersImporter`
+        // (mirroring system→Room) and this worker (starting in parallel from MainApplication):
+        //  1. Room snapshot — what we've already mirrored locally, including app-initiated
+        //     blocks that may not be in the system provider yet.
+        //  2. Live system snapshot — fresh read of `BlockedNumberContract`, so a Téléphone /
+        //     Samsung Messages entry blocks SMS at first import even before the importer has
+        //     had a chance to mirror it.
+        // v1.26.1 (audit H4) — `blockKey()` des DEUX côtés, plus `phoneSuffix8()`.
+        //
+        // La v1.25.4 a unifié la clé de liste noire sur `blockKey()` (9 chiffres significatifs,
+        // ou le libellé en minuscules pour un expéditeur alphanumérique) précisément parce que
+        // 8 chiffres amputaient le chiffre qui sépare un `06…` d'un `07…`. Ce chemin d'import
+        // était resté à 8, et re-tronquait des clés DÉJÀ en `blockKey`. Deux effets, tous deux
+        // faux : (1) bloquer `0612345678` faisait jeter EN SILENCE, à l'import, les messages du
+        // `0712345678` — un numéro jamais bloqué — et le curseur avançait quand même, donc la
+        // perte était définitive ; (2) une clé alphanumérique (« sfr ») donnait une chaîne vide,
+        // éliminée par le `filter`, si bien qu'un expéditeur alphanumérique bloqué passait.
+        // `blockKey()` est idempotente sur sa propre sortie, on peut donc l'appliquer
+        // uniformément au snapshot Room (déjà en clés) comme à la lecture système (brute).
+        // v1.27.2 (audit Codex du 2026-08-05, C-08) — jumeau exact du manager : formes BRUTES et
+        // comparaison region-aware. Neuf chiffres confondaient `+33612345678` et `+15612345678`,
+        // et le curseur avancait quand meme sur la ligne rejetee — perte definitive.
+        val roomBlocked = runCatching { blockedRepo.blockedRawSnapshot() }
+            .getOrDefault(emptyList())
+        val systemBlocked = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            runCatching { blockedSystem.listSystemBlocked() }.getOrDefault(emptyList())
+        } else emptyList()
+        // v1.27.2 (audit Codex final, F-01) — instantane pris APRES hydratation, une seule fois.
+        val isBlockedAddress = phoneIdentity.snapshot()
+            .blockedMatcher(roomBlocked + systemBlocked)
+        var imported = 0
+        val maxSeen = reader.readSmsSince(sinceId = sinceId, pageSize = 500) { page ->
+            val filtered = page.filterNot { isBlockedAddress(it.entity.address) }
+            if (filtered.isNotEmpty()) {
+                mirror.bulkImportFromTelephony(filtered.map { it.entity })
+            }
+            imported += filtered.size
+        }
+        if (maxSeen > sinceId) {
+            settings.update { it.copy(advanced = it.advanced.copy(lastSyncedSmsId = maxSeen)) }
+            Timber.i("Sync: imported %d rows, cursor advanced to %d", imported, maxSeen)
+        }
+    }
+
+    /**
+     * Deletes outbound staging files older than [STALE_CACHE_AGE_MS]. Targets:
+     *  - `cache/mms_outgoing/` — built `.pdu` files for in-flight MMS. The SmsSentReceiver
+     *    normally deletes its own file on completion; we catch the orphans (process died, OS
+     *    dropped the receiver, etc.).
+     */
+    private fun pruneStaleOutboundCaches(context: Context) {
+        val cutoff = System.currentTimeMillis() - STALE_CACHE_AGE_MS
+        // v1.2.3 audit F13: also sweep `media_outgoing/` where the ViewModel stages user-picked
+        // attachments before dispatch. Files leak when the user backs out without confirm/cancel.
+        val dirs = listOf(
+            File(context.cacheDir, "mms_outgoing"),
+            File(context.cacheDir, "media_outgoing"),
+            // v1.27.2 (relecture Codex 2026-08-04) — `mms_incoming` balayé lui aussi, par ÂGE.
+            //
+            // [com.relay.sms.system.receiver.MmsDownloadedReceiver] ne supprime plus le PDU
+            // entrant tant que son sort n'est pas réglé : c'est ce qui ferme la perte d'un MMS
+            // quand la base est indisponible. Sans ce balayage, ces fichiers conservés
+            // s'accumuleraient indéfiniment. Un jour d'ancienneté est très au-delà de toute
+            // reprise plausible — le message est traité en quelques secondes ou jamais.
+            File(context.cacheDir, com.relay.sms.data.mms.MmsDownloader.MMS_IN_DIR),
+        )
+        for (dir in dirs) {
+            if (!dir.exists()) continue
+            runCatching {
+                dir.listFiles()?.forEach { f ->
+                    if (f.isFile && f.lastModified() < cutoff) runCatching { f.delete() }
+                }
+            }.onFailure { Timber.w(it, "Cache prune failed for %s", dir.absolutePath) }
+        }
+    }
+
+    companion object {
+        const val PERIODIC_NAME = "telephony_sync_periodic"
+        const val ONE_SHOT_NAME = "telephony_sync_oneshot"
+        // v1.6.1 (audit QUAL-16) — `STALE_CACHE_AGE_MS` exprimé via [MS_PER_DAY] (était
+        // une expansion en clair `24L * 60L * 60L * 1_000L` ≡ MS_PER_DAY, source de
+        // duplication silencieuse).
+        private val STALE_CACHE_AGE_MS = MS_PER_DAY
+        private const val PENDING_TIMEOUT_MS = 15L * 60L * 1_000L
+        // v1.6.1 (audit QUAL-01) — MS_PER_DAY et SAFETY_NET_DAYS centralisés dans
+        // [com.relay.sms.domain.purge.PurgePolicy]. Importés en tête de fichier.
+        /**
+         * v1.3.0 — cadence de l'auto-nettoyage. Le worker tourne toutes les 12 h pour
+         * d'autres raisons (sync SMS, watchdogs PENDING / OUTBOX) mais on gate la purge
+         * sur 30 jours pour matcher l'attente utilisateur ("1 fois par mois"). Le bouton
+         * "Effacer maintenant" du dialog réglages bypass complètement ce gate.
+         */
+        private val AUTO_PURGE_INTERVAL_MS: Long = 30L * MS_PER_DAY
+
+        /**
+         * Enqueues the recurring 12 h job. Uses [ExistingPeriodicWorkPolicy.KEEP] so repeated
+         * calls (every app launch) are no-ops once scheduled.
+         */
+        fun schedulePeriodic(context: Context) {
+            val constraints = Constraints.Builder()
+                .setRequiredNetworkType(NetworkType.NOT_REQUIRED)
+                .build()
+            val request = PeriodicWorkRequestBuilder<TelephonySyncWorker>(12, TimeUnit.HOURS)
+                .setConstraints(constraints)
+                .build()
+            WorkManager.getInstance(context).enqueueUniquePeriodicWork(
+                PERIODIC_NAME,
+                ExistingPeriodicWorkPolicy.KEEP,
+                request,
+            )
+        }
+
+        /**
+         * Enqueues a one-shot sync now (used by [com.relay.sms.system.receiver.BootReceiver]
+         * after [Intent.ACTION_BOOT_COMPLETED]). Uses [ExistingWorkPolicy.REPLACE] so the
+         * freshest request wins if multiple boot triggers arrive in close succession.
+         */
+        fun enqueueOneShot(context: Context) {
+            val request = OneTimeWorkRequestBuilder<TelephonySyncWorker>().build()
+            WorkManager.getInstance(context).enqueueUniqueWork(
+                ONE_SHOT_NAME,
+                ExistingWorkPolicy.REPLACE,
+                request,
+            )
+        }
+    }
+}

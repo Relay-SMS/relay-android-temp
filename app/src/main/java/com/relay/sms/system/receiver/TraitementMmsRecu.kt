@@ -1,0 +1,213 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.system.receiver
+
+import com.relay.sms.core.result.runCatchingCancellable
+import com.relay.sms.data.local.db.dao.MessageDao
+import com.relay.sms.data.mms.ContenuMmsRecu
+import com.relay.sms.data.mms.IntegrationMmsRecu
+import com.relay.sms.data.mms.IntegrationMmsRecu.Resultat
+import com.relay.sms.data.mms.LecteurRetrieveConf
+import com.relay.sms.data.sms.PhoneIdentity
+import com.relay.sms.data.sms.SimSelfNumber
+import com.relay.sms.domain.mms.GroupMmsMembers
+import com.relay.sms.domain.model.PhoneAddress
+import com.relay.sms.domain.settings.AppSettingsSource
+import com.relay.sms.pdu.RetrieveConf
+import com.relay.sms.system.notifications.IncomingMessageNotifier
+import com.relay.sms.system.notifications.MmsFailureNotifier
+import timber.log.Timber
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * v1.28.9 (F17, septième note d'Andrew sur la MR !38458) — **le traitement d'un MMS reçu, écrit une fois**,
+ * pour le receveur qui vient de le télécharger comme pour la reprise qui rouvre un PDU gardé.
+ *
+ * Il vivait en ligne dans `MmsDownloadedReceiver`. La reprise en a besoin à l'identique — mêmes règles
+ * d'écartement, même reconstitution de groupe, même écriture, mêmes notifications — et deux copies auraient
+ * divergé : c'est le motif de défaut le plus fréquent de ce dépôt.
+ *
+ * # L'issue
+ *
+ * [Issue.garderLePdu] : le PDU porte encore ce que la base n'a pas — un média non écrit —, il reste la seule
+ * copie et la reprise le rouvrira. [Issue.consigner] : un message de cette transaction a été écrit, par ce
+ * passage ou par un précédent ; un autre exemplaire du même MMS n'a plus rien à écrire. C'est vrai aussi d'un
+ * message supprimé depuis ([Resultat.Disparu]) : son exemplaire suivant ne doit pas le ressusciter.
+ *
+ * Une exception remonte : l'appelant garde le PDU.
+ */
+@Singleton
+class TraitementMmsRecu @Inject constructor(
+    private val blockPolicy: IncomingBlockPolicy,
+    private val settings: AppSettingsSource,
+    private val phoneIdentity: PhoneIdentity,
+    private val simSelfNumber: SimSelfNumber,
+    private val integration: IntegrationMmsRecu,
+    private val messageDao: MessageDao,
+    private val notifier: IncomingMessageNotifier,
+    private val failureNotifier: MmsFailureNotifier,
+) {
+
+    data class Issue(val garderLePdu: Boolean, val consigner: Boolean)
+
+    /**
+     * @param cle la clé de transaction lue dans le nom du PDU, ou `null` : rien ne reconnaîtra alors un
+     *   message déjà écrit.
+     * @param indiceExpediteur l'expéditeur annoncé par la notification WAP-Push ; `null` à la reprise.
+     * @param pduPresent lu dans la transaction d'écriture : `false` quand le PDU est parti avec son message
+     *   pendant le traitement, cf. `ConversationMirror.inscrireMmsRecu`.
+     */
+    suspend fun traiter(
+        conf: RetrieveConf,
+        cle: String?,
+        subId: Int?,
+        indiceExpediteur: String?,
+        pduPresent: () -> Boolean,
+    ): Issue {
+        val contenu = LecteurRetrieveConf.lire(conf, indiceExpediteur, System.currentTimeMillis())
+        // v1.28.9 (relecture GPT 5.2 du code F17, constat 3) — ni `From:` ni indice WAP-Push : le message
+        // était écrit sous une adresse VIDE, dans une conversation sans numéro à qui répondre. Écarté, comme
+        // l'import écarte un MMS du fournisseur sans adresse (`TelephonyReader.readMmsBatched`) et comme la
+        // reprise laisse un PDU sans expéditeur. Le PDU n'est pas gardé : aucune passe ne lui trouverait
+        // l'expéditeur qui lui manque.
+        if (contenu.expediteur.isBlank()) {
+            Timber.w("MMS sans expediteur (ni From, ni indice WAP-Push) : ecarte")
+            return Issue(garderLePdu = false, consigner = false)
+        }
+        // v1.26.1 (audit H5) — garde miroir de [MmsWapPushReceiver], posée ici parce que le WAP-Push ne porte
+        // pas toujours l'expéditeur. ⚠️ AVANT toute écriture sur le disque : écrit puis abandonné, le média
+        // d'un expéditeur bloqué restait dans `filesDir/mms_attachments/`, en clair, sans ligne ni purge pour
+        // y mener. v1.27.2 — repli ouvert commun aux trois receveurs (`isBlockedFailOpen`), sans avaler
+        // l'annulation. v1.28.3 (F26) — couvre aussi « bloquer les numéros inconnus ».
+        if (blockPolicy.doitEcarter(contenu.expediteur)) {
+            // Rejet DÉLIBÉRÉ, sur un `true` franc : le message ne doit pas être conservé. Une ERREUR de
+            // consultation rend `false` et n'arrive jamais ici.
+            Timber.i("Dropping downloaded MMS from blocked sender")
+            return Issue(garderLePdu = false, consigner = false)
+        }
+        val groupe = membresDuGroupe(contenu, subId)
+        return when (
+            val resultat = integration.integrer(
+                contenu,
+                subId,
+                groupe.adresses,
+                groupe.inclutSoi,
+                cle,
+                pduPresent,
+            )
+        ) {
+            is Resultat.Ecrit -> {
+                notifierArrivee(contenu, resultat.messageId)
+                Issue(garderLePdu = false, consigner = true)
+            }
+            // v1.28.3 (F15) — LE MÉDIA EXISTAIT ET N'A PAS PU ÊTRE ÉCRIT (disque plein, renommage refusé). La
+            // ligne part quand même — la légende et la trace valent mieux que rien —, mais le PDU, seule copie
+            // du média, est GARDÉ, et l'échec est DIT.
+            is Resultat.EcritIncomplet -> {
+                signalerMediaNonEcrit(contenu)
+                notifierArrivee(contenu, resultat.messageId)
+                Issue(garderLePdu = true, consigner = true)
+            }
+            is Resultat.ToujoursIncomplet -> Issue(garderLePdu = true, consigner = true)
+            is Resultat.DejaComplet, is Resultat.Complete -> Issue(garderLePdu = false, consigner = true)
+            Resultat.Disparu -> Issue(garderLePdu = false, consigner = true)
+        }
+    }
+
+    /**
+     * v1.28.10 — le groupe reconstitué depuis l'en-tête du PDU. [inclutSoi] : la liste porte alors
+     * l'utilisateur lui-même — « Mon numéro » n'est pas renseigné — et le miroir doit la rapprocher
+     * d'un groupe existant « moins un » au lieu de créer un groupe qui compterait l'utilisateur
+     * comme membre.
+     */
+    private data class GroupeRecu(val adresses: List<PhoneAddress>?, val inclutSoi: Boolean)
+
+    /**
+     * v1.28.4 — MMS de groupe : l'en-tête du PDU porte tous les destinataires, nous compris. Réglage actif et
+     * « Mon numéro » connu, la conversation est celle du groupe (retrouvée ou créée) ; sinon, conversation
+     * ordinaire, comme avant.
+     *
+     * v1.28.10 — « Mon numéro » absent : le PDU porte quand même le groupe. Trois participants ou plus,
+     * c'est un groupe même après nous en avoir retiré un — on passe alors la liste brute, avec
+     * [GroupeRecu.inclutSoi], et le miroir la rapproche d'un groupe existant « moins un ». Le groupe est
+     * donc retrouvé sans que le numéro soit saisi ; s'il n'existe pas encore, on retombe sur la
+     * conversation individuelle de l'expéditeur (on ne peut pas créer un groupe sans savoir qui retirer).
+     *
+     * Round 14 — avant ce repli, la carte SIM : quand « Mon numéro » n'est pas renseigné, le
+     * numéro lu sur la SIM ([SimSelfNumber]) sert de « nous ». Le réglage gagne toujours quand
+     * il est renseigné ; la SIM ne fait que le remplacer quand il est vide — et si elle ne rend
+     * rien non plus, le repli v1.28.10 ci-dessus s'applique, inchangé.
+     */
+    private suspend fun membresDuGroupe(contenu: ContenuMmsRecu, subId: Int?): GroupeRecu {
+        val envoi = runCatchingCancellable { settings.hydratedOrNull() }.getOrNull()?.sending
+        if (envoi?.groupMms != true) return GroupeRecu(null, false)
+        val identite = phoneIdentity.snapshot()
+        val moi = envoi.userMsisdn?.takeIf { it.isNotBlank() } ?: simSelfNumber.ownNumber(subId)
+        val groupe = if (moi != null) {
+            GroupeRecu(
+                GroupMmsMembers.of(
+                    from = contenu.expediteur,
+                    to = contenu.destinataires,
+                    cc = contenu.copies,
+                    self = moi,
+                    identityKey = identite::key,
+                ),
+                inclutSoi = false,
+            )
+        } else {
+            val participants = GroupMmsMembers.participantsOf(
+                from = contenu.expediteur,
+                to = contenu.destinataires,
+                cc = contenu.copies,
+                identityKey = identite::key,
+            )
+            // Moins de trois participants, ce n'est pas un groupe même après nous en
+            // avoir retiré un : conversation ordinaire, sans drapeau.
+            val liste = participants.takeIf { it.size >= 3 }
+            GroupeRecu(liste, inclutSoi = liste != null)
+        }
+        // Mesure sans numéro : ce que le PDU porte, et ce qu'on en a décidé.
+        Timber.i(
+            "MMS groupe: reglage=%s monNumero=%s to=%d cc=%d -> membres=%s inclutSoi=%s",
+            envoi.groupMms,
+            moi != null,
+            contenu.destinataires.size,
+            contenu.copies.size,
+            groupe.adresses?.size,
+            groupe.inclutSoi,
+        )
+        return groupe
+    }
+
+    /**
+     * Le message est en base : rien de ce qui suit n'est de la persistance, et un échec de notification ne
+     * doit pas changer le sort du PDU. Symétrique de `SmsDeliverReceiver` : la ligne relue donne la
+     * conversation, pour que la notification puisse être retirée par étiquette à l'ouverture du fil.
+     */
+    private suspend fun notifierArrivee(contenu: ContenuMmsRecu, messageId: Long) {
+        runCatchingCancellable {
+            val conversationId = messageDao.findById(messageId)?.conversationId
+            if (conversationId == null) {
+                Timber.w("MMS: message %d introuvable apres ecriture", messageId)
+            } else {
+                notifier.notifyIncoming(
+                    address = contenu.expediteur,
+                    body = contenu.libelleApercu,
+                    messageId = messageId,
+                    conversationId = conversationId,
+                )
+            }
+        }.onFailure { Timber.w(it, "MMS: notification d'arrivee non postee") }
+    }
+
+    private suspend fun signalerMediaNonEcrit(contenu: ContenuMmsRecu) {
+        runCatchingCancellable {
+            failureNotifier.notifyFailure(MmsFailureNotifier.Reason.DOWNLOAD_FAILED, senderAddress = contenu.expediteur)
+        }.onFailure { Timber.w(it, "MMS: notification d'echec non postee") }
+    }
+}

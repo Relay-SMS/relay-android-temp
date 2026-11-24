@@ -1,0 +1,356 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.ui.screens.compose
+
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import androidx.lifecycle.SavedStateHandle
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.relay.sms.core.ext.foldForSearch
+import com.relay.sms.core.ext.normalizePhone
+import com.relay.sms.core.ext.oneShotEvents
+import com.relay.sms.core.result.AppError
+import com.relay.sms.core.result.Outcome
+import com.relay.sms.core.result.runCatchingCancellable
+import com.relay.sms.di.IoDispatcher
+import com.relay.sms.domain.clientmode.ClientActionGateway
+import com.relay.sms.domain.clientmode.NoOpClientActionGateway
+import com.relay.sms.domain.model.Contact
+import com.relay.sms.domain.model.NOTE_TITLE_MAX_LENGTH
+import com.relay.sms.domain.model.PhoneAddress
+import com.relay.sms.domain.repository.ContactRepository
+import com.relay.sms.domain.repository.ConversationRepository
+import com.relay.sms.domain.repository.NoteRepository
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import timber.log.Timber
+import javax.inject.Inject
+
+@HiltViewModel
+class ComposeViewModel @Inject constructor(
+    savedStateHandle: SavedStateHandle,
+    private val contactRepo: ContactRepository,
+    private val conversationRepo: ConversationRepository,
+    @IoDispatcher private val io: CoroutineDispatcher,
+    /**
+     * Notes — the note repository, for [createNote] in hub mode. In
+     * client mode the note is created on the hub instead (the
+     * `create_note` frame, via [clientActions] — round 36 phase 2).
+     */
+    private val noteRepo: NoteRepository,
+    /**
+     * Client mode C3 — the create-conversation gateway (the group
+     * name rides the `create_conversation` frame; the repo's
+     * `findOrCreate` has no name parameter). Default NoOp keeps
+     * tests compiling; Hilt always provides the real one.
+     */
+    private val clientActions: ClientActionGateway = NoOpClientActionGateway,
+) : ViewModel() {
+
+    // v1.6.1 (audit QUAL-17) — @Stable pour Compose recomposition skipping.
+    @androidx.compose.runtime.Stable
+    data class UiState(
+        val results: List<Contact> = emptyList(),
+        val recipients: List<PhoneAddress> = emptyList(),
+        val initialLoaded: Boolean = false,
+        /** v1.28.13 — `READ_CONTACTS` refusée : la liste est vide parce qu'on n'a pas pu la lire. */
+        val contactsRefused: Boolean = false,
+    )
+
+    private val _state = MutableStateFlow(UiState())
+    val state: StateFlow<UiState> = _state.asStateFlow()
+
+    /**
+     * v1.27.9 — **le texte saisi dans le champ de recherche est un état Compose (snapshot),
+     * plus un champ de [UiState].**
+     *
+     * `OutlinedTextField(value = …, onValueChange = …)` exige que la valeur remontée par
+     * `onValueChange` lui revienne **dans la même recomposition**. Elle transitait ici par
+     * `MutableStateFlow` → `collectAsStateWithLifecycle`, qui la rend au mieux une frame plus
+     * tard (dispatch `AndroidUiDispatcher`), et bien davantage quand la frappe déclenche en
+     * plus le re-filtrage de la liste de contacts. Le champ recevait alors une valeur périmée
+     * — **et la position de curseur qui l'accompagne** : lettres réinsérées dans le désordre
+     * (« christine » → « hchi… ») et touche « effacer » qui ne faisait que reculer le curseur
+     * sans rien supprimer. Un `mutableStateOf` est lu par le champ dans la frame courante.
+     */
+    var searchInput by mutableStateOf("")
+        private set
+
+    val events = oneShotEvents<Event>()
+
+    sealed interface Event {
+        data class ConversationCreated(val id: Long) : Event
+
+        /** Notes — a note was created; the screen opens its thread. */
+        data class NoteCreated(val id: Long) : Event
+
+        /** Client mode C3 — the hub refused the create (or could not be reached). */
+        data class CreateFailed(val error: AppError) : Event
+    }
+
+    /**
+     * Client mode C3 — the compose screen hides the create-contact
+     * row on a linked device (no contact frames until C4).
+     */
+    private val _isClientMode = MutableStateFlow(false)
+    val isClientMode: StateFlow<Boolean> = _isClientMode.asStateFlow()
+
+    /**
+     * v1.28.3 — mode groupe (« Nouveau groupe » dans la liste) : le raccourci « toucher = ouvrir le
+     * fil » est désactivé, chaque ligne ajoute une puce, « Continuer » crée la conversation.
+     */
+    val modeGroupe: Boolean = savedStateHandle.get<Boolean>("groupe") ?: false
+
+    init {
+        savedStateHandle.get<String>("initialAddress")?.let { addr ->
+            _state.update { it.copy(recipients = listOf(PhoneAddress.of(addr))) }
+        }
+        chargerContacts()
+        viewModelScope.launch { _isClientMode.value = clientActions.isClientMode() }
+    }
+
+    /**
+     * v1.28.13 (MR F-Droid !38458, test de by-architect sur Android 16) — **la liste se charge sans
+     * la permission Contacts, et l'écran dit pourquoi elle est vide.**
+     *
+     * `ContactsReader.listAll` lève `SecurityException` quand `READ_CONTACTS` est refusée, et rien
+     * ne la rattrapait dans `viewModelScope` : ouvrir « Nouveau message » faisait planter l'app. Le
+     * protocole de test de F-Droid refuse exprès les permissions optionnelles ; nos tests, et le
+     * premier testeur, les accordaient toutes.
+     *
+     * ⚠️ Le refus se rattrape ICI, pas dans `ContactRepositoryImpl` : `IncomingBlockPolicy` a besoin
+     * de l'exception pour distinguer « je n'ai pas pu regarder » de « expéditeur inconnu ». L'avaler
+     * dans le dépôt couperait toute réception à qui bloque les inconnus sans accorder les contacts.
+     *
+     * Rappelée par l'écran à chaque retour au premier plan tant que l'accès manque : Android tue le
+     * processus quand on RETIRE une permission, pas quand on l'accorde.
+     */
+    fun chargerContacts() {
+        viewModelScope.launch {
+            val lecture = runCatchingCancellable { contactRepo.listAll() }
+            lecture.exceptionOrNull()?.let { Timber.w(it, "ComposeViewModel: contacts illisibles") }
+            _state.update {
+                it.copy(
+                    results = lecture.getOrDefault(emptyList()),
+                    initialLoaded = true,
+                    contactsRefused = lecture.exceptionOrNull() is SecurityException,
+                )
+            }
+        }
+    }
+
+    fun setQuery(q: String) {
+        searchInput = q
+    }
+
+    fun addRecipient(rawNumber: String) {
+        val addr = PhoneAddress.of(rawNumber)
+        if (addr.normalized.isEmpty()) return
+        if (_state.value.recipients.any { it.normalized == addr.normalized }) return
+        _state.update { it.copy(recipients = it.recipients + addr) }
+    }
+
+    fun removeRecipient(addr: PhoneAddress) {
+        _state.update { it.copy(recipients = it.recipients - addr) }
+    }
+
+    /**
+     * Group picking (the compose screen's "Create a group" mode): tapping a contact
+     * adds their number when it is not there yet, and removes it when it already is —
+     * the same add the old per-row +person icon did, but reversible, so the selection
+     * circle can fill and empty. Matches by normalized number, like [addRecipient].
+     */
+    fun toggleRecipient(rawNumber: String) {
+        val addr = PhoneAddress.of(rawNumber)
+        if (addr.normalized.isEmpty()) return
+        _state.update { s ->
+            if (s.recipients.any { it.normalized == addr.normalized }) {
+                s.copy(recipients = s.recipients.filterNot { it.normalized == addr.normalized })
+            } else {
+                s.copy(recipients = s.recipients + addr)
+            }
+        }
+    }
+
+    /**
+     * v1.3.11 (F2) — "tap-to-pick" UX: when the picker is empty (the common single-recipient
+     * case), tapping a contact / free-entry row should immediately open the thread instead of
+     * requiring an extra "Continuer" tap. If the user has already started building a group
+     * (chips already present), the tap only appends a new chip and the explicit "Continuer"
+     * button stays as the validation step — preserving the multi-recipient flow.
+     *
+     * Returns `true` when the tap triggered the navigation (caller can use this to dismiss
+     * the keyboard / clear the query field), `false` when it just appended a chip.
+     */
+    fun pickRecipient(rawNumber: String): Boolean {
+        val addr = PhoneAddress.of(rawNumber)
+        if (addr.normalized.isEmpty()) return false
+        val wasEmpty = _state.value.recipients.isEmpty()
+        if (_state.value.recipients.none { it.normalized == addr.normalized }) {
+            _state.update { it.copy(recipients = it.recipients + addr) }
+        }
+        if (wasEmpty && !modeGroupe) {
+            createConversation()
+            return true
+        }
+        return false
+    }
+
+    /**
+     * Round 13 — creates the conversation for the picked recipients, then
+     * applies a group name when one was typed on the "Name your group"
+     * screen: [conversationRepo.setCustomName] already exists (used by the
+     * rename flow), so no new repository work was needed. A blank name
+     * leaves the group unnamed (it shows member names, as before).
+     */
+    fun createConversation(groupName: String? = null) {
+        viewModelScope.launch {
+            val rec = _state.value.recipients
+            if (rec.isEmpty()) return@launch
+            // Client mode C3 — the name rides the
+            // `create_conversation` frame (the hub applies it; a
+            // local-only rename would be overwritten by the next
+            // sync). Unnamed: the repo opens a local thread without
+            // a round-trip, and creates via wire only when absent.
+            if (clientActions.isClientMode()) {
+                val name = groupName?.trim()
+                if (name.isNullOrEmpty()) {
+                    when (val res = conversationRepo.findOrCreate(rec)) {
+                        is Outcome.Success -> events.tryEmit(Event.ConversationCreated(res.value.id))
+                        is Outcome.Failure -> events.tryEmit(Event.CreateFailed(res.error))
+                    }
+                    return@launch
+                }
+                when (val res = clientActions.createConversation(rec.map { it.raw }, name)) {
+                    is Outcome.Success -> events.tryEmit(Event.ConversationCreated(res.value))
+                    is Outcome.Failure -> events.tryEmit(Event.CreateFailed(res.error))
+                }
+                return@launch
+            }
+            val res = conversationRepo.findOrCreate(rec)
+            if (res is Outcome.Success) {
+                val name = groupName?.trim()
+                if (!name.isNullOrEmpty()) {
+                    conversationRepo.setCustomName(res.value.id, name)
+                }
+                events.tryEmit(Event.ConversationCreated(res.value.id))
+            }
+        }
+    }
+
+    /**
+     * Notes — creates a note with the given title and emits
+     * [Event.NoteCreated] so the screen opens its thread. Unlike a
+     * group name, the title is REQUIRED (a note with no title has
+     * no identity in the list): a blank title does nothing. Every
+     * note is a new row — there is no `findOrCreate` for notes.
+     * Round 36 phase 2 — client mode creates via the `create_note`
+     * frame (no optimistic note: the hub answers with the row, and
+     * the engine upserts it before the answer lands); a failure
+     * emits [Event.CreateFailed].
+     */
+    fun createNote(title: String) {
+        val clean = title.trim().take(NOTE_TITLE_MAX_LENGTH)
+        if (clean.isBlank()) return
+        viewModelScope.launch {
+            if (clientActions.isClientMode()) {
+                when (val res = clientActions.createNote(clean)) {
+                    is Outcome.Success -> events.tryEmit(Event.NoteCreated(res.value))
+                    is Outcome.Failure -> events.tryEmit(Event.CreateFailed(res.error))
+                }
+                return@launch
+            }
+            val note = noteRepo.createNote(clean)
+            events.tryEmit(Event.NoteCreated(note.id))
+        }
+    }
+
+    /**
+     * Contact « pré-indexé » pour la recherche : le nom est **replié une seule fois**
+     * (casse + accents retirés via [foldForSearch]) et les numéros normalisés une seule
+     * fois, au moment où la liste de contacts change — et non à chaque frappe. Le filtrage
+     * par requête ne fait alors que des `contains` sur ces chaînes déjà calculées.
+     */
+    private data class IndexedContact(
+        val contact: Contact,
+        val foldedName: String,
+        val phoneDigits: List<String>,
+    )
+
+    /**
+     * Résultats filtrés exposés en [StateFlow] dérivé (optimal) plutôt qu'en fonction
+     * rappelée à chaque recomposition : le repli des contacts n'a lieu qu'au changement
+     * de la liste source ([distinctUntilChanged]), et le filtrage qu'au changement de
+     * requête. Recherche insensible à la **casse ET aux accents** (« maite » trouve
+     * « Maïté »), et par numéro si l'utilisateur tape des chiffres.
+     */
+    val filtered: StateFlow<List<Contact>> = combine(
+        // `snapshotFlow` fait le pont état Compose → Flow : le champ lit [searchInput] dans la frame
+        // courante, le filtrage se déclenche derrière, sur IO, sans jamais réécrire le champ.
+        snapshotFlow { searchInput.trim() }.distinctUntilChanged(),
+        _state.map { it.results }.distinctUntilChanged().map { list ->
+            list.map { c ->
+                IndexedContact(
+                    contact = c,
+                    foldedName = c.displayName?.foldForSearch().orEmpty(),
+                    phoneDigits = c.phones.map { it.normalized },
+                )
+            }
+        },
+    ) { q, indexed ->
+        if (q.isEmpty()) return@combine indexed.map { it.contact }
+        val needle = q.foldForSearch()
+        // v1.2.10 : `normalizePhone()` d'un texte pur (ex. "Patrice") rend "" et
+        // `contains("")` matcherait TOUT → on ne tente le match numéro que si la requête
+        // contient réellement des chiffres (`n.isNotBlank()`).
+        val n = q.normalizePhone()
+        indexed.mapNotNull { idx ->
+            val match = idx.foldedName.contains(needle) ||
+                (n.isNotBlank() && idx.phoneDigits.any { it.contains(n) })
+            if (match) idx.contact else null
+        }
+    }
+        // Le repli NFD (`foldForSearch`) de tous les contacts au chargement de la liste ne doit
+        // pas s'exécuter sur le Main : `combine{}.stateIn` tourne sur Main.immediate par défaut.
+        // `flowOn(io)` déplace le fold + le filtrage sur IO — parité avec ConversationsViewModel.
+        .flowOn(io)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000L), emptyList())
+
+    companion object {
+        /**
+         * v1.28.3 (audit global, X-06 — mesuré sur le S9) — **une saisie n'est proposée comme
+         * destinataire que si elle se compose.**
+         *
+         * La ligne de saisie libre offrait n'importe quel texte comme adresse : taper « Pat »
+         * puis l'ajouter envoyait un SMS au destinataire « Pat », que la pile refusait avec
+         * `RESULT_ERROR_NULL_PDU`, bulle rouge et notification d'échec à la clé — pour un nom
+         * qui figurait dans les contacts juste au-dessus. `PhoneAddress.of` garde à dessein les
+         * adresses alphanumériques (« Free », « INFO ») : elles servent en RÉCEPTION, jamais en
+         * destination. Chiffres, `+`, espaces, parenthèses, tirets et points ; au moins deux
+         * chiffres pour couvrir les numéros courts.
+         */
+        fun estComposable(saisie: String): Boolean {
+            val propre = saisie.trim()
+            if (propre.count { it.isDigit() } < 2) return false
+            return propre.all { it.isDigit() || it in "+ ()-." }
+        }
+    }
+}

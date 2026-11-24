@@ -1,0 +1,100 @@
+/*
+ * Copyright 2026 Relay Messaging. All rights reserved.
+ *
+ * This file is proprietary to Relay Messaging and is not licensed under the
+ * Apache License 2.0. See LICENSE-RELAY for the terms.
+ */
+
+package com.relay.sms.crashlog
+
+import android.content.Context
+import android.content.SharedPreferences
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+
+/**
+ * Local-only error log — the on/off switch for the whole error
+ * log: crash reports, the session marker, and the startup
+ * death check. Round 36 — one flag gates every writer (see
+ * [CrashLogHandler], [SessionMarkerTracker],
+ * [SessionDeathChecker]); each of them reads it live through a
+ * `() -> Boolean`, so flipping the switch mid-session takes
+ * effect at once — no writer trusts a value captured at
+ * startup.
+ *
+ * SharedPreferences, not DataStore, on purpose: the crash
+ * handler runs on a dying thread and must read the flag
+ * synchronously; a DataStore read there would block the crash
+ * path. The value is a single boolean, so there is nothing a
+ * DataStore would buy here.
+ *
+ * Default ON: the error log has always been on, and turning it
+ * off is the user's explicit choice. The flag lives in its own
+ * preferences file, separate from the app settings, so it
+ * survives a "Reset all" — resetting preferences must not
+ * silently re-enable logging the user turned off.
+ *
+ * The change listener is registered for the life of the
+ * process: this class is a Hilt singleton, and the two
+ * instances built at startup (handler, tracker) are held by
+ * their install lambdas for the process lifetime anyway.
+ *
+ * Round 44 — [setEnabled] updates [_enabledFlow] directly, in
+ * addition to writing the pref: on device the switch did not
+ * redraw when tapped (the setting changed — a restart showed
+ * the true state — but the UI never updated), which means the
+ * listener alone did not deliver the change to the Flow. The
+ * direct update makes the Flow independent of listener
+ * delivery, so the switch flips immediately on tap. The
+ * listener stays: it covers writes from outside this class
+ * (there are none today, but a restore or a future writer
+ * would reach the Flow through it) and setting the same value
+ * twice is a no-op for a StateFlow.
+ */
+class CrashLogSettings(context: Context) {
+
+    companion object {
+        /** Preferences file for the error-log switch. */
+        const val PREFS_NAME: String = "crash-log"
+
+        /** The on/off flag inside [PREFS_NAME]. */
+        const val KEY_ENABLED: String = "enabled"
+
+        /** The error log is on unless the user turns it off. */
+        const val DEFAULT_ENABLED: Boolean = true
+    }
+
+    private val prefs: SharedPreferences =
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    private val _enabledFlow = MutableStateFlow(enabled)
+
+    private val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == KEY_ENABLED) {
+            _enabledFlow.value = enabled
+        }
+    }
+
+    init {
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+    }
+
+    /** Whether the error log is on. Read live on every call. */
+    val enabled: Boolean
+        get() = prefs.getBoolean(KEY_ENABLED, DEFAULT_ENABLED)
+
+    /** The flag as a flow, for the Settings toggle. */
+    val enabledFlow: StateFlow<Boolean> = _enabledFlow.asStateFlow()
+
+    /**
+     * Turns the error log on or off. The Flow is updated
+     * directly, synchronously — the listener alone did not
+     * deliver the change to the UI on device (round 44), so
+     * the switch must not depend on it.
+     */
+    fun setEnabled(value: Boolean) {
+        prefs.edit().putBoolean(KEY_ENABLED, value).apply()
+        _enabledFlow.value = value
+    }
+}

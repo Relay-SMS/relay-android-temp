@@ -1,0 +1,792 @@
+/*
+ * Copyright 2026 Relay Messaging. All rights reserved.
+ *
+ * This file is proprietary to Relay Messaging and is not licensed under the
+ * Apache License 2.0. See LICENSE-RELAY for the terms.
+ */
+
+package com.relay.sms.sync
+
+import com.google.common.truth.Truth.assertThat
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import org.junit.jupiter.api.Test
+
+/**
+ * Slice 2 — the sync engine, driven without a socket: a fake
+ * [SyncMessageSource] holds the conversations and messages, and the
+ * harness records every outbound frame. This is the contract the
+ * desktop syncs against, so the frame order, the paging cursors, the
+ * live diff and the readiness errors are all pinned here.
+ */
+class SyncEngineTest {
+
+    @Test fun `full sync streams conversations then messages then complete`() = runTest {
+        val source = FakeSyncMessageSource()
+        source.snapshot = listOf(
+            sampleConversation(id = 1, lastMessageAt = 2000, messageCount = 3),
+            sampleConversation(id = 2, lastMessageAt = 1000, messageCount = 1),
+        )
+        source.store(sampleMessage(id = 11, conversationId = 1))
+        source.store(sampleMessage(id = 12, conversationId = 1))
+        source.store(sampleMessage(id = 13, conversationId = 1))
+        source.store(sampleMessage(id = 21, conversationId = 2))
+        runEngine(source) { engine, sent ->
+            engine.onSyncRequest(SyncProtocol.SyncRequest(mode = "full"))
+            advanceUntilIdle()
+            assertThat(sent.map { it.frameType() }).containsExactly(
+                "sync_started",
+                // Slice 5 — the contact snapshot streams between
+                // `sync_started` and the conversations (empty here:
+                // the fake holds no contacts, but the prune-signal
+                // batch still goes out).
+                "contacts",
+                "conversations",
+                "messages_batch",
+                "messages_batch",
+                "sync_complete",
+                // Category mutes — the full muted set rides right
+                // after the snapshot (empty here: the fake mutes
+                // nothing).
+                "category_mutes",
+            ).inOrder()
+
+            val started = sent.first { it.frameType() == "sync_started" }.asObject()
+            assertThat(started["mode"]?.jsonPrimitive?.content).isEqualTo("full")
+            assertThat(started["total_conversations"]?.jsonPrimitive?.content).isEqualTo("2")
+            assertThat(started["total_messages"]?.jsonPrimitive?.content).isEqualTo("4")
+            assertThat(started["cursor_message_id"]?.jsonPrimitive?.content).isEqualTo("21")
+
+            val conversations = sent.first { it.frameType() == "conversations" }.asObject()
+            val ids = conversations["conversations"]!!.jsonArray
+                .map { it.jsonObject["id"]?.jsonPrimitive?.content }
+            assertThat(ids).containsExactly("1", "2").inOrder()
+            assertThat(conversations["has_more"]?.jsonPrimitive?.content).isEqualTo("false")
+
+            val batches = sent.filter { it.frameType() == "messages_batch" }.map { it.asObject() }
+            assertThat(batches[0]["conversation_id"]?.jsonPrimitive?.content).isEqualTo("1")
+            val batchIds = batches[0]["messages"]!!.jsonArray
+                .map { it.jsonObject["id"]?.jsonPrimitive?.content }
+            assertThat(batchIds).containsExactly("13", "12", "11").inOrder()
+            assertThat(batches[0]["has_more"]?.jsonPrimitive?.content).isEqualTo("false")
+            assertThat(batches[1]["conversation_id"]?.jsonPrimitive?.content).isEqualTo("2")
+
+            val complete = sent.first { it.frameType() == "sync_complete" }.asObject()
+            assertThat(complete["cursor_message_id"]?.jsonPrimitive?.content).isEqualTo("21")
+        }
+    }
+
+    @Test fun `sync_started reports the phone's default-SMS status`() = runTest {
+        val source = FakeSyncMessageSource()
+        source.isDefaultSms = false
+        source.snapshot = listOf(sampleConversation(id = 1, messageCount = 0))
+        runEngine(source) { engine, sent ->
+            engine.onSyncRequest(SyncProtocol.SyncRequest(mode = "full"))
+            advanceUntilIdle()
+            val started = sent.first { it.frameType() == "sync_started" }.asObject()
+            assertThat(started["hub_is_default_sms"]?.jsonPrimitive?.content).isEqualTo("false")
+        }
+    }
+
+    @Test fun `sync_started reports the phone's tunnel IP when one is up`() = runTest {
+        val source = FakeSyncMessageSource()
+        source.tunnelIp = "10.6.0.2"
+        source.snapshot = listOf(sampleConversation(id = 1, messageCount = 0))
+        runEngine(source) { engine, sent ->
+            engine.onSyncRequest(SyncProtocol.SyncRequest(mode = "full"))
+            advanceUntilIdle()
+            val started = sent.first { it.frameType() == "sync_started" }.asObject()
+            assertThat(started["hub_tunnel_ip"]?.jsonPrimitive?.content).isEqualTo("10.6.0.2")
+        }
+    }
+
+    @Test fun `sync_started omits the tunnel IP when no tunnel is up`() = runTest {
+        val source = FakeSyncMessageSource()
+        source.snapshot = listOf(sampleConversation(id = 1, messageCount = 0))
+        runEngine(source) { engine, sent ->
+            engine.onSyncRequest(SyncProtocol.SyncRequest(mode = "full"))
+            advanceUntilIdle()
+            val started = sent.first { it.frameType() == "sync_started" }.asObject()
+            assertThat(started.containsKey("hub_tunnel_ip")).isFalse()
+        }
+    }
+
+    @Test fun `full sync pages a long thread at 200`() = runTest {
+        val source = FakeSyncMessageSource()
+        source.snapshot = listOf(sampleConversation(id = 1, messageCount = 250))
+        for (id in 1..250) source.store(sampleMessage(id = id.toLong(), conversationId = 1))
+        runEngine(source) { engine, sent ->
+            engine.onSyncRequest(SyncProtocol.SyncRequest(mode = "full"))
+            advanceUntilIdle()
+            val batches = sent.filter { it.frameType() == "messages_batch" }.map { it.asObject() }
+            assertThat(batches).hasSize(2)
+            assertThat(batches[0]["messages"]!!.jsonArray).hasSize(200)
+            assertThat(batches[0]["has_more"]?.jsonPrimitive?.content).isEqualTo("true")
+            assertThat(batches[0]["next_before_id"]?.jsonPrimitive?.content).isEqualTo("51")
+            assertThat(batches[1]["messages"]!!.jsonArray).hasSize(50)
+            assertThat(batches[1]["has_more"]?.jsonPrimitive?.content).isEqualTo("false")
+            assertThat(batches[1].containsKey("next_before_id")).isFalse()
+        }
+    }
+
+    @Test fun `new_only sync skips messages and reports the now cursor`() = runTest {
+        val source = FakeSyncMessageSource()
+        source.snapshot = listOf(sampleConversation(id = 1, messageCount = 3))
+        source.store(sampleMessage(id = 11, conversationId = 1))
+        source.store(sampleMessage(id = 12, conversationId = 1))
+        source.store(sampleMessage(id = 13, conversationId = 1))
+        runEngine(source) { engine, sent ->
+            engine.onSyncRequest(SyncProtocol.SyncRequest(mode = "new_only"))
+            advanceUntilIdle()
+            assertThat(sent.map { it.frameType() }).containsExactly(
+                "sync_started",
+                // Slice 5 — contacts sync in both modes (the mode
+                // choice is about message history).
+                "contacts",
+                "conversations",
+                "sync_complete",
+                // Category mutes — the full muted set rides right
+                // after the snapshot, in both modes.
+                "category_mutes",
+            ).inOrder()
+            val started = sent.first { it.frameType() == "sync_started" }.asObject()
+            assertThat(started["mode"]?.jsonPrimitive?.content).isEqualTo("new_only")
+            assertThat(started["cursor_message_id"]?.jsonPrimitive?.content).isEqualTo("13")
+        }
+    }
+
+    @Test fun `delta sync sends only messages above the cursor`() = runTest {
+        val source = FakeSyncMessageSource()
+        source.snapshot = listOf(sampleConversation(id = 1, messageCount = 5))
+        for (id in 1..5) source.store(sampleMessage(id = id.toLong(), conversationId = 1))
+        runEngine(source) { engine, sent ->
+            engine.onSyncRequest(SyncProtocol.SyncRequest(mode = "full", sinceMessageId = "2"))
+            advanceUntilIdle()
+            val batches = sent.filter { it.frameType() == "messages_batch" }.map { it.asObject() }
+            assertThat(batches).hasSize(1)
+            val batchIds = batches[0]["messages"]!!.jsonArray
+                .map { it.jsonObject["id"]?.jsonPrimitive?.content }
+            assertThat(batchIds).containsExactly("3", "4", "5").inOrder()
+            assertThat(batches[0]["has_more"]?.jsonPrimitive?.content).isEqualTo("false")
+            assertThat(sent.map { it.frameType() }).contains("sync_complete")
+        }
+    }
+
+    @Test fun `messages_request answers one page and pages with before_id`() = runTest {
+        val source = FakeSyncMessageSource()
+        source.snapshot = listOf(sampleConversation(id = 1, messageCount = 3))
+        source.store(sampleMessage(id = 11, conversationId = 1))
+        source.store(sampleMessage(id = 12, conversationId = 1))
+        source.store(sampleMessage(id = 13, conversationId = 1))
+        runEngine(source) { engine, sent ->
+            engine.onMessagesRequest(
+                SyncProtocol.MessagesRequest(conversationId = "1", beforeId = "0", limit = 2),
+            )
+            advanceUntilIdle()
+            val batches = sent.filter { it.frameType() == "messages_batch" }.map { it.asObject() }
+            assertThat(batches).hasSize(1)
+            val batchIds = batches[0]["messages"]!!.jsonArray
+                .map { it.jsonObject["id"]?.jsonPrimitive?.content }
+            assertThat(batchIds).containsExactly("13", "12").inOrder()
+            assertThat(batches[0]["has_more"]?.jsonPrimitive?.content).isEqualTo("true")
+            assertThat(batches[0]["next_before_id"]?.jsonPrimitive?.content).isEqualTo("12")
+
+            engine.onMessagesRequest(
+                SyncProtocol.MessagesRequest(conversationId = "1", beforeId = "12", limit = 2),
+            )
+            advanceUntilIdle()
+            val second = sent.filter { it.frameType() == "messages_batch" }.map { it.asObject() }
+            assertThat(second).hasSize(2)
+            val secondIds = second[1]["messages"]!!.jsonArray
+                .map { it.jsonObject["id"]?.jsonPrimitive?.content }
+            assertThat(secondIds).containsExactly("11")
+            assertThat(second[1]["has_more"]?.jsonPrimitive?.content).isEqualTo("false")
+        }
+    }
+
+    @Test fun `messages_request for an unknown conversation answers error`() = runTest {
+        val source = FakeSyncMessageSource()
+        source.snapshot = listOf(sampleConversation(id = 1))
+        runEngine(source) { engine, sent ->
+            engine.onMessagesRequest(SyncProtocol.MessagesRequest(conversationId = "999"))
+            advanceUntilIdle()
+            assertThat(sent.map { it.frameType() }).containsExactly("error")
+        }
+    }
+
+    @Test fun `unknown sync mode answers error`() = runTest {
+        val source = FakeSyncMessageSource()
+        runEngine(source) { engine, sent ->
+            engine.onSyncRequest(SyncProtocol.SyncRequest(mode = "sideways"))
+            advanceUntilIdle()
+            assertThat(sent.map { it.frameType() }).containsExactly("error")
+        }
+    }
+
+    @Test fun `no sms permission answers sync_error hub_no_sms_access`() = runTest {
+        val source = FakeSyncMessageSource()
+        source.readiness = Readiness.NoSmsPermission
+        runEngine(source) { engine, sent ->
+            engine.onSyncRequest(SyncProtocol.SyncRequest(mode = "full"))
+            advanceUntilIdle()
+            assertThat(sent.map { it.frameType() }).containsExactly("sync_error")
+            val error = sent.first().asObject()
+            assertThat(error["code"]?.jsonPrimitive?.content)
+                .isEqualTo(SyncProtocol.SyncError.HUB_NO_SMS_ACCESS)
+        }
+    }
+
+    @Test fun `empty mirror answers sync_error hub_mirror_empty`() = runTest {
+        val source = FakeSyncMessageSource()
+        source.readiness = Readiness.MirrorEmpty
+        runEngine(source) { engine, sent ->
+            engine.onSyncRequest(SyncProtocol.SyncRequest(mode = "full"))
+            advanceUntilIdle()
+            assertThat(sent.map { it.frameType() }).containsExactly("sync_error")
+            val error = sent.first().asObject()
+            assertThat(error["code"]?.jsonPrimitive?.content)
+                .isEqualTo(SyncProtocol.SyncError.HUB_MIRROR_EMPTY)
+        }
+    }
+
+    @Test fun `live push sends conversation_updated and message_new for a new message`() = runTest {
+        val source = FakeSyncMessageSource()
+        val conv = sampleConversation(id = 1, lastMessageAt = 1000, messageCount = 1)
+        source.store(sampleMessage(id = 11, conversationId = 1))
+        assertThat(source.conversationsFlow.tryEmit(listOf(conv))).isTrue()
+        runEngine(source) { engine, sent ->
+            engine.start()
+            advanceUntilIdle()
+            assertThat(sent).isEmpty()
+
+            source.store(sampleMessage(id = 12, conversationId = 1, body = "fresh"))
+            val updated = conv.copy(
+                lastMessageAt = 2000,
+                lastMessagePreview = "fresh",
+                unread = 1,
+                messageCount = 2,
+            )
+            assertThat(source.conversationsFlow.tryEmit(listOf(updated))).isTrue()
+            advanceUntilIdle()
+            assertThat(sent.map { it.frameType() })
+                .containsExactly("conversation_updated", "message_new").inOrder()
+            val newMessage = sent.first { it.frameType() == "message_new" }.asObject()
+            assertThat(newMessage["message"]!!.jsonObject["id"]?.jsonPrimitive?.content)
+                .isEqualTo("12")
+            assertThat(newMessage["message"]!!.jsonObject["body"]?.jsonPrimitive?.content)
+                .isEqualTo("fresh")
+        }
+    }
+
+    @Test fun `live push sends message_new for a new conversation's first message`() = runTest {
+        val source = FakeSyncMessageSource()
+        val existing = sampleConversation(id = 1, lastMessageAt = 1000, messageCount = 1)
+        source.store(sampleMessage(id = 11, conversationId = 1))
+        assertThat(source.conversationsFlow.tryEmit(listOf(existing))).isTrue()
+        runEngine(source) { engine, sent ->
+            engine.start()
+            advanceUntilIdle()
+            assertThat(sent).isEmpty()
+
+            // A first text from a new number (the OTP case): the
+            // conversation appears with its first message already
+            // in it — the desktop must hear about the message, not
+            // just the thread, or it never notifies for it.
+            source.store(sampleMessage(id = 12, conversationId = 2, body = "Your code is 123456"))
+            val fresh = sampleConversation(
+                id = 2,
+                lastMessageAt = 2000,
+                lastMessagePreview = "Your code is 123456",
+                unread = 1,
+                messageCount = 1,
+            )
+            assertThat(source.conversationsFlow.tryEmit(listOf(fresh, existing))).isTrue()
+            advanceUntilIdle()
+            assertThat(sent.map { it.frameType() })
+                .containsExactly("conversation_updated", "message_new").inOrder()
+            val newMessage = sent.first { it.frameType() == "message_new" }.asObject()
+            assertThat(newMessage["message"]!!.jsonObject["id"]?.jsonPrimitive?.content)
+                .isEqualTo("12")
+            assertThat(newMessage["message"]!!.jsonObject["body"]?.jsonPrimitive?.content)
+                .isEqualTo("Your code is 123456")
+        }
+    }
+
+    @Test fun `a new conversation pushes each of its new messages oldest first`() = runTest {
+        val source = FakeSyncMessageSource()
+        assertThat(source.conversationsFlow.tryEmit(emptyList())).isTrue()
+        runEngine(source) { engine, sent ->
+            engine.start()
+            advanceUntilIdle()
+            assertThat(sent).isEmpty()
+
+            source.store(sampleMessage(id = 11, conversationId = 2, body = "one"))
+            source.store(sampleMessage(id = 12, conversationId = 2, body = "two"))
+            val conv = sampleConversation(id = 2, lastMessageAt = 2000, messageCount = 2)
+            assertThat(source.conversationsFlow.tryEmit(listOf(conv))).isTrue()
+            advanceUntilIdle()
+            assertThat(sent.map { it.frameType() })
+                .containsExactly("conversation_updated", "message_new", "message_new").inOrder()
+            val bodies = sent.filter { it.frameType() == "message_new" }
+                .map { it.asObject()["message"]!!.jsonObject["body"]?.jsonPrimitive?.content }
+            assertThat(bodies).containsExactly("one", "two").inOrder()
+        }
+    }
+
+    @Test fun `a new conversation never re-pushes messages from before the session baseline`() = runTest {
+        val source = FakeSyncMessageSource()
+        // The message predates the session (its id is at the
+        // baseline the collector seeds at start); only its
+        // conversation row appears now — the message itself must
+        // not be re-pushed.
+        source.store(sampleMessage(id = 11, conversationId = 2, body = "old"))
+        assertThat(source.conversationsFlow.tryEmit(emptyList())).isTrue()
+        runEngine(source) { engine, sent ->
+            engine.start()
+            advanceUntilIdle()
+            assertThat(sent).isEmpty()
+
+            val conv = sampleConversation(id = 2, lastMessageAt = 1000, messageCount = 1)
+            assertThat(source.conversationsFlow.tryEmit(listOf(conv))).isTrue()
+            advanceUntilIdle()
+            assertThat(sent.map { it.frameType() }).containsExactly("conversation_updated").inOrder()
+        }
+    }
+
+    @Test fun `live push sends conversation_deleted when a conversation disappears`() = runTest {
+        val source = FakeSyncMessageSource()
+        val convA = sampleConversation(id = 1, lastMessageAt = 2000)
+        val convB = sampleConversation(id = 2, lastMessageAt = 1000, title = "Curt")
+        assertThat(source.conversationsFlow.tryEmit(listOf(convA, convB))).isTrue()
+        runEngine(source) { engine, sent ->
+            engine.start()
+            advanceUntilIdle()
+            assertThat(sent).isEmpty()
+
+            assertThat(source.conversationsFlow.tryEmit(listOf(convA))).isTrue()
+            advanceUntilIdle()
+            assertThat(sent.map { it.frameType() }).containsExactly("conversation_deleted")
+            val deleted = sent.first().asObject()
+            assertThat(deleted["conversation_id"]?.jsonPrimitive?.content).isEqualTo("2")
+        }
+    }
+
+    @Test fun `an identical list emission sends nothing`() = runTest {
+        val source = FakeSyncMessageSource()
+        val conv = sampleConversation(id = 1, lastMessageAt = 1000, messageCount = 1)
+        assertThat(source.conversationsFlow.tryEmit(listOf(conv))).isTrue()
+        runEngine(source) { engine, sent ->
+            engine.start()
+            advanceUntilIdle()
+            assertThat(sent).isEmpty()
+
+            // An equal list, re-emitted (a draft keystroke re-emits the
+            // Room flow upstream; the DTOs carry no draft, so the diff
+            // must stay silent).
+            assertThat(source.conversationsFlow.tryEmit(listOf(conv.copy()))).isTrue()
+            advanceUntilIdle()
+            assertThat(sent).isEmpty()
+        }
+    }
+
+    @Test fun `states watch sends message_updated with only the changed field`() = runTest {
+        val source = FakeSyncMessageSource()
+        source.snapshot = listOf(sampleConversation(id = 1, messageCount = 1))
+        source.store(sampleMessage(id = 11, conversationId = 1, status = "pending"))
+        source.statesFlow.value = mapOf(
+            11L to MessageState(
+                id = 11,
+                conversationId = 1,
+                status = "pending",
+                reaction = null,
+                read = false,
+                starred = false,
+            ),
+        )
+        runEngine(source) { engine, sent ->
+            engine.start()
+            advanceUntilIdle()
+            // Push the message through the stream so the watch follows it.
+            engine.onSyncRequest(SyncProtocol.SyncRequest(mode = "full"))
+            advanceUntilIdle()
+            val before = sent.size
+
+            source.statesFlow.value = mapOf(
+                11L to MessageState(
+                    id = 11,
+                    conversationId = 1,
+                    status = "delivered",
+                    reaction = null,
+                    read = false,
+                    starred = false,
+                ),
+            )
+            advanceUntilIdle()
+            val updates = sent.drop(before).filter { it.frameType() == "message_updated" }
+            assertThat(updates).hasSize(1)
+            val update = updates.first().asObject()
+            assertThat(update["message_id"]?.jsonPrimitive?.content).isEqualTo("11")
+            assertThat(update["conversation_id"]?.jsonPrimitive?.content).isEqualTo("1")
+            assertThat(update["status"]?.jsonPrimitive?.content).isEqualTo("delivered")
+            assertThat(update.containsKey("reaction")).isFalse()
+            assertThat(update.containsKey("reaction_removed")).isFalse()
+            assertThat(update.containsKey("read")).isFalse()
+            assertThat(update.containsKey("starred")).isFalse()
+        }
+    }
+
+    @Test fun `states watch reports a removed reaction`() = runTest {
+        val source = FakeSyncMessageSource()
+        source.snapshot = listOf(sampleConversation(id = 1, messageCount = 1))
+        source.store(sampleMessage(id = 11, conversationId = 1))
+        source.statesFlow.value = mapOf(
+            11L to MessageState(
+                id = 11,
+                conversationId = 1,
+                status = "received",
+                reaction = "❤️",
+                read = false,
+                starred = false,
+            ),
+        )
+        runEngine(source) { engine, sent ->
+            engine.start()
+            advanceUntilIdle()
+            engine.onSyncRequest(SyncProtocol.SyncRequest(mode = "full"))
+            advanceUntilIdle()
+            val before = sent.size
+
+            source.statesFlow.value = mapOf(
+                11L to MessageState(
+                    id = 11,
+                    conversationId = 1,
+                    status = "received",
+                    reaction = null,
+                    read = false,
+                    starred = false,
+                ),
+            )
+            advanceUntilIdle()
+            val updates = sent.drop(before).filter { it.frameType() == "message_updated" }
+            assertThat(updates).hasSize(1)
+            val update = updates.first().asObject()
+            assertThat(update.containsKey("reaction")).isFalse()
+            assertThat(update["reaction_removed"]?.jsonPrimitive?.content).isEqualTo("true")
+            assertThat(update.containsKey("status")).isFalse()
+        }
+    }
+
+    @Test fun `a second sync_request cancels the first stream`() = runTest {
+        val source = FakeSyncMessageSource()
+        source.snapshot = listOf(sampleConversation(id = 1))
+        val gate = CompletableDeferred<Unit>()
+        source.conversationsGate = gate
+        runEngine(source) { engine, sent ->
+            engine.onSyncRequest(SyncProtocol.SyncRequest(mode = "full"))
+            advanceUntilIdle()
+            assertThat(sent).isEmpty()
+
+            engine.onSyncRequest(SyncProtocol.SyncRequest(mode = "full"))
+            advanceUntilIdle()
+            gate.complete(Unit)
+            advanceUntilIdle()
+            assertThat(sent.filter { it.frameType() == "sync_started" }).hasSize(1)
+            assertThat(sent.filter { it.frameType() == "sync_complete" }).hasSize(1)
+        }
+    }
+
+    @Test fun `stop cancels the collectors`() = runTest {
+        val source = FakeSyncMessageSource()
+        val conv = sampleConversation(id = 1, lastMessageAt = 1000)
+        assertThat(source.conversationsFlow.tryEmit(listOf(conv))).isTrue()
+        runEngine(source) { engine, sent ->
+            engine.start()
+            advanceUntilIdle()
+            engine.stop()
+            advanceUntilIdle()
+
+            assertThat(source.conversationsFlow.tryEmit(listOf(conv.copy(unread = 3)))).isTrue()
+            advanceUntilIdle()
+            assertThat(sent).isEmpty()
+        }
+    }
+
+    // -- Slice 3: send + write-back -----------------------------------
+
+    @Test fun `send_message routes to the source and answers message_sent`() = runTest {
+        val source = FakeSyncMessageSource()
+        runEngine(source) { engine, sent ->
+            engine.onSendMessage(
+                SyncProtocol.SendMessage(
+                    clientMessageId = CLIENT_KEY,
+                    conversationId = "123",
+                    body = "See you at 6",
+                ),
+            )
+            advanceUntilIdle()
+            assertThat(source.sends).containsExactly(
+                SendCall(CLIENT_KEY, 123L, "See you at 6", null),
+            )
+            assertThat(sent.map { it.frameType() }).containsExactly("message_sent")
+            val ack = sent.first().asObject()
+            assertThat(ack["client_message_id"]?.jsonPrimitive?.content).isEqualTo(CLIENT_KEY)
+            assertThat(ack["message_id"]?.jsonPrimitive?.content).isEqualTo("999")
+            assertThat(ack["conversation_id"]?.jsonPrimitive?.content).isEqualTo("123")
+            assertThat(ack["status"]?.jsonPrimitive?.content).isEqualTo("pending")
+            assertThat(ack.containsKey("blocked_count")).isFalse()
+        }
+    }
+
+    @Test fun `send_message passes the reply id and the blocked count through`() = runTest {
+        val source = FakeSyncMessageSource()
+        source.sendResult = SendResult.Sent(messageId = 555, status = "sent", blockedCount = 1)
+        runEngine(source) { engine, sent ->
+            engine.onSendMessage(
+                SyncProtocol.SendMessage(
+                    clientMessageId = CLIENT_KEY,
+                    conversationId = "123",
+                    body = "Agreed",
+                    replyToMessageId = "77",
+                ),
+            )
+            advanceUntilIdle()
+            assertThat(source.sends).containsExactly(
+                SendCall(CLIENT_KEY, 123L, "Agreed", 77L),
+            )
+            val ack = sent.first { it.frameType() == "message_sent" }.asObject()
+            assertThat(ack["message_id"]?.jsonPrimitive?.content).isEqualTo("555")
+            assertThat(ack["status"]?.jsonPrimitive?.content).isEqualTo("sent")
+            assertThat(ack["blocked_count"]?.jsonPrimitive?.content).isEqualTo("1")
+        }
+    }
+
+    @Test fun `a refused send answers message_failed with the source code`() = runTest {
+        val source = FakeSyncMessageSource()
+        source.sendResult = SendResult.Failed(
+            code = SyncProtocol.MessageFailed.HUB_NOT_DEFAULT_SMS,
+            message = "Relay on the phone isn't your default messaging app.",
+        )
+        runEngine(source) { engine, sent ->
+            engine.onSendMessage(
+                SyncProtocol.SendMessage(
+                    clientMessageId = CLIENT_KEY,
+                    conversationId = "123",
+                    body = "Hi",
+                ),
+            )
+            advanceUntilIdle()
+            assertThat(sent.map { it.frameType() }).containsExactly("message_failed")
+            val failed = sent.first().asObject()
+            assertThat(failed["client_message_id"]?.jsonPrimitive?.content).isEqualTo(CLIENT_KEY)
+            assertThat(failed["conversation_id"]?.jsonPrimitive?.content).isEqualTo("123")
+            assertThat(failed["code"]?.jsonPrimitive?.content).isEqualTo("hub_not_default_sms")
+        }
+    }
+
+    @Test fun `send_message with an unparseable conversation id never reaches the source`() = runTest {
+        val source = FakeSyncMessageSource()
+        runEngine(source) { engine, sent ->
+            engine.onSendMessage(
+                SyncProtocol.SendMessage(
+                    clientMessageId = CLIENT_KEY,
+                    conversationId = "not-a-number",
+                    body = "Hi",
+                ),
+            )
+            advanceUntilIdle()
+            assertThat(source.sends).isEmpty()
+            assertThat(sent.map { it.frameType() }).containsExactly("message_failed")
+            val failed = sent.first().asObject()
+            assertThat(failed["code"]?.jsonPrimitive?.content)
+                .isEqualTo(SyncProtocol.MessageFailed.UNKNOWN_CONVERSATION)
+        }
+    }
+
+    @Test fun `a throwing source answers message_failed internal and keeps the socket up`() = runTest {
+        val source = FakeSyncMessageSource()
+        source.sendError = IllegalStateException("boom")
+        runEngine(source) { engine, sent ->
+            engine.onSendMessage(
+                SyncProtocol.SendMessage(
+                    clientMessageId = CLIENT_KEY,
+                    conversationId = "123",
+                    body = "Hi",
+                ),
+            )
+            advanceUntilIdle()
+            assertThat(sent.map { it.frameType() }).containsExactly("message_failed")
+            val failed = sent.first().asObject()
+            assertThat(failed["code"]?.jsonPrimitive?.content)
+                .isEqualTo(SyncProtocol.MessageFailed.INTERNAL)
+            // The message stays generic — never the exception text.
+            assertThat(failed["message"]?.jsonPrimitive?.content).doesNotContain("boom")
+        }
+    }
+
+    @Test fun `mark_read dispatches and answers action_result ok`() = runTest {
+        val source = FakeSyncMessageSource()
+        runEngine(source) { engine, sent ->
+            engine.onMarkRead(SyncProtocol.MarkRead(conversationId = "123"))
+            advanceUntilIdle()
+            assertThat(source.actions).containsExactly(ActionCall("mark_read", 123L))
+            assertThat(sent.map { it.frameType() }).containsExactly("action_result")
+            val result = sent.first().asObject()
+            assertThat(result["action"]?.jsonPrimitive?.content).isEqualTo("mark_read")
+            assertThat(result["conversation_id"]?.jsonPrimitive?.content).isEqualTo("123")
+            assertThat(result["ok"]?.jsonPrimitive?.content).isEqualTo("true")
+        }
+    }
+
+    @Test fun `mark_all_read dispatches and answers without a conversation id`() = runTest {
+        val source = FakeSyncMessageSource()
+        runEngine(source) { engine, sent ->
+            engine.onMarkAllRead()
+            advanceUntilIdle()
+            assertThat(source.actions).containsExactly(ActionCall("mark_all_read"))
+            val result = sent.first { it.frameType() == "action_result" }.asObject()
+            assertThat(result["action"]?.jsonPrimitive?.content).isEqualTo("mark_all_read")
+            assertThat(result.containsKey("conversation_id")).isFalse()
+            assertThat(result["ok"]?.jsonPrimitive?.content).isEqualTo("true")
+        }
+    }
+
+    @Test fun `set_pin set_archived set_muted and set_blocked dispatch with the value`() = runTest {
+        val source = FakeSyncMessageSource()
+        runEngine(source) { engine, sent ->
+            engine.onSetPin(SyncProtocol.SetPin(conversationId = "123", value = true))
+            engine.onSetArchived(SyncProtocol.SetArchived(conversationId = "123", value = false))
+            engine.onSetMuted(SyncProtocol.SetMuted(conversationId = "456", value = true))
+            engine.onSetBlocked(SyncProtocol.SetBlocked(conversationId = "789", value = true))
+            advanceUntilIdle()
+            assertThat(source.actions).containsExactly(
+                ActionCall("set_pin", 123L, value = true),
+                ActionCall("set_archived", 123L, value = false),
+                ActionCall("set_muted", 456L, value = true),
+                ActionCall("set_blocked", 789L, value = true),
+            ).inOrder()
+            val results = sent.filter { it.frameType() == "action_result" }.map { it.asObject() }
+            assertThat(results).hasSize(4)
+            // `containsExactly` alone rend un `Ordered` : en dernière position
+            // d'un `= runTest`, la méthode aurait un retour non-void et JUnit
+            // l'ignorerait — d'où le `inOrder()` (void) en dernier.
+            assertThat(results.map { it["ok"]?.jsonPrimitive?.content })
+                .containsExactly("true", "true", "true", "true")
+            assertThat(results.map { it["action"]?.jsonPrimitive?.content })
+                .containsExactly("set_pin", "set_archived", "set_muted", "set_blocked").inOrder()
+        }
+    }
+
+    @Test fun `set_reaction dispatches emoji and answers with the message id`() = runTest {
+        val source = FakeSyncMessageSource()
+        runEngine(source) { engine, sent ->
+            engine.onSetReaction(
+                SyncProtocol.SetReaction(conversationId = "123", messageId = "789", emoji = "❤️"),
+            )
+            advanceUntilIdle()
+            assertThat(source.actions).containsExactly(
+                ActionCall("set_reaction", 123L, messageId = 789L, emoji = "❤️"),
+            )
+            val result = sent.first { it.frameType() == "action_result" }.asObject()
+            assertThat(result["action"]?.jsonPrimitive?.content).isEqualTo("set_reaction")
+            assertThat(result["message_id"]?.jsonPrimitive?.content).isEqualTo("789")
+            assertThat(result["ok"]?.jsonPrimitive?.content).isEqualTo("true")
+        }
+    }
+
+    @Test fun `set_pinned_message dispatches a null message id for unpin`() = runTest {
+        val source = FakeSyncMessageSource()
+        runEngine(source) { engine, sent ->
+            engine.onSetPinnedMessage(
+                SyncProtocol.SetPinnedMessage(conversationId = "123", messageId = null),
+            )
+            advanceUntilIdle()
+            assertThat(source.actions).containsExactly(
+                ActionCall("set_pinned_message", 123L, messageId = null),
+            )
+            val result = sent.first { it.frameType() == "action_result" }.asObject()
+            assertThat(result["ok"]?.jsonPrimitive?.content).isEqualTo("true")
+            assertThat(result.containsKey("message_id")).isFalse()
+        }
+    }
+
+    @Test fun `a refused action answers action_result ok false with the code`() = runTest {
+        val source = FakeSyncMessageSource()
+        source.actionResult = ActionResult(
+            ok = false,
+            code = SyncProtocol.MessageFailed.UNKNOWN_CONVERSATION,
+            message = "Conversation not found.",
+        )
+        runEngine(source) { engine, sent ->
+            engine.onMarkRead(SyncProtocol.MarkRead(conversationId = "999"))
+            advanceUntilIdle()
+            val result = sent.first { it.frameType() == "action_result" }.asObject()
+            assertThat(result["ok"]?.jsonPrimitive?.content).isEqualTo("false")
+            assertThat(result["code"]?.jsonPrimitive?.content).isEqualTo("unknown_conversation")
+        }
+    }
+
+    @Test fun `an action with an unparseable conversation id never reaches the source`() = runTest {
+        val source = FakeSyncMessageSource()
+        runEngine(source) { engine, sent ->
+            engine.onSetPin(SyncProtocol.SetPin(conversationId = "nope", value = true))
+            advanceUntilIdle()
+            assertThat(source.actions).isEmpty()
+            val result = sent.first { it.frameType() == "action_result" }.asObject()
+            assertThat(result["ok"]?.jsonPrimitive?.content).isEqualTo("false")
+            assertThat(result["code"]?.jsonPrimitive?.content)
+                .isEqualTo(SyncProtocol.MessageFailed.UNKNOWN_CONVERSATION)
+        }
+    }
+
+    @Test fun `a throwing action answers action_result ok false internal`() = runTest {
+        val source = FakeSyncMessageSource()
+        source.actionError = IllegalStateException("boom")
+        runEngine(source) { engine, sent ->
+            engine.onMarkRead(SyncProtocol.MarkRead(conversationId = "123"))
+            advanceUntilIdle()
+            val result = sent.first { it.frameType() == "action_result" }.asObject()
+            assertThat(result["ok"]?.jsonPrimitive?.content).isEqualTo("false")
+            assertThat(result["code"]?.jsonPrimitive?.content)
+                .isEqualTo(SyncProtocol.MessageFailed.INTERNAL)
+            assertThat(result["message"]?.jsonPrimitive?.content).doesNotContain("boom")
+        }
+    }
+
+    companion object {
+        private const val CLIENT_KEY = "3f2a1b00-0000-4000-8000-00000000c41d"
+    }
+}
+
+/**
+ * Builds an engine on the test scope and guarantees it is stopped
+ * afterwards — the live collectors run forever, so a test that
+ * leaks one would hang `runTest` until its timeout. The wakelock
+ * defaults to a no-op; pass a recording one to pin the hub
+ * wiring (see SyncWakelockTest).
+ */
+internal suspend fun TestScope.runEngine(
+    source: FakeSyncMessageSource,
+    wakelock: SyncWakelock = NoOpSyncWakelock,
+    block: suspend TestScope.(SyncEngine, MutableList<String>) -> Unit,
+) {
+    val sent = mutableListOf<String>()
+    val engine = SyncEngine(source, this, send = { sent += it }, wakelock = wakelock)
+    try {
+        block(engine, sent)
+    } finally {
+        engine.stop()
+        advanceUntilIdle()
+    }
+}
+
+internal fun String.frameType(): String? =
+    Json.parseToJsonElement(this).jsonObject["type"]?.jsonPrimitive?.content
+
+internal fun String.asObject(): JsonObject = Json.parseToJsonElement(this).jsonObject

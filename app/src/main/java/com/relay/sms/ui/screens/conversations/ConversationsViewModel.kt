@@ -1,0 +1,1307 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.ui.screens.conversations
+
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import androidx.lifecycle.SavedStateHandle
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.relay.sms.core.ext.canonicalPhone
+import com.relay.sms.core.ext.foldForSearch
+import com.relay.sms.core.ext.normalizePhone
+import com.relay.sms.core.result.Outcome
+import com.relay.sms.data.local.datastore.SettingsRepository
+import com.relay.sms.data.repository.ConversationMirror
+import com.relay.sms.data.sms.DefaultSmsAppManager
+import com.relay.sms.data.sync.TelephonySyncManager
+import com.relay.sms.di.ApplicationScope
+import com.relay.sms.di.IoDispatcher
+import com.relay.sms.domain.categories.MessageCategory
+import com.relay.sms.domain.categories.MessageClassifier
+import com.relay.sms.domain.model.Conversation
+import com.relay.sms.domain.model.MessageSearchHit
+import com.relay.sms.domain.model.Note
+import com.relay.sms.domain.repository.BlockedNumberRepository
+import com.relay.sms.domain.repository.ContactRepository
+import com.relay.sms.domain.repository.ConversationRepository
+import com.relay.sms.domain.repository.NoteRepository
+import com.relay.sms.domain.settings.AdvancedSettings
+import com.relay.sms.domain.settings.AppSettings
+import com.relay.sms.domain.settings.DeviceMode
+import com.relay.sms.domain.settings.SortMode
+import com.relay.sms.domain.usecase.BlockNumberUseCase
+import com.relay.sms.domain.usecase.ToggleConversationStateUseCase
+import com.relay.sms.e2e.E2ePeerRepository
+import com.relay.sms.security.AppLockManager
+import com.relay.sms.sync.client.ClientSyncEngine
+import com.relay.sms.sync.client.ClientSyncUiState
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.firstOrNull
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.mapLatest
+import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import timber.log.Timber
+import javax.inject.Inject
+
+/**
+ * Round 11 — one tab in the category row: `null` is All, otherwise the
+ * category. [unreadCount] is the summed unread of that category's
+ * conversations (total unread for All); [muted] comes from
+ * `conversations.mutedCategories`.
+ */
+data class CategoryTab(
+    val category: MessageCategory?,
+    val unreadCount: Int,
+    val muted: Boolean,
+)
+
+/**
+ * State holder for the [ConversationsScreen]. Exposes a single [UiState] driven by four flows
+ * (Room repository, persisted settings, local search query, telephony sync state) and a small
+ * set of mutation methods.
+ *
+ * The search filters conversations by display name, raw / normalized phone numbers, and last
+ * message preview — case- and accent-insensitive, client-side because the dataset stays modest.
+ * v1.28.8 (issue #17): the TEXT of every message is searched too, through the full-text index
+ * ([messageHits]); before, a message older than the last one of its conversation was never found.
+ *
+ * The SMS import is no longer driven from this ViewModel — it is owned by [TelephonySyncManager],
+ * a singleton registered in [com.relay.sms.MainApplication.onCreate] that listens on the
+ * system `content://sms` URI. We just surface its [TelephonySyncManager.state] so the screen
+ * can show a banner during the very first sync.
+ */
+@HiltViewModel
+class ConversationsViewModel @Inject constructor(
+    savedStateHandle: SavedStateHandle,
+    private val repo: ConversationRepository,
+    private val settings: SettingsRepository,
+    private val toggle: ToggleConversationStateUseCase,
+    private val mirror: ConversationMirror,
+    private val contacts: ContactRepository,
+    private val syncManager: TelephonySyncManager,
+    private val appLock: AppLockManager,
+    private val blockNumber: BlockNumberUseCase,
+    private val unblockNumber: com.relay.sms.domain.usecase.UnblockNumberUseCase,
+    private val iAmOk: com.relay.sms.domain.usecase.IAmOkUseCase,
+    // v1.6.1 (audit QUAL-03) — privé : la screen passe désormais par
+    // [buildChangeDefaultIntent] au lieu de manipuler le manager directement.
+    private val defaultAppManager: DefaultSmsAppManager,
+    // Audit H4 (v1.14.8) — `MessageDao`, `ConversationDao` et `TelephonyReader` retirés des
+    // dépendances directes du VM. La logique "tout marquer comme lu" est désormais dans
+    // [ConversationRepository.markAllRead]. Le VM respecte data → domain → presentation.
+    @IoDispatcher private val io: CoroutineDispatcher,
+    // Round 13 fix — the application scope (outlives this ViewModel) for the
+    // category-choice write in [selectCategory]: `viewModelScope` is cancelled
+    // when the screen/app closes, which could drop the write if the user shut
+    // the app right after tapping a tab. The app scope is not cancelled, so the
+    // DataStore write flushes even if the ViewModel is cleared immediately.
+    @ApplicationScope private val appScope: CoroutineScope,
+    // Client mode C2 — the sync engine, lazy: resolving it builds the
+    // mirror graph (Room + the sync-state tables); a hub phone never
+    // touches it, and the list only resolves it in client mode.
+    private val syncEngine: dagger.Lazy<ClientSyncEngine>,
+    /**
+     * Notes — the note repository. Its [NoteRepository.observeAllNotes]
+     * rides the packed combine arm below (the outer combine is at the
+     * 5-arg typed limit), so the list merges notes with conversations.
+     */
+    private val noteRepo: NoteRepository,
+    /**
+     * E2E — the peer repository, for the list's lock badges: the
+     * addresses whose peer state is ENCRYPTED ([encryptedAddresses]).
+     */
+    private val e2ePeers: E2ePeerRepository,
+    /**
+     * Round 49 — the blocklist, for the group lock badge: a group
+     * with a blocked member never encrypts (design §13 — the
+     * provider's MEMBER_BLOCKED reason), so the blocked
+     * addresses are subtracted from the group-encrypted set
+     * ([groupEncryptedAddresses]). Nullable with a null default:
+     * Hilt provides it in production; the existing tests keep
+     * compiling untouched (a null repo subtracts nothing — a
+     * blocked member is then a badge-only miss, never a
+     * plaintext leak: the send gate checks the blocklist itself).
+     */
+    private val blockedRepo: BlockedNumberRepository? = null,
+) : ViewModel() {
+
+    private val archivedFlag: Boolean = savedStateHandle.get<Boolean>("archived") ?: false
+
+    /**
+     * Client mode C2 — the sync state, as a SEPARATE flow (the
+     * UiState combine is already at the 5-arg typed limit): IDLE in
+     * hub mode, the engine's state in client mode. The list renders
+     * the hub-not-default notice, the progress row and the error
+     * row from this.
+     */
+    val clientSyncUi: StateFlow<ClientSyncUiState> = settings.flow
+        .map { it.mode }
+        .distinctUntilChanged()
+        .flatMapLatest { mode ->
+            if (mode == DeviceMode.CLIENT) syncEngine.get().ui else flowOf(ClientSyncUiState())
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), ClientSyncUiState())
+
+    /**
+     * E2E — the addresses with a live encryption session, as a SEPARATE
+     * flow (the UiState combine is already at the 5-arg typed limit). A
+     * conversation is encrypted when it is 1:1 and its single address
+     * is in this set; the row shows its avatar lock badge then. No mode
+     * branch: on a linked device the rows are DERIVED — the client
+     * mirror records ENCRYPTED from the synced conversation flag
+     * (phase 2), so the badge renders in client mode too.
+     */
+    val encryptedAddresses: StateFlow<Set<String>> = e2ePeers
+        .observeEncryptedAddresses()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptySet())
+
+    /**
+     * Round 49 (E2E groups, design §13) — the addresses that can
+     * take part in an encrypted group: ENCRYPTED + group-capable,
+     * MINUS the blocked addresses (a group with a blocked member
+     * never encrypts — the provider's MEMBER_BLOCKED). A group is
+     * encrypted when EVERY member is in this set ([isConversationEncrypted]);
+     * the row shows its avatar lock badge then. The blocklist
+     * entries are normalized numbers, canonicalized before the
+     * subtraction (a `+1`-stored block must still subtract the
+     * 10-digit member). No mode branch, like
+     * [encryptedAddresses]: on a linked device the rows are
+     * DERIVED from the synced conversation flag.
+     */
+    val groupEncryptedAddresses: StateFlow<Set<String>> = combine(
+        e2ePeers.observeGroupEncryptedAddresses(),
+        blockedRepo?.observe() ?: flowOf(emptyList()),
+    ) { groupEncrypted, blocked ->
+        val blockedCanonical = blocked.map { it.normalizedNumber.canonicalPhone() }.toSet()
+        groupEncrypted - blockedCanonical
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptySet())
+
+    /** Client mode C2 — re-issues the sync request after an error (the Retry affordance). */
+    fun retryClientSync() {
+        viewModelScope.launch { syncEngine.get().retry() }
+    }
+
+    /** Client mode — resumes a paused sync run where it stopped (the Resume affordance). */
+    fun resumeClientSync() {
+        viewModelScope.launch { syncEngine.get().resume() }
+    }
+
+    /**
+     * v1.27.9 — **texte saisi dans le champ de recherche, en état Compose (snapshot).**
+     *
+     * `OutlinedTextField(value = …, onValueChange = …)` exige que la valeur remontée par
+     * `onValueChange` lui revienne **dans la même recomposition**. Elle transitait ici par un
+     * `MutableStateFlow` qui alimentait `UiState.query` **après le `debounce(200 ms)`** : le
+     * champ se voyait donc réécrire, 200 ms plus tard, une valeur périmée — **et la position
+     * de curseur qui l'accompagne**. Mesuré sur Galaxy S9 (v1.27.8) : « christine » tapé au
+     * clavier donnait `hrrrttttc`, et trois « effacer » retiraient des lettres au milieu du
+     * mot au lieu de la dernière.
+     *
+     * Le champ lit désormais [searchInput] directement : la frappe est rendue dans la frame
+     * courante. Le `debounce` reste intact — il ne pilote plus que le **filtrage**, ce qui
+     * était sa seule raison d'être (audit PERF-06).
+     */
+    var searchInput by mutableStateOf("")
+        private set
+
+    /** Pont état Compose → Flow, en entrée de [debouncedQuery]. */
+    private val query = snapshotFlow { searchInput }
+
+    /**
+     * Bumped whenever the host screen suspects the OS-side default-SMS state may have changed
+     * (e.g. user returns from the role-request dialog, or the screen comes back to foreground).
+     * The combine() chain re-evaluates [DefaultSmsAppManager.isDefault] on every emission, so a
+     * single bump is enough to refresh the banner.
+     */
+    private val defaultRefreshTick = MutableStateFlow(0L)
+
+    /**
+     * Bumped when contact-photo lookups may newly succeed or return different photos — e.g.
+     * after `READ_CONTACTS` is granted ([requestSyncNow] runs right after the permission
+     * result), and on every resume ([refreshContactPhotos]). A photo edit touches no
+     * conversation row, so without this bump the list would keep the old photo until the
+     * process restarts: the keys projection below drops every re-emission whose keys are
+     * unchanged, and the tick is what forces the lookup to re-run anyway. Same pattern as
+     * `ThreadViewModel.contactPhotoTick`.
+     */
+    private val contactPhotoTick = MutableStateFlow(0L)
+
+    /**
+     * Feedback round 7 — in-memory guard for the reaction reparse: prevents
+     * two `Idle` emissions from starting it twice in the same process. The
+     * durable gate is `AdvancedSettings.reactionReparseVersion`.
+     */
+    private var reactionReparseStarted = false
+
+    /**
+     * Round 11 — the selected category tab (`null` = All). Folded into
+     * the packed combine arm below so the outer combine keeps its 5-arg
+     * typed shape.
+     *
+     * Declared BEFORE the first `init` block (not beside the other
+     * `combine` inputs below): the init block launches a coroutine that
+     * seeds this flow from the persisted choice, and on a reopen the
+     * DataStore flow can emit synchronously — if this were declared after
+     * the init block, the coroutine could read it before its initializer
+     * ran and crash with an NPE (round-13 test feedback, 2026-11-11).
+     */
+    private val selectedCategoryFlow = MutableStateFlow<MessageCategory?>(null)
+
+    init {
+        // Backfill contact names for conversations that existed before READ_CONTACTS was granted
+        // or that imported with displayName=null. Cheap when there's nothing to do.
+        viewModelScope.launch { runCatching { mirror.refreshContactNames() } }
+        // Round 13 — restore the category tab the user last selected: the
+        // persisted choice seeds the in-memory flow, so the list reopens
+        // on that tab instead of defaulting to All. `firstOrNull` (not
+        // `first`) so an unreadable store leaves the default All instead
+        // of failing the coroutine. The seed lands before the UI
+        // subscribes in practice, and re-emits harmlessly if it lands
+        // after — the combine below re-reads the flow.
+        viewModelScope.launch {
+            settings.flow.firstOrNull()?.conversations?.selectedCategory?.let {
+                selectedCategoryFlow.value = it
+            }
+        }
+        // v1.13.0 audit SEC-4 — purge la sélection multiple à chaque entrée
+        // en PanicDecoy (séparé du combine pour éviter une mutation depuis un
+        // flow transform — anti-pattern fragile face à un futur changement de
+        // .stateIn → .shareIn). collect distinctUntilChanged-equivalent via
+        // StateFlow sémantique : aucune cascade.
+        viewModelScope.launch {
+            appLock.state.collect { lockState ->
+                if (lockState is AppLockManager.LockState.PanicDecoy) {
+                    selectedIds.value = emptySet()
+                }
+            }
+        }
+    }
+
+    // v1.6.1 (audit QUAL-17) — @Stable : Compose traite la classe comme stable et
+    // skip les recompositions de sous-arbres dont les inputs n'ont pas changé.
+    @androidx.compose.runtime.Stable
+    data class UiState(
+        val isLoading: Boolean = true,
+        val conversations: List<Conversation> = emptyList(),
+        /**
+         * Notes — the merged list the LazyColumn renders: conversations
+         * and notes together, sorted by [trierListItems] (pinned first,
+         * then recency). [conversations] stays as the conversations-only
+         * list: the contact-photo flows, the blocked partition and the
+         * message-hits gating all read it, and none of those apply to
+         * notes.
+         */
+        val items: List<ConversationListItem> = emptyList(),
+        val settings: AppSettings = AppSettings(),
+        val isDefaultSmsApp: Boolean = true,
+        val archived: Boolean = false,
+        /**
+         * v1.27.9 — le texte saisi **n'est plus** dans [UiState] : il vit dans
+         * [ConversationsViewModel.searchInput] (état Compose), seul moyen de le rendre au
+         * champ dans la frame courante. Ne rien remettre ici : une valeur de champ de
+         * saisie qui repasse par `StateFlow` + `debounce` casse la saisie au clavier.
+         */
+        val filtered: Boolean = false,
+        /**
+         * v1.28.3 (audit global C-03) — noms de contact partagés par au moins deux conversations
+         * (même contact, numéro FR et numéro étranger). L'écran n'affiche le numéro sous le nom
+         * que pour celles-là. Calculé ICI, sur le dispatcher IO avec le filtre et le tri, et non
+         * plus dans un `remember` de l'écran : c'était un parcours de toute la liste sur le fil
+         * principal à chaque écriture de la table `conversations`.
+         */
+        val duplicateDisplayNames: Set<String> = emptySet(),
+        val isImporting: Boolean = false,
+        val importedCount: Int = 0,
+        /** First-run import total, when the system store could be counted up front (null = unknown). */
+        val importTotalCount: Int? = null,
+        /**
+         * `true` when the session was unlocked via the panic code. The host screen uses this to
+         * hide all vault entry points (top-bar icon, deep-link buttons). Combined with the
+         * navigation gate in [com.relay.sms.ui.AppRoot] and the data-layer filter in
+         * [com.relay.sms.data.repository.ConversationRepositoryImpl.observeVault], it makes
+         * the panic decoy a real privacy backstop (audit S-P0-1).
+         */
+        @Deprecated(
+            "v1.26.1 (audit H18) — ne plus lire ce champ pour masquer une entrée sensible : il " +
+                "vaut `false` pendant toute la fenêtre de repli du flux agrégé. Utiliser " +
+                "`ConversationsViewModel.isPanicDecoy`, dérivé directement de l'état du verrou.",
+        )
+        val isPanicDecoy: Boolean = false,
+        /**
+         * v1.14.0 — `true` si l'user a déclenché le mode urgence il y a moins de
+         * [I_AM_OK_WINDOW_MS] (30 min) et la session n'est pas en PanicDecoy.
+         * Quand `true`, ConversationsScreen affiche un chip flottant
+         * "Je vais bien" qui ouvre un dialog de confirmation puis appelle
+         * [com.relay.sms.domain.usecase.IAmOkUseCase]. Le flag retombe
+         * à `false` automatiquement à l'écoulement de la fenêtre OU dès le
+         * reset (via `lastTriggeredAt = 0L`).
+         */
+        val showIAmOkChip: Boolean = false,
+        /**
+         * v1.13.0 — sélection multiple de conversations pour action en masse
+         * "Déplacer vers le coffre". `selectedIds` non vide ⇒ TopAppBar bascule en
+         * mode contextuel (titre = count, action principale = déplacer, navigation
+         * icon = X annule). Toujours vide quand `isPanicDecoy=true` (toute entrée
+         * en mode décoy vide la sélection par `clearSelection`).
+         */
+        val selectedIds: Set<Long> = emptySet(),
+        /**
+         * Round 11 — the category tabs above the list: All (always) plus
+         * each category holding at least one conversation, computed from
+         * the search-filtered list BEFORE the category filter, so a tab
+         * never vanishes because it is selected. Empty when nothing has
+         * loaded yet.
+         */
+        val categoryTabs: List<CategoryTab> = emptyList(),
+        /**
+         * Round 11 — the selected tab (`null` = All). The list shows only
+         * this category's conversations while set.
+         */
+        val selectedCategory: MessageCategory? = null,
+    ) {
+        val selectionMode: Boolean get() = selectedIds.isNotEmpty()
+    }
+
+    /**
+     * v1.6.1 (audit PERF-06) — `debounce(200ms)` sur la query de recherche pour éviter
+     * une recomposition LazyColumn complète à chaque frappe. Une saisie rapide "bonjour"
+     * (7 frappes en < 200 ms) déclenchait 7 filterConversations + 7 émissions stateIn.
+     * Désormais : un seul filter + une seule émission après stabilisation. La valeur
+     * vide est émise immédiatement (cas "effacer la recherche") via `distinctUntilChanged`
+     * appliqué sur l'OUTPUT du debounce — pas de perte de réactivité perceptible.
+     */
+    @OptIn(FlowPreview::class)
+    private val debouncedQuery = query
+        .debounce { q -> if (q.isEmpty()) 0L else 200L }
+        .distinctUntilChanged()
+
+    /**
+     * v1.13.0 — IDs des conversations actuellement sélectionnées pour une action
+     * en masse. Mutée par [toggleSelection] / [clearSelection] depuis l'UI.
+     * Mergée dans le `combine` via le tuple `(defaultRefreshTick, appLock.state)`
+     * pour conserver le 5-arg cap typé de kotlinx-coroutines.
+     */
+    private val selectedIds = MutableStateFlow<Set<Long>>(emptySet())
+
+    /**
+     * Notes — the packed combine arm's value: the lock state, the
+     * selection, the selected category, and the notes. A data class
+     * (not a `Triple` + something) because the arm now carries four
+     * values, and destructuring keeps the transform readable.
+     */
+    private data class PackedInputs(
+        val lockState: AppLockManager.LockState,
+        val selectedIds: Set<Long>,
+        val category: MessageCategory?,
+        val notes: List<Note>,
+    )
+
+    val state: StateFlow<UiState> = combine(
+        repo.observeAll(includeArchived = archivedFlag),
+        settings.flow,
+        debouncedQuery,
+        // v1.13.0 — Triple : on packe defaultRefreshTick + appLock.state + selectedIds
+        // pour rester dans la limite 5-args typée. Tous sont des inputs de
+        // recomposition pure ; le packing est sound. Notes — the packed arm
+        // now carries a fifth input, `observeAllNotes()` (the typed
+        // `combine` stops at 5 args, so this is the last one the arm can
+        // take): the merged list needs the notes on every emission.
+        combine(
+            defaultRefreshTick,
+            appLock.state,
+            selectedIds,
+            selectedCategoryFlow,
+            noteRepo.observeAllNotes(),
+        ) { _, lockState, sel, cat, notes ->
+            PackedInputs(lockState, sel, cat, notes)
+        },
+        syncManager.state,
+    ) { rows, s, q, packed, syncState ->
+        val (lockState, sel, selected) = packed
+        val notes = packed.notes
+        val matched = filterConversations(rows, q)
+        // Round 11 — category filter AFTER search, BEFORE sort: the tabs
+        // are computed from `matched` (search-filtered, not yet
+        // category-filtered) and the list is then sorted as before, so
+        // date grouping and unread-first sort operate on the filtered
+        // list unchanged. Round 12 — when the user hides categories
+        // (Settings → Appearance), no filter applies and no tabs are
+        // built, so the row never renders. Round 13 — the stored tab may
+        // be stale (its category emptied out, or categories switched off),
+        // so the list honours the *effective* selection: All when the
+        // stored tab has no conversations left to show.
+        // Round 36 — notes live in Personal as well as All: the
+        // Personal tab exists (and a stored Personal selection
+        // stays effective) while notes exist in this view, even
+        // with no Personal conversation.
+        val hasNotes = notes.any { it.archived == archivedFlag }
+        val effectiveSelected = effectiveSelectedCategory(
+            rows,
+            selected,
+            s.conversations.showCategories,
+            hasNotes,
+        )
+        val (visible, tabs) = applyCategoryFilter(
+            matched,
+            effectiveSelected,
+            s.conversations.mutedCategories,
+            s.conversations.showCategories,
+            hasNotes,
+        )
+        val sorted = trierConversations(visible, s.conversations.sortMode)
+        // Notes — the merged list: notes join when the effective
+        // category is All or Personal (round 36 — notes are
+        // personal, not spam/OTP/transactions; see
+        // [notesVisibleInCategory]), filtered by the archived
+        // flag and by the search query (title only — note CONTENT is
+        // not searched in phase 1: there is no FTS table for
+        // `note_messages`, and adding one is a data-layer follow-up).
+        // The merged sort is the same order as the conversation sort,
+        // so a note and a conversation interleave by pinned + recency.
+        val noteItems = if (notesVisibleInCategory(effectiveSelected)) {
+            notes
+                .filter { it.archived == archivedFlag && noteMatchesQuery(it, q) }
+                .map { ConversationListItem.NoteItem(it) }
+        } else {
+            emptyList()
+        }
+        val items = trierListItems(
+            sorted.map { ConversationListItem.ConversationItem(it) } + noteItems,
+            s.conversations.sortMode,
+        )
+        // A blocked twin must not force the number onto an active row:
+        // blocked rows render in their own section at the bottom, via a
+        // bare `ConversationRow` with no subtitle — so they can neither
+        // be confused with the active row nor show a number of their
+        // own. Only conversations whose rows actually render with a
+        // subtitle count toward the ambiguity.
+        val nomsPartages = sorted
+            .filter { !it.blocked }
+            .mapNotNull { it.displayName?.takeIf { n -> n.isNotBlank() } }
+            .groupingBy { it }
+            .eachCount()
+            .filterValues { it >= 2 }
+            .keys
+        // v1.13.0 — sélection effective filtrée :
+        //  - PanicDecoy → purge via le collector dans `init {}` (audit SEC-4),
+        //    ici on rend juste emptySet par sécurité défensive.
+        //  - sinon → intersect avec les conv présentes (filtre les IDs orphelins
+        //    si une conv est supprimée pendant la sélection multi).
+        val effectiveSelection: Set<Long> = if (lockState is AppLockManager.LockState.PanicDecoy) {
+            emptySet()
+        } else {
+            val present = sorted.mapTo(HashSet(sorted.size)) { it.id }
+            sel.intersect(present)
+        }
+        // v1.14.0 — chip "Je vais bien" visible si l'user a déclenché urgence
+        // < 30 min ET non-PanicDecoy. Anti-tampering : décoy masque le chip
+        // pour ne pas révéler à l'agresseur qu'un déclenchement a eu lieu.
+        val isPanic = lockState is AppLockManager.LockState.PanicDecoy
+        val triggeredAt = s.security.emergency.lastTriggeredAt
+        val showChip = !isPanic &&
+            triggeredAt > 0L &&
+            (System.currentTimeMillis() - triggeredAt) < I_AM_OK_WINDOW_MS
+        UiState(
+            isLoading = false,
+            conversations = sorted,
+            items = items,
+            settings = s,
+            isDefaultSmsApp = defaultAppManager.isDefault(),
+            archived = archivedFlag,
+            filtered = q.isNotBlank(),
+            duplicateDisplayNames = nomsPartages,
+            // Show the "Importing your SMS…" banner only during the very first sync — after that,
+            // delta syncs touch a handful of rows and complete in milliseconds, no banner needed.
+            isImporting = syncState is TelephonySyncManager.State.Running && syncState.isFirstRun,
+            importedCount = (syncState as? TelephonySyncManager.State.Running)?.importedSoFar ?: 0,
+            importTotalCount = (syncState as? TelephonySyncManager.State.Running)?.totalMessages,
+            isPanicDecoy = isPanic,
+            showIAmOkChip = showChip,
+            selectedIds = effectiveSelection,
+            categoryTabs = tabs,
+            selectedCategory = effectiveSelected,
+        )
+    }
+        // v1.6.1 (audit QUAL-02) — `defaultAppManager.isDefault()` est un IPC Binder
+        // synchrone (RoleManager.isRoleHeld + ContentProvider query) qui peut bloquer
+        // ~5-15 ms sur OEM lents. `flowOn(io)` déplace tout le `combine` sur le
+        // dispatcher IO ; le dernier émetteur (stateIn) bascule sur Main pour la
+        // souscription côté Compose, comme attendu.
+        .flowOn(io)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000L), UiState())
+
+    init {
+        // Feedback round 7 — fold old reaction texts into badges once the
+        // first post-grant sync has landed the history in Room (see below).
+        // NOTE: this lives in its own init block AFTER `state` on purpose —
+        // the reparse observer combines `syncManager.state` with `state`,
+        // and `viewModelScope` runs on Main.immediate, so calling it from
+        // the first init block read `state` before its initializer ran
+        // (null) and crashed the app on launch with an NPE in combine().
+        observeSyncForReactionReparse()
+    }
+
+    /**
+     * v1.28.8 (issue #17) — messages dont le TEXTE correspond à la recherche, sous les conversations.
+     *
+     * Hors coffre, donc aussi en session leurre, qui voit la même liste. Une requête qui échoue ne
+     * rend une liste vide que pour ELLE : l'erreur est absorbée dans `flatMapLatest`, pas après,
+     * sans quoi la première erreur couperait toutes les recherches suivantes.
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val messageHits: StateFlow<List<MessageSearchHit>> = debouncedQuery
+        .flatMapLatest { q ->
+            repo.observeMessageSearch(q, archivedOnly = archivedFlag)
+                .catch { t ->
+                    Timber.w(t, "ConversationsViewModel: recherche de messages en echec")
+                    emit(emptyList())
+                }
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000L), emptyList())
+
+    /**
+     * Contact photos for the list, keyed by conversation id.
+     *
+     * Root cause of the missing avatars: nothing ever resolved them. The list only ever
+     * carried `Conversation.avatarUri` — the custom avatar a user picks per conversation —
+     * whose KDoc promises a native-contact fallback that no code implemented: the mirror
+     * resolves only the display name from `ContactsReader.lookupByPhone` and drops the
+     * photo URI it already fetches (`PHOTO_THUMBNAIL_URI`). Every row therefore fell back
+     * to initials. Resolved here, on IO, through the cached `ContactRepository` lookup; a
+     * custom avatar still wins, groups are skipped (no single contact to show — their
+     * member photos come from [groupMemberPhotos]), and a denied `READ_CONTACTS` just
+     * yields no photos — initials stay the fallback.
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val contactPhotos: StateFlow<Map<Long, String>> =
+        combine(state, contactPhotoTick) { ui, tick -> tick to ui.conversations }
+            // Feedback round 6 — project the list to its photo-relevant keys
+            // BEFORE the lookup: the full lookup used to re-run on every
+            // `state` emission (new message, read change, sync tick), even
+            // though its result only depends on (conversation id, first
+            // address, custom avatar) + the tick. `distinctUntilChanged` on
+            // the (tick, keys) pair drops those emissions, so the lookup +
+            // map rebuild only run when a conversation appears, an address
+            // or custom avatar changes, or the tick bumps (permission
+            // granted, resume). The tick rides along in the pair on
+            // purpose: the old shape discarded it in the combine lambda,
+            // so `distinctUntilChanged` on the keys alone swallowed the
+            // bump and the re-trigger never actually re-ran. The lookups
+            // themselves are LRU-cached in `ContactsReader`, and the cache
+            // IS invalidated in-process on a provider change (the
+            // ContentObserver in `MainApplication`, and the photo write) —
+            // so a tick-triggered re-run can return a new photo, which is
+            // the whole point of the bump.
+            .map { (tick, conversations) ->
+                tick to conversations
+                    .filter { !it.isGroup && it.avatarUri == null }
+                    .map { it.id to it.firstAddress?.raw }
+            }
+            .distinctUntilChanged()
+            .mapLatest { (_, keys) ->
+                withContext(io) {
+                    keys
+                        .mapNotNull { (id, phone) ->
+                            val raw = phone ?: return@mapNotNull null
+                            runCatching { contacts.lookupByPhone(raw)?.photoUri }
+                                .getOrNull()?.let { id to it }
+                        }
+                        .toMap()
+                }
+            }
+            // Identical maps are dropped here so a key change that resolves
+            // to the same photos (new conversation with no photo, address
+            // change to an unknown number) does not re-compose the list.
+            .distinctUntilChanged()
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000L), emptyMap())
+
+    /**
+     * Contact photos of the first two members of each group conversation, keyed by
+     * conversation id — the two overlapping minis of the group avatar. [contactPhotos]
+     * deliberately skips groups (no single contact to show), so group rows showed
+     * initials even when the members had photos; this flow fills that gap. A group
+     * with a custom avatar ([Conversation.avatarUri]) is skipped — the custom photo
+     * wins in the row. An entry is emitted only when at least one of the two members
+     * has a photo; a member without one leaves a null slot, so the minis keep their
+     * address order. Same shape as [contactPhotos]: the keys projection, the tick
+     * (so [refreshContactPhotos] re-runs it) and the LRU-cached lookups, so a photo
+     * edited on the phone or set from a linked device shows up on resume.
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val groupMemberPhotos: StateFlow<Map<Long, List<String?>>> =
+        combine(state, contactPhotoTick) { ui, tick -> tick to ui.conversations }
+            .map { (tick, conversations) ->
+                tick to conversations
+                    .filter { it.isGroup && it.avatarUri == null }
+                    .map { it.id to it.addresses.take(2).map { addr -> addr.raw } }
+            }
+            .distinctUntilChanged()
+            .mapLatest { (_, keys) ->
+                withContext(io) {
+                    keys
+                        .mapNotNull { (id, phones) ->
+                            val photos = phones.map { raw ->
+                                runCatching { contacts.lookupByPhone(raw)?.photoUri }
+                                    .getOrNull()
+                            }
+                            if (photos.any { it != null }) id to photos else null
+                        }
+                        .toMap()
+                }
+            }
+            .distinctUntilChanged()
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000L), emptyMap())
+
+    /** Forces a re-evaluation of [DefaultSmsAppManager.isDefault]. Call from ON_RESUME / role result. */
+    fun refreshDefaultStatus() {
+        defaultRefreshTick.update { it + 1 }
+    }
+
+    /**
+     * Re-resolves [contactPhotos]. Call from ON_RESUME, like
+     * `ThreadViewModel.refreshContactPhoto`: a contact photo changed while the list was
+     * away — edited on the phone, or set from a linked device — otherwise stays stale
+     * until the process restarts, because no conversation row changes and the keys
+     * projection would drop the re-emission. The tick is carried through that projection
+     * so the bump re-runs the lookup even when the keys are unchanged.
+     */
+    fun refreshContactPhotos() {
+        contactPhotoTick.update { it + 1 }
+    }
+
+    /**
+     * v1.6.1 (audit QUAL-03) — facade pour la screen, qui n'a plus à tenir une référence
+     * directe à [DefaultSmsAppManager] (couche data). Retourne l'`Intent` à lancer pour
+     * que l'utilisateur choisisse Relay comme app SMS par défaut, ou `null` si l'OS
+     * n'expose pas cette demande (Android < 7 — hors target ici puisque minSdk=26).
+     */
+    fun buildChangeDefaultIntent(): android.content.Intent? =
+        defaultAppManager.buildChangeDefaultIntent()
+
+    /**
+     * Triggered by the host screen when SMS permissions are freshly granted, so the sync manager
+     * picks up rows it couldn't read before. The manager itself debounces concurrent calls.
+     *
+     * Client mode — no telephony sync on a linked device: its messages
+     * arrive from the hub. The contact-photo refresh below still runs
+     * (photos still resolve locally).
+     */
+    fun requestSyncNow() {
+        if (state.value.settings.mode != DeviceMode.CLIENT) {
+            syncManager.requestSync(reason = "permission granted")
+        }
+        // Re-resolve contact photos: the caller just got READ_CONTACTS (or came back from
+        // the role dialog), so lookups that previously failed may now succeed.
+        contactPhotoTick.update { it + 1 }
+    }
+
+    /**
+     * Feedback round 7 — retroactive reaction reparse.
+     *
+     * Old reaction texts (`Reacted ❤️ to «…»`, iOS tapbacks, French readable
+     * forms) that arrived before this build — or before Relay became the
+     * default app — sit in Room as plain text bubbles. Once the history is in
+     * Room, [ConversationMirror.reparseStoredReactions] folds them onto their
+     * target messages; the versioned DataStore gate
+     * `AdvancedSettings.reactionReparseVersion` makes each version run
+     * exactly once (v2 re-runs on installs that already ran v1, to fold our
+     * own outgoing tapbacks too).
+     *
+     * Trigger — a sync completion observed while default:
+     *   - fresh install: the first sync after the role grant is the big
+     *     first-run import; its `Running → Idle` transition fires this (the
+     *     `sawRunning` arm). The cursor is > 0 by then, so the history is
+     *     actually in Room.
+     *   - existing install (already default, cursor > 0): no first-run sync
+     *     will ever come, so the cursor arm fires on the first `Idle`
+     *     emission — the history is already there, no sync to wait for.
+     *   - not default yet: nothing runs; the next `requestSyncNow()` after
+     *     the grant produces the `Running → Idle` transition.
+     *
+     * The `combine` with [state] re-evaluates on either side: a sync that
+     * completes before [UiState.isDefaultSmsApp] flips to `true` is still
+     * caught when the UiState emission lands.
+     *
+     * The version is set only on success — a failed run (DB error) retries on
+     * the next sync completion instead of losing the reactions silently.
+     */
+    private fun observeSyncForReactionReparse() {
+        viewModelScope.launch {
+            var sawRunning = false
+            combine(syncManager.state, state) { syncState, ui ->
+                syncState to ui.isDefaultSmsApp
+            }.collect { (syncState, isDefault) ->
+                if (syncState is TelephonySyncManager.State.Running) {
+                    sawRunning = true
+                    return@collect
+                }
+                if (reactionReparseStarted || !isDefault) return@collect
+                val advanced = settings.state.value.advanced
+                if (advanced.reactionReparseVersion >= AdvancedSettings.REACTION_REPARSE_CURRENT_VERSION) {
+                    return@collect
+                }
+                if (!sawRunning && advanced.lastSyncedSmsId == 0L) return@collect
+                reactionReparseStarted = true
+                try {
+                    val result = mirror.reparseStoredReactions()
+                    Timber.i("ConversationsViewModel: reaction reparse done: %s", result)
+                    settings.update { s ->
+                        s.copy(
+                            advanced = s.advanced.copy(
+                                reactionReparseVersion = AdvancedSettings.REACTION_REPARSE_CURRENT_VERSION,
+                            ),
+                        )
+                    }
+                } catch (ce: kotlinx.coroutines.CancellationException) {
+                    throw ce
+                } catch (t: Throwable) {
+                    Timber.w(t, "ConversationsViewModel: reaction reparse failed — will retry")
+                    reactionReparseStarted = false
+                }
+            }
+        }
+    }
+
+    /**
+     * v1.8.0 — action utilisateur "Tout marquer comme lu" depuis le menu
+     * overflow de la liste. Marque tous les messages INCOMING `read=0`
+     * comme lus EN MASSE puis recalcule les `conversations.unread_count`
+     * pour repasser tous les badges à 0. Très utile quand l'utilisateur a
+     * lu ses messages dans une autre app SMS sans ouvrir Relay : sans
+     * cette action, les badges restent indéfiniment car Relay ne re-lit
+     * pas le flag `READ` système pour les messages déjà mirror-és.
+     *
+     * Le dialog de confirmation est géré côté UI ([ConversationsScreen]).
+     */
+    fun markAllAsRead() {
+        // Audit H4 (v1.14.8) — Délégué au [ConversationRepository.markAllRead] qui encapsule
+        // les 3 étapes (Room markAllIncomingAsRead + recomputeAllUnreadCounts + propagation
+        // content://sms+mms). Le VM ne touche plus aux DAOs ni au TelephonyReader directement.
+        viewModelScope.launch { repo.markAllRead() }
+    }
+
+    fun setQuery(q: String) { searchInput = q }
+    fun clearQuery() { searchInput = "" }
+
+    private fun filterConversations(rows: List<Conversation>, q: String): List<Conversation> {
+        if (q.isBlank()) return rows
+        // Repli insensible casse + accents (« maite » trouve « Maïté ») calculé une fois pour la
+        // requête ; le repli par ligne se fait à la volée. `trim()` conservé (parité avec l'ancien
+        // `q.trim().lowercase()`) pour qu'un espace en tête/fin ne casse pas le match.
+        val needle = q.trim().foldForSearch()
+        val needleDigits = q.normalizePhone()
+        return rows.filter { c ->
+            // `||` court-circuite : le repli (coûteux) du preview n'est effectué que si le nom
+            // ne matche pas, et le match numéro que si l'utilisateur a tapé des chiffres.
+            c.displayName?.foldForSearch()?.contains(needle) == true ||
+                c.lastMessagePreview?.foldForSearch()?.contains(needle) == true ||
+                (needleDigits.isNotBlank() && c.addresses.any { it.normalized.contains(needleDigits) })
+        }
+    }
+
+    /**
+     * Notes — the list search over notes: TITLE only, same
+     * case/ accent-insensitive fold as [filterConversations]. Note
+     * CONTENT is not searched in phase 1 (no FTS table for
+     * `note_messages` — a data-layer follow-up, see the merged-list
+     * comment in [state]).
+     */
+    private fun noteMatchesQuery(note: Note, q: String): Boolean {
+        if (q.isBlank()) return true
+        val needle = q.trim().foldForSearch()
+        return note.title.foldForSearch().contains(needle)
+    }
+
+    /** Persists the picked sort mode — observed by the conversations Flow which re-sorts. */
+    fun setSortMode(mode: SortMode) = viewModelScope.launch {
+        settings.update { it.copy(conversations = it.conversations.copy(sortMode = mode)) }
+    }
+
+    /**
+     * Round 11 — picks a category tab. Tapping the selected pill again,
+     * or All (`null`), clears the filter back to the full list.
+     * Round 13 — the choice is persisted (by enum name) so the list
+     * reopens on it instead of defaulting to All. The write runs after
+     * the in-memory flow already moved, and it is best-effort: a failed
+     * write never blocks tab switching.
+     */
+    fun selectCategory(category: MessageCategory?) {
+        selectedCategoryFlow.update { current ->
+            if (current == category || category == null) null else category
+        }
+        val next = selectedCategoryFlow.value
+        // Round 13 fix — persisted on the application scope, not
+        // `viewModelScope`: the ViewModel is cleared when the screen/app
+        // closes, and a `viewModelScope` write could be cancelled before
+        // the DataStore flush landed, losing the choice on reopen.
+        appScope.launch {
+            runCatching {
+                settings.update {
+                    it.copy(conversations = it.conversations.copy(selectedCategory = next))
+                }
+            }
+        }
+    }
+
+    /**
+     * Round 11 — mutes / unmutes a category's notifications, from the tab
+     * long-press or the matching Settings toggle: both flip the same
+     * `conversations.mutedCategories` entry.
+     */
+    fun toggleCategoryMute(category: MessageCategory) = viewModelScope.launch {
+        settings.update {
+            val muted = if (category in it.conversations.mutedCategories) {
+                it.conversations.mutedCategories - category
+            } else {
+                it.conversations.mutedCategories + category
+            }
+            it.copy(conversations = it.conversations.copy(mutedCategories = muted))
+        }
+    }
+
+    /**
+     * Contacts-permission fix — persists the contacts-banner
+     * dismissal: the user asked not to be nagged, so the banner
+     * stays gone across launches. Written on the application scope,
+     * like [selectCategory]: a `viewModelScope` write could be
+     * cancelled before the DataStore flush landed. Once dismissed
+     * the banner never comes back — a later grant hides it by the
+     * permission check instead.
+     */
+    fun dismissContactsPermissionBanner() {
+        appScope.launch {
+            runCatching {
+                settings.update {
+                    it.copy(
+                        conversations = it.conversations.copy(contactsBannerDismissed = true),
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * v1.26.1 (audit H18) — état leurre dérivé DIRECTEMENT du verrou, hors du flux agrégé.
+     *
+     * Porté par `UiState`, il valait `false` pendant toute la fenêtre de repli : le `combine`
+     * amont agrège Room, DataStore et l'état de synchronisation en `flowOn(io)`, donc sa première
+     * émission coûte une requête chiffrée et un appel Binder. Et avec `WhileSubscribed(5 s)`, la
+     * valeur EN CACHE — calculée avant le verrouillage, donc avec `isPanicDecoy = false` — était
+     * resservie au dépilement de l'écran de verrouillage. Résultat : en session leurre, l'icône
+     * du Coffre s'affichait le temps que le flux redémarre, alors que tout le mode leurre
+     * s'emploie à nier son EXISTENCE.
+     *
+     * Ici la source est `appLock.state`, déjà chaude et autoritaire, avec un repli `Locked` —
+     * donc jamais « session normale » par défaut.
+     */
+    val isPanicDecoy: StateFlow<Boolean> = appLock.state
+        .map { it is AppLockManager.LockState.PanicDecoy }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
+    /**
+     * v1.28.9 (septième note d'Andrew, point 5) — une conversation conservée se dit. La liste
+     * n'affiche pas le coffre, mais un état illisible ou une suppression locale qui échoue laissent
+     * aussi la ligne en place : sans message, le geste semblait simplement ignoré.
+     */
+    fun delete(id: Long) = viewModelScope.launch {
+        val copieSysteme = when (toggle.delete(id)) {
+            com.relay.sms.domain.repository.ConversationDeleteResult.DELETED -> return@launch
+            com.relay.sms.domain.repository.ConversationDeleteResult.KEPT_SYSTEM_COPY -> true
+            com.relay.sms.domain.repository.ConversationDeleteResult.KEPT_LOCAL_FAILURE -> false
+        }
+        _events.trySend(Event.DeleteKept(copieSysteme))
+    }
+
+    /**
+     * v1.26.1 (audit F1) — épingler / archiver / mettre en sourdine.
+     *
+     * `setPinned`, `setArchived` et `setMuted` existaient sur les quatre couches — DAO,
+     * repository, interface, use case — avec **zéro appelant**. L'interface, elle, montrait déjà
+     * les conséquences : le tri « Épinglés d'abord » du menu 3-points était donc rigoureusement
+     * identique au tri par date, la sous-page « Archivés » était structurellement toujours vide,
+     * et les deux badges de [ConversationRow] ne pouvaient jamais s'allumer. Les six libellés
+     * étaient déjà traduits FR et EN, référencés par personne. Il ne manquait que le geste.
+     */
+    /** v1.28.3 — nommer un groupe depuis l'appui long ; la normalisation est dans le use case. */
+    fun rename(conversation: Conversation, raw: String?) = viewModelScope.launch {
+        toggle.rename(conversation.id, raw)
+    }
+
+    fun togglePinned(conversation: Conversation) = viewModelScope.launch {
+        toggle.setPinned(conversation.id, !conversation.pinned)
+    }
+
+    fun toggleArchived(conversation: Conversation) = viewModelScope.launch {
+        toggle.setArchived(conversation.id, !conversation.archived)
+    }
+
+    /**
+     * Notes — toggles a note's pinned state (same one-liner shape as
+     * [togglePinned], straight to the note repository: notes have no
+     * mirror, no sync, no conversation-state use case).
+     */
+    fun toggleNotePinned(note: Note) = viewModelScope.launch {
+        noteRepo.setPinned(note.id, !note.pinned)
+    }
+
+    /** Notes — toggles a note's archived state (see [toggleNotePinned]). */
+    fun toggleNoteArchived(note: Note) = viewModelScope.launch {
+        noteRepo.setArchived(note.id, !note.archived)
+    }
+
+    /**
+     * Notes — deletes a note: the repository cascades the rows and
+     * deletes the attachment files. The list re-emits without it.
+     */
+    fun deleteNote(noteId: Long) = viewModelScope.launch {
+        noteRepo.deleteNote(noteId)
+    }
+
+    fun toggleMuted(conversation: Conversation) = viewModelScope.launch {
+        toggle.setMuted(conversation.id, !conversation.muted)
+    }
+
+    /**
+     * Long-press "Mark unread / Mark read" (desktop parity): a
+     * read conversation (0 unread) becomes unread, an unread one
+     * becomes read. Client mode: the unread mark is local-only
+     * (no mark-unread frame exists); the read mark still writes
+     * back to the hub like every other mark-read.
+     */
+    fun toggleUnread(conversation: Conversation) = viewModelScope.launch {
+        toggle.setUnread(conversation.id, conversation.unreadCount == 0)
+    }
+
+    /**
+     * v1.25.3 — débloque toutes les adresses d'une conversation. Le geste réparateur du blocage :
+     * la conversation quitte la section « Bloqués » et retrouve sa place, sans qu'aucune donnée
+     * n'ait été touchée entre-temps. Chaque adresse est isolée pour qu'un échec sur l'une
+     * n'empêche pas les autres.
+     */
+    fun unblock(conversation: Conversation) = viewModelScope.launch {
+        // Client mode C3 — unblock via the hub (one `set_blocked`
+        // frame); the per-address telephony block list is hub-only.
+        if (state.value.settings.mode == DeviceMode.CLIENT) {
+            when (val res = toggle.setBlocked(conversation.id, false)) {
+                is Outcome.Success -> Unit
+                is Outcome.Failure -> {
+                    Timber.w("unblock: client unblock failed: %s", res.error)
+                    _events.trySend(Event.BlockFailed)
+                }
+            }
+            return@launch
+        }
+        for (addr in conversation.addresses) {
+            runCatching { unblockNumber.invoke(addr.raw) }
+                .onFailure { Timber.w(it, "unblock: unblock threw for one address") }
+        }
+    }
+
+    /**
+     * Blocks **every recipient** of a conversation.
+     *
+     * v1.25.4 — la description d'origine (« puis supprime la conversation, ici comme dans le
+     * fournisseur système ») ne vaut plus : la suppression a été retirée en v1.25.3 après qu'elle
+     * a réellement détruit des conversations. La conversation reste, marquée `Conversation.blocked`
+     * et regroupée en fin de liste ; l'effacement est un geste distinct, explicite et confirmé.
+     *
+     * Each address is sent individually to [BlockNumberUseCase] so a group-MMS with one already-
+     * blocked party still adds the others without partial-failure noise. Idempotent.
+     *
+     * v1.25.3 (audit H16) — la conversation était supprimée même quand **aucun** blocage n'avait
+     * abouti : le `runCatching` n'attrapait que les exceptions, et [BlockNumberUseCase] signale
+     * ses échecs par un `Outcome.Failure`, pas en jetant. L'utilisateur perdait donc son
+     * historique en croyant avoir bloqué un numéro qui ne l'était pas. On ne supprime plus
+     * qu'après au moins un blocage réellement réussi, et l'échec total est remonté à l'écran.
+     */
+    fun block(conversation: Conversation) = viewModelScope.launch {
+        // Client mode C3 — block via the hub (one `set_blocked`
+        // frame); the per-address telephony block list is hub-only.
+        if (state.value.settings.mode == DeviceMode.CLIENT) {
+            when (val res = toggle.setBlocked(conversation.id, true)) {
+                is Outcome.Success -> Unit
+                is Outcome.Failure -> {
+                    Timber.w("block: client block failed: %s", res.error)
+                    _events.trySend(Event.BlockFailed)
+                }
+            }
+            return@launch
+        }
+        val blocked = conversation.addresses.count { addr ->
+            runCatching { blockNumber.invoke(addr.raw, conversation.displayName) }
+                .onFailure { Timber.w(it, "block: block threw for one address") }
+                .getOrNull() is Outcome.Success
+        }
+        // v1.25.3 — bloquer ne SUPPRIME plus la conversation. Le `delete()` datait de la v1.2.5,
+        // quand un blocage laissait le fil visible ; il effaçait les messages de Room ET du
+        // fournisseur système, sans que la confirmation le dise. La conversation reste désormais
+        // en place, signalée comme bloquée dans la liste ([Conversation.blocked]), et l'utilisateur
+        // la retrouve intacte au déblocage.
+        when {
+            blocked == conversation.addresses.size -> Unit
+            blocked > 0 -> _events.trySend(
+                Event.BlockPartial(blocked = blocked, total = conversation.addresses.size),
+            )
+            else -> _events.trySend(Event.BlockFailed)
+        }
+    }
+
+    /**
+     * v1.11.0 — déplace la conversation dans le coffre depuis la liste
+     * principale. Délègue à [ToggleConversationStateUseCase.requestMoveToVault]
+     * qui check `AppLockState` (refuse PanicDecoy + Locked). Émet un [Event] de
+     * résultat pour que l'UI affiche le snackbar de confirmation ou d'erreur.
+     *
+     * v1.27.2 (audit externe 2026-08-04 #3) — le déplacement n'arme PLUS la
+     * session coffre : l'ouverture du Coffre repasse par son second facteur.
+     */
+    fun moveConversationToVault(conversationId: Long) = viewModelScope.launch {
+        val outcome = toggle.requestMoveToVault(conversationId, intoVault = true)
+        _events.trySend(
+            when (outcome) {
+                is Outcome.Success -> Event.MovedToVault(count = 1)
+                is Outcome.Failure -> Event.MoveToVaultFailed(count = 1)
+            },
+        )
+    }
+
+    /**
+     * v1.13.0 — entre en mode sélection multiple sur un long-press d'item, OU
+     * toggle l'appartenance d'un item dans la sélection si on est déjà en mode
+     * sélection. Pas d'effet si `id` n'existe plus (la sélection effective est
+     * filtrée dans le `combine` à chaque émission).
+     */
+    fun toggleSelection(id: Long) {
+        selectedIds.update { current ->
+            if (current.contains(id)) current - id else current + id
+        }
+    }
+
+    /**
+     * v1.13.0 — sort du mode sélection (TopAppBar `navigationIcon = X`,
+     * `onBack`, sortie vers `VaultScreen`, etc.). Idempotent.
+     */
+    fun clearSelection() {
+        selectedIds.update { emptySet() }
+    }
+
+    /**
+     * v1.13.0 — action "Déplacer les N conv sélectionnées vers le coffre".
+     * Boucle séquentielle (pas batch transactionnel — Room WAL absorbe et la
+     * défense PanicDecoy est ré-évaluée à chaque appel). Émet un seul
+     * [Event.MovedToVault] avec le count effectif (`success`) ; si TOUTES les
+     * conv échouent (e.g. décoy actif), émet `MoveToVaultFailed`. Mixed
+     * outcome rare en pratique mais traité défensivement.
+     */
+    fun bulkMoveSelectedToVault() = viewModelScope.launch {
+        val ids = selectedIds.value.toList()
+        if (ids.isEmpty()) return@launch
+        // v1.14.8 R8 — Wrap atomique Room transaction. Avant : boucle itérative N appels →
+        // process-kill au milieu = état partiel non-récupérable. Maintenant : succès complet
+        // ou rollback complet. Cf. [ConversationRepository.bulkMoveToVault].
+        val outcome = toggle.requestBulkMoveToVault(ids = ids, intoVault = true)
+        // Vide la sélection avant d'émettre — l'UI revient au mode normal pendant
+        // que le snackbar s'affiche, plus naturel qu'un retour en mode sélection
+        // avec 0 sélectionné (les IDs ont été filtrés par `effectiveSelection`).
+        clearSelection()
+        _events.trySend(
+            when (outcome) {
+                is Outcome.Success<Int> -> {
+                    if (outcome.value > 0) Event.MovedToVault(count = outcome.value)
+                    else Event.MoveToVaultFailed(count = ids.size)
+                }
+                is Outcome.Failure -> Event.MoveToVaultFailed(count = ids.size)
+            }
+        )
+    }
+
+    private val _events = Channel<Event>(Channel.BUFFERED)
+    val events: Flow<Event> = _events.receiveAsFlow()
+
+    /**
+     * v1.14.0 — Trigger "Je vais bien" : reset cooldown urgence + (optionnel)
+     * SMS aux contacts safety. Délègue à [com.relay.sms.domain.usecase.IAmOkUseCase].
+     * Émet un [Event] selon outcome. Idempotent : si pas de trigger récent,
+     * NothingToReset → pas d'event.
+     */
+    fun triggerIAmOk() = viewModelScope.launch {
+        val result = iAmOk()
+        val event = when (result) {
+            is com.relay.sms.domain.usecase.IAmOkUseCase.Result.ResetAndSmsSent ->
+                Event.IAmOkDoneWithSms(sent = result.sent, failed = result.failed)
+            is com.relay.sms.domain.usecase.IAmOkUseCase.Result.ResetWithoutSms ->
+                Event.IAmOkDoneNoSms
+            is com.relay.sms.domain.usecase.IAmOkUseCase.Result.NothingToReset -> null
+            is com.relay.sms.domain.usecase.IAmOkUseCase.Result.PanicSuppressed -> null
+        }
+        if (event != null) _events.trySend(event)
+    }
+
+    /**
+     * v1.13.0 — le count permet à l'UI d'afficher le bon snackbar
+     * ("N déplacées" au pluriel) sans dupliquer les events. count = 1 pour
+     * un mouvement single (long-press → menu), count = N pour la sélection
+     * multiple.
+     */
+    sealed interface Event {
+        data class MovedToVault(val count: Int) : Event
+        data class MoveToVaultFailed(val count: Int) : Event
+
+        /**
+         * v1.28.9 — les échecs qui s'affichent en rouge, sous UNE seule branche de l'écran : sa
+         * complexité est au seuil de detekt. Le texte de chacun est choisi hors de l'écran, à partir
+         * de chaînes résolues à la composition (audit H16).
+         */
+        sealed interface Erreur : Event
+
+        /** v1.25.3 (audit H16) — aucun numéro n'a pu être bloqué ; la conversation est conservée. */
+        data object BlockFailed : Erreur
+
+        /** v1.25.3 (audit SEC3) — blocage partiel ; la conversation est conservée volontairement. */
+        data class BlockPartial(val blocked: Int, val total: Int) : Event
+
+        /**
+         * v1.28.9 (septième note d'Andrew, point 5) — la suppression n'a pas eu lieu. [copieSysteme] :
+         * la copie d'une conversation du coffre résiste dans la messagerie du téléphone ; sinon, un
+         * élément local n'a pas pu être supprimé ou l'état de la conversation n'a pas pu être lu.
+         */
+        data class DeleteKept(val copieSysteme: Boolean) : Erreur
+        /** v1.14.0 — Reset cooldown + SMS "Je vais bien" envoyé. */
+        data class IAmOkDoneWithSms(val sent: Int, val failed: Int) : Event
+        /** v1.14.0 — Reset cooldown effectué, pas de SMS (opt-in OFF). */
+        data object IAmOkDoneNoSms : Event
+    }
+
+    companion object {
+        /**
+         * v1.14.0 — Fenêtre d'affichage du chip "Je vais bien" sur
+         * [com.relay.sms.ui.screens.conversations.ConversationsScreen].
+         * 30 minutes post-trigger : assez long pour que l'user constate
+         * que c'était une fausse alerte et envoie une rassurance.
+         */
+        const val I_AM_OK_WINDOW_MS: Long = 30L * 60L * 1000L
+    }
+}
+
+/**
+ * Round 13 — the selection the list actually honours. The stored tab
+ * may be stale: its category can have emptied out (its tab is then
+ * hidden) or categories can be switched off. In both cases the list
+ * falls back to All instead of filtering onto a tab that is not there.
+ * The stored value itself is left alone, so the choice comes back if
+ * the category fills up again. Checked against `rows` (the full list),
+ * not the search-filtered `matched`: while searching, the tab row is
+ * hidden anyway and the filter must keep applying to the query, even
+ * when it matches nothing in that category.
+ *
+ * Round 36 — notes live in Personal: a stored Personal tab stays
+ * effective while notes exist ([hasNotes]), even with no Personal
+ * conversation left to show.
+ */
+internal fun effectiveSelectedCategory(
+    rows: List<Conversation>,
+    selected: MessageCategory?,
+    showCategories: Boolean,
+    hasNotes: Boolean = false,
+): MessageCategory? {
+    if (!showCategories || selected == null) return null
+    val hasAny = rows.any { MessageClassifier.classifyConversation(it) == selected } ||
+        (hasNotes && selected == MessageCategory.PERSONAL)
+    return if (hasAny) selected else null
+}
+
+/**
+ * Round 36 — notes live in All and in Personal (notes are personal,
+ * not spam/OTP/transactions). Every other tab hides them. The gate
+ * for the note merge in the list combine (see
+ * [ConversationsViewModel.state]).
+ */
+internal fun notesVisibleInCategory(selected: MessageCategory?): Boolean =
+    selected == null || selected == MessageCategory.PERSONAL
+
+/**
+ * Round 11 — applies the selected category to the search-filtered list
+ * and builds the tab row from the SAME list, before the category filter:
+ * every conversation is classified exactly once, the tabs never lose a
+ * category because it is selected, and the visible list keeps its
+ * relative order (each category keeps its encounter order in `matched`).
+ *
+ * Round 36 — notes live in Personal: [hasNotes] makes the Personal
+ * tab exist even with no Personal conversation (the notes themselves
+ * join later, at the list merge — they are not conversations).
+ *
+ * Returns the visible conversations and the tabs (All first, then each
+ * non-empty category in enum order).
+ */
+internal fun applyCategoryFilter(
+    matched: List<Conversation>,
+    selected: MessageCategory?,
+    muted: Set<MessageCategory>,
+    showCategories: Boolean,
+    hasNotes: Boolean = false,
+): Pair<List<Conversation>, List<CategoryTab>> {
+    // Round 12 — categories hidden: the full list, no tabs, no filter —
+    // even if a category was selected before the toggle went off.
+    if (!showCategories) return matched to emptyList()
+    val byCategory = matched.groupBy { MessageClassifier.classifyConversation(it) }
+    val tabs = buildCategoryTabs(byCategory, matched.sumOf { it.unreadCount }, muted, hasNotes)
+    val visible = if (selected == null) matched else byCategory[selected].orEmpty()
+    return visible to tabs
+}
+
+/**
+ * Round 11 — All (always, with the total unread) plus each category
+ * holding at least one conversation. Empty categories get no tab.
+ *
+ * Round 36 — notes live in Personal: [hasNotes] gives Personal a tab
+ * even with no Personal conversation (notes are always read, so they
+ * add no unread count).
+ */
+internal fun buildCategoryTabs(
+    byCategory: Map<MessageCategory, List<Conversation>>,
+    totalUnread: Int,
+    muted: Set<MessageCategory>,
+    hasNotes: Boolean = false,
+): List<CategoryTab> {
+    val tabs = ArrayList<CategoryTab>(MessageCategory.entries.size + 1)
+    tabs += CategoryTab(category = null, unreadCount = totalUnread, muted = false)
+    for (category in MessageCategory.entries) {
+        val inCategory = byCategory[category].orEmpty()
+        val hasNoteItems = hasNotes && category == MessageCategory.PERSONAL
+        if (inCategory.isNotEmpty() || hasNoteItems) {
+            tabs += CategoryTab(
+                category = category,
+                unreadCount = inCategory.sumOf { it.unreadCount },
+                muted = category in muted,
+            )
+        }
+    }
+    return tabs
+}

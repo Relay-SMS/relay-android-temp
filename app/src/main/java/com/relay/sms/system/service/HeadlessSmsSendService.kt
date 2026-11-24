@@ -1,0 +1,145 @@
+package com.relay.sms.system.service
+
+import android.app.Service
+import android.content.Intent
+import android.os.IBinder
+import android.telephony.TelephonyManager
+import com.relay.sms.di.ApplicationScope
+import com.relay.sms.domain.model.PhoneAddress
+import com.relay.sms.domain.usecase.EnvoyerMessageUseCase
+import com.relay.sms.security.AppLockManager
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
+import timber.log.Timber
+import javax.inject.Inject
+
+/**
+ * Required by the platform for the default SMS app: must accept "respond via message" intents
+ * (e.g. from the in-call screen). We translate them to our normal send path.
+ *
+ * **Audit F11 mitigation**: the service is `exported="true"` (required by the OS) and protected
+ * by `SEND_RESPOND_VIA_MESSAGE` (held only by the OS). On top of that:
+ *  - We refuse when the app lock is held (the user isn't authenticated → no sending).
+ *  - We cap [Intent.EXTRA_TEXT] at [MAX_TEXT] characters.
+ *  - We cap the number of recipients at [MAX_RECIPIENTS].
+ *  - We reject any normalized recipient that doesn't match a phone shape.
+ */
+@AndroidEntryPoint
+class HeadlessSmsSendService : Service() {
+
+    // v1.24.0 SEC-CRIT — `Lazy` : atteint un DAO donc `AppDatabase` donc la réparation zéro-clé.
+    // L'injection de champ Hilt précède onCreate/onStartCommand, sur le main thread.
+    // v1.28.5 (audit de coherence C2) — l'AIGUILLAGE unique (SMS / MMS / MMS de groupe), et non
+    // plus SendSmsUseCase en direct : ce service etait le troisieme point d'envoi, celui que le
+    // refactor du 2026-09-10 n'avait pas vu. Une reponse rapide vers plusieurs numeros suit
+    // desormais le reglage « MMS de groupe » comme le fil et l'envoi programme.
+    @Inject lateinit var envoyerLazy: dagger.Lazy<EnvoyerMessageUseCase>
+    @Inject lateinit var appLock: AppLockManager
+    @Inject @ApplicationScope lateinit var scope: CoroutineScope
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent == null) {
+            stopSelf(startId)
+            return START_NOT_STICKY
+        }
+        // v1.3.5 G8 audit fix — ACTION_SEND retiré : le handler `handleSendTo` extrait
+        // les numéros via `intent.data.schemeSpecificPart` qui n'est rempli QUE pour
+        // les schemes `smsto:/sms:/mmsto:/mms:` (donc ACTION_SENDTO + ACTION_VIEW).
+        // Sur un véritable ACTION_SEND (avec EXTRA_TEXT au lieu de scheme), la liste
+        // numbers serait vide → no-op silencieux. Cette branche morte ouvrait
+        // inutilement une surface IPC au pattern `SEND_RESPOND_VIA_MESSAGE`.
+        // v1.27.10 (revue externe GitLab !38458) — ACTION_RESPOND_VIA_MESSAGE ajoute.
+        //
+        // Le manifeste declare ce service pour `android.intent.action.RESPOND_VIA_MESSAGE`
+        // depuis la v1.2.0, mais ce `when` ne l'a JAMAIS accepte : « repondre par message »
+        // depuis l'ecran d'appel entrant tombait donc dans le `else`, et le service s'arretait
+        // sans rien envoyer. Fonctionnalite annoncee au systeme, jamais rendue — verifie par
+        // `git log -S` sur ce fichier, le filtre du manifeste et le `when` n'ont jamais
+        // concorde.
+        //
+        // Le contenu de l'intention est celui qu'attend deja [handleSendTo] : destinataire dans
+        // l'URI `smsto:` / `sms:`, corps dans `EXTRA_TEXT`. Aucune surface IPC nouvelle — le
+        // service reste protege par `SEND_RESPOND_VIA_MESSAGE`, permission de niveau systeme,
+        // et repasse par les memes gardes (verrou, plafonds, forme du numero).
+        when (intent.action) {
+            Intent.ACTION_SENDTO,
+            Intent.ACTION_VIEW,
+            TelephonyManager.ACTION_RESPOND_VIA_MESSAGE -> handleSendTo(intent, startId)
+            else -> stopSelf(startId)
+        }
+        return START_NOT_STICKY
+    }
+
+    private fun handleSendTo(intent: Intent, startId: Int) {
+        // Parse + validate first (synchronously, cheap), then move the lock check + send into a
+        // coroutine — this lets us call `appLock.ensureResolved()` lazily instead of forcing
+        // `MainApplication.onCreate` to block the main thread waiting on DataStore (P-P0-5).
+        // v1.27.2 (audit externe Gemini 2026-08-04) — garde jumelle de celle de [MainActivity] :
+        // la partie `?query` d'une URI `smsto:` est retirée avant le découpage.
+        //
+        // Ici la conséquence dépassait l'adresse corrompue. `0612345678?body=Bonjour` contient
+        // des lettres : `blockKey()` bascule alors en régime alphanumérique et rend la chaîne
+        // entière, si bien que la garde de liste noire de [SendSmsUseCase] — qui interroge
+        // `r.raw` — ne pouvait plus jamais correspondre à une clé numérique enregistrée. Une
+        // application tierce contournait donc la liste noire d'envoi en ajoutant `?x` à l'URI.
+        // Même piège que le suffixe `/TYPE=PLMN` fermé en v1.26.1 (H5) : une garde rendue
+        // silencieusement inopérante par du bruit de transport laissé dans l'adresse.
+        val numbers = intent.data?.schemeSpecificPart
+            ?.substringBefore('?')
+            ?.split(',', ';')
+            ?.asSequence()
+            ?.map { it.trim() }
+            ?.filter { it.isNotEmpty() }
+            ?.take(MAX_RECIPIENTS)
+            ?.toList()
+            ?: emptyList()
+        val text = intent.getStringExtra(Intent.EXTRA_TEXT).orEmpty().take(MAX_TEXT)
+        if (numbers.isEmpty() || text.isBlank()) {
+            stopSelf(startId)
+            return
+        }
+        val recipients = numbers
+            .map { PhoneAddress.of(it) }
+            .filter { it.normalized.isNotBlank() && it.normalized.length <= MAX_NUMBER_LEN }
+        if (recipients.isEmpty()) {
+            stopSelf(startId)
+            return
+        }
+        scope.launch {
+            try {
+                val envoyer = envoyerLazy.get()
+                // Audit M-12: bound the service lifetime. SendSmsUseCase opens N Room transactions
+                // (one per recipient) sequentially; a single stuck SQLCipher write or a deadlock
+                // with the import job could keep this Service alive past the OS Service-watchdog,
+                // ending in a forced ANR + bad UX. 30 s is generous for the 50-recipient cap
+                // (real-world send <500 ms per row) yet short enough to fail fast.
+                withTimeout(SEND_TIMEOUT_MS) {
+                    appLock.ensureResolved()
+                    if (!appLock.isOpenForUi(appLock.state.value)) {
+                        Timber.i("HeadlessSmsSendService: refused while app is locked")
+                        return@withTimeout
+                    }
+                    envoyer.invoke(recipients = recipients, body = text)
+                }
+            } catch (_: TimeoutCancellationException) {
+                Timber.w("HeadlessSmsSendService timed out after %d ms", SEND_TIMEOUT_MS)
+            } catch (t: Throwable) {
+                Timber.w(t, "HeadlessSmsSendService failed")
+            } finally {
+                stopSelf(startId)
+            }
+        }
+    }
+
+    private companion object {
+        const val MAX_RECIPIENTS = 50
+        const val MAX_TEXT = 5_000
+        const val MAX_NUMBER_LEN = 32
+        const val SEND_TIMEOUT_MS = 30_000L
+    }
+}

@@ -1,0 +1,649 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.system.notifications
+
+import android.Manifest
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.app.Person
+import androidx.core.app.RemoteInput
+import androidx.core.content.ContextCompat
+import com.relay.sms.MainActivity
+import com.relay.sms.R
+import com.relay.sms.data.local.datastore.SettingsRepository
+import com.relay.sms.data.local.db.dao.ConversationDao
+import com.relay.sms.di.IoDispatcher
+import com.relay.sms.domain.categories.MessageClassifier
+import com.relay.sms.domain.model.PhoneAddress
+import com.relay.sms.domain.notification.ConversationNotificationCanceller
+import com.relay.sms.domain.otp.OtpCodeDetector
+import com.relay.sms.domain.repository.ContactRepository
+import com.relay.sms.domain.settings.NotificationSettings
+import com.relay.sms.domain.settings.NotificationStyle
+import com.relay.sms.domain.settings.PreviewMode
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.withContext
+import timber.log.Timber
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class IncomingMessageNotifier @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val settings: SettingsRepository,
+    private val contacts: ContactRepository,
+    private val activeConversationTracker: ActiveConversationTracker,
+    private val conversationDao: ConversationDao,
+    // v1.26.1 (audit H2) — authentifie l'intent d'ouverture de conversation, cf.
+    // [NotificationIntentToken]. `MainActivity` est expose : sans ce secret, une app tierce
+    // pouvait forger `ACTION_OPEN_CONVERSATION` et forcer l'affichage d'un fil arbitraire.
+    private val intentToken: NotificationIntentToken,
+    @IoDispatcher private val io: CoroutineDispatcher,
+) : ConversationNotificationCanceller {
+
+    suspend fun notifyIncoming(
+        address: String,
+        body: String,
+        messageId: Long,
+        conversationId: Long,
+    ) = withContext(io) {
+        // v1.11.0 — Vault gate. Si la conversation est dans le coffre, on
+        // n'affiche AUCUNE notification — ni nom, ni preview, ni heads-up,
+        // ni icône silencieuse. Cohérent avec la promesse Vault "les conv
+        // déplacées disparaissent ET des notifications". Le badge unread
+        // côté Vault reste comptabilisé (via Room) pour le récap à l'ouverture
+        // explicite du coffre.
+        //
+        // Lecture synchrone Room (~1-3 ms) acceptable sur SMS entrant.
+        // v1.26.1 (audit H16) — le repli dit désormais « traiter comme SI c'était dans le coffre ».
+        //
+        // Il disait l'inverse (`false` = « pas dans le coffre ») : toute erreur de lecture Room /
+        // SQLCipher — base tenue par une transaction concurrente, I/O disque, base non ouvrable
+        // après une réparation — faisait afficher nom de l'expéditeur ET aperçu du corps sur
+        // l'écran de verrouillage pour une conversation protégée. La promesse du coffre (« ni
+        // nom, ni preview, ni icône ») tombait exactement quand la base allait mal.
+        //
+        // Le coût du repli sûr est une notification manquée ; le message reste lisible dans
+        // l'application. Le coût du repli permissif était l'aperçu d'une conversation du coffre
+        // sur un écran verrouillé. Ce n'est pas symétrique.
+        // v1.26.1 (audit F1) — une seule lecture sert désormais aux DEUX gardes : coffre et
+        // sourdine. `muted` n'était lu par aucun notifier, si bien que mettre une conversation
+        // en sourdine n'aurait rien silencié même une fois le geste câblé.
+        //
+        // Les trois cas sont distingués volontairement, pour ne pas changer la sémantique
+        // existante en passant :
+        //  - ÉCHEC de lecture  → on ne notifie pas (repli sûr, cf. audit H16 ci-dessus) ;
+        //  - conversation ABSENTE → on notifie, comportement d'origine (`?.inVault == true`
+        //    rendait `false` dans ce cas) ;
+        //  - `inVault` ou `muted` → on ne notifie pas.
+        val convResult = runCatching { conversationDao.findById(conversationId) }
+        if (convResult.isFailure) {
+            Timber.w(
+                convResult.exceptionOrNull(),
+                "IncomingMessageNotifier: conversation lookup failed, suppressing notification",
+            )
+            return@withContext
+        }
+        val conv = convResult.getOrNull()
+        val inVault = conv?.inVault == true
+        val muted = conv?.muted == true
+        if (muted) return@withContext
+        // v1.11.0 audit S3 — pas de log explicite "conv #N suppressed in vault"
+        // pour éviter qu'un ReleaseTree mal configuré (Crashlytics bêta, OEM
+        // logcat persistant) corrèle le conversationId avec le fait qu'il
+        // s'agit d'une conv vault. Le silence du return suffit côté debug.
+        if (inVault) return@withContext
+
+        // Resolve the contact so the notification shows "Marie" instead of "+33612345678".
+        // Falls back gracefully if READ_CONTACTS is denied or no match exists. The lookup
+        // result is also what tells the category check below whether the sender is a
+        // contact — one lookup serves both.
+        val contact = runCatching { contacts.lookupByPhone(address) }.getOrNull()
+        val senderName = contact?.displayName
+            ?.takeIf { it.isNotBlank() } ?: address
+        // v1.6.1 (audit PERF-11) — on évite `flow.first()` sur chaque SMS entrant (ouverture
+        // DataStore + désérialisation, 5-15 ms sous charge, notification retardée d'autant).
+        //
+        // v1.27.2 — mais on ne peut PAS se contenter de `settings.state.value` ici. Ce
+        // `StateFlow` démarre sur `AppSettings()` et s'hydrate depuis DataStore de façon
+        // asynchrone : tant que la première émission n'est pas arrivée, il rend les valeurs PAR
+        // DÉFAUT. Or un SMS entrant réveille très souvent un processus qui VIENT de naître —
+        // c'est même le cas nominal quand le téléphone dort. Le défaut par défaut le plus grave
+        // est `previewMode = ALWAYS` : l'aperçu du message s'affichait sur l'écran de
+        // verrouillage de quelqu'un qui avait explicitement choisi de le masquer. Le réglage
+        // tombait exactement dans la situation contre laquelle il existe.
+        //
+        // [hydratedOrNull] garde le chemin chaud à coût nul et ne paie la lecture qu'une fois
+        // par démarrage à froid. Même famille de défaut que celui corrigé dans
+        // [com.relay.sms.system.scheduler.SafetyCallWorker].
+        //
+        // Un seul instantané sert aux DEUX lectures ci-dessous — le contrôle de catégorie et
+        // les réglages de notification — pour ne payer la lecture qu'une fois.
+        val appSettings = settings.hydratedOrNull()
+
+        // Round 11 — category mute: a message whose category the user muted
+        // (long-press on a tab, or Settings → Notifications) does not ring.
+        // A group reply's sender is a real person, so it lands in Personal —
+        // muting Promotional never silences a person. Pure string matching
+        // on the fresh body, plus the stored sticky category (round 35) —
+        // no extra query: `conv` was already loaded above.
+        //
+        // Fail OPEN, unlike the vault guard above: if settings cannot be
+        // read (`hydratedOrNull()` returns null), `mutedCategories` is empty
+        // and the message notifies as normal. A missed notification is worse
+        // than a muted one misfiring once — and unlike the vault, nothing
+        // private leaks by notifying: the sender name and preview still
+        // follow the user's preview settings either way.
+        val mutedCategories = appSettings?.conversations?.mutedCategories.orEmpty()
+        if (mutedCategories.isNotEmpty()) {
+            val freshCategory = MessageClassifier.classify(
+                body = body,
+                sender = PhoneAddress.of(address),
+                isContact = contact != null,
+                isGroup = false,
+            )
+            // Round 35 — the sticky category wins for a stranger 1:1: the
+            // mirror already filed this message from its FULL body before
+            // the notifier ran, so a muted Promotional follow-up ("Touching
+            // base again…") stays silent even though its own text is plain.
+            // A `;` in the CSV is what marks a group (the DAO's own
+            // convention). For an MMS the notifier's `body` is only the
+            // preview label, so the sticky value is what carries the
+            // caption's signal here.
+            val isGroupConversation = conv?.addressesCsv?.contains(';') == true
+            val category = MessageClassifier.effectiveCategory(
+                stickyCategory = conv?.stickyCategory,
+                fresh = freshCategory,
+                isContact = contact != null,
+                isGroup = isGroupConversation,
+            )
+            if (category in mutedCategories) return@withContext
+        }
+
+        val notifSettings = appSettings?.notifications ?: FALLBACK_NOTIFICATIONS
+        if (!notifSettings.enabled) return@withContext
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(
+                    context, Manifest.permission.POST_NOTIFICATIONS,
+                ) != PackageManager.PERMISSION_GRANTED
+            ) return@withContext
+        }
+
+        // v1.8.0 (bug 3 fix) — route vers le canal silent quand l'utilisateur a
+        // explicitement choisi `NotificationStyle.SILENT` dans Paramètres →
+        // Notifications. Le canal silent est IMPORTANCE_LOW → pas de heads-up,
+        // son masqué par le système. L'utilisateur garde l'icône de notif dans
+        // le shade (utile pour ne pas rater un message) mais sans dérangement
+        // sonore ni visuel intrusif.
+        //
+        // Pour `BANNER` (Heads-up désactivé mais son conservé), on reste sur le
+        // canal HIGH mais on coupe le son côté NotificationCompat — Android
+        // tente d'afficher un heads-up pour les notifs HIGH "qui font du bruit",
+        // donc en désamorçant le son on neutralise effectivement le pop-up tout
+        // en conservant le badge + icône shade. Compromis volontairement
+        // documenté dans le toggle UI ([R.string.settings_notif_style_banner_hint]).
+        // v1.28.12 — ce renvoi nommait `settings_notif_style_desc`, une chaîne qui n'était
+        // rendue nulle part : le compromis était donc « documenté » dans un texte que
+        // personne ne voyait. C'est `settings_notif_style_banner_hint` qui le décrit à
+        // l'écran, et la chaîne orpheline a été retirée des cinq langues.
+        // v1.28.13 — table partagée avec la bannière des Réglages, qui vérifie CE canal.
+        val channelId = canalDesMessages(notifSettings.style)
+
+        // Audit F15: the legacy "WHEN_UNLOCKED" branch leaked the body in setContentText on some
+        // OEMs that disregarded VISIBILITY_PRIVATE. Both WHEN_UNLOCKED and NEVER now ship a
+        // placeholder for setContentText; the real body only flows through MessagingStyle, which
+        // honours the OS lock-screen redaction.
+        val hidePreview = when (notifSettings.previewMode) {
+            PreviewMode.ALWAYS -> false
+            PreviewMode.WHEN_UNLOCKED, PreviewMode.NEVER -> true
+        }
+        val redactedPreview = context.getString(R.string.notif_preview_hidden_content)
+        val visiblePreview = if (hidePreview) redactedPreview else body
+
+        val person = Person.Builder().setName(senderName).setKey(address).build()
+        val notificationId = stableNotificationId(messageId)
+
+        val openIntent = PendingIntent.getActivity(
+            context,
+            notificationId,
+            Intent(context, MainActivity::class.java)
+                .setAction(ACTION_OPEN_CONVERSATION)
+                .putExtra(EXTRA_ADDRESS, address)
+                .putExtra(EXTRA_MESSAGE_ID, messageId)
+                // v1.8.0 (bug 4 fix) — on passe le `conversationId` en extra pour
+                // que MainActivity.handleSharedIntent puisse le déposer dans
+                // PendingNavHolder sans avoir à résoudre `address → conversationId`
+                // de manière asynchrone (qui aurait nécessité une requête Room
+                // côté MainActivity, source potentielle de race avec l'import).
+                .putExtra(EXTRA_CONVERSATION_ID, conversationId)
+                .putExtra(NotificationIntentToken.EXTRA_NAV_TOKEN, intentToken.current())
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+
+        // v1.3.9 — si l'utilisateur est ACTUELLEMENT en train de regarder cette
+        // conversation au foreground (cf. [ActiveConversationTracker]), on pose
+        // quand même la notification (son + heads-up éphémère = signal sonore
+        // préservé : le user "entend" le nouveau message) mais on demande à Android
+        // de la cancel automatiquement après [ACTIVE_CONV_TIMEOUT_MS] ms — l'icone
+        // ne persiste pas dans le shade puisque l'utilisateur voit déjà le message
+        // arriver en temps réel dans la conv ouverte. `setTimeoutAfter` est l'API
+        // officielle Android 8+ (API 26+, dans notre minSdk) pour ce besoin précis,
+        // sans timer/coroutine custom côté app (Android s'en charge atomiquement).
+        val isActiveConversation = activeConversationTracker.isActive(conversationId)
+
+        val notif = NotificationCompat.Builder(context, channelId)
+            .setSmallIcon(R.drawable.ic_notification_message)
+            .setContentTitle(senderName)
+            .setContentText(visiblePreview)
+            .setStyle(
+                // v1.6.1 (audit SEC-01) — Passe `visiblePreview` (redacté quand
+                // `previewMode` est NEVER / WHEN_UNLOCKED) au lieu de `body` brut.
+                // L'ancien code laissait fuiter le contenu via `MessagingStyle.Message`
+                // sur certains OEMs (Xiaomi MIUI / HyperOS, Samsung One UI < 5) qui
+                // ignorent `VISIBILITY_SECRET` pour MessagingStyle. Désormais le body
+                // sensible n'est exposé QUE quand l'utilisateur a explicitement choisi
+                // PreviewMode.ALWAYS.
+                NotificationCompat.MessagingStyle(person).addMessage(
+                    NotificationCompat.MessagingStyle.Message(
+                        visiblePreview,
+                        System.currentTimeMillis(),
+                        person,
+                    ),
+                ),
+            )
+            // v1.28.3 (audit global D-02) — la table vit dans la politique commune, les deux
+            // notificateurs d'échec la lisent aussi.
+            .setVisibility(notifSettings.previewMode.ecranVerrouille().versNotificationCompat())
+            .setAutoCancel(true)
+            .setContentIntent(openIntent)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            // v1.3.3 bug #6 — Z4 audit fix : on N'utilise PAS `setGroup(...)` (qui peut
+            // créer un summary phantome sur OneUI/MIUI et complique le cleanup). À la
+            // place, on poste les notifs avec un TAG dérivé du conversationId. Lookup
+            // côté [cancelAllForConversation] = `for (sbn in activeNotifications)
+            // if (sbn.tag == tag) nm.cancel(tag, sbn.id)`. Simple, fiable, pas de
+            // summary à gérer.
+            .also { b ->
+                if (notifSettings.inlineReply) {
+                    b.addAction(buildReplyAction(address, messageId, notificationId, conversationId))
+                }
+                // Feedback round 5 — one-tap copy for a detected login code.
+                // Only when the preview itself is visible: with a hidden preview
+                // the code must not leave the app through the clipboard either.
+                // The code is never logged — it travels only in the action's
+                // intent extra, like the reply text does.
+                val otpCode = OtpCodeDetector.detect(body)
+                if (otpCode != null && !hidePreview) {
+                    b.addAction(
+                        buildCopyCodeAction(
+                            otpCode,
+                            address,
+                            messageId,
+                            notificationId,
+                            conversationId,
+                        ),
+                    )
+                }
+                b.addAction(buildMarkReadAction(address, messageId, notificationId, conversationId))
+                if (isActiveConversation) {
+                    b.setTimeoutAfter(ACTIVE_CONV_TIMEOUT_MS)
+                }
+                // v1.8.0 (bug 3 fix) — mode BANNER : neutralise le son côté notif
+                // pour empêcher Android d'inférer un heads-up. Le canal reste HIGH
+                // (conservé pour ne pas perturber les users en HEADS_UP existants),
+                // mais sans son la notif retombe à un simple badge dans le shade.
+                // En SILENT, le canal LOW se charge déjà de masquer son + heads-up,
+                // donc pas besoin de setSound ici.
+                if (notifSettings.style == NotificationStyle.BANNER) {
+                    b.setSound(null)
+                    b.setDefaults(0)
+                }
+            }
+            .build()
+        // Z4 audit fix — tag-based notif : permet à `cancelAllForConversation` de
+        // tout cancel via `nm.cancel(tag, id)` sans toucher à un éventuel summary.
+        NotificationManagerCompat.from(context).notify(
+            conversationTag(conversationId),
+            notificationId,
+            notif,
+        )
+    }
+
+    /**
+     * Maps a Room message id to a unique notification id.
+     *
+     * Audit F38 avait corrigé un `msgId.toInt().or(1)` qui collisionnait un message sur deux —
+     * mais le remède, `hash or BASE_TAG`, **collisionnait à son tour**, et c'est ce qu'a relevé
+     * la relecture externe (F19).
+     *
+     * `or 0x10000` force le bit 16 : `1` et `65537` rendaient tous deux `65537`, et plus
+     * généralement toute paire `(n, n xor 0x10000)` se confondait. Le `or` détruisait de
+     * l'information pour une raison — ne jamais rendre `0`, que le système écarterait — qu'un
+     * simple remplacement du seul cas `0` traite sans rien perdre.
+     *
+     * v1.28.3 — la collision d'AFFICHAGE était bornée (la notification porte un tag de
+     * conversation), mais l'identifiant sert aussi de `requestCode` aux `PendingIntent` des
+     * actions, où la conséquence était tout autre. Cf. [buildReplyAction].
+     */
+    private fun stableNotificationId(messageId: Long): Int = notificationIdFor(messageId)
+
+    /**
+     * v1.28.3 (F19) — donne à chaque action de notification une IDENTITÉ propre.
+     *
+     * `PendingIntent.filterEquals` **ignore les extras**. Deux actions dont l'`Intent` ne diffère
+     * que par ses `putExtra` sont donc le même `PendingIntent` aux yeux du système, et
+     * `FLAG_UPDATE_CURRENT` réécrit les extras du premier avec ceux du second. L'identité ne
+     * tenait ici qu'au `requestCode`, dérivé de [stableNotificationId] — qui collisionnait.
+     *
+     * Conséquence concrète, et c'est la seule qui compte : `NotificationActionReceiver` lit
+     * l'adresse du destinataire dans ces extras. Une réponse tapée depuis l'ancienne
+     * notification pouvait donc **partir à quelqu'un d'autre**.
+     *
+     * Un `data` distinct par (action, message) fait porter l'identité par `filterEquals`
+     * lui-même, sans dépendre du `requestCode`. L'`Intent` est explicite (composant posé, aucun
+     * `intent-filter` au manifeste) : ce `data` ne change que l'identité, jamais le routage.
+     */
+    private fun identiteAction(action: String, messageId: Long): android.net.Uri =
+        android.net.Uri.parse("relay://notification/$action/$messageId")
+
+    private fun buildReplyAction(
+        address: String,
+        messageId: Long,
+        notificationId: Int,
+        conversationId: Long,
+    ): NotificationCompat.Action {
+        val remoteInput = RemoteInput.Builder(KEY_REPLY)
+            .setLabel(context.getString(R.string.notif_reply_label))
+            .build()
+        val replyIntent = Intent(context, NotificationActionReceiver::class.java).apply {
+            // Audit F8: clamp the intent to our component so even with an action collision
+            // (matching string), no other app can receive it.
+            component = ComponentName(context, NotificationActionReceiver::class.java)
+            action = NotificationActionReceiver.ACTION_REPLY
+            `package` = context.packageName
+            // v1.28.3 (F19) — l'identite du PendingIntent, que les extras ne portent PAS.
+            data = identiteAction("reply", messageId)
+            putExtra(NotificationActionReceiver.EXTRA_ADDRESS, address)
+            putExtra(NotificationActionReceiver.EXTRA_MESSAGE_ID, messageId)
+            putExtra(NotificationActionReceiver.EXTRA_NOTIFICATION_ID, notificationId)
+            // ⚠️ v1.28.12 — la CONVERSATION, pas seulement l'expéditeur. L'intent d'OUVERTURE
+            // le porte depuis la v1.8.0 (« bug 4 fix ») ; ses deux jumeaux d'action ne l'ont
+            // jamais reçu, et ils résolvaient donc la conversation par l'ADRESSE. Sur un MMS
+            // de groupe, la notification est posée pour le GROUPE : répondre partait au seul
+            // expéditeur, la ligne miroir s'écrivait dans un fil 1-à-1, la notification —
+            // étiquetée par l'id du groupe — ne se fermait pas, et « marquer comme lu » pouvait
+            // CRÉER une conversation vide. Relevé par un audit de motifs le 2026-09-17.
+            putExtra(NotificationActionReceiver.EXTRA_CONVERSATION_ID, conversationId)
+        }
+        val pi = PendingIntent.getBroadcast(
+            context,
+            notificationId.xor(REPLY_REQUEST_SALT),
+            replyIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE,
+        )
+        return NotificationCompat.Action.Builder(
+            R.drawable.ic_notification_reply,
+            context.getString(R.string.notif_reply_label),
+            pi,
+        ).addRemoteInput(remoteInput).setAllowGeneratedReplies(true).build()
+    }
+
+    /**
+     * Feedback round 5 — "Copy code" action for a detected login code
+     * ([OtpCodeDetector]). Same shape as [buildMarkReadAction]: the code
+     * travels in the intent extra (never in a log), the `data` URI gives the
+     * PendingIntent its identity (cf. [identiteAction], audit F19), and the
+     * request code is salted so it cannot collide with the reply / mark-read
+     * actions of the same message.
+     */
+    private fun buildCopyCodeAction(
+        code: String,
+        address: String,
+        messageId: Long,
+        notificationId: Int,
+        conversationId: Long,
+    ): NotificationCompat.Action {
+        val intent = Intent(context, NotificationActionReceiver::class.java).apply {
+            component = ComponentName(context, NotificationActionReceiver::class.java)
+            action = NotificationActionReceiver.ACTION_COPY_CODE
+            `package` = context.packageName
+            data = identiteAction("copycode", messageId)
+            putExtra(NotificationActionReceiver.EXTRA_ADDRESS, address)
+            putExtra(NotificationActionReceiver.EXTRA_MESSAGE_ID, messageId)
+            putExtra(NotificationActionReceiver.EXTRA_NOTIFICATION_ID, notificationId)
+            putExtra(NotificationActionReceiver.EXTRA_CONVERSATION_ID, conversationId)
+            putExtra(NotificationActionReceiver.EXTRA_CODE, code)
+        }
+        val pi = PendingIntent.getBroadcast(
+            context,
+            notificationId.xor(COPY_CODE_REQUEST_SALT),
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        return NotificationCompat.Action.Builder(
+            R.drawable.ic_notification_copy,
+            context.getString(R.string.notif_copy_code_label),
+            pi,
+        ).build()
+    }
+
+    private fun buildMarkReadAction(
+        address: String,
+        messageId: Long,
+        notificationId: Int,
+        conversationId: Long,
+    ): NotificationCompat.Action {
+        val intent = Intent(context, NotificationActionReceiver::class.java).apply {
+            component = ComponentName(context, NotificationActionReceiver::class.java)
+            action = NotificationActionReceiver.ACTION_MARK_READ
+            `package` = context.packageName
+            // v1.28.3 (F19) — cf. [identiteAction] : distincte de celle de la reponse.
+            data = identiteAction("read", messageId)
+            putExtra(NotificationActionReceiver.EXTRA_ADDRESS, address)
+            putExtra(NotificationActionReceiver.EXTRA_MESSAGE_ID, messageId)
+            putExtra(NotificationActionReceiver.EXTRA_NOTIFICATION_ID, notificationId)
+            // ⚠️ v1.28.12 — la CONVERSATION, pas seulement l'expéditeur. L'intent d'OUVERTURE
+            // le porte depuis la v1.8.0 (« bug 4 fix ») ; ses deux jumeaux d'action ne l'ont
+            // jamais reçu, et ils résolvaient donc la conversation par l'ADRESSE. Sur un MMS
+            // de groupe, la notification est posée pour le GROUPE : répondre partait au seul
+            // expéditeur, la ligne miroir s'écrivait dans un fil 1-à-1, la notification —
+            // étiquetée par l'id du groupe — ne se fermait pas, et « marquer comme lu » pouvait
+            // CRÉER une conversation vide. Relevé par un audit de motifs le 2026-09-17.
+            putExtra(NotificationActionReceiver.EXTRA_CONVERSATION_ID, conversationId)
+        }
+        val pi = PendingIntent.getBroadcast(
+            context,
+            notificationId.xor(MARK_READ_REQUEST_SALT),
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        return NotificationCompat.Action.Builder(
+            R.drawable.ic_notification_check,
+            context.getString(R.string.notif_mark_read_label),
+            pi,
+        ).build()
+    }
+
+    /**
+     * v1.28.6 — remplace un `cancel(messageId: Long)` qui était **mort ET faux**.
+     *
+     * Il annulait par `nm.cancel(id)`, sans tag, alors que tout est posté avec tag (cf. le
+     * `notify` ci-dessus) : il ne pouvait rien annuler. Aucun appelant, ni dans le source ni
+     * dans les tests — donc aucun défaut observable, mais un piège posé pour qui l'aurait
+     * câblé en croyant tenir la suppression d'un message. Celle-ci le tient : même tag qu'à la
+     * pose, même identité que [cancelAllForConversation] emploie.
+     */
+    override fun cancelForMessage(conversationId: Long, messageId: Long) {
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager?
+            ?: return
+        runCatching { nm.cancel(conversationTag(conversationId), stableNotificationId(messageId)) }
+            .onFailure { Timber.w(it, "cancelForMessage: %d", messageId) }
+    }
+
+    /** v1.28.7 — voir [ConversationNotificationCanceller.cancelForMessages]. */
+    override fun cancelForMessages(messagesByConversation: Map<Long, Collection<Long>>) {
+        if (messagesByConversation.isEmpty()) return
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager?
+            ?: return
+        runCatching {
+            val actives = nm.activeNotifications.map { it.tag to it.id }
+            for ((tag, id) in notificationsToCancel(actives, messagesByConversation)) nm.cancel(tag, id)
+        }.onFailure { Timber.w(it, "cancelForMessages") }
+    }
+
+    /**
+     * v1.3.3 bug #6 — cancel TOUTES les notifications affichées qui appartiennent à la
+     * conversation [conversationId]. Appelé depuis `ConversationRepositoryImpl.markRead`
+     * pour que l'ouverture de la thread depuis l'app efface le pavé de notifs cumulées
+     * (qui n'était précédemment effacé QUE par les actions Reply / MarkAsRead émises
+     * directement depuis la notif).
+     *
+     * Z4 audit fix — implémentation **tag-based** : chaque notif est postée avec
+     * `tag = conversationTag(id)`. Cancel = itère `activeNotifications`, filtre par
+     * tag, `nm.cancel(tag, id)`. Pas de `setGroup` → pas de risque de summary phantome
+     * non-cancellé sur OneUI/MIUI. Pas de cache RAM (qui se viderait au kill process
+     * et raterait les notifs déposées en background) — on demande au système la liste
+     * à chaque appel.
+     */
+    override fun cancelAllForConversation(conversationId: Long) {
+        val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager?
+            ?: return
+        val tag = conversationTag(conversationId)
+        runCatching {
+            for (sbn in nm.activeNotifications) {
+                if (sbn.tag == tag) {
+                    nm.cancel(sbn.tag, sbn.id)
+                }
+            }
+        }
+    }
+
+    /**
+     * v1.3.3 — tag stable pour toutes les notifs d'une conversation donnée. Inclut le
+     * préfixe `com.relay.sms.conv.` pour rendre le tag auto-explicatif dans les
+     * outils debug (`dumpsys notification`) et éviter toute collision avec d'éventuels
+     * tags posés par d'autres composants futurs.
+     */
+    private fun conversationTag(conversationId: Long): String = conversationTagFor(conversationId)
+
+    companion object {
+        const val KEY_REPLY = "key_reply_text"
+
+        /**
+         * v1.8.0 (bug 4 fix) — constantes partagées avec [com.relay.sms.MainActivity]
+         * et les tests, pour éviter la duplication littérale source de bugs (typo
+         * silencieuse type "OPEN_CONVERSARTION" → handler jamais déclenché, etc.).
+         */
+        const val ACTION_OPEN_CONVERSATION = "com.relay.sms.OPEN_CONVERSATION"
+        const val EXTRA_ADDRESS = "address"
+        const val EXTRA_MESSAGE_ID = "messageId"
+        const val EXTRA_CONVERSATION_ID = "conversationId"
+
+        /**
+         * v1.27.2 — réglages retenus quand DataStore reste **illisible**
+         * ([SettingsRepository.hydratedOrNull] rend `null` après ses reprises).
+         *
+         * Ce n'est PAS `NotificationSettings()` : les défauts du constructeur sont taillés pour
+         * un premier lancement confortable, pas pour un repli. Ici chaque champ est choisi par
+         * le sens dans lequel il échoue :
+         *
+         *  - `previewMode = NEVER` — masquer un aperçu que l'utilisateur voulait voir est une
+         *    gêne visible et réversible ; afficher un aperçu qu'il avait masqué est une fuite
+         *    silencieuse sur un écran verrouillé. Ce n'est pas symétrique.
+         *  - `inlineReply = false` — pas de champ de saisie posé sur la base d'une configuration
+         *    qu'on ne sait pas lire.
+         *  - `enabled = true` — on notifie quand même. Taire un SMS entrant dans une application
+         *    de SMS est un échec fonctionnel que l'utilisateur subit sans comprendre, alors que
+         *    la notification masquée ne divulgue rien : l'expéditeur seul, sans le corps.
+         *  - `style = HEADS_UP` — comportement attendu par défaut, sans effet sur la vie privée.
+         */
+        private val FALLBACK_NOTIFICATIONS = NotificationSettings(
+            enabled = true,
+            style = NotificationStyle.HEADS_UP,
+            previewMode = PreviewMode.NEVER,
+            inlineReply = false,
+        )
+
+        private const val REPLY_REQUEST_SALT = 0x52455050 // 'REPL'
+        private const val MARK_READ_REQUEST_SALT = 0x4D524541 // 'MREA'
+        private const val COPY_CODE_REQUEST_SALT = 0x434F5059 // 'COPY'
+
+        /**
+         * v1.3.9 — durée après laquelle Android cancel automatiquement la notification
+         * d'un message arrivant sur la conv actuellement ouverte au foreground. 1500 ms
+         * laisse jouer le son + le heads-up (peak ≈ 800 ms sur la plupart des OEMs)
+         * tout en garantissant que la notification ne persiste pas dans le shade
+         * (l'utilisateur voit déjà le message en temps réel dans la conv ouverte).
+         */
+        private const val ACTIVE_CONV_TIMEOUT_MS: Long = 1500L
+    }
+}
+
+/**
+ * v1.28.3 (F19) — identifiant de notification stable pour un identifiant de message Room.
+ *
+ * Extrait de [IncomingMessageNotifier] pour être **testable sans échafaudage** : le défaut relevé
+ * par la relecture externe était purement arithmétique, et le notifier compte sept dépendances
+ * dont un `Context`. Le tester là où il vit aurait voulu dire ne pas le tester.
+ *
+ * # Le défaut, et le correctif qu'il a fallu corriger à son tour
+ *
+ * L'audit F38 avait remplacé `msgId.toInt().or(1)`, qui collisionnait un message sur deux, par
+ * `hash or BASE_TAG`. Le remède collisionnait aussi : `or 0x10000` force le bit 16, donc `1` et
+ * `65537` rendaient tous deux `65537`, et plus généralement toute paire `(n, n xor 0x10000)`.
+ *
+ * Le `or` détruisait de l'information pour une raison légitime — ne jamais rendre `0`, que le
+ * système écarterait — qu'un simple remplacement du seul cas `0` traite sans rien perdre.
+ *
+ * L'enjeu n'est pas l'affichage, borné par le tag de conversation : c'est que cet identifiant
+ * sert de `requestCode` aux `PendingIntent` des actions, où une collision pouvait faire partir
+ * une réponse au mauvais destinataire.
+ */
+internal fun notificationIdFor(messageId: Long): Int {
+    val hash = (messageId xor (messageId ushr 32)).toInt() and 0x7FFFFFFF
+    return if (hash == 0) NOTIFICATION_ID_FALLBACK else hash
+}
+
+/** Seule valeur de repli, pour l'unique identifiant dont le hachage vaut `0`. */
+internal const val NOTIFICATION_ID_FALLBACK = 0x10000
+
+/**
+ * v1.28.7 — le tag de toutes les notifications d'une conversation. Sorti de la classe pour que
+ * [notificationsToCancel] le construise à l'identique : deux écritures du même littéral auraient
+ * pu diverger, et l'annulation ne toucherait alors plus rien, sans erreur.
+ */
+internal fun conversationTagFor(conversationId: Long): String = "com.relay.sms.conv.$conversationId"
+
+/**
+ * v1.28.7 — parmi les notifications [actives] (tag, identifiant), celles qui portent un des
+ * messages [cibles], groupés par conversation.
+ *
+ * Fonction pure, et c'est le point : la décision d'annuler se teste sans `NotificationManager`.
+ * Une notification appartient à un message par la PAIRE tag + identifiant — l'identifiant seul
+ * est un hachage, deux conversations peuvent le partager. Les notifications sans tag
+ * (raccourci d'urgence, échecs d'envoi) ne sont jamais concernées.
+ */
+internal fun notificationsToCancel(
+    actives: List<Pair<String?, Int>>,
+    cibles: Map<Long, Collection<Long>>,
+): List<Pair<String, Int>> {
+    val voulues = HashSet<Pair<String, Int>>()
+    for ((conversationId, messages) in cibles) {
+        val tag = conversationTagFor(conversationId)
+        for (messageId in messages) voulues += tag to notificationIdFor(messageId)
+    }
+    return actives.mapNotNull { (tag, id) -> if (tag != null && (tag to id) in voulues) tag to id else null }
+}

@@ -1,0 +1,231 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.ui.components
+
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Description
+import androidx.compose.material.icons.outlined.Image
+import androidx.compose.material.icons.outlined.PersonOutline
+import androidx.compose.material.icons.outlined.Videocam
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
+import com.relay.sms.R
+import com.relay.sms.ui.theme.RelayText
+
+/**
+ * Compose-side picker for "compose with an attachment" (#2). Hosted by the thread's composer:
+ * tapping the paperclip opens this modal sheet, picking an option launches the appropriate
+ * system contract (photo, video, file, contact), the contract emits a [Uri] that is forwarded
+ * to the parent via [onAttachmentPicked].
+ *
+ * Each tile is wired to its **own** [rememberLauncherForActivityResult] so the contracts are
+ * registered at composition time — required by the new ActivityResultRegistry API. Cancelling
+ * a system picker dismisses gracefully (null uri ignored).
+ *
+ * UX choices:
+ *  - 4 round tiles in a single row, evenly spaced. Each tile is large enough (56 dp icon target)
+ *    to meet WCAG 2.5.5 (44×44 dp minimum).
+ *  - The sheet auto-dismisses after a successful pick to avoid double-taps that would launch
+ *    two contracts back-to-back.
+ *  - Subtitle "Envoyé comme MMS" sets honest expectations — the user knows their carrier will
+ *    charge MMS rates if they don't have an unlimited bundle.
+ */
+@Composable
+fun AttachmentPickerSheet(
+    onDismiss: () -> Unit,
+    onAttachmentPicked: (uri: Uri, kind: AttachmentKind) -> Unit,
+    /**
+     * Notes — the subtitle under the title. Null keeps the MMS
+     * subtitle ("Envoyé comme MMS"); a note passes its own text —
+     * note attachments are never sent as MMS.
+     */
+    subtitle: String? = null,
+) {
+    val photoLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickVisualMedia(),
+    ) { uri ->
+        if (uri != null) onAttachmentPicked(uri, AttachmentKind.PHOTO)
+        onDismiss()
+    }
+    val videoLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickVisualMedia(),
+    ) { uri ->
+        if (uri != null) onAttachmentPicked(uri, AttachmentKind.VIDEO)
+        onDismiss()
+    }
+    val fileLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri != null) onAttachmentPicked(uri, AttachmentKind.FILE)
+        onDismiss()
+    }
+    val contactLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickContact(),
+    ) { uri ->
+        if (uri != null) onAttachmentPicked(uri, AttachmentKind.CONTACT)
+        onDismiss()
+    }
+
+    // Relay UI refresh: the shared sheet shell (28dp top corners, drag handle, light
+    // scrim) instead of a bare ModalBottomSheet.
+    RelaySheet(onDismissRequest = onDismiss) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 24.dp)
+                // Round 4 — restore the breathing room above the title that the
+                // pre-refresh sheet had. Before the refresh this sheet was a bare
+                // ModalBottomSheet whose DEFAULT drag handle carries 22dp of
+                // vertical padding (material3 1.4.0, `DragHandleVerticalPadding`,
+                // verified in the library jar — same BOM then as now, 2026.09.00).
+                // The refresh switched to RelaySheet, whose handle is a bare 4dp
+                // pill with no padding, so the title ended up flush against it.
+                .padding(top = 22.dp)
+                .padding(bottom = 24.dp)
+                .navigationBarsPadding(),
+        ) {
+            Text(
+                text = stringResource(R.string.attach_sheet_title),
+                style = RelayText.ThreadTitle,
+            )
+            Text(
+                text = subtitle ?: stringResource(R.string.attach_sheet_subtitle),
+                style = RelayText.SystemNote,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 2.dp, bottom = 16.dp),
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly,
+            ) {
+                AttachmentTile(
+                    icon = Icons.Outlined.Image,
+                    label = stringResource(R.string.attach_photo),
+                    onClick = {
+                        photoLauncher.launch(
+                            androidx.activity.result.PickVisualMediaRequest(
+                                ActivityResultContracts.PickVisualMedia.ImageOnly,
+                            ),
+                        )
+                    },
+                )
+                AttachmentTile(
+                    icon = Icons.Outlined.Videocam,
+                    label = stringResource(R.string.attach_video),
+                    onClick = {
+                        videoLauncher.launch(
+                            androidx.activity.result.PickVisualMediaRequest(
+                                ActivityResultContracts.PickVisualMedia.VideoOnly,
+                            ),
+                        )
+                    },
+                )
+                AttachmentTile(
+                    icon = Icons.Outlined.Description,
+                    label = stringResource(R.string.attach_file),
+                    onClick = {
+                        // v1.3.10 — accepter N'IMPORTE QUEL fichier au niveau du file picker
+                        // système. Le cap de taille MMS (280 KB pratique chez les MMSCs FR)
+                        // filtrera de toute façon les fichiers trop gros à l'envoi, et le MIME
+                        // réel sera détecté + transmis par `MmsBuilder` au moment de la
+                        // construction du PDU. Élargir le picker à `*/*` débloque tous les
+                        // formats bureautiques (.docx, .xlsx, .pptx, .odt, .ods, .odp, .pdf,
+                        // .zip, .epub, .json, .csv, .xml…) que les utilisateurs s'attendent
+                        // à pouvoir joindre, sans avoir à maintenir une whitelist exhaustive
+                        // qui dévie inévitablement avec les nouveaux formats.
+                        fileLauncher.launch(arrayOf("*/*"))
+                    },
+                )
+                AttachmentTile(
+                    icon = Icons.Outlined.PersonOutline,
+                    label = stringResource(R.string.attach_contact),
+                    onClick = { contactLauncher.launch(null) },
+                )
+            }
+        }
+    }
+}
+
+/**
+ * High-level taxonomy reported back to the parent. The parent maps this to the concrete
+ * [com.relay.sms.domain.mms.MmsAttachment.Kind] at send time — keeping the UI
+ * layer independent of the MMS PDU types.
+ */
+enum class AttachmentKind { PHOTO, VIDEO, FILE, CONTACT }
+
+@Composable
+private fun AttachmentTile(
+    icon: ImageVector,
+    label: String,
+    onClick: () -> Unit,
+) {
+    val cs = MaterialTheme.colorScheme
+    val haptic = androidx.compose.ui.platform.LocalHapticFeedback.current
+    // v1.2.3 audit U8: hit area widened to ≥64 dp so the touch target meets WCAG 2.5.5 even
+    // for the "Contact" tile (~60 dp wide label). Semantics expose the role + the label so
+    // TalkBack announces "Photo, bouton" instead of just "Photo".
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier
+            .widthIn(min = 64.dp)
+            .clip(androidx.compose.foundation.shape.RoundedCornerShape(12.dp))
+            .clickable(
+                onClickLabel = label,
+                role = androidx.compose.ui.semantics.Role.Button,
+                onClick = {
+                    haptic.performHapticFeedback(androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress)
+                    onClick()
+                },
+            )
+            .padding(8.dp),
+    ) {
+        Box(
+            modifier = Modifier
+                .size(56.dp)
+                .clip(CircleShape)
+                .background(cs.primaryContainer),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = cs.onPrimaryContainer,
+                modifier = Modifier.size(28.dp),
+            )
+        }
+        Spacer(Modifier.size(6.dp))
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelMedium,
+            color = cs.onSurface,
+        )
+    }
+}

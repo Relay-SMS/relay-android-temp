@@ -1,0 +1,2844 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.ui.screens.thread
+
+import android.net.Uri
+import androidx.lifecycle.SavedStateHandle
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.relay.sms.core.ext.asEvents
+import com.relay.sms.core.ext.oneShotEvents
+import com.relay.sms.core.result.AppError
+import com.relay.sms.core.result.Outcome
+import com.relay.sms.data.local.datastore.SettingsRepository
+import com.relay.sms.data.local.db.entity.E2ePeerState
+import com.relay.sms.data.sms.SmsSegmentCounter
+import com.relay.sms.data.voice.VoicePlaybackController
+import com.relay.sms.data.voice.VoiceRecorder
+import com.relay.sms.domain.model.Conversation
+import com.relay.sms.domain.model.Message
+import com.relay.sms.domain.model.MessageWindowSpec
+import com.relay.sms.domain.repository.ConversationRepository
+import com.relay.sms.domain.repository.SetReactionResult
+import com.relay.sms.domain.settings.AppSettings
+import com.relay.sms.domain.settings.DeviceMode
+import com.relay.sms.domain.usecase.EnvoyerMessageUseCase
+import com.relay.sms.domain.usecase.ExportConversationPdfUseCase
+import com.relay.sms.domain.usecase.MarkConversationReadUseCase
+import com.relay.sms.domain.usecase.RetrySendUseCase
+import com.relay.sms.domain.usecase.SendMediaMmsUseCase
+import com.relay.sms.domain.usecase.SendReactionUseCase
+import com.relay.sms.domain.usecase.SendVoiceMmsUseCase
+import com.relay.sms.e2e.E2eNoticeUi
+import com.relay.sms.e2e.E2eThreadEntryPoint
+import com.relay.sms.e2e.E2eWireFormat
+import com.relay.sms.e2e.GroupEncryptionState
+import com.relay.sms.e2e.PlainReason
+import com.relay.sms.sync.client.ClientSendManagerEntryPoint
+import com.relay.sms.sync.client.ClientSyncEngineEntryPoint
+import com.relay.sms.system.notifications.ActiveConversationTracker
+import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import java.io.File
+import javax.inject.Inject
+
+@HiltViewModel
+class ThreadViewModel @Inject constructor(
+    savedStateHandle: SavedStateHandle,
+    private val repo: ConversationRepository,
+    private val envoyer: EnvoyerMessageUseCase,
+    private val sendVoiceMms: SendVoiceMmsUseCase,
+    private val retrySend: RetrySendUseCase,
+    private val markRead: MarkConversationReadUseCase,
+    private val segCounter: SmsSegmentCounter,
+    private val exportPdf: ExportConversationPdfUseCase,
+    private val voiceRecorder: VoiceRecorder,
+    private val playbackController: VoicePlaybackController,
+    private val settings: SettingsRepository,
+    private val blockNumber: com.relay.sms.domain.usecase.BlockNumberUseCase,
+    private val toggleConvState: com.relay.sms.domain.usecase.ToggleConversationStateUseCase,
+    private val contactRepo: com.relay.sms.domain.repository.ContactRepository,
+    private val sendReaction: SendReactionUseCase,
+    // v1.15.1 — Schedule a SMS for later via WorkManager (infra existait avant, UI nouvelle).
+    private val scheduleMessage: com.relay.sms.domain.usecase.ScheduleMessageUseCase,
+    private val incomingShare: com.relay.sms.system.share.IncomingShareHolder,
+    private val activeConversationTracker: ActiveConversationTracker,
+    @ApplicationContext private val context: android.content.Context,
+    @com.relay.sms.di.IoDispatcher private val io: kotlinx.coroutines.CoroutineDispatcher,
+    // v1.12.0 — overflow "Déplacer vers le coffre" : on a besoin du flag
+    // PanicDecoy pour gater l'item (cohérence avec masquage liste +
+    // Settings + filtre nav AppRoot). En decoy, l'item NE DOIT PAS
+    // apparaître (l'agresseur ne doit pas savoir qu'un coffre existe).
+    private val appLock: com.relay.sms.security.AppLockManager,
+) : ViewModel() {
+
+    /** Live playback state, surfaced for the composer's preview UI. */
+    val playbackState: StateFlow<VoicePlaybackController.PlaybackState> get() = playbackController.state
+
+    /**
+     * Round 12 — the user's most recently used reaction emojis, most recent
+     * first, for the quick-reaction bar on a bubble tap. Empty until the
+     * first reaction is sent; the bar falls back to its defaults then.
+     *
+     * The store is built from the injected application context, not a
+     * constructor parameter: the constructor is at the Detekt 20-parameter
+     * limit, and the `preferencesDataStore` delegate is a singleton per
+     * name, so this shares the same file as any injected instance would.
+     */
+    private val recentReactionsStore =
+        com.relay.sms.data.local.datastore.RecentReactionsStore(context)
+
+    val recentReactions: StateFlow<List<String>> = recentReactionsStore.flow
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000L), emptyList())
+
+    private val conversationId: Long = checkNotNull(savedStateHandle["conversationId"])
+
+    /**
+     * Feedback round 6 — one-shot mark-read state (see [scheduleDeferredMarkRead]
+     * / [markReadNow]). `readMarked` is set once the write has actually run;
+     * `deferredMarkReadJob` holds the pending delayed job so leaving the thread
+     * early can cancel it and mark read immediately instead.
+     */
+    private var readMarked = false
+    private var deferredMarkReadJob: Job? = null
+
+    /**
+     * v1.26.1 (audit H1, suite de revue) — `true` quand le Coffre s'est refermé alors que ce fil
+     * lui appartient. L'écran ressort du fil plutôt que d'afficher un écran vide dont l'envoi
+     * échoue en silence. Voir [ConversationRepository.observeVaultHidden].
+     *
+     * Valeur initiale `false` : ici, le repli signifie « ne pas naviguer », ce qui ne dévoile
+     * rien — le masquage du contenu, lui, est assuré par les flux de données eux-mêmes. C'est
+     * le sens sûr pour ce drapeau-ci.
+     */
+    val vaultHidden: StateFlow<Boolean> = repo.observeVaultHidden(conversationId)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000L), false)
+
+    /**
+     * Size of the loaded window. Raising it widens the query in place and the repository
+     * re-subscribes via `flatMapLatest`. It starts at [INITIAL_WINDOW_SIZE], not [PAGE_SIZE]:
+     * the first paint composes and lays out the whole window before jumping to its bottom,
+     * so opening a long conversation with a 200-message window is what made it feel slow.
+     *
+     * The scroll position is **not** preserved by Compose alone: its key-based re-anchoring only
+     * covers roughly 130 items around the first visible one, and [PAGE_SIZE] is 200. `ThreadScreen`
+     * therefore captures the anchor message and its offset before growing the window, and restores
+     * the position itself once the wider window lands.
+     *
+     * Feedback round 5 — this is the TAIL size only now: the loaded window is
+     * described by [windowSpec], which swaps the tail for a window ending at a
+     * search match when the user jumps to old history.
+     */
+    private val tailLimit = MutableStateFlow(INITIAL_WINDOW_SIZE)
+
+    /**
+     * Feedback round 5 — the message a jump anchored the window on
+     * (`null` = the default tail window). Set by [jumpToMessage] (search
+     * matches and the pinned-message banner share it), cleared by
+     * [clearWindowAnchor] when the search closes or the user goes back to
+     * the latest messages.
+     */
+    private val windowAnchor = MutableStateFlow<WindowAnchor?>(null)
+
+    /** Feedback round 5 — whether the window is currently anchored on a jumped-to message. */
+    val isWindowAnchored: StateFlow<Boolean> = windowAnchor
+        .map { it != null }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000L), false)
+
+    private val windowSpec: Flow<MessageWindowSpec> =
+        combine(tailLimit, windowAnchor) { limit, anchor ->
+            if (anchor == null) {
+                MessageWindowSpec.Tail(limit)
+            } else {
+                MessageWindowSpec.EndingAt(anchor.messageId, anchor.date, limit)
+            }
+        }
+
+    /** Loads one more page of older messages. No-op when everything is already loaded. */
+    fun loadOlder() {
+        if (!_state.value.hasMoreMessages || _state.value.isLoadingOlder) return
+        _state.update { it.copy(isLoadingOlder = true) }
+        tailLimit.update { it + PAGE_SIZE }
+    }
+
+    /**
+     * Feedback round 5 — full-history thread search.
+     *
+     * The typed query is debounced like the conversations-list search (200 ms;
+     * blank clears immediately), then the repository re-runs the SQL `LIKE`
+     * over the WHOLE thread on IO; Room re-emits when the table changes, so the
+     * match count stays fresh if a matching message arrives mid-search. The
+     * screen maps the ids onto the loaded window ([mapThreadSearchMatches])
+     * for the count, the highlight ranges and the jump targets.
+     */
+    private val searchQueryInput = MutableStateFlow("")
+
+    @OptIn(FlowPreview::class)
+    val threadSearchResults: StateFlow<ThreadSearchResults> = searchQueryInput
+        .debounce { query -> if (query.isBlank()) 0L else THREAD_SEARCH_DEBOUNCE_MS }
+        .distinctUntilChanged()
+        .flatMapLatest { query ->
+            if (query.isBlank()) {
+                flowOf(ThreadSearchResults("", emptyList()))
+            } else {
+                repo.observeSearchInConversation(conversationId, query)
+                    .map { ids -> ThreadSearchResults(query, ids) }
+            }
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000L), ThreadSearchResults("", emptyList()))
+
+    /** Feedback round 5 — feeds the debounced search above; called on every keystroke. */
+    fun setThreadSearchQuery(query: String) {
+        searchQueryInput.value = query
+    }
+
+    /**
+     * Feedback round 5 — jumps the loaded window to [messageId], a search
+     * match in old history that is not in the current window. The message is
+     * resolved for its date (the keyset anchor), then the window reloads
+     * ending at it — the match lands at the bottom with its preceding
+     * messages as context. The screen scrolls to it once it is loaded.
+     */
+    fun jumpToSearchMatch(messageId: Long) = jumpToMessage(messageId)
+
+    /**
+     * Feedback round 5 — the shared jump-to-message loader: resolves the
+     * message for its date (the keyset anchor) and reloads the window ending
+     * at it. Used by search jumps and by the pinned-message banner.
+     */
+    fun jumpToMessage(messageId: Long) {
+        viewModelScope.launch {
+            val target = runCatching { repo.findMessageById(messageId) }.getOrNull()
+                ?: return@launch
+            windowAnchor.value = WindowAnchor(target.id, target.date)
+        }
+    }
+
+    /**
+     * Feedback round 5 — back to the newest window after a jump. The screen
+     * scrolls to the bottom once the tail window lands.
+     */
+    fun clearWindowAnchor() {
+        windowAnchor.value = null
+        _isPinAnchored.value = false
+    }
+
+    /**
+     * Feedback round 5 — the pinned message the banner wants the list to
+     * scroll to. Set by [jumpToPinnedMessage]; the screen scrolls to it once
+     * it is in the loaded window, then clears it with [clearPinJumpTarget].
+     */
+    private val _pinJumpTarget = MutableStateFlow<Long?>(null)
+    val pinJumpTarget: StateFlow<Long?> = _pinJumpTarget.asStateFlow()
+
+    fun clearPinJumpTarget() {
+        _pinJumpTarget.value = null
+    }
+
+    /**
+     * Feedback round 5 — whether the window is anchored because the user
+     * jumped to the pinned message (as opposed to a search match). Drives
+     * the "Latest" button that takes them back to the newest window.
+     */
+    private val _isPinAnchored = MutableStateFlow(false)
+    val isPinAnchored: StateFlow<Boolean> = _isPinAnchored.asStateFlow()
+
+    /**
+     * Feedback round 5 — pins [messageId] in this conversation, or unpins
+     * it when it is already the pinned message. One pin per conversation:
+     * pinning another message replaces the current pin. The pin date is
+     * "now" — it is what the banner shows ("Pinned · 11/3/26 at 9:41 PM").
+     */
+    fun togglePin(messageId: Long) {
+        viewModelScope.launch {
+            if (_state.value.conversation?.pinnedMessageId == messageId) {
+                repo.setPinnedMessage(conversationId, null, null)
+            } else {
+                repo.setPinnedMessage(conversationId, messageId, System.currentTimeMillis())
+            }
+        }
+    }
+
+    /**
+     * Feedback round 5 — jumps to the pinned message from the banner. When
+     * it is already in the loaded window, just scroll to it; otherwise load
+     * the window around it first (same [jumpToMessage] loader as search)
+     * and scroll once it lands. The window stays anchored afterwards, so
+     * the "Latest" button offers the way back to the newest messages.
+     */
+    fun jumpToPinnedMessage(messageId: Long) {
+        if (_state.value.messages.any { it.id == messageId }) {
+            _pinJumpTarget.value = messageId
+        } else {
+            viewModelScope.launch {
+                val target = runCatching { repo.findMessageById(messageId) }.getOrNull()
+                    ?: return@launch
+                windowAnchor.value = WindowAnchor(target.id, target.date)
+                _isPinAnchored.value = true
+                _pinJumpTarget.value = messageId
+            }
+        }
+    }
+
+    /**
+     * Feedback round 5 — id of the pinned message the [pinnedOutsideWindow]
+     * copy was resolved for (`null` = nothing pinned or not resolved yet).
+     * Guards [resolvePinnedMessage] so a conversation re-emission (draft
+     * keystroke, read receipt) does not re-run the lookup.
+     */
+    private var pinnedResolveId: Long? = null
+
+    /**
+     * Feedback round 5 — resolves the pinned message for the banner fallback
+     * copy. Runs only when the pinned id changes: a `null` id clears the
+     * copy, a new id looks the message up once. When the lookup comes back
+     * empty the message is gone (purge, resync) — the pin self-heals by
+     * clearing itself instead of leaving a banner that points nowhere.
+     */
+    private fun resolvePinnedMessage(pinnedMessageId: Long?) {
+        if (pinnedMessageId == null) {
+            pinnedResolveId = null
+            return
+        }
+        if (pinnedMessageId == pinnedResolveId) return
+        pinnedResolveId = pinnedMessageId
+        viewModelScope.launch {
+            val resolved = runCatching { repo.findMessageById(pinnedMessageId) }.getOrNull()
+            if (resolved == null) {
+                repo.setPinnedMessage(conversationId, null, null)
+            } else {
+                _state.update { it.copy(pinnedOutsideWindow = resolved) }
+            }
+        }
+    }
+
+    /**
+     * Resolves reply targets that are not in the loaded window, so their quote renders properly.
+     *
+     * Idempotent and additive: ids already resolved — or already visible in the window — are
+     * skipped, so the caller can hand over the full set of missing ids on every recomposition
+     * without causing a query storm. Targets that genuinely no longer exist are recorded as
+     * absent by [unresolvableQuoteIds] so they are not retried forever.
+     */
+    fun ensureQuotedResolved(ids: Set<Long>) {
+        val pending = ids - _state.value.quotedOutsideWindow.keys - unresolvableQuoteIds
+        if (pending.isEmpty()) return
+        viewModelScope.launch {
+            val resolved = mutableMapOf<Long, Message>()
+            pending.forEach { id ->
+                val message = runCatching { repo.findMessageById(id) }.getOrNull()
+                if (message != null) resolved[id] = message else unresolvableQuoteIds += id
+            }
+            if (resolved.isNotEmpty()) {
+                _state.update { it.copy(quotedOutsideWindow = it.quotedOutsideWindow + resolved) }
+            }
+        }
+    }
+
+    /** Reply targets confirmed missing — deleted or purged. Prevents endless re-lookups. */
+    private val unresolvableQuoteIds = mutableSetOf<Long>()
+
+    /**
+     * Voice composer state machine:
+     *   Idle      → no recording, normal text composer
+     *   Recording → microphone is live, [elapsedMs]/[amplitude] update every 100 ms
+     *   Reviewing → recording finished, user can play it back and Send or Discard
+     */
+    sealed interface VoiceState {
+        data object Idle : VoiceState
+        data class Recording(val elapsedMs: Long, val amplitude: Int) : VoiceState
+        data class Reviewing(
+            val file: File,
+            val durationMs: Long,
+            val sizeBytes: Long,
+            val mimeType: String,
+        ) : VoiceState
+    }
+
+    /**
+     * v1.6.1 (audit QUAL-17) — `@Stable` indique au compilateur Compose que les écritures
+     * sur les propriétés `val` de la data class sont observables via le moteur de runtime
+     * (StateFlow chez nous). Sans cette annotation, Compose marque la classe `unstable` et
+     * recompose tout sous-arbre qui la lit dès qu'un parent change. Avec 14 champs ici,
+     * le gain est significatif sur l'animation/scroll des bulles.
+     */
+    @androidx.compose.runtime.Stable
+    data class UiState(
+        val isLoading: Boolean = true,
+        val conversation: Conversation? = null,
+        val messages: List<Message> = emptyList(),
+        val draft: String = "",
+        val segments: SmsSegmentCounter.Stats = SmsSegmentCounter.Stats(0, 0, 0, false),
+        val isExporting: Boolean = false,
+        /**
+         * v1.28.4 — noms de contact des expéditeurs, par adresse brute de message : c'est le nom
+         * que chaque bulle reçue d'un GROUPE affiche. Inutilisé pour une conversation ordinaire.
+         */
+        val memberNames: Map<String, String> = emptyMap(),
+        /**
+         * Round 33 — group member contact photos (`PHOTO_THUMBNAIL_URI`),
+         * by raw address: the details panel's Members rows and the
+         * group header's overlapping minis show real photos, falling
+         * back to initials when a member has none. Empty for 1:1
+         * threads — the header uses [contactPhotoUri] there.
+         */
+        val memberPhotos: Map<String, String> = emptyMap(),
+        val draftSeeded: Boolean = false,
+        val hasContact: Boolean = false,
+        /**
+         * Feedback round 7 — contact photo (`PHOTO_THUMBNAIL_URI`) for the
+         * thread header avatar, resolved from the first address via
+         * [ContactRepository.lookupByPhone] — the same lookup the main list
+         * uses for its contact photos. The user-picked custom avatar
+         * ([Conversation.avatarUri]) still wins at the call site; groups
+         * stay `null` (no single contact to show — the group glyph stays).
+         */
+        val contactPhotoUri: String? = null,
+        /**
+         * Round 43 — the best available contact photo for the
+         * Details panel's 96dp header avatar, resolved from the
+         * first address in the same lookup as [contactPhotoUri]:
+         * the FULL-SIZE photo (`PHOTO_URI`) when the contact has
+         * one, the thumbnail otherwise. The ~96px thumbnail
+         * pixelates at 96dp; the thread header keeps the thumbnail
+         * (small). Null for groups, like [contactPhotoUri]. The
+         * fallback lives HERE, not in the panel — the panel takes
+         * one photo URI (its parameter list is already at Detekt's
+         * 20-parameter ceiling).
+         */
+        val contactPhotoLargeUri: String? = null,
+        val messageCount: Int = 0,
+        /** Older messages exist beyond the loaded window. */
+        val hasMoreMessages: Boolean = false,
+        /** A "load older" request is in flight. */
+        val isLoadingOlder: Boolean = false,
+        /**
+         * Reply targets that live OUTSIDE the loaded window, resolved on demand.
+         *
+         * Without this a reply quoting an old message would render as "message supprimé" as soon
+         * as its target scrolled out of the window — telling the user their message is gone when
+         * it is merely not loaded.
+         */
+        val quotedOutsideWindow: Map<Long, Message> = emptyMap(),
+        /**
+         * Feedback round 5 — the pinned message, resolved from the database
+         * when it is NOT in the loaded window. The banner prefers the live
+         * copy from [messages] when it is loaded (so it follows text edits);
+         * this is the fallback for an old pinned message. `null` when nothing
+         * is pinned, or while the resolution is still running.
+         */
+        val pinnedOutsideWindow: Message? = null,
+        val firstMessageAt: Long? = null,
+        val lastMessageAt: Long? = null,
+        val voice: VoiceState = VoiceState.Idle,
+        val isSendingVoice: Boolean = false,
+        /**
+         * v1.26.1 (audit H7) — un envoi texte ou média est en cours.
+         *
+         * Le chemin VOCAL avait déjà son garde (`isSendingVoice`) et son bouton remplacé par un
+         * indicateur de progression ; les chemins texte et média n'en avaient AUCUN, et le bouton
+         * Envoyer n'avait pas de `enabled`. Or `sendSms.invoke` suspend plusieurs dizaines de
+         * millisecondes (lecture de la liste noire, insertion dans `content://sms`, transaction
+         * Room) et le brouillon n'est vidé qu'APRÈS le retour : un second appui dans cette
+         * fenêtre partait avec le même corps et envoyait — et facturait — un deuxième SMS.
+         */
+        val isSending: Boolean = false,
+        /**
+         * Non-null when the user tapped Send while [SendingSettings.confirmBeforeBroadcast] is on.
+         * UI displays a confirm dialog with this body; [confirmPendingSend] / [cancelPendingSend]
+         * resolves it.
+         */
+        val pendingSend: String? = null,
+        /**
+         * v1.28.3 (F30) — vrai quand l'utilisateur a tapé Envoyer avec des pièces jointes en
+         * attente et que [SendingSettings.confirmBeforeBroadcast] est actif.
+         *
+         * Le réglage promettait de couvrir « tous les chemins d'envoi », et le commentaire de
+         * `ThreadScreen` l'affirmait encore — mais le dialogue de confirmation des pièces
+         * jointes avait été retiré en v1.3.4 au profit de la bande de staging. Or la bande
+         * MONTRE ce qui est joint, elle ne demande pas s'il faut l'envoyer : l'envoi le plus
+         * coûteux était devenu le seul à partir sans confirmation.
+         */
+        val pendingAttachmentSend: Boolean = false,
+        /**
+         * Active contextual-reply target (#8). Set by [startReply] when the user picks
+         * "Répondre" from a bubble's overflow menu; the composer paints a cartouche with the
+         * quoted excerpt and the next [send] call tags the outgoing row with this message's id.
+         * Cleared by [cancelReply], by a successful send, or when the user switches threads.
+         */
+        val replyingTo: Message? = null,
+        /**
+         * v1.3.4 — pièces jointes stagées dans le composer (passé du dialog modal singleton
+         * v1.2.1 à une liste affichée comme une bande horizontale au-dessus du champ texte).
+         * L'utilisateur empile autant de PJ qu'il veut (cap par taille totale 280 KB,
+         * pas par nombre), peut en retirer une via le X sur le chip, écrit éventuellement
+         * du texte, puis tap Envoyer = un seul MMS multipart (texte + N PJ).
+         *
+         * État vide = `emptyList()`. Le composer reste fonctionnel pour les SMS texte purs.
+         */
+        val pendingAttachments: List<PendingAttachment> = emptyList(),
+        /** Voice MMS staged for confirmation (toggle "Confirmer avant envoi" ON). */
+        val pendingVoiceConfirm: Boolean = false,
+        /**
+         * v1.11.0 — Sujet 3 anti-smishing : toggle Settings exposé dans le state
+         * pour gater l'application de [com.relay.sms.domain.smishing.SmishingDetector]
+         * sur les bulles entrantes côté [com.relay.sms.ui.screens.thread.ThreadScreen].
+         */
+        val smishingDetectionEnabled: Boolean = true,
+        /**
+         * v1.11.0 audit P1 — verdicts smishing calculés côté ViewModel sur IO
+         * dispatcher (ne plus bloquer le main thread dans `remember` côté
+         * ThreadScreen). Clef = message.id, valeur = liste des raisons
+         * détectées (vide si non-suspect ou sortant). Mis à jour quand
+         * `messages` change ou que le toggle bascule.
+         */
+        val smishingVerdicts: Map<Long, List<com.relay.sms.domain.smishing.SmishingReason>> = emptyMap(),
+        /**
+         * v1.12.0 — flag PanicDecoy pour gater l'overflow item "Déplacer
+         * vers le coffre" / "Sortir du coffre". En decoy, l'option ne doit
+         * pas apparaître (preserve l'illusion app SMS ordinaire).
+         */
+        val isPanicDecoy: Boolean = false,
+        /**
+         * Client mode C2 — true when this device is a linked device:
+         * the thread is read-only (no composer, no bubble actions
+         * that write, no schedule/block/delete/rename in the menu).
+         * Set from the settings collector, like
+         * [smishingDetectionEnabled].
+         */
+        val isClientMode: Boolean = false,
+        /**
+         * Client mode C5 — the attachment download states for this
+         * thread's bubbles, keyed by local attachment id. Empty in
+         * hub mode (and before the first download starts).
+         */
+        val attachmentDownloads: Map<Long, com.relay.sms.sync.client.ClientDownloadState> = emptyMap(),
+        /**
+         * E2E — this conversation's peer state (1:1 only; groups use
+         * [e2eGroupState] and this stays UNKNOWN). Observed live
+         * from [com.relay.sms.e2e.E2ePeerRepository]: the
+         * composer placeholder and the send icon flip the moment
+         * the key exchange completes, without reopening the thread.
+         */
+        val e2ePeerState: E2ePeerState = E2ePeerState.UNKNOWN,
+        /**
+         * E2E groups (round 49, design §13) — this conversation's
+         * group encryption state (groups only; 1:1 threads stay on
+         * the [PlainReason.NOT_A_GROUP] default). Observed live
+         * from [com.relay.sms.e2e.E2eGroupStateProvider]: the
+         * composer placeholder, the send icon and the
+         * details-panel row flip the moment the last member's
+         * exchange completes, without reopening the thread.
+         */
+        val e2eGroupState: GroupEncryptionState =
+            GroupEncryptionState.Plain(PlainReason.NOT_A_GROUP, emptyList()),
+        /** E2E — the peer was verified by comparing safety numbers. */
+        val e2eVerified: Boolean = false,
+        /**
+         * E2E — this conversation's in-thread notices (activation /
+         * key change), oldest first. The screen interleaves them with
+         * the messages by date ([com.relay.sms.e2e.E2eThreadNotices]).
+         */
+        val e2eNotices: List<E2eNoticeUi> = emptyList(),
+    )
+
+    /** Staged attachment awaiting user confirmation in the composer. */
+    data class PendingAttachment(
+        val file: java.io.File,
+        val mimeType: String,
+        val displayName: String,
+        val sizeBytes: Long,
+    )
+
+    sealed interface Event {
+        /**
+         * v1.3.7 — `isError` distingue les confirmations positives (succès → snackbar slate-blue,
+         * couleur de marque) des notifications d'échec (erreur → snackbar rouge `errorContainer`).
+         * Default `false` pour ne casser aucun call site existant ; les sites _FAILED le passent
+         * explicitement à `true`. Cf. [com.relay.sms.ui.screens.thread.ThreadScreen] qui
+         * traduit ce flag en `containerColor` via [androidx.compose.material3.SnackbarVisuals].
+         */
+        data class ShowSnackbar(val message: String, val isError: Boolean = false) : Event
+        data class PdfReady(val uri: android.net.Uri, val pages: Int) : Event
+        data class SendError(val error: AppError) : Event
+
+        /**
+         * v1.28.3 (F21) — l'envoi a abouti pour une partie seulement des destinataires.
+         *
+         * Distinct de [SendError], qui dit « rien n'est parti ». Ici quelque chose est parti, le
+         * brouillon a donc été effacé à juste titre, et c'est précisément ce qui rendait le
+         * silence trompeur : l'écran se comportait exactement comme après un envoi complet.
+         *
+         * [blocked] est compté à part de [failed] parce que ce n'est pas une panne : l'envoi a
+         * été refusé par une règle que l'utilisateur a lui-même posée, et attendre « que ça
+         * repasse » ne servirait à rien.
+         */
+        data class PartialSend(val sent: Int, val failed: Int, val blocked: Int) : Event
+
+        /**
+         * "Mettre à jour un contact" — ouvre l'éditeur système en mode `ACTION_INSERT_OR_EDIT`
+         * (sélecteur : rattacher le numéro à un contact existant, ou en créer un).
+         */
+        data class OpenAddContact(val rawNumber: String) : Event
+
+        /**
+         * "Modifier le contact" (round 42) — ouvre l'éditeur système sur la fiche du
+         * contact existant (`ACTION_EDIT` + URI du contact), sans passer par le sélecteur.
+         */
+        data class OpenEditContact(val contactId: Long) : Event
+
+        /**
+         * "Créer un contact" — ouvre l'éditeur système sur une fiche vierge pré-remplie
+         * (`ACTION_INSERT`), sans passer par le sélecteur de contacts existants.
+         */
+        data class OpenCreateContact(val rawNumber: String) : Event
+
+        /** Launch the system dialer pre-filled with the conversation's phone number. */
+        data class OpenDialer(val rawNumber: String) : Event
+    }
+
+    private val _state = MutableStateFlow(UiState())
+    val state: StateFlow<UiState> = _state.asStateFlow()
+
+    private val _events = oneShotEvents<Event>()
+    val events: SharedFlow<Event> = _events.asEvents()
+
+    private var recorderJob: Job? = null
+
+    /** Client mode C2 — the fetch-on-open guard (once per ViewModel, see `init`). */
+    private var fetchOnOpenDone = false
+
+    /** E2E — the probe-on-open guard (once per ViewModel, see `init`). */
+    private var e2eProbeOnOpenDone = false
+
+    /** E2E — the notice-backfill-on-open guard (once per ViewModel, see `init`). */
+    private var e2eBackfillOnOpenDone = false
+
+    /**
+     * Feedback round 7 — re-resolution trigger for the header contact photo.
+     * The address flow below only re-runs when the address changes, so a
+     * READ_CONTACTS grant while the thread is open needs an explicit nudge —
+     * same pattern as `ConversationsViewModel.contactPhotoTick`.
+     */
+    private val contactPhotoTick = MutableStateFlow(0)
+
+    /** Re-resolves [UiState.contactPhotoUri] (call on resume / permission grant). */
+    fun refreshContactPhoto() {
+        contactPhotoTick.update { it + 1 }
+    }
+
+    /**
+     * v1.6.1 PERF-01 / v1.6.2 BUGFIX — snapshot chaud des AppSettings.
+     *
+     * **Bug v1.6.1** : la version précédente utilisait `stateIn(viewModelScope,
+     * WhileSubscribed(5_000))` mais aucun consommateur ne collectait jamais la
+     * StateFlow (lecture uniquement via `.value`). Sans collecteur actif, le flux
+     * sous-jacent n'était jamais souscrit et `.value` retournait toujours la valeur
+     * initiale `AppSettings()` — donc TOUS les réglages utilisateur étaient ignorés :
+     * `confirmBeforeBroadcast`, `reactionEmojiOnly`,
+     * `sendReactionsToRecipient`, etc. resteraient figés sur leurs valeurs DEFAULT.
+     *
+     * **Fix v1.6.2** : on lit directement `settings.state` (StateFlow `Eagerly`
+     * hydratée par `appScope` côté [SettingsRepository]) — garantie d'être à jour
+     * tout au long de la vie du processus, zero-I/O, sans race.
+     */
+    private val cachedSettings: StateFlow<AppSettings> get() = settings.state
+
+    /**
+     * v1.11.0 audit P1 — recompute smishing verdicts sur IO dispatcher. Le
+     * calcul des regex + Levenshtein peut prendre 3-15 ms par message sur
+     * low-end ; sur thread 200 messages cela bloquerait le main thread
+     * pendant 600 ms à 3 s en première composition. Ici on calcule sur IO,
+     * on émet une seule fois le Map résultant — la recomposition Compose
+     * sur changement de StateFlow ne fait que lire un Map (O(1) par bulle).
+     *
+     * Optimisation cache : on PRÉSERVE les verdicts déjà calculés pour les
+     * mêmes message.id si le body n'a pas changé (rare en SMS — un message
+     * ne change pas son contenu). En pratique on récalcule seulement les
+     * nouveaux IDs apparus dans `msgs`, ce qui rend le coût O(delta).
+     */
+    // v1.11.0 audit SEC-V6 — job courant annulé avant re-lancement pour
+    // éviter qu'un toggle rapide ON→OFF→ON ne produise deux compute IO
+    // concurrents avec un snapshot stale → Map smishingVerdicts incohérent.
+    private var smishingJob: Job? = null
+
+    private fun recomputeSmishingVerdicts(
+        msgs: List<com.relay.sms.domain.model.Message>,
+    ) {
+        smishingJob?.cancel()
+        smishingJob = viewModelScope.launch(io) {
+            val previous = _state.value.smishingVerdicts
+            val verdicts = msgs.asSequence()
+                .filter { it.isIncoming && it.body.isNotBlank() }
+                .associate { msg ->
+                    val cached = previous[msg.id]
+                    val reasons = cached ?: com.relay.sms.domain.smishing.SmishingDetector
+                        .analyze(msg.body)
+                        .takeIf { it.shouldWarn }
+                        ?.reasons
+                        ?: emptyList()
+                    msg.id to reasons
+                }
+                .filterValues { it.isNotEmpty() } // ne stocke que les positifs
+            _state.update { it.copy(smishingVerdicts = verdicts) }
+        }
+    }
+
+    init {
+        // v1.12.0 — propage `isPanicDecoy` dans le state pour gater
+        // l'overflow item "Déplacer vers le coffre" côté UI.
+        viewModelScope.launch {
+            appLock.state.collect { lockState ->
+                val inDecoy = lockState is com.relay.sms.security.AppLockManager.LockState.PanicDecoy
+                if (_state.value.isPanicDecoy != inDecoy) {
+                    _state.update { it.copy(isPanicDecoy = inDecoy) }
+                }
+            }
+        }
+
+        // v1.11.0 — Sujet 3 anti-smishing : propage le toggle Settings + RE-
+        // CALCULE les verdicts pour les messages quand toggle bascule. Une
+        // seule collect sur `settings.state` (hot StateFlow Eagerly), zéro
+        // coût supplémentaire en lecture.
+        viewModelScope.launch {
+            settings.state.collect { snapshot ->
+                val enabled = snapshot.security.smishingDetectionEnabled
+                _state.update {
+                    it.copy(
+                        smishingDetectionEnabled = enabled,
+                        // Client mode C2 — the thread reads its mode
+                        // from the same snapshot (one collect, no
+                        // extra subscription).
+                        isClientMode = snapshot.mode == DeviceMode.CLIENT,
+                    )
+                }
+                // Audit P1 : recompute sur IO lorsque le toggle change.
+                if (enabled) {
+                    recomputeSmishingVerdicts(_state.value.messages)
+                } else {
+                    _state.update { it.copy(smishingVerdicts = emptyMap()) }
+                }
+            }
+        }
+
+        // Client mode C5 — the attachment download states for this
+        // thread's bubbles (one map, keyed by local attachment id).
+        // Resolved via the Hilt entry point — the constructor is at
+        // the 20-parameter cap (same reason as [clientSendManager]
+        // below). A missing downloader leaves the map empty: the
+        // bubbles render as before.
+        viewModelScope.launch {
+            val downloader = runCatching { clientAttachmentDownloader() }.getOrNull() ?: return@launch
+            downloader.states.collect { states ->
+                _state.update { it.copy(attachmentDownloads = states) }
+            }
+        }
+
+
+        // Audit Q3: ONE observation of the conversation row (seeds the draft on first emission
+        // only — subsequent emissions don't overwrite what the user is typing).
+        // v1.6.1 (audit PERF-02) — la lookup contact est séparée et déclenchée UNIQUEMENT
+        // quand le numéro du destinataire change. Avant : chaque frappe clavier mettait à
+        // jour le champ `draft` de la conversation → l'`onEach` se redéclenchait → query
+        // ContentProvider Contacts sur chaque frappe (jusqu'à 30 ms par lookup en cache miss).
+        val convFlow = repo.observeOne(conversationId)
+        convFlow.onEach { conv ->
+            _state.update { st ->
+                // v1.6.1 (audit QUAL-06) — `conv?.draft.orEmpty()` au lieu de
+                // `conv!!.draft.orEmpty()`. Si `seededDraft = true` alors `conv.draft`
+                // est non-vide donc `conv != null` ; mais le compilateur ne capture pas
+                // l'invariante à travers deux variables séparées. `?.` produit le même
+                // résultat ("" si null) sans risque NPE si un refactor casse l'invariante.
+                val seededDraft = !st.draftSeeded && !conv?.draft.isNullOrEmpty()
+                val draft = if (seededDraft) conv?.draft.orEmpty() else st.draft
+                st.copy(
+                    conversation = conv,
+                    draft = draft,
+                    segments = if (seededDraft) segCounter.count(draft) else st.segments,
+                    draftSeeded = st.draftSeeded || conv != null,
+                    // Feedback round 5 — no pin, no fallback copy.
+                    pinnedOutsideWindow = if (conv?.pinnedMessageId == null) {
+                        null
+                    } else {
+                        st.pinnedOutsideWindow
+                    },
+                )
+            }
+            // Feedback round 5 — resolve the pinned message when the pin
+            // changes. A missing message (deleted by a path the explicit
+            // delete hook did not cover — auto-purge, resync) self-heals:
+            // the pin is cleared so no banner points at a ghost.
+            resolvePinnedMessage(conv?.pinnedMessageId)
+            // Client mode C2 — fetch-on-open: on the first conversation
+            // emission, walk this thread's history from its stored
+            // frontier (the engine no-ops when the thread is complete
+            // or already fetched this session). Guarded to once per
+            // ViewModel: the row re-emits on every message, and each
+            // emission must not re-fetch. The engine is resolved via
+            // the Hilt entry point — the constructor is at the
+            // 20-parameter cap (same reason as
+            // [recentReactionsStore] above).
+            if (conv != null && !fetchOnOpenDone &&
+                settings.state.value.mode == DeviceMode.CLIENT
+            ) {
+                fetchOnOpenDone = true
+                viewModelScope.launch {
+                    runCatching {
+                        dagger.hilt.android.EntryPointAccessors.fromApplication(
+                            context,
+                            ClientSyncEngineEntryPoint::class.java,
+                        ).clientSyncEngine().fetchThread(conversationId)
+                    }.onFailure {
+                        timber.log.Timber.w(it, "ThreadViewModel: fetch-on-open failed")
+                    }
+                }
+            }
+            // E2E — probe on thread open (design §2.4): opening a 1:1
+            // thread is intent to talk, so the key exchange starts here
+            // and the first message is usually encrypted already. Once
+            // per ViewModel (the row re-emits on every message). Hub
+            // mode only: a linked device holds no identity keys and
+            // must never probe. The manager gates the rest itself
+            // (probeable number, budget, state). The four-way gate
+            // reads as one named condition (and keeps the `if` under
+            // Detekt's complexity ceiling).
+            val e2eShouldProbe = conv != null && !conv.isGroup && !e2eProbeOnOpenDone &&
+                settings.state.value.mode != DeviceMode.CLIENT
+            if (e2eShouldProbe) {
+                e2eProbeOnOpenDone = true
+                runCatching { e2eEntryPoint().probeManager().onThreadOpened(conversationId) }
+                    .onFailure {
+                        timber.log.Timber.w(it, "ThreadViewModel: e2e probe-on-open failed")
+                    }
+            }
+            // E2E — ACTIVATED-notice backfill on thread open (round
+            // 48): a conversation that re-established encryption
+            // under round 46 never got its second ACTIVATED pill
+            // (round 47's recordActivated only runs on a new bundle
+            // or encrypted message), so its latest pill still says
+            // "Encryption ended" while encryption is working. Same
+            // once-per-ViewModel, 1:1-only, hub-only gate as the
+            // probe above — a linked device holds no peer rows of
+            // its own and receives its notices from the hub. The
+            // backfill itself is self-limiting (after the insert
+            // the latest notice is ACTIVATED), so the guard only
+            // stops the redundant reads on later row emissions.
+            val e2eShouldBackfill = conv != null && !conv.isGroup &&
+                !e2eBackfillOnOpenDone &&
+                settings.state.value.mode != DeviceMode.CLIENT
+            if (e2eShouldBackfill) {
+                e2eBackfillOnOpenDone = true
+                conv?.firstAddress?.normalized?.let { address ->
+                    viewModelScope.launch {
+                        runCatching {
+                            val e2e = e2eEntryPoint()
+                            val peer = e2e.peerRepository().getPeer(address)
+                            e2e.noticeStore()
+                                .backfillActivatedIfNeeded(conversationId, peer)
+                        }.onFailure {
+                            timber.log.Timber.w(it, "ThreadViewModel: e2e notice backfill failed")
+                        }
+                    }
+                }
+            }
+        }.launchIn(viewModelScope)
+        combine(
+            convFlow.map { conv ->
+                conv?.let {
+                    Triple(
+                        it.addresses.map { a -> a.raw },
+                        it.isGroup,
+                        // Round 44 — the cached display name rides
+                        // along so the stale-name heal below can see
+                        // it without a second read (and a cleared
+                        // name re-emits, re-running the lookup once
+                        // with the guard already closed).
+                        it.displayName,
+                    )
+                }
+            }.distinctUntilChanged(),
+            contactPhotoTick,
+        ) { address, _ -> address }
+            .onEach { address ->
+                val numbers = address?.first.orEmpty()
+                val isGroup = address?.second == true
+                val displayName = address?.third
+                // v1.28.13 (MR F-Droid !38458) — sans `READ_CONTACTS`, la recherche lève
+                // `SecurityException` ; non rattrapée dans `viewModelScope`, ouvrir n'importe quelle
+                // conversation faisait planter l'app (jumeau de `ComposeViewModel.chargerContacts`).
+                // « Contact introuvable » est le bon repli ICI : il ne fait que proposer « Ajouter
+                // aux contacts », que l'appli Contacts du système traite sans notre permission.
+                // Round 33 — every address is looked up, not just the
+                // first: a group needs each member's photo for the
+                // details panel (Members rows + header minis), the
+                // same lookup the main list uses for its group
+                // avatars. A 1:1 thread has one address, so its
+                // behaviour is unchanged.
+                val contacts = numbers.mapNotNull { numero ->
+                    com.relay.sms.core.result
+                        .runCatchingCancellable { contactRepo.lookupByPhone(numero) }
+                        .getOrNull()?.let { numero to it }
+                }.toMap()
+                val firstContact = numbers.firstOrNull()?.let { contacts[it] }
+                _state.update {
+                    it.copy(
+                        hasContact = firstContact != null,
+                        // Feedback round 7 — header avatar photo, same lookup
+                        // as the main list. Groups keep the group glyph, so
+                        // the photo is only resolved for 1:1 threads.
+                        contactPhotoUri = if (isGroup) null else firstContact?.photoUri,
+                        // Round 43 — the best available photo for the
+                        // Details panel's 96dp header avatar (same
+                        // lookup, same 1:1-only rule): the full-size
+                        // photo when the contact has one, the
+                        // thumbnail otherwise.
+                        contactPhotoLargeUri = if (isGroup) {
+                            null
+                        } else {
+                            firstContact?.photoFullUri ?: firstContact?.photoUri
+                        },
+                        memberPhotos = if (!isGroup) {
+                            emptyMap()
+                        } else {
+                            contacts.entries.mapNotNull { (numero, contact) ->
+                                contact.photoUri?.takeIf { it.isNotBlank() }
+                                    ?.let { numero to it }
+                            }.toMap()
+                        },
+                    )
+                }
+                // Round 44 — self-heal a stale cached display name.
+                // Android's PhoneLookup used to match on the last 7
+                // digits, so a conversation could be cached under
+                // the wrong contact's name ("Maria" for a number
+                // that is not hers) and the name was never
+                // corrected. The live lookup above is now strict:
+                // when it says "no contact" for a 1:1 thread that
+                // still carries a cached name, the name is stale
+                // and the repository clears it (permission-gated
+                // there — a denied lookup never clears). Groups
+                // are excluded: their display name is the joined
+                // member names, never one lookup.
+                if (!isGroup && firstContact == null && !displayName.isNullOrBlank()) {
+                    val firstNumber = numbers.firstOrNull()
+                    if (firstNumber != null) {
+                        com.relay.sms.core.result.runCatchingCancellable {
+                            repo.clearStaleDisplayName(conversationId, firstNumber)
+                        }.onFailure {
+                            timber.log.Timber.w(it, "ThreadViewModel: stale display-name clear failed")
+                        }
+                    }
+                }
+            }
+            .launchIn(viewModelScope)
+
+        // v1.24.0 (finding A) — fenêtre bornée au lieu du fil entier. Les statistiques
+        // (`messageCount`, `firstMessageAt`, `lastMessageAt`) viennent d'un agrégat SQL sur TOUT
+        // le fil, jamais de la fenêtre : le panneau d'infos décrit la conversation, pas la tranche
+        // chargée en mémoire.
+        // Feedback round 6 — the first window only SCHEDULES the mark-read
+        // (see [scheduleDeferredMarkRead]): marking read here wrote to Room
+        // mid-transition, re-emitting the window and recomposing the whole
+        // visible list a second time inside the open animation.
+        repo.observeMessagesWindow(conversationId, windowSpec).onEach { window ->
+            val msgs = window.messages
+            resoudreNomsDesExpediteurs(msgs)
+            _state.update {
+                it.copy(
+                    isLoading = false,
+                    messages = msgs,
+                    hasMoreMessages = window.hasMore,
+                    // Seule l'émission qui porte la fenêtre élargie clôt le chargement : un SMS
+                    // arrivant entre le tap et cette émission rouvrirait sinon la garde de
+                    // `loadOlder`, et un second tap sauterait deux pages d'un coup.
+                    isLoadingOlder = window.hasMore && msgs.size < tailLimit.value,
+                    messageCount = window.totalCount,
+                    firstMessageAt = window.firstMessageAt,
+                    lastMessageAt = window.lastMessageAt,
+                )
+            }
+            // v1.11.0 audit P1 — recompute les verdicts smishing sur IO
+            // dispatcher quand la liste de messages change (ajout, suppression,
+            // edit). Le calcul reste limité aux INCOMING messages qui n'ont
+            // pas encore de verdict cached → coût O(delta) en pratique.
+            if (_state.value.smishingDetectionEnabled) {
+                recomputeSmishingVerdicts(msgs)
+            }
+            scheduleDeferredMarkRead()
+        }.launchIn(viewModelScope)
+
+        // E2E — the peer state + notices for this conversation, observed
+        // live (see [E2eThreadEntryPoint] for why the entry point, not
+        // the constructor). A failed resolution (JVM tests with a mocked
+        // context) leaves the thread plain: E2E is additive, never
+        // load-bearing. Groups have no peer row — the address is null
+        // there and the state stays UNKNOWN; groups observe their own
+        // group state instead (round 49, design §13).
+        runCatching { e2eEntryPoint() }.getOrNull()?.let { e2e ->
+            convFlow.map { conv ->
+                conv?.takeIf { !it.isGroup }?.firstAddress?.normalized
+            }.distinctUntilChanged()
+                .flatMapLatest { address ->
+                    if (address == null) {
+                        flowOf(null)
+                    } else {
+                        e2e.peerRepository().observePeer(address)
+                    }
+                }
+                .onEach { peer ->
+                    _state.update {
+                        it.copy(
+                            e2ePeerState = peer?.state ?: E2ePeerState.UNKNOWN,
+                            e2eVerified = peer?.verified == true,
+                        )
+                    }
+                }
+                .launchIn(viewModelScope)
+            convFlow.map { conv ->
+                conv?.takeIf { it.isGroup }?.addresses?.map { it.raw }
+            }.distinctUntilChanged()
+                .flatMapLatest { members ->
+                    if (members.isNullOrEmpty()) {
+                        flowOf(GroupEncryptionState.Plain(PlainReason.NOT_A_GROUP, emptyList()))
+                    } else {
+                        e2e.groupStateProvider().observeGroupState(members)
+                    }
+                }
+                .onEach { groupState ->
+                    _state.update { it.copy(e2eGroupState = groupState) }
+                }
+                .launchIn(viewModelScope)
+            e2e.noticeStore().observeNotices(conversationId)
+                .onEach { notices ->
+                    _state.update {
+                        it.copy(
+                            e2eNotices = notices.map { notice ->
+                                E2eNoticeUi(
+                                    id = notice.id,
+                                    kind = notice.kind,
+                                    date = notice.date,
+                                    subject = notice.subject,
+                                )
+                            },
+                        )
+                    }
+                }
+                .launchIn(viewModelScope)
+        }
+
+        // Best-effort: drop yesterday's orphan recordings from the cache on screen open.
+        voiceRecorder.pruneOld()
+    }
+
+    /**
+     * v1.28.3 (F22) — numéro de révision du brouillon, incrémenté à chaque frappe.
+     *
+     * Un envoi n'est pas instantané : `SendSmsUseCase` écrit côté système, miroite en Room puis
+     * appelle `SmsManager`, et le champ de saisie reste actif pendant tout ce temps (seul le
+     * bouton d'envoi est gardé par `isSending`). L'utilisateur peut donc commencer un NOUVEAU
+     * message avant que le précédent ne se conclue — d'autant plus sur le chemin MMS, où le
+     * commentaire M2 ci-dessous chiffre lui-même la fenêtre à 1-5 s.
+     *
+     * On efface donc le brouillon seulement si personne n'y a touché depuis le dispatch. Cf.
+     * [effacerBrouillonSiIntact]. Une révision plutôt qu'une comparaison de texte : ce qu'on
+     * veut savoir est « l'utilisateur a-t-il repris la main ? », pas « le texte se trouve-t-il
+     * être le même ? ».
+     */
+    private var draftRevision = 0L
+
+    fun updateDraft(text: String) {
+        draftRevision++
+        _state.update { it.copy(draft = text, segments = segCounter.count(text), draftSeeded = true) }
+        viewModelScope.launch { repo.setDraft(conversationId, text.ifBlank { null }) }
+    }
+
+    /**
+     * v1.28.3 (F22) — efface le brouillon UNIQUEMENT s'il est encore celui qui a été envoyé.
+     *
+     * Le chemin des pièces jointes prenait déjà cette précaution pour elles (« filter, not
+     * wipe », audit M2 v1.3.4) — mais la même mise à jour écrivait `draft = ""` sans condition,
+     * juste à côté. Le texte n'avait pas eu le traitement que la pièce jointe avait reçu, et un
+     * message commencé pendant l'envoi précédent disparaissait, de l'écran ET de la base.
+     */
+    private suspend fun effacerBrouillonSiIntact(revisionEnvoyee: Long) {
+        if (draftRevision != revisionEnvoyee) return
+        _state.update { it.copy(draft = "", segments = segCounter.count("")) }
+        repo.setDraft(conversationId, null)
+    }
+
+    /**
+     * E2E — whether this text-only send is too long to go out encrypted
+     * (design §3.2: 8,000 characters — the fragment budget). MMS is
+     * never encrypted, so attachments skip the cap; plain threads do
+     * too. The use case enforces the same cap; the composer refuses
+     * first, with the UI message. Round 49: a group in the Encrypted
+     * state is under the same cap (group media stays plain, so an
+     * attachment still skips it).
+     */
+    private fun isTooLongForEncrypted(body: String, hasAttachments: Boolean): Boolean {
+        val encrypted = _state.value.e2ePeerState == E2ePeerState.ENCRYPTED ||
+            _state.value.e2eGroupState == GroupEncryptionState.Encrypted
+        return encrypted && !hasAttachments && E2eWireFormat.plaintextExceedsCap(body)
+    }
+
+    /** E2E — the "Too long to send encrypted" refusal (red snackbar). */
+    private fun refuseTooLongEncrypted() {
+        _events.tryEmit(
+            Event.ShowSnackbar(
+                context.getString(com.relay.sms.R.string.e2e_too_long),
+                isError = true,
+            ),
+        )
+    }
+
+    fun send() {
+        val body = _state.value.draft.trim()
+        val hasAttachments = _state.value.pendingAttachments.isNotEmpty()
+        // v1.3.4 — 3 chemins :
+        //   (a) PJ stagées + texte optionnel → 1 MMS multipart via dispatchPendingAttachments
+        //   (b) texte seul → flow SMS classique (avec confirm dialog si broadcast multi-dest)
+        //   (c) rien → no-op
+        if (!hasAttachments && body.isEmpty()) return
+        // v1.26.1 (audit H7) — garde en vol, calqué sur celui du chemin vocal. Sans lui, un
+        // double appui rapide produisait deux SMS (ou deux MMS) réellement envoyés et facturés.
+        if (_state.value.isSending) return
+        // E2E — a text-only send over 8,000 characters is refused in
+        // the composer (the use case enforces the same cap; this is the
+        // UI message). Refused BEFORE the confirm dialog: asking first
+        // would promise a send that cannot happen.
+        if (isTooLongForEncrypted(body, hasAttachments)) {
+            refuseTooLongEncrypted()
+            return
+        }
+        viewModelScope.launch {
+            // v1.28.3 (F30) — la confirmation se lit AVANT de router, pour les deux chemins.
+            //
+            // Le réglage s'appelle `confirmBeforeBroadcast` en interne mais s'affiche
+            // « Confirmer avant l'envoi » (`settings_confirm_broadcast`), il vaut `true` par
+            // défaut, et le texte comme le vocal le respectent. Le média, lui, sortait de la
+            // fonction avant même que le réglage soit lu : l'envoi le plus coûteux et le plus
+            // difficile à rattraper était le seul à partir sans être confirmé.
+            val confirm = cachedSettings.value.sending.confirmBeforeBroadcast
+            if (hasAttachments) {
+                if (confirm) {
+                    _state.update { it.copy(pendingAttachmentSend = true) }
+                } else {
+                    dispatchPendingAttachments()
+                }
+                return@launch
+            }
+            if (confirm) {
+                _state.update { it.copy(pendingSend = body) }
+            } else {
+                doSend(body)
+            }
+        }
+    }
+
+    /**
+     * v1.28.3 (F30) — l'utilisateur accepte l'envoi des pièces jointes en attente.
+     *
+     * Jumeau de [confirmPendingSend] pour le chemin média. L'instantané confirmé est la liste
+     * `pendingAttachments` telle qu'elle est au moment du dispatch, que
+     * [dispatchPendingAttachments] capture déjà (audit M2 v1.3.4).
+     */
+    fun confirmPendingAttachmentSend() {
+        _state.update { it.copy(pendingAttachmentSend = false) }
+        if (_state.value.isSending) return
+        viewModelScope.launch { dispatchPendingAttachments() }
+    }
+
+    /** v1.28.3 (F30) — l'utilisateur refuse : rien ne part, les pièces jointes restent stagées. */
+    fun cancelPendingAttachmentSend() {
+        _state.update { it.copy(pendingAttachmentSend = false) }
+    }
+
+    /** Called from the UI when the user accepts the "Send this message?" confirmation. */
+    fun confirmPendingSend() {
+        val body = _state.value.pendingSend ?: return
+        _state.update { it.copy(pendingSend = null) }
+        viewModelScope.launch { doSend(body) }
+    }
+
+    /** Dismisses the pending-send confirmation without sending. */
+    fun cancelPendingSend() {
+        _state.update { it.copy(pendingSend = null) }
+    }
+
+    /**
+     * v1.15.1 — Programme l'envoi du draft courant pour une date/heure future. Le draft est
+     * vidé après scheduling réussi (cohérent avec le comportement `send()` standard) ; l'user
+     * peut consulter / annuler depuis Settings → Messages programmés.
+     *
+     * Le draft est validé non-vide ET la date est validée future côté Use Case. En cas d'échec,
+     * un Event.ShowSnackbar(isError=true) est émis vers la View.
+     *
+     * Round 32 — [bodyOverride] programme un autre texte que le draft (le
+     * panneau latéral, dont le brouillon est vide : l'utilisateur tape son
+     * message dans l'étape dédiée). Le draft n'est alors ni lu ni vidé.
+     */
+    fun scheduleSend(epochMillis: Long, bodyOverride: String? = null) {
+        val body = (bodyOverride ?: _state.value.draft).trim()
+        // v1.28.3 (F29) — un MMS programmé sans légende est LÉGITIME, et trois couches sur
+        // quatre le savaient déjà.
+        //
+        // L'écran active « Programmer » dès qu'il y a du texte OU une pièce jointe
+        // (`ThreadScreen.canSchedule`), `ScheduledMessageRepositoryImpl` applique exactement la
+        // même règle, et `ScheduleMessageUseCase` ne contrôle pas le corps du tout. Seul ce
+        // garde-ci exigeait encore du texte — vestige d'un planificateur qui ne savait envoyer
+        // que du texte, comme le dit le commentaire du repository. L'utilisateur qui joignait une
+        // photo sans légende parcourait donc le sélecteur de date PUIS celui d'heure avant de se
+        // voir refuser « Écrivez un message avant de programmer ».
+        if (body.isEmpty() && _state.value.pendingAttachments.isEmpty()) {
+            _events.tryEmit(Event.ShowSnackbar(
+                context.getString(com.relay.sms.R.string.thread_schedule_empty_body),
+                isError = true,
+            ))
+            return
+        }
+        if (epochMillis <= System.currentTimeMillis()) {
+            _events.tryEmit(Event.ShowSnackbar(
+                context.getString(com.relay.sms.R.string.thread_schedule_invalid_past),
+                isError = true,
+            ))
+            return
+        }
+        // E2E — the same 8,000-character refusal as the immediate send:
+        // a scheduled message that cannot go out encrypted must be
+        // refused now, not fail silently at fire time.
+        if (isTooLongForEncrypted(body, _state.value.pendingAttachments.isNotEmpty())) {
+            refuseTooLongEncrypted()
+            return
+        }
+        viewModelScope.launch {
+            val conv = _state.value.conversation
+            // Les destinataires sont ceux de la conversation courante (cohérent avec sendSms).
+            // `conv.addresses` est la liste normalisée. Si conv est null (cas extrême : avant
+            // hydratation), on bail proprement.
+            val recipients = conv?.addresses ?: emptyList()
+            if (recipients.isEmpty()) {
+                _events.tryEmit(Event.ShowSnackbar(
+                    context.getString(com.relay.sms.R.string.thread_schedule_failed),
+                    isError = true,
+                ))
+                return@launch
+            }
+            val effectiveSubId = cachedSettings.value.sending.defaultSubId
+            // v1.26.0 — les pieces jointes en attente partent AVEC l'envoi programme.
+            //
+            // Elles etaient purement ignorees : on pouvait joindre une photo, programmer, et
+            // seul le texte partait a l'heure dite — la photo restant dans le composeur, ce qui
+            // laissait croire qu'elle suivrait. `ScheduleMessageUseCase` les rend durables avant
+            // d'enregistrer, sans quoi le fichier aurait disparu bien avant l'echeance.
+            val pending = _state.value.pendingAttachments
+            val payloads = pending.map { p ->
+                SendMediaMmsUseCase.AttachmentPayload(file = p.file, mimeType = p.mimeType)
+            }
+            val revisionEnvoyee = draftRevision
+            val r = scheduleMessage(
+                conversationId = conversationId,
+                addresses = recipients,
+                body = body,
+                whenEpochMillis = epochMillis,
+                subId = effectiveSubId,
+                attachments = payloads,
+            )
+            when (r) {
+                is com.relay.sms.core.result.Outcome.Success -> {
+                    // Vide le draft ET les pieces jointes retenues : elles appartiennent
+                    // desormais a l'envoi programme. Les laisser dans le composeur ferait croire
+                    // qu'elles sont encore a envoyer, et un envoi immediat les expedierait une
+                    // seconde fois.
+                    _state.update { it.copy(pendingAttachments = it.pendingAttachments - pending.toSet()) }
+                    // v1.28.3 (F22) — même garde que sur les deux chemins d'envoi : la fenêtre
+                    // est plus étroite ici (aucune attente radio), mais le motif est le même et
+                    // il ne doit pas rester un chemin qui efface sans regarder.
+                    // Round 32 — avec un bodyOverride, le draft n'a pas servi : on ne l'efface pas.
+                    if (bodyOverride == null) effacerBrouillonSiIntact(revisionEnvoyee)
+                    _events.tryEmit(Event.ShowSnackbar(
+                        context.getString(com.relay.sms.R.string.thread_schedule_success),
+                    ))
+                }
+                is com.relay.sms.core.result.Outcome.Failure -> {
+                    _events.tryEmit(Event.ShowSnackbar(
+                        context.getString(com.relay.sms.R.string.thread_schedule_failed),
+                        isError = true,
+                    ))
+                }
+            }
+        }
+    }
+
+    /**
+     * Round 32 — Details panel: flips this conversation's mute. Same
+     * toggle as the list's long-press menu (client mode goes through
+     * the `set_muted` frame, like the pin toggle).
+     */
+    fun toggleMute() {
+        viewModelScope.launch {
+            val conv = _state.value.conversation ?: return@launch
+            toggleConvState.setMuted(conv.id, !conv.muted)
+        }
+    }
+
+    private suspend fun doSend(body: String) {
+        val conv = _state.value.conversation ?: return
+        val replyTargetId = _state.value.replyingTo?.id
+        // v1.28.3 (F22) — capturée AVANT l'envoi : c'est elle qui dira, au retour, si le
+        // brouillon affiché est encore celui qu'on vient d'expédier.
+        val revisionEnvoyee = draftRevision
+        _state.update { it.copy(isSending = true) }
+        try {
+            // v1.26.1 (audit H8) — l'envoi ne doit PLUS pouvoir être annulé à mi-parcours.
+            //
+            // `SendSmsUseCase` enchaîne, par destinataire : insertion dans `content://sms`
+            // (suspend), miroir Room (`withContext(io)` + transaction, suspend), puis l'appel
+            // NON suspend à `SmsManager`. `withContext` est un point d'annulation à l'entrée ET
+            // à la sortie : si l'utilisateur tapait « Envoyer » puis revenait en arrière — geste
+            // que l'écran encourage, il masque le clavier juste après — `onCleared()` annulait
+            // `viewModelScope` et la troisième étape n'était JAMAIS exécutée. Résultat : une
+            // ligne « envoyée » visible dans les autres applications SMS, une ligne `PENDING`
+            // chez nous, et AUCUN SMS parti — que le chien de garde basculait en échec quinze
+            // minutes plus tard, sans cause visible.
+            val res = withContext(NonCancellable) {
+                // v1.28.4 — le routeur decide : MMS de groupe si le reglage est actif et que
+                // la conversation est un groupe, SMS sinon (cf. [EnvoyerMessageUseCase]).
+                // Client mode C3 — the local conversation id lets the
+                // wire branch resolve the hub conversation directly.
+                envoyer.invoke(conv.addresses, body, replyToMessageId = replyTargetId, conversationId = conversationId)
+            }
+            when (res) {
+                is Outcome.Success -> {
+                    // La cible de réponse, elle, se referme toujours : elle appartient au
+                    // message qui vient de partir, pas à celui que l'utilisateur commence.
+                    _state.update { it.copy(replyingTo = null) }
+                    effacerBrouillonSiIntact(revisionEnvoyee)
+                    // v1.28.3 (F21) — un envoi PARTIEL ne peut plus passer pour un envoi réussi.
+                    //
+                    // `Outcome.Success` était rendu dès qu'UN destinataire avait été remis à la
+                    // pile. Sur un envoi à plusieurs, le brouillon s'effaçait et l'écran ne
+                    // disait rien — alors que les bulles en échec, SMS n'ayant pas de vrai
+                    // groupe, vivent chacune dans la conversation individuelle de son
+                    // destinataire, c'est-à-dire là où l'expéditeur n'allait pas regarder.
+                    val rapport = res.value
+                    if (!rapport.isComplete) {
+                        _events.tryEmit(
+                            Event.PartialSend(
+                                sent = rapport.dispatched.size,
+                                failed = rapport.failed.size,
+                                blocked = rapport.blocked.size,
+                            ),
+                        )
+                    }
+                }
+                is Outcome.Failure -> _events.tryEmit(Event.SendError(res.error))
+            }
+        } finally {
+            _state.update { it.copy(isSending = false) }
+        }
+    }
+
+    /**
+     * Arms a contextual reply (#8). The picked message stays visible above the composer until
+     * the user sends or cancels. Calling twice with different targets overwrites the previous
+     * target — there is no "stack of replies", at most one is pending at any time.
+     */
+    fun startReply(message: Message) {
+        _state.update { it.copy(replyingTo = message) }
+    }
+
+    /** Drops the pending reply target without sending. Idempotent. */
+    fun cancelReply() {
+        if (_state.value.replyingTo == null) return
+        _state.update { it.copy(replyingTo = null) }
+    }
+
+    /**
+     * v1.3.0 — pose / change / retire la réaction emoji locale d'un message. Le badge sur la
+     * bulle se met à jour automatiquement via le Flow d'observation de la conversation.
+     *
+     * v1.3.1 — si la préférence [com.relay.sms.domain.settings.SendingSettings
+     * .sendReactionsToRecipient] est activée, on prévient le correspondant par SMS :
+     * **première pose** ([SetReactionResult.First] : null → emoji), **changement**
+     * ([SetReactionResult.Changed] : A → B, dispatché depuis v1.4.1 — l'utilisateur
+     * change légitimement d'avis et le correspondant doit voir le nouvel emoji) et
+     * **retrait** ([SetReactionResult.Removed] : emoji → null, dispatché comme
+     * `Removed a like from "…"` — Apple et Google ont tous deux une forme de
+     * retrait sur le fil). Feedback round 5 — l'envoi est immédiat, sans
+     * dialog de confirmation : la réaction part en SMS dès qu'elle est
+     * posée, changée ou retirée (tant que [SendingSettings.sendReactionsToRecipient]
+     * est activée). Voir KDoc [ConversationRepository.setReaction] pour la
+     * sémantique complète.
+     */
+    fun setReaction(messageId: Long, emoji: String?) {
+        viewModelScope.launch {
+            // Emoji retiré éventuel, lu AVANT l'update : [SetReactionResult.Removed]
+            // ne porte pas l'emoji retiré, et c'est lui qu'il faut envoyer au
+            // correspondant (`Removed a like from "…"`). Lecture indexée, négligeable.
+            val previousEmoji = runCatching { repo.findMessageById(messageId)?.reactionEmoji }
+                .getOrNull()
+            val result = runCatching { repo.setReaction(messageId, emoji) }
+                .onFailure { timber.log.Timber.w(it, "setReaction(%d, %s) failed", messageId, emoji) }
+                .getOrNull() ?: return@launch
+
+            // Dispatch SMS sur First (null → emoji), Changed (A → B) et Removed
+            // (emoji → null, forme de retrait Apple). Voir KDoc de [setReaction].
+            //
+            // [SetReactionResult.Changed] does not carry the messageId (the sealed type
+            // is shared across the repo layer), so we close over the [messageId] /
+            // [emoji] parameters from the enclosing call — both are still in scope and
+            // describe the exact state the repo just committed.
+            val targetMessageId: Long
+            val targetEmoji: String
+            val targetIsRemoval: Boolean
+            // v1.6.0 (audit Q3) — `when` exhaustif sur sealed : pas de branche `else`
+            // pour qu'une future variante du sealed interface fasse échouer la compilation
+            // ici plutôt que d'être avalée silencieusement.
+            when (result) {
+                is SetReactionResult.First -> {
+                    targetMessageId = result.messageId
+                    targetEmoji = result.emoji
+                    targetIsRemoval = false
+                }
+                is SetReactionResult.Changed -> {
+                    targetMessageId = messageId
+                    targetEmoji = result.to
+                    targetIsRemoval = false
+                }
+                SetReactionResult.Removed -> {
+                    targetMessageId = messageId
+                    targetEmoji = previousEmoji ?: return@launch
+                    targetIsRemoval = true
+                }
+                SetReactionResult.Noop -> return@launch
+            }
+
+            // Round 12 — record the emoji as recently used for the
+            // quick-reaction bar. Only for actual sets (First / Changed):
+            // removals pass `null` and Noops return above. A DataStore
+            // failure must not break the reaction itself — it is best
+            // effort, like the dispatch below.
+            if (!emoji.isNullOrBlank()) {
+                runCatching { recentReactionsStore.recordUsed(emoji) }
+                    .onFailure {
+                        timber.log.Timber.w(it, "setReaction recent record failed")
+                    }
+            }
+
+            // v1.3.1 audit P1 — tout le bloc post-dispatch est wrappé : un crash DataStore
+            // (CorruptionException, IOException disque plein) ne doit pas remonter au
+            // ViewModelScope (= crash process). Log + return safe.
+            runCatching {
+                // v1.3.1 audit F1/F2 — defense-in-depth : le UseCase résout les
+                // destinataires (expéditeur unique pour un message entrant, toute
+                // la conversation pour un de nos propres messages), mais on garde
+                // un guard ici pour ne pas envoyer sur un message disparu. Le repo
+                // a déjà mis à jour la colonne reaction_emoji ; on ne touche pas
+                // au badge local (cohérent avec la sémantique "réaction locale
+                // toujours possible").
+                val targetMessage = repo.findMessageById(targetMessageId)
+                if (targetMessage == null) return@runCatching
+                // Anti-race retrait : si une réaction est revenue entre-temps, le
+                // retrait n'a plus lieu d'être envoyé.
+                if (targetIsRemoval && targetMessage.reactionEmoji != null) return@runCatching
+
+                // Feedback round 5 — envoi immédiat, sans dialog de confirmation :
+                // la réaction part dès qu'elle est posée, changée ou retirée. La
+                // lecture du snapshot se fait via `cachedSettings` comme les autres
+                // sites PERF-01 (plus de write précédent à attendre depuis la
+                // suppression du dialog).
+                val sending = cachedSettings.value.sending
+                if (!sending.sendReactionsToRecipient) return@runCatching
+                dispatchReactionSms(
+                    targetMessageId,
+                    targetEmoji,
+                    sending.reactionFormat,
+                    isRemoval = targetIsRemoval,
+                )
+            }.onFailure {
+                timber.log.Timber.w(it, "setReaction post-emit failed for %d", targetMessageId)
+            }
+        }
+    }
+
+    /**
+     * v1.3.1 — chemin commun d'envoi SMS d'une réaction, appelé directement
+     * par [setReaction] (feedback round 5 : plus de dialog de confirmation,
+     * l'envoi est immédiat). Propage les erreurs via [Event.SendError]
+     * (snack utilisateur), comme tout autre envoi. Les cibles (expéditeur
+     * unique du message entrant, toute la conversation pour un de nos propres
+     * messages) sont résolues dans [SendReactionUseCase].
+     *
+     * **Dedup X2 (audit v1.3.1)** : un utilisateur qui hésite peut générer la séquence
+     * `null → ❤️ → null → ❤️ → …`, chaque pose étant un `SetReactionResult.First` (donc
+     * éligible à l'envoi). Sans garde, c'est 1 SMS facturé par cycle. On stocke en RAM
+     * (session, pas DataStore — c'est une protection contre les rafales, pas un cache
+     * d'état long terme) la dernière dispatch par messageId et on skip si < 60 secondes.
+     *
+     * Retourne :
+     *   - [DispatchOutcome.DedupSkipped] : dans la fenêtre, rien tenté
+     *   - [DispatchOutcome.Sent] : le use case a renvoyé [Outcome.Success]
+     *   - [DispatchOutcome.Failed] : tentative effectuée mais échouée (snack émis)
+     *
+     * @param format v1.8.0 (bug 5 fix) — passé par le caller qui a déjà lu le snapshot
+     *   `sending` une fois ; évite une 2e lecture DataStore par envoi de réaction.
+     *   Voir [com.relay.sms.domain.model.ReactionFormat] pour les 3 options
+     *   (READABLE_FR par défaut, TAPBACK_EN pour compat iPhone, EMOJI_ONLY minimal).
+     */
+    private suspend fun dispatchReactionSms(
+        messageId: Long,
+        emoji: String,
+        format: com.relay.sms.domain.model.ReactionFormat,
+        isRemoval: Boolean = false,
+    ): DispatchOutcome {
+        val now = System.currentTimeMillis()
+        // v1.3.5 G7 audit fix — purge opportuniste des entries expirées AVANT lecture
+        // (la map croîtrait sinon linéairement avec le nb de messages réagis pendant
+        // la vie du ViewModel). Coût O(N) acceptable car N est borné par la fenêtre
+        // de dedup et l'activité utilisateur (typiquement < 50 entries).
+        recentlySentReactionFor.entries.removeAll { now - it.value.timestamp > REACTION_DEDUP_WINDOW_MS }
+        // v1.4.1 — dedup ne s'applique QU'AU MÊME emoji. Si l'utilisateur change
+        // (❤️ → 👍), la réaction part même si on est dans la fenêtre 60s — sinon le
+        // destinataire reste bloqué sur la 1ʳᵉ réaction et ne voit jamais le changement.
+        // Le retrait est une direction distincte : poser puis retirer dans la fenêtre
+        // doit partir aussi, sinon le correspondant garde une réaction retirée.
+        // (Conditions découpées en booléens nommés : Detekt ComplexCondition max 3.)
+        val last = recentlySentReactionFor[messageId]
+        val sameReaction = last != null &&
+            last.emoji == emoji && last.isRemoval == isRemoval
+        val withinWindow = last != null &&
+            now - last.timestamp < REACTION_DEDUP_WINDOW_MS
+        if (sameReaction && withinWindow) {
+            timber.log.Timber.d("dispatchReactionSms: dedup re-send on %d within %ds", messageId, REACTION_DEDUP_WINDOW_MS / 1000)
+            return DispatchOutcome.DedupSkipped
+        }
+        recentlySentReactionFor[messageId] =
+            ReactionDispatch(emoji = emoji, timestamp = now, isRemoval = isRemoval)
+        return when (val res = sendReaction(messageId, emoji, format, isRemoval)) {
+            is Outcome.Success -> DispatchOutcome.Sent
+            is Outcome.Failure -> {
+                _events.tryEmit(Event.SendError(res.error))
+                DispatchOutcome.Failed
+            }
+        }
+    }
+
+    /** v1.3.1 — résultat triadique de [dispatchReactionSms] (audit X2 + X3). */
+    private enum class DispatchOutcome { Sent, Failed, DedupSkipped }
+
+    /**
+     * v1.4.1 — `(emoji, timestamp)` tuple. Track emoji in addition to time so the dedup
+     * only fires on **same emoji + within 60s** — a legitimate change of heart
+     * (❤️ → 👍) bypasses the window and reaches the correspondent. [isRemoval]
+     * distinguishes a pose from a retrait of the same emoji.
+     */
+    private data class ReactionDispatch(
+        val emoji: String,
+        val timestamp: Long,
+        val isRemoval: Boolean = false,
+    )
+
+    /**
+     * X2 — dedup en mémoire des envois récents de réactions. Clé = messageId, valeur =
+     * dernier `(emoji, epoch ms)` dispatché. RAM seulement (perdu au kill process) —
+     * voulu : c'est une protection courte fenêtre contre les rafales de taps sur
+     * **le même emoji**, pas un journal pérenne.
+     */
+    private val recentlySentReactionFor = mutableMapOf<Long, ReactionDispatch>()
+
+    /**
+     * Receives an attachment URI from [com.relay.sms.ui.components.AttachmentPickerSheet]
+     * (#2) and dispatches it as a multipart MMS via [SendMediaMmsUseCase].
+     *
+     * v1.2.1 — the URI is read through `ContentResolver`, copied into a private cache file
+     * (`cache/media_outgoing/`) so the system content URI is no longer needed past the call,
+     * then handed to the use case. The use case caps payload at 300 KB total (Free MMSC is
+     * the tightest French carrier).
+     *
+     * Photo / Video / Contact card / arbitrary file are all routed through the same path; the
+     * MIME type is detected from the content resolver, with a fallback per [kind] for cases
+     * where the system doesn't expose it.
+     */
+    fun onAttachmentPicked(
+        uri: android.net.Uri,
+        kind: com.relay.sms.ui.components.AttachmentKind,
+    ) {
+        if (_state.value.conversation == null) return
+        viewModelScope.launch {
+            val cr = context.contentResolver
+            // v1.28.3 (audit global, X-02 — mesure sur le S9) — un CONTACT n'est pas un fichier.
+            //
+            // Le selecteur rend l'URI d'une fiche, dont `openInputStream` ne lit rien et dont
+            // `getType` repond `vnd.android.cursor.item/contact` : la copie echouait a tous les
+            // coups, et joindre un contact n'a jamais fonctionne. La carte de visite se lit a
+            // une autre adresse — cf. [ContactCardSource]. Une fiche illisible garde le message
+            // d'echec, qui devient vrai.
+            val carte = if (kind == com.relay.sms.ui.components.AttachmentKind.CONTACT) {
+                val resolue = kotlinx.coroutines.withContext(io) { ContactCardSource(cr).resoudre(uri) }
+                if (resolue == null) {
+                    _events.tryEmit(Event.ShowSnackbar(snackEchecPieceJointe(kind), isError = true))
+                    return@launch
+                }
+                resolue
+            } else {
+                null
+            }
+            val source = carte?.uri ?: uri
+            val mime = carte?.mime ?: cr.getType(uri) ?: when (kind) {
+                com.relay.sms.ui.components.AttachmentKind.PHOTO -> "image/jpeg"
+                com.relay.sms.ui.components.AttachmentKind.VIDEO -> "video/mp4"
+                else -> "application/octet-stream"
+            }
+            // Resolve the user-facing name via OpenableColumns when possible — Android's
+            // PickVisualMedia / OpenDocument both expose it. Falls back to the cached filename
+            // (auto-generated, so always visually ugly, hence the lookup).
+            // v1.28.12 — le nom de repli passe par `strings.xml`. Il était écrit en dur, en
+            // français : « Pièce jointe » s'affichait en légende du chip ET comme
+            // `contentDescription`, donc lu par TalkBack, quelle que soit la langue de
+            // l'application. Le `context` est celui de l'application, et la langue par
+            // application s'applique au processus : il rend bien la langue choisie.
+            // Round 33 follow-up — the source name BEFORE the generic fallback: a sticker
+            // render's FileProvider name starts with `sticker-`, and the copy keeps that
+            // marker in the staged filename so the stored row still says "sticker" (see
+            // `outgoingCacheFileName`). The fallback string is never a sticker name.
+            // Resolved once: the display name and the copy share it.
+            val sourceName = carte?.nomDeFichier ?: resolveDisplayName(uri)
+            val displayName = sourceName
+                ?: context.getString(com.relay.sms.R.string.attachment_generic_name)
+            val file = copyAttachmentToCache(source, mime, sourceName)
+            if (file == null) {
+                _events.tryEmit(Event.ShowSnackbar(snackEchecPieceJointe(kind), isError = true))
+                return@launch
+            }
+            // v1.28.3 (audit global, X-03 — mesure sur le S9) — le plafond se PARTAGE entre
+            // les images.
+            //
+            // Chaque image etait compressee pour tenir SEULE sous les 280 Ko, puis l'ajout de la
+            // seconde faisait depasser le total : « Limite MMS atteinte » des la deuxieme photo,
+            // quelle qu'elle soit. Envoyer deux photos etait impossible. Le plafond est desormais
+            // divise entre les images du message, texte et pieces non compressibles deduits
+            // d'abord ; celles deja en attente sont recompressees a leur nouvelle part, et le
+            // refus ne vient que lorsque la part de chacune tomberait sous le seuil de
+            // lisibilite — cf. [MmsAttachmentBudget].
+            //
+            // v1.3.4 — la PJ est AJOUTEE a la liste `pendingAttachments` ; l'utilisateur
+            // visualise tout dans la bande du composeur et touche Envoyer quand il a fini.
+            val estImage = mime.startsWith("image/")
+            val enAttente = _state.value.pendingAttachments
+            val draftLen = _state.value.draft.length.toLong()
+            val autres = enAttente.filterNot { it.mimeType.startsWith("image/") }.sumOf { it.sizeBytes } +
+                (if (estImage) 0L else file.length())
+            val nombreImages = enAttente.count { it.mimeType.startsWith("image/") } + (if (estImage) 1 else 0)
+            val part = if (nombreImages == 0) {
+                CARRIER_PAYLOAD_CAP_BYTES
+            } else {
+                MmsAttachmentBudget.partParImage(CARRIER_PAYLOAD_CAP_BYTES, draftLen, autres, nombreImages)
+            }
+            if (part == null) {
+                runCatching { file.delete() }
+                _events.tryEmit(Event.ShowSnackbar(snackAttachCapReached()))
+                return@launch
+            }
+            // Round 16 — a GIF is never JPEG-compressed: re-encoding it to JPEG
+            // would keep only the first frame and kill the animation. GIFs
+            // arrive already sized for MMS (the Klipy download walks down
+            // the SMALL then EXTRA-SMALL renditions when MEDIUM exceeds the
+            // carrier cap), and the projected-total check below still
+            // refuses an over-cap GIF honestly instead of silently
+            // flattening it.
+            val estGif = mime.equals("image/gif", ignoreCase = true)
+            val finalFile =
+                if (estImage && !estGif && file.length() > part) compressImage(file, part) ?: file else file
+            // Les images deja en attente prennent leur nouvelle part. Une recompression qui
+            // echoue laisse le fichier tel quel : la projection ci-dessous tranchera.
+            val reequilibrees = enAttente.map { pj ->
+                val pjEstGif = pj.mimeType.equals("image/gif", ignoreCase = true)
+                if (pj.mimeType.startsWith("image/") && !pjEstGif && pj.sizeBytes > part) {
+                    val reduite = compressImage(pj.file, part) ?: pj.file
+                    pj.copy(file = reduite, sizeBytes = reduite.length())
+                } else {
+                    pj
+                }
+            }
+            val projected = reequilibrees.sumOf { it.sizeBytes } + finalFile.length() + draftLen
+            if (projected > CARRIER_PAYLOAD_CAP_BYTES) {
+                runCatching { finalFile.delete() }
+                // Les images reequilibrees, elles, restent : leurs nouveaux fichiers sont valables
+                // et les anciens ont ete supprimes par la compression.
+                _state.update { it.copy(pendingAttachments = reequilibrees) }
+                _events.tryEmit(Event.ShowSnackbar(snackAttachCapReached()))
+                return@launch
+            }
+            _state.update {
+                it.copy(
+                    pendingAttachments = reequilibrees + PendingAttachment(
+                        file = finalFile,
+                        mimeType = mime,
+                        displayName = displayName,
+                        sizeBytes = finalFile.length(),
+                    ),
+                )
+            }
+        }
+    }
+
+    /**
+     * v1.3.4 — envoie en UN SEUL MMS multipart le texte du draft + toutes les PJ
+     * actuellement stagées. Vide le draft et la liste pendingAttachments en cas de
+     * succès. En cas d'échec : on garde les PJ stagées pour permettre un retry sans
+     * re-pick (les fichiers ne sont PAS supprimés).
+     *
+     * Si `pendingAttachments` est vide ET draft non vide : route vers le SMS texte
+     * standard (pas via cette méthode — `doSend` est l'autre chemin pour texte pur).
+     */
+    private suspend fun dispatchPendingAttachments() {
+        // v1.3.4 M2 — snapshot des PJ au moment du send. Si l'user ajoute une N+1ᵉ PJ
+        // pendant que le dispatch est in-flight (1-5 s), elle ne sera PAS wipée par
+        // le clear post-Success — on filtre uniquement les PJ effectivement envoyées.
+        val pending = _state.value.pendingAttachments
+        if (pending.isEmpty()) return
+        val conv = _state.value.conversation ?: return
+        val textBody = _state.value.draft
+        // v1.28.3 (F22) — cf. [effacerBrouillonSiIntact]. La fenêtre est ici la plus large du
+        // fichier : le commentaire M2 juste au-dessus la chiffre lui-même à 1-5 s.
+        val revisionEnvoyee = draftRevision
+
+        // v1.3.4 M3 audit fix — re-check cap au moment du send (le check à
+        // `onAttachmentPicked` ne couvre PAS le cas où l'user ajoute du texte APRÈS
+        // les PJ et fait dépasser le total).
+        val totalBytes = pending.sumOf { it.sizeBytes } + textBody.length.toLong()
+        if (totalBytes > CARRIER_PAYLOAD_CAP_BYTES) {
+            _events.tryEmit(Event.ShowSnackbar(snackAttachCapReached()))
+            return
+        }
+
+        val payloads = pending.map { p ->
+            SendMediaMmsUseCase.AttachmentPayload(file = p.file, mimeType = p.mimeType)
+        }
+        // v1.26.1 (audit H7 + H8) — même traitement que [doSend] : garde en vol contre le
+        // double appui, et envoi non annulable pour qu'un retour arrière ne laisse pas un MMS
+        // à moitié parti.
+        _state.update { it.copy(isSending = true) }
+        val res = try {
+            withContext(NonCancellable) {
+                // Client mode C3/C5 — the local conversation id lets
+                // the wire branch resolve the hub conversation
+                // directly (a budget refusal there returns before any
+                // optimistic row exists — the staged attachments stay
+                // put for retry).
+                envoyer.invoke(conv.addresses, textBody, attachments = payloads, conversationId = conversationId)
+            }
+        } finally {
+            _state.update { it.copy(isSending = false) }
+        }
+        when (res) {
+            is Outcome.Success -> {
+                // M2 audit fix — filter, not wipe, pour préserver les PJ ajoutées
+                // pendant le dispatch async.
+                val dispatchedSet = pending.toSet()
+                _state.update {
+                    it.copy(pendingAttachments = it.pendingAttachments.filterNot { p -> p in dispatchedSet })
+                }
+                // v1.28.3 (F22) — le texte reçoit enfin le même traitement que les pièces
+                // jointes ci-dessus, qui l'avaient depuis la v1.3.4.
+                effacerBrouillonSiIntact(revisionEnvoyee)
+                // v1.28.3 (F21) — l'envoi partiel se dit ici AUSSI. Le succes annonce et le
+                // brouillon efface pendant qu'un destinataire n'a rien recu, c'est le meme
+                // silence que sur la voie SMS ; le corriger d'un seul cote serait reproduire le
+                // motif que cette relecture entiere combat.
+                if (res.value.isComplete) {
+                    _events.tryEmit(Event.ShowSnackbar(snackAttachSent()))
+                } else {
+                    _events.tryEmit(
+                        Event.PartialSend(
+                            sent = res.value.dispatched.size,
+                            failed = res.value.failed.size,
+                            blocked = res.value.blocked.size,
+                        ),
+                    )
+                }
+            }
+            is Outcome.Failure -> {
+                // Garde les PJ stagées pour retry, ne supprime pas les fichiers cache.
+                _events.tryEmit(Event.SendError(res.error))
+            }
+        }
+    }
+
+    /**
+     * v1.3.4 — retire UNE PJ de la bande staging (clic sur le X du chip) + supprime
+     * son fichier cache. M4 audit fix : matching par **path absolu du fichier**
+     * (id stable) au lieu d'index numérique → résistant aux races add/remove qui
+     * pourraient sinon viser la mauvaise PJ après un shift d'index.
+     */
+    fun removePendingAttachment(fileAbsolutePath: String) {
+        val current = _state.value.pendingAttachments
+        val removed = current.firstOrNull { it.file.absolutePath == fileAbsolutePath } ?: return
+        _state.update { it.copy(pendingAttachments = current - removed) }
+        runCatching { removed.file.delete() }
+    }
+
+    // v1.28.12 (audit B2) — `clearAllPendingAttachments()` a été SUPPRIMÉE. Son KDoc la disait
+    // « appelée sur quitter de la conversation » : c'est faux, [onCleared] supprime les fichiers
+    // lui-même, et le bouton « Tout supprimer » n'a jamais été exposé. Deux façons de vider la
+    // même bande, dont une seule branchée, sur un chemin qui EFFACE des fichiers.
+
+    /**
+     * v1.28.3 (F27) — facteur de sous-echantillonnage a appliquer au decodage.
+     *
+     * Puissance de deux, seule valeur que `BitmapFactory` honore reellement. On s'arrete des que
+     * la dimension decodee passe sous [maxDim] : le redimensionnement fin qui suit fait le reste,
+     * mais sur un bitmap deja petit. `1` quand les bornes sont inconnues (`outWidth <= 0`), ce
+     * qui reproduit le comportement d'avant plutot que de deviner.
+     */
+    @androidx.annotation.VisibleForTesting
+    internal fun echantillonnagePour(largeur: Int, hauteur: Int, maxDim: Int): Int {
+        if (largeur <= 0 || hauteur <= 0 || maxDim <= 0) return 1
+        var echantillon = 1
+        while (maxOf(largeur, hauteur) / (echantillon * 2) >= maxDim) {
+            echantillon *= 2
+        }
+        return echantillon
+    }
+
+    /** Resolves OpenableColumns.DISPLAY_NAME for a content URI. */
+    private suspend fun resolveDisplayName(uri: android.net.Uri): String? =
+        kotlinx.coroutines.withContext(io) {
+            runCatching {
+                context.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+                    if (c.moveToFirst()) c.getString(0) else null
+                }
+            }.getOrNull()
+        }
+
+    /**
+     * Ré-encode l'image en JPEG jusqu'à tenir sous [budget] : quatre qualités décroissantes à
+     * 1600 px, puis à 1024 px, puis à 800 px. Rend le fichier ré-encodé (même dossier) ou `null`
+     * si rien n'y fait ; la source n'est supprimée que sur succès.
+     *
+     * v1.28.3 (audit global, X-03) — le budget est un PARAMÈTRE : la part de cette image dans le
+     * plafond du message, et non plus le plafond entier. Les deux paliers de réduction
+     * supplémentaires existent pour les petites parts — trois photos se partagent 280 Ko.
+     */
+    private suspend fun compressImage(src: java.io.File, budget: Long): java.io.File? =
+        kotlinx.coroutines.withContext(io) {
+            val out = java.io.File(src.parentFile, src.nameWithoutExtension + "-compressed.jpg")
+            for (maxDim in intArrayOf(1600, 1024, 800)) {
+                val scaled = decoderReduite(src, maxDim) ?: continue
+                try {
+                    for (quality in intArrayOf(75, 60, 45, 30)) {
+                        try {
+                            out.outputStream().use { os ->
+                                scaled.compress(android.graphics.Bitmap.CompressFormat.JPEG, quality, os)
+                            }
+                            if (out.length() in 1..budget) {
+                                // Drop the source — we only keep the compressed copy from here on.
+                                runCatching { src.delete() }
+                                return@withContext out
+                            }
+                        } catch (t: Throwable) {
+                            timber.log.Timber.w(t, "JPEG compress dim=%d quality=%d failed", maxDim, quality)
+                        }
+                    }
+                } finally {
+                    scaled.recycle()
+                }
+            }
+            runCatching { out.delete() }
+            // Last-resort: hand the original back, the use-case will fail the size check and
+            // the user sees an explicit "trop volumineux" snackbar instead of a silent black hole.
+            null
+        }
+
+    /**
+     * Décode [src] réduite à [maxDim] au plus.
+     *
+     * v1.28.3 (F27) — en DEUX PASSES : `decodeFile` en `ARGB_8888` alloue largeur × hauteur × 4
+     * octets AVANT tout redimensionnement — ~48 Mo pour 12 Mpx, sur le tas d'une application qui
+     * en a rarement autant. La première passe ne lit que l'en-tête, la seconde décode près de la
+     * taille voulue.
+     *
+     * v1.28.3 (audit du 2026-09-09) — CHAQUE allocation est sous `runCatching`, qui attrape
+     * `Throwable` donc aussi `OutOfMemoryError`. `createScaledBitmap` ne l'était pas, alors
+     * qu'elle alloue un second bitmap pendant que le premier occupe déjà la mémoire — au pire
+     * moment ; elle remontait jusqu'à `viewModelScope.launch`, sans gestionnaire : plantage
+     * précisément quand la mémoire est sous tension.
+     */
+    private fun decoderReduite(src: java.io.File, maxDim: Int): android.graphics.Bitmap? {
+        val bornes = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        runCatching { android.graphics.BitmapFactory.decodeFile(src.absolutePath, bornes) }
+        val opts = android.graphics.BitmapFactory.Options()
+        opts.inPreferredConfig = android.graphics.Bitmap.Config.ARGB_8888
+        opts.inSampleSize = echantillonnagePour(bornes.outWidth, bornes.outHeight, maxDim)
+        val bitmap = runCatching { android.graphics.BitmapFactory.decodeFile(src.absolutePath, opts) }
+            .getOrNull() ?: return null
+        if (bitmap.width <= maxDim && bitmap.height <= maxDim) return bitmap
+        val ratio = maxDim.toFloat() / maxOf(bitmap.width, bitmap.height)
+        return runCatching {
+            android.graphics.Bitmap.createScaledBitmap(
+                bitmap,
+                (bitmap.width * ratio).toInt(),
+                (bitmap.height * ratio).toInt(),
+                true,
+            )
+        }.getOrElse {
+            bitmap.recycle()
+            return null
+        }.also { if (it !== bitmap) bitmap.recycle() }
+    }
+
+    /**
+     * Copies the content-URI handed back by the system picker into our private cache so the
+     * MMS dispatch path can read it as a regular file (the system URI can revoke its grant
+     * the moment the picker activity finishes). Returns `null` on IO error or empty content.
+     */
+    private suspend fun copyAttachmentToCache(
+        uri: android.net.Uri,
+        mime: String,
+        sourceName: String?,
+    ): java.io.File? =
+        kotlinx.coroutines.withContext(io) {
+            val ext = mime.substringAfter('/', "bin").take(8).replace(Regex("[^A-Za-z0-9]"), "")
+            val dir = java.io.File(context.cacheDir, "media_outgoing").apply { mkdirs() }
+            val target = java.io.File(dir, outgoingCacheFileName(sourceName, ext))
+            // v1.28.3 (F27) — la copie est BORNEE, et le refus precede l'ecriture quand il peut.
+            //
+            // `input.copyTo(it)` recopiait l'integralite de ce que le selecteur rendait, sans
+            // aucune limite, AVANT tout controle de taille — celui-ci n'arrive qu'apres la
+            // compression, plusieurs dizaines de lignes plus loin. Choisir une video de deux
+            // gigaoctets remplissait donc le cache de l'application, et potentiellement
+            // l'appareil, pour un fichier qu'on allait refuser de toute facon.
+            //
+            // Deux gardes plutot qu'un : la taille DECLAREE par le fournisseur evite la copie
+            // dans le cas courant, et la borne au fil de l'eau rattrape les fournisseurs qui ne
+            // la declarent pas — ou qui mentent.
+            val tailleDeclaree = tailleDeclareeDe(uri)
+            if (tailleDeclaree != null && tailleDeclaree > PLAFOND_COPIE_BYTES) return@withContext null
+            // v1.28.4 (F27) — la borne vit dans `LectureBornee`, testée à l'octet ; ici on ne
+            // fait que l'appliquer.
+            runCatching {
+                val input = context.contentResolver.openInputStream(uri) ?: return@runCatching null
+                val tenue = com.relay.sms.core.io.LectureBornee.recopier(
+                    input,
+                    target,
+                    PLAFOND_COPIE_BYTES,
+                    COPIE_TAMPON_BYTES,
+                )
+                if (tenue) target else null
+            }.getOrNull()
+        }
+
+    /** v1.28.3 (F27) — taille annoncee par le fournisseur, ou `null` s'il ne la donne pas. */
+    private suspend fun tailleDeclareeDe(uri: android.net.Uri): Long? =
+        kotlinx.coroutines.withContext(io) {
+            runCatching {
+                context.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.SIZE), null, null, null)
+                    ?.use { c ->
+                        if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else null
+                    }
+            }.getOrNull()
+        }
+
+    /**
+     * v1.27.2 (audit de cohérence 2026-08-04) — mêmes deux gardes que [doSend] et
+     * [dispatchPendingAttachments], qui les portent depuis les audits H7 et H8. Ce troisième
+     * chemin d'envoi avait été nommé par l'audit du 2026-08-03 puis oublié du lot de correctifs.
+     *
+     * - `isSending` : un renvoi part d'un simple appui sur une bulle en échec, et rien à l'écran
+     *   ne change pendant la lecture Room. Deux appuis rapprochés lançaient donc deux renvois
+     *   concurrents — deux SMS réels, facturés, pour un seul message.
+     * - `NonCancellable` : sans lui, un retour arrière pendant le renvoi annulait
+     *   `viewModelScope` au milieu de la séquence (insertion système, miroir Room, appel
+     *   `SmsManager`) et laissait le message ni envoyé ni marqué en échec.
+     *
+     * Le garde s'appuie sur le MÊME drapeau `isSending` que les deux jumeaux : un renvoi et un
+     * envoi ne peuvent donc pas non plus se chevaucher entre eux.
+     */
+    fun retry(messageId: Long) {
+        if (_state.value.isSending) return
+        viewModelScope.launch {
+            _state.update { it.copy(isSending = true) }
+            try {
+                // v1.28.3 (F21) — l'issue de la relance remonte enfin a l'ecran. Elle etait
+                // avalee : toucher la bulle rouge d'un destinataire bloque ne produisait
+                // strictement RIEN, ni envoi ni message, et l'utilisateur recommencait.
+                //
+                // Client mode C3 — a failed wire send retries with the
+                // SAME client key (the hub dedups on it); the telephony
+                // retry path must never run on a linked device. The
+                // manager comes from the entry point: this ViewModel
+                // is at its constructor-param cap.
+                val res = withContext(NonCancellable) {
+                    if (_state.value.isClientMode) {
+                        runCatching { clientSendManager().resend(messageId) }
+                            .getOrElse { Outcome.Failure(AppError.Unknown(it)) }
+                    } else {
+                        retrySend.invoke(messageId)
+                    }
+                }
+                if (res is Outcome.Failure) _events.tryEmit(Event.SendError(res.error))
+            } finally {
+                _state.update { it.copy(isSending = false) }
+            }
+        }
+    }
+
+    /** Client mode C3 — the send manager, via the entry point (see [retry]). */
+    private fun clientSendManager(): com.relay.sms.sync.client.ClientSendManager =
+        dagger.hilt.android.EntryPointAccessors.fromApplication(
+            context,
+            ClientSendManagerEntryPoint::class.java,
+        ).clientSendManager()
+
+    /**
+     * Client mode C5 — asks the downloader for an attachment's bytes
+     * (tap-to-download, or the bubble's auto-request on render). A
+     * no-op in hub mode: the screen only wires the callback in client
+     * mode, and the downloader itself no-ops for a row with no hub id.
+     */
+    fun requestAttachmentDownload(localAttachmentId: Long) {
+        viewModelScope.launch {
+            runCatching { clientAttachmentDownloader().request(localAttachmentId) }
+        }
+    }
+
+    /** Client mode C5 — retries a failed download (tap-to-retry on the failed tile). */
+    fun retryAttachmentDownload(localAttachmentId: Long) {
+        viewModelScope.launch {
+            runCatching { clientAttachmentDownloader().retry(localAttachmentId) }
+        }
+    }
+
+    /** Client mode C5 — the attachment downloader, via the entry point (see [retry]). */
+    private fun clientAttachmentDownloader(): com.relay.sms.sync.client.ClientAttachmentDownloader =
+        dagger.hilt.android.EntryPointAccessors.fromApplication(
+            context,
+            com.relay.sms.sync.client.ClientAttachmentDownloaderEntryPoint::class.java,
+        ).clientAttachmentDownloader()
+
+    /**
+     * E2E — the peer repository, notice store and probe manager, via the
+     * entry point (the constructor is at the Detekt 20-parameter cap).
+     * Throws when Hilt cannot serve it (JVM unit tests with a mocked
+     * context) — callers catch.
+     */
+    private fun e2eEntryPoint(): E2eThreadEntryPoint =
+        dagger.hilt.android.EntryPointAccessors.fromApplication(
+            context,
+            E2eThreadEntryPoint::class.java,
+        )
+
+    /**
+     * E2E — manual probe retry from the Details panel (round 41): the
+     * user asked to retry the key exchange, so one probe goes out now
+     * (bypassing the budget and the discovery toggle — the tap is
+     * explicit consent for this one probe). Hub mode only, like the
+     * probe-on-open: the panel shows no encryption row in client
+     * mode, so this never fires there.
+     */
+    fun retryE2eProbe() {
+        runCatching { e2eEntryPoint().probeManager().retryProbe(conversationId) }
+            .onFailure {
+                timber.log.Timber.w(it, "ThreadViewModel: e2e manual probe retry failed")
+            }
+    }
+
+    /**
+     * E2E — manual probe retry over regular SMS (round 45): the
+     * Details panel "Send via SMS" button. Same shape as
+     * [retryE2eProbe], but the probe travels as one `RLYH:` text —
+     * for peers whose data SMS never arrive. Hub mode only, like
+     * [retryE2eProbe]: the panel shows no encryption row in client
+     * mode, so this never fires there.
+     */
+    fun retryE2eProbeViaSms() {
+        runCatching { e2eEntryPoint().probeManager().retryProbeViaSms(conversationId) }
+            .onFailure {
+                timber.log.Timber.w(it, "ThreadViewModel: e2e manual SMS probe retry failed")
+            }
+    }
+
+    fun deleteMessage(messageId: Long) {
+        viewModelScope.launch { repo.deleteMessage(messageId) }
+    }
+
+    /**
+     * v1.26.1 (audit F2) — bascule « favori ». Le drapeau est déjà respecté par la purge
+     * automatique (`DELETE … AND starred = 0`) : c'est le geste qui manquait.
+     */
+    fun toggleMessageStarred(messageId: Long, starred: Boolean) {
+        viewModelScope.launch { repo.setMessageStarred(messageId, starred) }
+    }
+
+    /**
+     * v1.12.0 — Déplace la conversation courante DANS le coffre ou L'EN
+     * SORT depuis l'overflow ThreadScreen. Délègue à
+     * [ToggleConversationStateUseCase.requestMoveToVault] qui check
+     * `AppLockState` (refuse PanicDecoy + Locked).
+     * Émet un snackbar `ShowSnackbar` de confirmation succès / échec.
+     *
+     * v1.27.2 (audit externe 2026-08-04 #3) — le déplacement n'arme PLUS la
+     * session coffre, et la SORTIE du coffre exige une session coffre déjà
+     * déverrouillée (AppError.Locked sinon — le `when` ci-dessous affiche déjà
+     * le message « session verrouillée » pour ce cas).
+     *
+     * En PanicDecoy, l'overflow item est masqué côté UI (cf. `state.isPanicDecoy`)
+     * — defense in depth : le UseCase refuse aussi en domain.
+     */
+    fun moveCurrentConversationToVault(intoVault: Boolean) {
+        viewModelScope.launch {
+            val outcome = toggleConvState.requestMoveToVault(conversationId, intoVault)
+            // v1.12.0 audit B3 — différencier l'échec "session verrouillée"
+            // (AppError.Locked, retourné par requestMoveToVault si lockState
+            // = Locked ou PanicDecoy) du failure générique : message UX clair
+            // au lieu d'un "Déplacement échoué" ambigu.
+            val msgRes = when (outcome) {
+                is com.relay.sms.core.result.Outcome.Success ->
+                    if (intoVault) com.relay.sms.R.string.vault_move_in_done
+                    else com.relay.sms.R.string.vault_move_out_done
+                is com.relay.sms.core.result.Outcome.Failure -> when (outcome.error) {
+                    is com.relay.sms.core.result.AppError.Locked ->
+                        com.relay.sms.R.string.error_session_locked
+                    else ->
+                        if (intoVault) com.relay.sms.R.string.vault_move_in_failed
+                        else com.relay.sms.R.string.vault_move_out_failed
+                }
+            }
+            _events.tryEmit(
+                Event.ShowSnackbar(
+                    message = context.getString(msgRes),
+                    isError = outcome is com.relay.sms.core.result.Outcome.Failure,
+                ),
+            )
+        }
+    }
+
+    /**
+     * v1.11.0 — Sujet 5 apparence : couleur bulle sortante + avatar custom
+     * (URI `content://` persistée par l'appelant via
+     * `takePersistableUriPermission`). `null` sur un argument = reset à la
+     * valeur par défaut.
+     */
+    /** v1.28.3 — nommer le groupe ; la normalisation est dans le use case. */
+    fun renameGroup(raw: String?) {
+        viewModelScope.launch {
+            toggleConvState.rename(conversationId, raw)
+            _events.tryEmit(Event.ShowSnackbar(context.getString(com.relay.sms.R.string.group_renamed)))
+        }
+    }
+
+    /**
+     * v1.28.4 — dans un groupe, chaque bulle reçue nomme SON expéditeur, pas le groupe. Les noms
+     * sont résolus par adresse BRUTE de message, une fois par adresse : c'est la clé que l'écran
+     * possède, et `lookupByPhone` applique déjà la règle de rapprochement des numéros.
+     */
+    private fun resoudreNomsDesExpediteurs(msgs: List<Message>) {
+        val connus = _state.value.memberNames
+        val inconnus = msgs.asSequence()
+            .filter { it.isIncoming }
+            .map { it.address }
+            .filter { it.isNotBlank() && it !in connus }
+            .distinct()
+            .toList()
+        if (inconnus.isEmpty()) return
+        viewModelScope.launch {
+            val noms = inconnus.mapNotNull { a ->
+                runCatching { contactRepo.lookupByPhone(a)?.displayName }.getOrNull()
+                    ?.takeIf { it.isNotBlank() }
+                    ?.let { a to it }
+            }.toMap()
+            if (noms.isNotEmpty()) _state.update { it.copy(memberNames = it.memberNames + noms) }
+        }
+    }
+
+    fun setAppearance(bubbleColorArgb: Int?, avatarUri: String?) {
+        viewModelScope.launch {
+            toggleConvState.setAppearance(conversationId, bubbleColorArgb, avatarUri)
+            _events.tryEmit(
+                Event.ShowSnackbar(context.getString(com.relay.sms.R.string.appearance_saved)),
+            )
+        }
+    }
+
+    // ──────────────────────────── Voice MMS composer ────────────────────────────
+
+    /**
+     * Starts a new recording. Caller must have already obtained [android.Manifest.permission.RECORD_AUDIO]
+     * — the underlying [MediaRecorder] would otherwise emit a SecurityException and the use case
+     * surfaces it as [AppError.Permission].
+     *
+     * If the user happens to be Reviewing a previous recording, that recording is discarded
+     * (file deleted, playback stopped) before the new one starts.
+     */
+    fun startVoiceRecording() {
+        if (_state.value.voice is VoiceState.Recording) return
+        discardVoiceDraft()
+        _state.update { it.copy(voice = VoiceState.Recording(elapsedMs = 0, amplitude = 0)) }
+        recorderJob = viewModelScope.launch {
+            voiceRecorder.record().collect { event ->
+                when (event) {
+                    is VoiceRecorder.Event.Tick -> _state.update { st ->
+                        if (st.voice is VoiceState.Recording) {
+                            st.copy(voice = VoiceState.Recording(event.elapsedMs, event.amplitude))
+                        } else st
+                    }
+                    is VoiceRecorder.Event.Completed -> {
+                        _state.update {
+                            it.copy(
+                                voice = VoiceState.Reviewing(
+                                    file = event.result.file,
+                                    durationMs = event.result.durationMs,
+                                    sizeBytes = event.result.sizeBytes,
+                                    mimeType = event.result.mimeType,
+                                ),
+                            )
+                        }
+                        if (event.cappedByLimit) {
+                            _events.tryEmit(Event.ShowSnackbar(snackMaxDuration()))
+                        }
+                    }
+                    is VoiceRecorder.Event.Failed -> {
+                        _state.update { it.copy(voice = VoiceState.Idle) }
+                        _events.tryEmit(Event.SendError(event.error))
+                    }
+                }
+            }
+        }
+    }
+
+    /** Asks the recorder to stop. Result will appear as [VoiceState.Reviewing] via the Flow. */
+    fun stopVoiceRecording() {
+        if (_state.value.voice !is VoiceState.Recording) return
+        voiceRecorder.stop()
+    }
+
+    /**
+     * Discards the active recording (Recording or Reviewing). Deletes the audio file and stops
+     * any in-progress playback. Idempotent.
+     */
+    fun discardVoiceDraft() {
+        playbackController.stop()
+        when (val v = _state.value.voice) {
+            is VoiceState.Recording -> voiceRecorder.cancel()
+            is VoiceState.Reviewing -> v.file.delete()
+            VoiceState.Idle -> Unit
+        }
+        recorderJob?.cancel()
+        recorderJob = null
+        _state.update { it.copy(voice = VoiceState.Idle) }
+    }
+
+    /** Toggles playback of any audio source, keyed for the controller's single-clip-at-a-time guarantee. */
+    fun togglePlayback(key: String, uri: Uri) {
+        playbackController.toggle(key, uri)
+    }
+
+    /** Seeks within whichever clip is currently active in the playback controller. */
+    fun seekPlaybackTo(positionMs: Int) {
+        playbackController.seekTo(positionMs)
+    }
+
+    /** Convenience for the composer preview — keyed on the recording's absolute path. */
+    fun togglePreviewPlayback() {
+        val r = _state.value.voice as? VoiceState.Reviewing ?: return
+        playbackController.toggle(r.file.absolutePath, Uri.fromFile(r.file))
+    }
+
+    fun seekPreviewTo(positionMs: Int) {
+        if (_state.value.voice !is VoiceState.Reviewing) return
+        playbackController.seekTo(positionMs)
+    }
+
+    /**
+     * Sends the reviewed audio clip as an MMS to the conversation's recipients. On failure the
+     * draft is preserved so the user can retry; on success the audio file's ownership transfers
+     * to the AttachmentEntity and the composer returns to Idle.
+     */
+    fun sendVoiceMms() {
+        if (_state.value.conversation == null) return
+        if (_state.value.voice !is VoiceState.Reviewing) return
+        if (_state.value.isSendingVoice) return
+        viewModelScope.launch {
+            val confirm = cachedSettings.value.sending.confirmBeforeBroadcast
+            if (confirm) {
+                _state.update { it.copy(pendingVoiceConfirm = true) }
+            } else {
+                doSendVoice()
+            }
+        }
+    }
+
+    /** Confirms and actually dispatches the staged voice recording. */
+    fun confirmPendingVoice() {
+        if (!_state.value.pendingVoiceConfirm) return
+        _state.update { it.copy(pendingVoiceConfirm = false) }
+        viewModelScope.launch { doSendVoice() }
+    }
+
+    /** Dismisses the voice confirm dialog without sending — the recording stays in Reviewing. */
+    fun cancelPendingVoice() {
+        _state.update { it.copy(pendingVoiceConfirm = false) }
+    }
+
+    private suspend fun doSendVoice() {
+        val conv = _state.value.conversation ?: return
+        val reviewing = _state.value.voice as? VoiceState.Reviewing ?: return
+        _state.update { it.copy(isSendingVoice = true) }
+        playbackController.stop()
+        // Client mode C5 — a voice send from a linked device goes
+        // through the router (S20), not the voice use case: the
+        // router's client branch prepares + uploads the recording,
+        // then sends it with the `attachments` array. The voice use
+        // case stays hub-only (it bypasses the router).
+        val res = if (_state.value.isClientMode) {
+            envoyer.invoke(
+                conv.addresses,
+                "",
+                attachments = listOf(
+                    SendMediaMmsUseCase.AttachmentPayload(
+                        file = reviewing.file,
+                        mimeType = reviewing.mimeType,
+                        durationMs = reviewing.durationMs,
+                    ),
+                ),
+                conversationId = conversationId,
+            )
+        } else {
+            sendVoiceMms.invoke(
+                recipients = conv.addresses,
+                echoInGroup = conv.isGroup,
+                groupMms = cachedSettings.value.sending.groupMms,
+                audioFile = reviewing.file,
+                mimeType = reviewing.mimeType,
+                durationMs = reviewing.durationMs,
+            )
+        }
+        when (res) {
+            is Outcome.Success -> {
+                _state.update { it.copy(voice = VoiceState.Idle, isSendingVoice = false) }
+                // v1.28.3 (F21) — idem sur la voie vocale, troisieme chemin d'envoi.
+                if (res.value.isComplete) {
+                    _events.tryEmit(Event.ShowSnackbar(snackVoiceSent()))
+                } else {
+                    _events.tryEmit(
+                        Event.PartialSend(
+                            sent = res.value.dispatched.size,
+                            failed = res.value.failed.size,
+                            blocked = res.value.blocked.size,
+                        ),
+                    )
+                }
+            }
+            is Outcome.Failure -> {
+                _state.update { it.copy(isSendingVoice = false) }
+                _events.tryEmit(Event.SendError(res.error))
+            }
+        }
+    }
+
+    // ──────────────────────────── Misc ────────────────────────────
+
+    fun exportToPdf() {
+        if (_state.value.isExporting) return
+        _state.update { it.copy(isExporting = true) }
+        viewModelScope.launch {
+            when (val r = exportPdf.invoke(conversationId)) {
+                is Outcome.Success -> _events.tryEmit(Event.PdfReady(Uri.parse(r.value.shareUri), r.value.pages))
+                // v1.6.1 (audit QUAL-07) — string localisée (avant : "PDF export failed"
+                // affiché en anglais même sur device FR — regression i18n).
+                is Outcome.Failure -> _events.tryEmit(
+                    Event.ShowSnackbar(
+                        context.getString(com.relay.sms.R.string.snack_pdf_export_failed),
+                        isError = true,
+                    ),
+                )
+            }
+            _state.update { it.copy(isExporting = false) }
+        }
+    }
+
+    fun requestAddContact() {
+        val addr = _state.value.conversation?.addresses?.firstOrNull()?.raw ?: return
+        _events.tryEmit(Event.OpenAddContact(addr))
+    }
+
+    /**
+     * "Edit contact" in the details panel (round 42): the thread's
+     * number is already saved, so the system editor opens on THAT
+     * person's card — `ACTION_EDIT` with the contact URI, not the
+     * `ACTION_INSERT_OR_EDIT` selector [requestAddContact] uses
+     * (without a URI, the Contacts app opens the whole list).
+     * The contact is re-looked-up on tap (fresh, like
+     * [openMemberContact]): if it was deleted since the thread
+     * loaded, or the lookup fails (`READ_CONTACTS` denied throws
+     * `SecurityException`), fall back to the add flow — better
+     * than nothing, and never a crash.
+     */
+    fun requestEditContact() {
+        val addr = _state.value.conversation?.addresses?.firstOrNull()?.raw ?: return
+        viewModelScope.launch {
+            val contactId = com.relay.sms.core.result
+                .runCatchingCancellable { contactRepo.lookupByPhone(addr) }
+                .getOrNull()?.id
+            _events.tryEmit(
+                if (contactId != null) {
+                    Event.OpenEditContact(contactId)
+                } else {
+                    Event.OpenAddContact(addr)
+                },
+            )
+        }
+    }
+
+    fun requestCreateContact() {
+        val addr = _state.value.conversation?.addresses?.firstOrNull()?.raw ?: return
+        _events.tryEmit(Event.OpenCreateContact(addr))
+    }
+
+    /**
+     * A group member tap in the details panel: a saved contact
+     * opens in the system editor on THAT person's card
+     * (`ACTION_EDIT` + contact URI, like [requestEditContact]),
+     * an unknown number opens a blank contact form prefilled
+     * with the number. The lookup decides which — `memberNames`
+     * only covers members who sent a message, so it cannot
+     * answer "is this a contact" for the whole member list.
+     * A failed lookup (`READ_CONTACTS` denied throws
+     * `SecurityException`) falls back to the create flow —
+     * better than nothing, and never a crash.
+     */
+    fun openMemberContact(rawAddress: String) {
+        viewModelScope.launch {
+            val contactId = com.relay.sms.core.result
+                .runCatchingCancellable { contactRepo.lookupByPhone(rawAddress) }
+                .getOrNull()?.id
+            _events.tryEmit(
+                if (contactId != null) {
+                    Event.OpenEditContact(contactId)
+                } else {
+                    Event.OpenCreateContact(rawAddress)
+                },
+            )
+        }
+    }
+
+    fun requestCall() {
+        val addr = _state.value.conversation?.addresses?.firstOrNull()?.raw ?: return
+        _events.tryEmit(Event.OpenDialer(addr))
+    }
+
+    /**
+     * Blocks every address of the current conversation. **The conversation is KEPT**, grouped
+     * under « Bloqués » in the list.
+     *
+     * ⚠️ v1.28.12 (relecture externe du 2026-09-17) — cette première ligne disait
+     * « AND deletes the conversation locally », ce qui n'est plus vrai depuis la v1.25.3 : la
+     * suppression a été retirée trois paragraphes plus bas, et la phrase d'ouverture est
+     * restée. Elle avait été recopiée dans l'aide de l'application
+     * (`about_help_block_step1`), qui promettait donc à l'utilisateur que son historique
+     * était effacé alors qu'il ne l'était pas — sur une application qui porte un coffre et
+     * une session leurre, c'est une promesse qu'on ne fait pas à tort.
+     *
+     * Le KDoc d'origine (v1.2.5) décrivait le comportement inverse, et il est conservé en
+     * dessous parce qu'il explique l'aller-retour.
+     *
+     * v1.25.3 (audit H15) — l'`Outcome` de [BlockNumberUseCase] était purement ignoré et la
+     * boucle n'isolait pas ses erreurs. Deux conséquences : une `SecurityException` du
+     * `BlockedNumberContract` système sur le premier destinataire faisait sauter le blocage des
+     * suivants **et** la suppression de la conversation ; et dans tous les cas l'utilisateur
+     * voyait « Numéro(s) bloqué(s) » alors que rien n'avait été bloqué. On isole chaque adresse,
+     * et on ne supprime la conversation — geste irréversible — que si au moins un blocage a
+     * réellement abouti.
+     */
+    fun blockSenders(onDone: () -> Unit = {}) {
+        val addresses = _state.value.conversation?.addresses ?: return
+        // Client mode C3 — block via the hub (one `set_blocked` frame
+        // for the conversation); the per-address telephony block list
+        // is hub-only.
+        if (_state.value.isClientMode) {
+            viewModelScope.launch {
+                when (val res = toggleConvState.setBlocked(conversationId, true)) {
+                    is Outcome.Success -> {
+                        _events.tryEmit(Event.ShowSnackbar(snackNumbersBlocked()))
+                        onDone()
+                    }
+                    is Outcome.Failure -> _events.tryEmit(Event.SendError(res.error))
+                }
+            }
+            return
+        }
+        viewModelScope.launch {
+            val blocked = addresses.count { addr ->
+                runCatching { blockNumber.invoke(addr.raw) }
+                    .onFailure { timber.log.Timber.w(it, "blockSenders: block threw for one address") }
+                    .getOrNull() is Outcome.Success
+            }
+            // v1.25.3 — bloquer ne SUPPRIME plus la conversation. Le `delete()` datait de la
+            // v1.2.5, quand un blocage laissait le fil visible dans la liste ; il avait ensuite
+            // doublonné avec un masquage, puis survécu à son retrait. Il était donc redondant —
+            // et irréversible, alors que le marquage se défait d'un simple déblocage.
+            // v1.25.4 — `ConversationRepositoryImpl.observeAll` ne masque plus rien : il pose
+            // `Conversation.blocked` et la liste regroupe ces fils sous « Bloqués ».
+            when {
+                blocked == addresses.size -> {
+                    _events.tryEmit(Event.ShowSnackbar(snackNumbersBlocked()))
+                    onDone()
+                }
+                // Blocage partiel : le fil reste visible (le filtre exige que TOUTES les adresses
+                // soient bloquées), ce qui est cohérent — un participant peut encore écrire.
+                blocked > 0 -> _events.tryEmit(
+                    Event.ShowSnackbar(snackBlockPartial(blocked, addresses.size)),
+                )
+                else -> _events.tryEmit(Event.ShowSnackbar(snackBlockFailed()))
+            }
+        }
+    }
+
+    fun deleteThisConversation(onDeleted: () -> Unit) {
+        viewModelScope.launch {
+            // v1.28.9 (septième note d'Andrew, point 5) — une conversation du coffre peut être
+            // CONSERVÉE : on reste alors dans le fil, et on dit pourquoi. Revenir à la liste aurait
+            // fait croire à une suppression qui n'a pas eu lieu.
+            val message = when (toggleConvState.delete(conversationId)) {
+                com.relay.sms.domain.repository.ConversationDeleteResult.DELETED -> null
+                com.relay.sms.domain.repository.ConversationDeleteResult.KEPT_SYSTEM_COPY ->
+                    com.relay.sms.R.string.conversations_delete_vault_kept_system
+                com.relay.sms.domain.repository.ConversationDeleteResult.KEPT_LOCAL_FAILURE ->
+                    com.relay.sms.R.string.conversations_delete_kept_local
+            }
+            if (message == null) {
+                onDeleted()
+            } else {
+                _events.tryEmit(Event.ShowSnackbar(context.getString(message), isError = true))
+            }
+        }
+    }
+
+    /**
+     * v1.29.1 (issue #60) — la conversation n'est « active » (cf. [ActiveConversationTracker]) que
+     * tant que son écran est VISIBLE, de ON_START à ON_STOP : `IncomingMessageNotifier` donne alors à
+     * la notification d'un message de CETTE conversation un `setTimeoutAfter` court — le son joue,
+     * puis la notification s'efface, le message étant déjà sous les yeux.
+     *
+     * Jusqu'à la 1.29.0, elle était déclarée active dans `init` et ne l'était plus qu'à `onCleared`.
+     * Or le ViewModel survit à l'écran éteint et à une autre application au premier plan : la
+     * notification d'un message que personne ne voyait disparaissait en 1,5 s.
+     */
+    /**
+     * Feedback round 6 — schedules the one-shot mark-read [MARK_READ_DELAY_MS]
+     * after the first window lands. Marking read immediately wrote to Room
+     * while the 300 ms open slide was still running, which re-emitted the
+     * window and recomposed the whole visible list a second time inside the
+     * animation — the glitchy slide-in. The delay lands past the slide and
+     * the first scroll-to-bottom, so the re-emission hits a settled list.
+     * No-op when already scheduled or done; the job is cancelled by
+     * [markReadNow] when the user leaves before the delay elapses.
+     */
+    private fun scheduleDeferredMarkRead() {
+        if (readMarked || deferredMarkReadJob != null) return
+        deferredMarkReadJob = viewModelScope.launch {
+            delay(MARK_READ_DELAY_MS)
+            markRead.invoke(conversationId)
+            readMarked = true
+        }
+    }
+
+    /**
+     * Feedback round 6 — marks the conversation read immediately. Called when
+     * the thread stops being visible (back navigation, another app in front):
+     * the unread badge must already be clear when the conversation list
+     * reappears, including when the user leaves before the deferred job in
+     * [scheduleDeferredMarkRead] fires. Cancels the pending job so the Room
+     * write happens exactly once per thread lifetime.
+     */
+    private fun markReadNow() {
+        if (readMarked) return
+        deferredMarkReadJob?.cancel()
+        deferredMarkReadJob = null
+        readMarked = true
+        viewModelScope.launch { markRead.invoke(conversationId) }
+    }
+
+    fun onVisibilityChanged(visible: Boolean) {
+        if (visible) {
+            activeConversationTracker.setActive(conversationId)
+        } else {
+            activeConversationTracker.clearActive(conversationId)
+            // Feedback round 6 — leaving the thread marks it read at once
+            // (see [markReadNow]): the deferred job may not have fired yet.
+            markReadNow()
+        }
+    }
+
+    fun onConversationOpened() {
+        // Feedback round 6 — no mark-read here anymore: the first window
+        // emission schedules the deferred one ([scheduleDeferredMarkRead]),
+        // and leaving the thread marks read at once ([markReadNow]).
+        // v1.3.3 bug #4 — auto-consume du partage entrant. Z3 audit fix : on ATTEND
+        // que la conversation soit hydratée (state.conversation != null) avant
+        // d'appeler onAttachmentPicked, qui sinon retourne early sans rien attacher
+        // et le holder serait vidé pour rien.
+        consumeIncomingShareIfAny()
+    }
+
+    /**
+     * v1.4.0 (F5 forward feature) — stages the given [message] into [com.relay.sms.system.share
+     * .IncomingShareHolder] so the next [ThreadViewModel] that hydrates (i.e. the
+     * destination thread the user picks in [com.relay.sms.ui.components
+     * .ForwardMessageSheet]) pulls it through [consumeIncomingShareIfAny] and pre-fills
+     * its draft / staged attachment.
+     *
+     * The payload mirrors what the share-target flow produces for [android.content
+     * .Intent.ACTION_SEND]:
+     *   - `text` = the message body (trimmed, `null` if blank);
+     *   - `uris` = the first attachment's URI if any (image / file / audio / video). The
+     *     URI is built from the stored `localUri` — either a `content://` (system MMS
+     *     parts) used as-is, or a `file://` for our own cache (intra-process consume,
+     *     no FileUriExposedException because no [Intent] crosses).
+     *   - `mimeType` = the attachment's MIME (drives the `AttachmentKind` selection in
+     *     [onAttachmentPicked]).
+     */
+    fun stageForward(message: com.relay.sms.domain.model.Message) {
+        val text = message.body.trim().takeIf { it.isNotBlank() }
+        val attachment = message.attachments.firstOrNull()
+        val uris = buildList {
+            if (attachment != null && attachment.localUri.isNotBlank()) {
+                // v1.4.0 (S1) — local file paths are wrapped via FileProvider so the
+                // resulting `content://` URI stays safe even if a future caller stuffs it
+                // into an outgoing Intent. Using `Uri.fromFile` here was technically OK
+                // (the consumer is intra-process via `ContentResolver.openInputStream`),
+                // but the `file://` pattern is a known FileUriExposedException landmine
+                // and we standardise on FileProvider throughout the app already (cf.
+                // [MediaAttachmentBubble.toShareableUri]).
+                val uri = if (attachment.localUri.startsWith("content://")) {
+                    android.net.Uri.parse(attachment.localUri)
+                } else {
+                    val file = java.io.File(attachment.localUri)
+                    if (file.exists()) {
+                        runCatching {
+                            androidx.core.content.FileProvider.getUriForFile(
+                                context,
+                                "${context.packageName}.fileprovider",
+                                file,
+                            )
+                        }.getOrNull()
+                    } else null
+                }
+                if (uri != null) add(uri)
+            }
+        }
+        val pending = com.relay.sms.system.share.IncomingShareHolder.Pending(
+            uris = uris,
+            mimeType = attachment?.mimeType,
+            text = text,
+        )
+        if (!pending.isEmpty) {
+            incomingShare.set(pending)
+        }
+    }
+
+    /**
+     * v1.3.3 bug #4 — auto-attach d'un partage entrant. Pas de routing dédié pour
+     * v1.3.3 ; l'user choisit lui-même la conversation cible parmi sa liste après
+     * tap sur Relay dans le chooser système. Le 1ᵉʳ URI du partage est attaché ;
+     * les éventuels suivants (ACTION_SEND_MULTIPLE) sont ignorés cette release (v1.3.4
+     * gérera le multi-attach). Le texte EXTRA_TEXT est préchargé dans le draft.
+     *
+     * Z3 audit fix : on suspend jusqu'à hydration de `state.conversation`. Sans ça
+     * la course `onConversationOpened` ⇆ flow Room peut faire échouer silencieusement
+     * `onAttachmentPicked` qui guarde `if (_state.value.conversation == null) return`.
+     */
+    private fun consumeIncomingShareIfAny() {
+        viewModelScope.launch {
+            // Attente bornée : si la conv n'arrive pas en 5 s (cas extrême purge
+            // concurrente), on abandonne pour ne pas leaker le holder en RAM.
+            val hydrated = withTimeoutOrNull(5_000L) {
+                _state.first { it.conversation != null }
+            }
+            if (hydrated == null) {
+                timber.log.Timber.w("consumeIncomingShareIfAny: conversation never hydrated, share ignored")
+                return@launch
+            }
+            val pending = incomingShare.consume() ?: return@launch
+            // 1) Texte → draft si encore vide.
+            if (!pending.text.isNullOrBlank() && _state.value.draft.isBlank()) {
+                updateDraft(pending.text)
+            }
+            // 2) Premier URI → attachement via le pipeline standard.
+            val firstUri = pending.uris.firstOrNull() ?: return@launch
+            val kind = when {
+                pending.mimeType?.startsWith("image/") == true ->
+                    com.relay.sms.ui.components.AttachmentKind.PHOTO
+                pending.mimeType?.startsWith("video/") == true ->
+                    com.relay.sms.ui.components.AttachmentKind.VIDEO
+                pending.mimeType == "text/x-vcard" || pending.mimeType == "text/vcard" ->
+                    com.relay.sms.ui.components.AttachmentKind.CONTACT
+                else -> com.relay.sms.ui.components.AttachmentKind.FILE
+            }
+            onAttachmentPicked(firstUri, kind)
+        }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        // v1.3.9 — libère le slot "conversation active" pour que les notifs futures
+        // (l'app étant désormais en background ou sur une autre conv) repassent en
+        // persistance normale. Le `compareAndSet` interne au tracker garantit qu'un
+        // ViewModel d'une autre conv fraîchement init ne sera pas écrasé par ce clear
+        // (race configChange : new init avant old onCleared).
+        activeConversationTracker.clearActive(conversationId)
+        recorderJob?.cancel()
+        voiceRecorder.cancel()
+        playbackController.stop()
+        // v1.2.3 audit F13: an attachment staged in `media_outgoing/` but never confirmed or
+        // cancelled (Activity recreated, user backed out) leaks until the TelephonySyncWorker's
+        // 24 h prune sweeps it. Clean up the in-memory staged file synchronously here so the
+        // common path (rotate, back-out) never leaves a trail.
+        // v1.3.4 — cleanup TOUS les fichiers cache des PJ stagées non-envoyées.
+        _state.value.pendingAttachments.forEach { p -> runCatching { p.file.delete() } }
+    }
+
+    // Audit ARCH-M2 (v1.14.8) — Snackbars i18n : strings extraites en R.string FR+EN. Les
+    // anciennes constantes `SNACK_*` (FR hardcodé) sont remplacées par ces helpers instance
+    // qui résolvent via `context.getString`. Cohérent avec le reste de l'app (zéro hardcoded
+    // hors comments / debug).
+    private fun snackMaxDuration(): String = context.getString(
+        com.relay.sms.R.string.snack_thread_max_duration,
+        (VoiceRecorder.MAX_DURATION_MS / 1000).toInt(),
+    )
+    private fun snackAttachSent(): String = context.getString(com.relay.sms.R.string.snack_thread_attach_sent)
+    private fun snackAttachCopyFailed(): String = context.getString(com.relay.sms.R.string.snack_thread_attach_copy_failed)
+
+    /**
+     * v1.28.13 (balayage des permissions refusées, MR F-Droid !38458) — l'échec d'une carte de
+     * visite SANS `READ_CONTACTS` se dit comme tel. Le sélecteur accorde un accès temporaire à la
+     * fiche choisie, mais la carte se lit à une autre adresse (`CONTENT_VCARD_URI`), que cet accès
+     * ne couvre probablement pas. On n'interdit rien d'avance : on tente, et seul le message
+     * d'échec change, pour que « Impossible de lire la pièce jointe » ne cache pas sa vraie cause.
+     */
+    private fun snackEchecPieceJointe(kind: com.relay.sms.ui.components.AttachmentKind): String {
+        // Contacts-permission fix — the direct framework call, NOT
+        // `ContextCompat.checkSelfPermission`: core 1.19's version
+        // calls `TextUtils.equals` (then `Process.myPid`/`myUid`) on
+        // its pre-33 path, and both are stubs that throw on plain-JVM
+        // unit tests — the throw escaped inside `viewModelScope`
+        // before the snackbar was emitted, so joining a contact
+        // showed NO message at all (`ContactsRefusesTest` saw `[]`
+        // for both cases). The framework call is API 23+ and minSdk
+        // is 26, so on device this is exactly what ContextCompat does
+        // for READ_CONTACTS. Same trap as
+        // `RepositorySyncMessageSource.contactsReadiness`.
+        val contactSansPermission = kind == com.relay.sms.ui.components.AttachmentKind.CONTACT &&
+            context.checkSelfPermission(
+                android.Manifest.permission.READ_CONTACTS,
+            ) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        return if (contactSansPermission) {
+            context.getString(com.relay.sms.R.string.attach_contact_needs_permission)
+        } else {
+            snackAttachCopyFailed()
+        }
+    }
+    private fun snackAttachCapReached(): String = context.getString(com.relay.sms.R.string.snack_thread_attach_cap_reached)
+    private fun snackVoiceSent(): String = context.getString(com.relay.sms.R.string.snack_thread_voice_sent)
+    private fun snackNumbersBlocked(): String = context.getString(com.relay.sms.R.string.snack_thread_numbers_blocked)
+
+    private fun snackBlockFailed(): String = context.getString(com.relay.sms.R.string.snack_block_failed)
+
+    private fun snackBlockPartial(blocked: Int, total: Int): String =
+        context.getString(com.relay.sms.R.string.snack_block_partial, blocked, total)
+
+    private companion object {
+        /**
+         * Messages loaded per page. 200 comfortably fills any screen, so the first paint looks
+         * complete, while keeping the per-emission cost flat on very long threads: before v1.24.0
+         * every incoming SMS re-read and re-mapped the entire conversation.
+         */
+        const val PAGE_SIZE: Int = 200
+
+        /**
+         * Messages loaded on first open. The first paint must compose and lay out the whole
+         * window before the list is shown — so a 200-message first window is what makes
+         * opening a long conversation feel slow. 50 still fills several screens of history,
+         * and the "load older" row pages the rest in 200-message steps via [PAGE_SIZE].
+         * (Round 43 — the reversed list starts at the bottom by layout, so there is no
+         * first-paint jump anymore; the window size is still about compose cost.)
+         */
+        const val INITIAL_WINDOW_SIZE: Int = 50
+
+        /**
+         * Feedback round 6 — debounce on the thread search query, mirroring the
+         * conversations-list search (`debounce(200ms)`): one Room query per
+         * pause in typing instead of one per keystroke.
+         */
+        const val THREAD_SEARCH_DEBOUNCE_MS: Long = 200L
+
+        /**
+         * Feedback round 6 — delay before marking the conversation read after
+         * the first window lands. The thread opens under a 300 ms slide while
+         * the first paint composes and jumps to the bottom; marking read
+         * immediately writes to Room, which re-emits the window and recomposes
+         * the whole visible list a second time — still inside the animation.
+         * 600 ms lands safely past the slide and the first scroll, so the
+         * re-emission hits a settled list.
+         */
+        const val MARK_READ_DELAY_MS: Long = 600L
+
+        // Audit C3 (v1.14.8) — Alias local pointant vers la SOURCE UNIQUE [MmsConstants].
+        // Avant : `280L * 1024L` dupliqué ici ET dans `VoiceRecorder.MAX_SIZE_BYTES`.
+        const val CARRIER_PAYLOAD_CAP_BYTES: Long = com.relay.sms.core.mms.MmsConstants.CARRIER_PAYLOAD_CAP_BYTES
+
+        /**
+         * v1.28.3 (F27) — plafond de ce qu'on accepte de RECOPIER depuis le selecteur.
+         *
+         * Tres au-dessus du plafond operateur de 280 Ko, et c'est voulu : une photo de 4 Mo est
+         * une entree parfaitement legitime, que la compression ramenera sous le plafond reel.
+         * Ce qu'on refuse ici, c'est ce qui n'a aucune chance d'etre un MMS — une video de
+         * plusieurs gigaoctets — et qu'on recopiait integralement avant de le refuser.
+         */
+        const val PLAFOND_COPIE_BYTES: Long = 25L * 1024 * 1024
+
+        private const val COPIE_TAMPON_BYTES = 64 * 1024
+
+        /**
+         * X2 audit v1.3.1 — fenêtre de dédup pour les envois SMS de réaction. Un user qui
+         * tape/retire/re-tape rapidement le même emoji ne paie qu'un SMS dans cette fenêtre.
+         * 60 secondes est large : couvre la rafale émotionnelle typique sans bloquer un
+         * envoi légitime "j'ai re-réfléchi 2 min plus tard".
+         */
+        const val REACTION_DEDUP_WINDOW_MS: Long = 60_000L
+    }
+}
+
+/**
+ * Feedback round 5 — the message a search jump anchored the window on: its id
+ * plus its date, the keyset anchor of the window query.
+ */
+private data class WindowAnchor(val messageId: Long, val date: Long)

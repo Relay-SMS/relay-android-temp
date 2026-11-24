@@ -1,0 +1,200 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.di
+
+import com.relay.sms.data.backup.BackupService
+import com.relay.sms.data.backup.NotesBackupService
+import com.relay.sms.data.local.datastore.SettingsRepository
+import com.relay.sms.data.location.LocationResolver
+import com.relay.sms.data.mms.MmsSender
+import com.relay.sms.data.mms.OutgoingAttachmentStoreImpl
+import com.relay.sms.data.notes.NoteAttachmentResolverImpl
+import com.relay.sms.data.notes.NoteRepositoryImpl
+import com.relay.sms.data.repository.BlockedNumberRepositoryImpl
+import com.relay.sms.data.repository.ConversationMirror
+import com.relay.sms.data.repository.ConversationRepositoryImpl
+import com.relay.sms.data.repository.ModeAwareContactRepository
+import com.relay.sms.data.repository.QuickReplyRepositoryImpl
+import com.relay.sms.data.repository.ScheduledMessageRepositoryImpl
+import com.relay.sms.data.sender.SenderNameProviderImpl
+import com.relay.sms.data.sms.DefaultSmsAppManager
+import com.relay.sms.data.sms.SmsSenderImpl
+import com.relay.sms.data.sms.SystemCopyEraser
+import com.relay.sms.data.sms.TelephonyReader
+import com.relay.sms.data.sms.TelephonySystemCopyEraser
+import com.relay.sms.domain.backup.BackupRestorer
+import com.relay.sms.domain.backup.NotesBackupRestorer
+import com.relay.sms.domain.clipboard.ClipboardCleaner
+import com.relay.sms.domain.emergency.IAmOkMessageProvider
+import com.relay.sms.domain.location.LocationProvider
+import com.relay.sms.domain.mms.MmsDispatcher
+import com.relay.sms.domain.mms.OutgoingAttachmentStore
+import com.relay.sms.domain.notes.NoteAttachmentResolver
+import com.relay.sms.domain.notification.AllNotificationsCanceller
+import com.relay.sms.domain.notification.ConversationNotificationCanceller
+import com.relay.sms.domain.ownnumber.OwnNumberEnsurer
+import com.relay.sms.domain.pdf.PdfExporter
+import com.relay.sms.domain.repository.BlockedNumberRepository
+import com.relay.sms.domain.repository.ContactRepository
+import com.relay.sms.domain.repository.ConversationRepository
+import com.relay.sms.domain.repository.NoteRepository
+import com.relay.sms.domain.repository.OutgoingMessageMirror
+import com.relay.sms.domain.repository.QuickReplyRepository
+import com.relay.sms.domain.repository.ScheduledMessageRepository
+import com.relay.sms.domain.safety.SafetyMessageTexts
+import com.relay.sms.domain.scheduler.ScheduledMessageScheduler
+import com.relay.sms.domain.security.PanicStateProvider
+import com.relay.sms.domain.sender.DefaultSmsAppChecker
+import com.relay.sms.domain.sender.SenderNameProvider
+import com.relay.sms.domain.sender.SentSmsRecorder
+import com.relay.sms.domain.sender.SmsSender
+import com.relay.sms.domain.settings.AppSettingsSource
+import com.relay.sms.domain.vault.VaultMover
+import com.relay.sms.ownnumber.OwnNumberEnsurerImpl
+import com.relay.sms.security.AppLockManager
+import com.relay.sms.security.VaultManager
+import com.relay.sms.sync.E2eSyncSource
+import com.relay.sms.sync.NoteSyncSource
+import com.relay.sms.sync.SyncMessageSource
+import com.relay.sms.system.clipboard.ClipboardCleanerImpl
+import com.relay.sms.system.emergency.IAmOkMessageProviderImpl
+import com.relay.sms.system.notifications.AllNotificationsCancellerImpl
+import com.relay.sms.system.notifications.IncomingMessageNotifier
+import com.relay.sms.system.pdf.ConversationPdfExporter
+import com.relay.sms.system.safety.AndroidSafetyMessageTexts
+import com.relay.sms.system.scheduler.ScheduledMessageSchedulerImpl
+import com.relay.sms.system.sync.RepositoryE2eSyncSource
+import com.relay.sms.system.sync.RepositoryNoteSyncSource
+import com.relay.sms.system.sync.RepositorySyncMessageSource
+import dagger.Binds
+import dagger.Module
+import dagger.hilt.InstallIn
+import dagger.hilt.components.SingletonComponent
+import javax.inject.Singleton
+
+@Module
+@InstallIn(SingletonComponent::class)
+abstract class RepositoryModule {
+
+    @Binds @Singleton
+    abstract fun bindConversationRepository(impl: ConversationRepositoryImpl): ConversationRepository
+
+    /** Slice 2 — the sync engine's message store (SYNC_PROTOCOL.md, glue point 4). */
+    @Binds @Singleton
+    abstract fun bindSyncMessageSource(impl: RepositorySyncMessageSource): SyncMessageSource
+
+    /** Round 36 phase 2 — the note engine's note store (SYNC_PROTOCOL.md, Notes sync). */
+    @Binds @Singleton
+    abstract fun bindNoteSyncSource(impl: RepositoryNoteSyncSource): NoteSyncSource
+
+    /** Round 42 — the engine's E2E store (SYNC_PROTOCOL.md, E2E safety numbers + notices). */
+    @Binds @Singleton
+    abstract fun bindE2eSyncSource(impl: RepositoryE2eSyncSource): E2eSyncSource
+
+    /**
+     * v1.28.1 — l'effacement de la copie systeme d'un message. Interface pour que le contrat
+     * destructeur soit falsifiable en test, cf. [com.relay.sms.data.sms.SystemCopyEraser].
+     */
+    @Binds @Singleton
+    abstract fun bindSystemCopyEraser(impl: TelephonySystemCopyEraser): SystemCopyEraser
+
+    @Binds @Singleton
+    abstract fun bindBlockedNumberRepository(impl: BlockedNumberRepositoryImpl): BlockedNumberRepository
+
+    /**
+     * Client mode C4 — the mode-aware contacts: hub mode reads the
+     * local provider, a linked device reads the synced cache.
+     */
+    @Binds @Singleton
+    abstract fun bindContactRepository(impl: ModeAwareContactRepository): ContactRepository
+
+    @Binds @Singleton
+    abstract fun bindQuickReplyRepository(impl: QuickReplyRepositoryImpl): QuickReplyRepository
+
+    @Binds @Singleton
+    abstract fun bindScheduledMessageRepository(impl: ScheduledMessageRepositoryImpl): ScheduledMessageRepository
+
+    /** Notes phase 1 — the single write path for notes + the decrypt-on-read seam. */
+    @Binds @Singleton
+    abstract fun bindNoteRepository(impl: NoteRepositoryImpl): NoteRepository
+
+    @Binds @Singleton
+    abstract fun bindNoteAttachmentResolver(impl: NoteAttachmentResolverImpl): NoteAttachmentResolver
+
+    @Binds @Singleton
+    abstract fun bindSmsSender(impl: SmsSenderImpl): SmsSender
+
+    @Binds @Singleton
+    abstract fun bindDefaultSmsAppChecker(impl: DefaultSmsAppManager): DefaultSmsAppChecker
+
+    @Binds @Singleton
+    abstract fun bindOutgoingAttachmentStore(impl: OutgoingAttachmentStoreImpl): OutgoingAttachmentStore
+
+    @Binds @Singleton
+    abstract fun bindScheduledMessageScheduler(impl: ScheduledMessageSchedulerImpl): ScheduledMessageScheduler
+
+    @Binds @Singleton
+    abstract fun bindVaultMover(impl: VaultManager): VaultMover
+
+    @Binds @Singleton
+    abstract fun bindPanicStateProvider(impl: AppLockManager): PanicStateProvider
+
+    @Binds @Singleton
+    abstract fun bindLocationProvider(impl: LocationResolver): LocationProvider
+
+    // v1.28.12 — les corps de SMS d'urgence et de Safety Call, dans la langue de l'application.
+    // Meme motif que `bindIAmOkMessageProvider` ci-dessous, qui avait deja sorti le message
+    // « Je vais bien » vers les ressources ; les trois modeles d'urgence, les trois de Safety
+    // Call et les trois relances y etaient restes en francais en dur jusqu'ici.
+    @Binds @Singleton
+    abstract fun bindSafetyMessageTexts(impl: AndroidSafetyMessageTexts): SafetyMessageTexts
+
+    @Binds @Singleton
+    abstract fun bindSenderNameProvider(impl: SenderNameProviderImpl): SenderNameProvider
+
+    @Binds @Singleton
+    abstract fun bindPdfExporter(impl: ConversationPdfExporter): PdfExporter
+
+    @Binds @Singleton
+    abstract fun bindBackupRestorer(impl: BackupService): BackupRestorer
+
+    /** Notes phase 1 — the `.notebk` restore port, mirroring the `.smsbk` one above. */
+    @Binds @Singleton
+    abstract fun bindNotesBackupRestorer(impl: NotesBackupService): NotesBackupRestorer
+
+    @Binds @Singleton
+    abstract fun bindIAmOkMessageProvider(impl: IAmOkMessageProviderImpl): IAmOkMessageProvider
+
+    @Binds @Singleton
+    abstract fun bindSentSmsRecorder(impl: TelephonyReader): SentSmsRecorder
+
+    @Binds @Singleton
+    abstract fun bindMmsDispatcher(impl: MmsSender): MmsDispatcher
+
+    @Binds @Singleton
+    abstract fun bindOutgoingMessageMirror(impl: ConversationMirror): OutgoingMessageMirror
+
+    @Binds @Singleton
+    abstract fun bindAppSettingsSource(impl: SettingsRepository): AppSettingsSource
+
+    /** Group-send own-number fix — just-in-time own-number detection before a group MMS send. */
+    @Binds @Singleton
+    abstract fun bindOwnNumberEnsurer(impl: OwnNumberEnsurerImpl): OwnNumberEnsurer
+
+    @Binds @Singleton
+    abstract fun bindConversationNotificationCanceller(
+        impl: IncomingMessageNotifier,
+    ): ConversationNotificationCanceller
+
+    @Binds @Singleton
+    abstract fun bindAllNotificationsCanceller(
+        impl: AllNotificationsCancellerImpl,
+    ): AllNotificationsCanceller
+
+    @Binds @Singleton
+    abstract fun bindClipboardCleaner(impl: ClipboardCleanerImpl): ClipboardCleaner
+}
