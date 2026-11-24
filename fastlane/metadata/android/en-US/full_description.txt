@@ -2,7 +2,7 @@ Relay is an ad-free, tracker-free SMS / MMS app for Android. It replaces the sto
 
 <b>End-to-end encrypted messaging</b>
 
-Messages between two Relay users are end-to-end encrypted with vodozemac — text, reactions, photos, videos and voice messages, and texts in groups — sent as ordinary SMS/MMS directly between phones, with no server, no internet and no account. Keys never leave your phone. Safety numbers let you verify a contact's identity if you want to; verification is optional. Messages to people who don't use Relay stay plain SMS/MMS over the carrier, as they are everywhere else.
+Messages between two Relay users are end-to-end encrypted with vodozemac — text, reactions, photos, videos and voice messages, and texts in groups — sent as ordinary SMS/MMS directly between phones, with no server, no internet and no account. Keys never leave your phone. Safety numbers let you verify a contact's identity if you want to; verification is optional. Messages to people who don't use Relay stay plain SMS/MMS over the carrier.
 
 <b>Your messages on every device</b>
 
@@ -16,19 +16,19 @@ Link a desktop or tablet over your local network and read, search and send from 
 <li>Notes — private local-only threads for text, photos, files and voice, never sent as SMS, with their own passphrase-protected backup</li>
 <li>Encrypted vault — hide sensitive conversations behind SQLCipher, with the key wrapped in the Android Keystore. Toggle "Lock vault on leave" to re-lock it every time the app goes to background</li>
 <li>Decoy PIN — a second PIN that opens the app in a decoy view where the vault stays invisible and inaccessible</li>
-<li>Emergency mode — hold the button for 3 s to send an alert SMS to your Safety Call contacts, with a single GPS fix if you granted location; without that permission the SMS still goes out, only without coordinates. Quick access to the emergency numbers of the country your phone is connected to, and shortcuts on the lockscreen notification. Placing the call directly is opt-in: by default the dialer simply opens pre-filled</li>
+<li>Emergency mode — hold the button for 3 s to send an alert SMS to your Safety Call contacts, with your location if you allow it. Quick access to the emergency numbers of the country your phone is connected to</li>
 <li>Biometric unlock — fingerprint or face, with a PIN fallback you set yourself</li>
 <li>Contextual reply — long-press a message, pick "Reply" and your composer shows a mini-quote so the recipient sees what you are answering</li>
-<li>Delegated translation — long-press a message and pick "Translate" to hand the text to whichever translation app you have installed (Google Translate, DeepL, Aves Translate …) through a system Intent. No translation model is bundled, and Relay itself sends nothing anywhere</li>
+<li>Delegated translation — long-press a message and pick "Translate" to hand the text to whichever translation app you have installed. No translation model is bundled, and Relay itself sends nothing anywhere</li>
 <li>Scheduled messages — write an SMS, pick a date and time, and it is sent at that moment even if the app is closed</li>
-<li>OS-wide blocked numbers — at first launch, Relay mirrors the system blocklist (Phone app, Samsung Messages) and retroactively deletes the conversations that match</li>
+<li>OS-wide blocked numbers — Relay mirrors the system blocklist (Phone app, Samsung Messages) and deletes the conversations that match</li>
 <li>Attachment picker — Photo, Video, File, Contact card. Photos are automatically re-encoded as JPEG to fit MMS carrier caps</li>
 <li>Full-text search across every conversation, with FTS4 indexing</li>
 <li>Export a conversation as a PDF for archival</li>
 <li>Encrypted local backup using a passphrase distinct from your unlock PIN</li>
 <li>Themes — Light / Dark / AMOLED / "Dark Tech" slate-blue accent</li>
 <li>English, French, German, Italian and Spanish UI</li>
-<li>Confirmation toggle in Settings → Send → "Confirm before send" requires a confirmation dialog before any SMS, MMS or attachment is dispatched</li>
+<li>Confirmation toggle in Settings → Send requires a confirmation dialog before any SMS, MMS or attachment is dispatched</li>
 </ul>
 
 <b>Privacy</b>

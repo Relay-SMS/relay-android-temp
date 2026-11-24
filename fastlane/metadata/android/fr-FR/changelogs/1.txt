@@ -1,0 +1,1 @@
+Relay 1.0.0 — première version. SMS et MMS privés avec chiffrement de bout en bout entre utilisateurs de Relay, liaison du bureau et de la tablette via le réseau local, Notes, messages épinglés, réactions emoji, copie en un geste des codes de connexion et recherche dans un fil. Sans publicité, sans traqueurs, sans services Google.
