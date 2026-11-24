@@ -1,0 +1,350 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.system.startup
+
+import android.content.Context
+import com.relay.sms.data.categories.StickyCategoryStore
+import com.relay.sms.data.local.datastore.SettingsRepository
+import com.relay.sms.data.local.db.dao.AttachmentDao
+import com.relay.sms.data.local.db.dao.ConversationDao
+import com.relay.sms.data.local.db.dao.MessageDao
+import com.relay.sms.data.repository.ConversationMirror
+import com.relay.sms.di.IoDispatcher
+import com.relay.sms.domain.settings.AdvancedSettings
+import dagger.Lazy
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withContext
+import timber.log.Timber
+import java.io.File
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Runs the one-shot cold-start migrations that **open the SQLCipher database**.
+ *
+ * v1.24.0 — before this collaborator, `MainApplication.onCreate` launched three of these as
+ * separate `appScope.launch` blocks, each with its own `settingsRepository.flow.first()` read.
+ * They all hit the same encrypted database, so running them in parallel produced only lock
+ * contention, and every cold start re-read the settings three times just to check flags that were
+ * usually already set.
+ *
+ * Here they run **sequentially, after a single settings read**, and — the real win — a global
+ * guard ([AdvancedSettings.startupDbMigrationsDone]) lets an up-to-date install return **without
+ * opening SQLCipher at all**. Each migration keeps its own flag as the source of truth; the global
+ * guard is only set once all three individual flags are, so it can never skip work that has not
+ * actually completed.
+ *
+ * The lighter cold-start repairs that never touch the database (emergency-state repair, monotonic
+ * drift, blocklist import) stay in `MainApplication`: moving them here would add risk without any
+ * database-contention benefit.
+ *
+ * The DAOs are [Lazy] because this class is resolved from `MainApplication` on the main thread; a
+ * direct injection would provision `AppDatabase` there. [run] is called from an IO coroutine, where
+ * `get()` is safe.
+ */
+@Singleton
+class StartupMigrations @Inject constructor(
+    private val settings: SettingsRepository,
+    private val messageDao: Lazy<MessageDao>,
+    private val conversationDao: Lazy<ConversationDao>,
+    private val attachmentDao: Lazy<AttachmentDao>,
+    private val conversationMirror: Lazy<ConversationMirror>,
+    private val stickyCategories: Lazy<StickyCategoryStore>,
+    @ApplicationContext private val context: Context,
+    @IoDispatcher private val io: CoroutineDispatcher,
+) {
+
+    /**
+     * Runs every pending database migration, then records completion globally.
+     *
+     * Must be called from a background coroutine — it opens SQLCipher, which the caller must never
+     * do on the main thread (cf. `LegacyZeroKeyRekey`).
+     */
+    suspend fun run() = withContext(io) {
+        val advanced = runCatching { settings.flow.first().advanced }.getOrNull() ?: return@withContext
+
+        // v1.24.0 — réparation one-shot des aperçus de conversation périmés par des suppressions
+        // sous ≤ 1.23.4. INDÉPENDANTE de la garde globale : elle doit tourner même sur une install
+        // déjà migrée qui passe à 1.24.0. Ciblée (ne touche que les conversations dont le dernier
+        // message a été supprimé), donc sûre à exécuter une fois.
+        if (!advanced.staleConversationPreviewsRepairedV1240) {
+            runCatching {
+                val fixed = messageDao.get().repairStaleConversationPreviews()
+                settings.update { s ->
+                    s.copy(advanced = s.advanced.copy(staleConversationPreviewsRepairedV1240 = true))
+                }
+                if (fixed > 0) Timber.i("Repaired %d stale conversation preview(s)", fixed)
+            }.onFailure { Timber.w(it, "stale conversation preview repair failed") }
+        }
+
+        // 🔴 v1.27.2 (audit Codex du 2026-08-05, LP-05 / LP-07) — DEUX REPARATIONS QUI DOIVENT
+        // TOURNER SUR UN PARC DEJA MARQUE.
+        //
+        // Elles sont placees AVANT le court-circuit global, comme la reparation des apercus
+        // ci-dessus, et pour la meme raison : une installation VICTIME des deux defauts a
+        // precisement deja tous les anciens drapeaux a `true`. C est la signature du probleme, pas
+        // son absence. Les gader derriere `startupDbMigrationsDone` revenait a ne jamais reparer
+        // les bases que ces correctifs visent.
+        runCatching { repairIdentityDedupV1272(advanced) }
+            .onFailure { Timber.w(it, "v1.27.2 identity dedup repair failed") }
+        runCatching { purgeEmptyConversationsV1272(advanced) }
+            .onFailure { Timber.w(it, "v1.27.2 empty conversations purge failed") }
+
+        // v1.28.12 (S7) — le format de réaction du parc existant, ramené une fois au défaut de
+        // la v1.14.4. Ici encore AVANT le court-circuit, et pour la raison déjà écrite au-dessus :
+        // le parc visé est précisément celui qui a tous les anciens drapeaux à `true`. Ne touche
+        // pas la base — c'est une seule écriture DataStore.
+        runCatching {
+            // La langue RÉSOLUE de l'application : elle suit la langue par application (API 33+)
+            // quand il y en a une, la langue système sinon — donc exactement celle dans laquelle
+            // l'utilisateur lit ses écrans, et celle qui dit si la forme française a du sens.
+            val langue = context.resources.configuration.locales[0].language
+            if (settings.migrerFormatDeReaction(langue)) {
+                Timber.i("v1.28.12 migration: reaction format READABLE_FR -> EMOJI_WITH_QUOTE")
+            }
+        }.onFailure { Timber.w(it, "v1.28.12 reaction format migration failed") }
+
+        // Migration du format de réaction vers IOS_TAPBACK : les «» de
+        // EMOJI_WITH_QUOTE arrivaient en <<>> côté correspondant. Même
+        // placement qu'au-dessus (AVANT le court-circuit) pour la même raison :
+        // le parc visé a déjà tous les anciens drapeaux à `true`.
+        runCatching {
+            if (settings.migrerFormatVersIosTapback()) {
+                Timber.i("migration: reaction format EMOJI_WITH_QUOTE -> IOS_TAPBACK")
+            }
+        }.onFailure { Timber.w(it, "reaction format iOS tapback migration failed") }
+
+        // Round 35 (schema v20) — le backfill one-shot des catégories
+        // collantes. Même placement (AVANT le court-circuit) pour la même
+        // raison : le parc visé — les conversations que les démarcheurs
+        // ont déjà atteintes — a déjà tous les anciens drapeaux à `true`.
+        // Borné (une requête plafonnée par conversation) et idempotent ;
+        // un échec ne bloque pas le démarrage, la passe rejoue au
+        // prochain cold start (le drapeau ne se pose qu'au succès).
+        // Spam follow-up (schema v22) — une seconde passe rejoue le même
+        // backfill sous un second drapeau : le classifieur a gagné de
+        // nouveaux signaux depuis la première passe.
+        runCatching { backfillStickyCategories(advanced) }
+            .onFailure { Timber.w(it, "sticky category backfill failed") }
+
+        // Global short-circuit: an up-to-date install does no migration work and never opens the
+        // database. This is the whole point of the consolidation.
+        if (advanced.startupDbMigrationsDone) return@withContext
+
+        runCatching { unreadResetV180(advanced) }
+            .onFailure { Timber.w(it, "v1.8.0 migration unreadResetV180 failed") }
+        runCatching { migrateAttachmentsToFilesDirIfNeeded(advanced) }
+            .onFailure { Timber.w(it, "v1.14.7 attachments migration failed") }
+        runCatching { dedupeSameNumberConversations(advanced) }
+            .onFailure { Timber.w(it, "dedupeSameNumberConversations failed") }
+
+        maybeMarkAllDone()
+    }
+
+    /**
+     * Sets the global short-circuit only when all three individual flags are set. Re-reads the
+     * settings once (the flags may have flipped during this run). Safe by construction: a migration
+     * still pending keeps its own flag false, so the guard stays off and we re-run next cold start.
+     */
+    private suspend fun maybeMarkAllDone() {
+        runCatching {
+            val a = settings.flow.first().advanced
+            val allDone = a.unreadResetV180 && a.attachmentsMovedToFilesDirV147 && a.dedupSameNumberV1230
+            if (allDone && !a.startupDbMigrationsDone) {
+                settings.update { s -> s.copy(advanced = s.advanced.copy(startupDbMigrationsDone = true)) }
+            }
+        }.onFailure { Timber.w(it, "startupDbMigrationsDone flag update failed") }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Migration bodies — moved VERBATIM from MainApplication (v1.24.0). Only the injected
+    // collaborator names changed; the logic and audit history are unchanged.
+    // ---------------------------------------------------------------------------------------------
+
+    /**
+     * v1.8.0 (post-audit fix unread badges) — purge l'état legacy v1.7.1 : marque tous les
+     * INCOMING lus + recompute les compteurs. Le flag `unreadResetV180` empêche le rejeu.
+     */
+    private suspend fun unreadResetV180(advanced: AdvancedSettings) {
+        if (advanced.unreadResetV180) return
+        val touched = messageDao.get().markAllIncomingAsRead()
+        conversationDao.get().recomputeAllUnreadCounts()
+        settings.update { s -> s.copy(advanced = s.advanced.copy(unreadResetV180 = true)) }
+        Timber.i(
+            "v1.8.0 migration unreadResetV180 done: marked %d incoming messages as read",
+            touched,
+        )
+    }
+
+    /**
+     * 🔴 v1.27.2 (audit Codex du 2026-08-05, LP-05) — rejoue la déduplication avec **l'identité
+     * région-aware corrigée**.
+     *
+     * `dedupSameNumberV1230` ne peut pas servir de garde : une installation victime du défaut l'a
+     * déjà à `true`. Elle avait comparé les numéros sur une région lue **avant hydratation** —
+     * donc souvent celle de la SIM au lieu du réglage — conclu que la base était propre, et posé le
+     * drapeau. Le correctif d'identité ne rejouait jamais là où il servait.
+     *
+     * Le drapeau n'est posé que si la passe rend `false`, c'est-à-dire si plus rien n'a été
+     * fusionné : tant qu'elle travaille encore, on rejoue au démarrage suivant. Même contrat que
+     * la passe d'origine, nouveau numéro de version.
+     */
+    private suspend fun repairIdentityDedupV1272(advanced: AdvancedSettings) {
+        if (advanced.identityDedupRepairedV1272) return
+        val merged = conversationMirror.get().dedupeSameNumberConversations()
+        if (!merged) {
+            settings.update { s -> s.copy(advanced = s.advanced.copy(identityDedupRepairedV1272 = true)) }
+            Timber.i("v1.27.2 identity dedup repair: base propre")
+        } else {
+            Timber.i("v1.27.2 identity dedup repair: doublons fusionnes, rejeu au prochain demarrage")
+        }
+    }
+
+    /**
+     * 🔴 v1.27.2 (audit Codex du 2026-08-05, LP-07) — retire les conversations **coquilles** déjà
+     * créées avant le correctif.
+     *
+     * Le nettoyage ajouté à `reconcileDeletions` ne s'applique qu'aux conversations dont un message
+     * vient d'être supprimé. Une coquille déjà vide n'a plus aucun message : elle ne peut donc plus
+     * être candidate, et restait affichée indéfiniment — sans aperçu, datée du 1ᵉʳ janvier 1970.
+     *
+     * ⚠️ Mêmes gardes que [ConversationDao.deleteIfEmpty] : brouillon, envoi programmé, Coffre.
+     * « Aucun message » ne veut pas dire « rien à perdre ».
+     */
+    private suspend fun purgeEmptyConversationsV1272(advanced: AdvancedSettings) {
+        if (advanced.emptyConversationsPurgedV1272) return
+        val removed = conversationDao.get().deleteAllEmptyConversations()
+        settings.update { s -> s.copy(advanced = s.advanced.copy(emptyConversationsPurgedV1272 = true)) }
+        if (removed > 0) Timber.i("v1.27.2: %d conversation(s) coquille(s) retiree(s)", removed)
+    }
+
+    /**
+     * Round 35 (schema v20) — classe les conversations 1:1 d'étrangers
+     * déjà en base à partir du corps COMPLET de leurs messages entrants
+     * récents (voir [StickyCategoryStore.backfill]), pour qu'elles
+     * rejoignent leur onglet sans attendre un nouveau message. Les
+     * drapeaux ne se posent qu'après une passe complète : en cas
+     * d'échec, la passe rejoue au prochain cold start.
+     *
+     * Spam follow-up (schema v22) — une seconde passe sous un second
+     * drapeau : le classifieur a gagné de nouveaux signaux depuis la
+     * première passe, donc les conversations classées tout-plain à
+     * l'époque sont réexaminées. Une seule invocation du backfill,
+     * gardée par les deux drapeaux : une installation fraîche pose les
+     * deux d'un coup, une installation déjà passée en v20 ne rejoue
+     * que la seconde passe.
+     */
+    private suspend fun backfillStickyCategories(advanced: AdvancedSettings) {
+        if (advanced.stickyCategoryBackfilledV20 && advanced.stickyCategoryBackfilledV22) return
+        val stored = stickyCategories.get().backfill()
+        settings.update { s ->
+            s.copy(
+                advanced = s.advanced.copy(
+                    stickyCategoryBackfilledV20 = true,
+                    stickyCategoryBackfilledV22 = true,
+                ),
+            )
+        }
+        if (stored > 0) Timber.i("sticky category backfill: %d conversation(s) filed", stored)
+    }
+
+    /**
+     * v1.22.x — dédup one-heal des doublons de conversations du même numéro. On ne mémorise la
+     * complétion QUE lorsque la base est propre (retour `false` = rien à fusionner) : tant que la
+     * passe fusionne encore des doublons, on re-scanne au prochain cold-start.
+     */
+    private suspend fun dedupeSameNumberConversations(advanced: AdvancedSettings) {
+        if (advanced.dedupSameNumberV1230) return
+        val merged = conversationMirror.get().dedupeSameNumberConversations()
+        if (!merged) {
+            settings.update { s -> s.copy(advanced = s.advanced.copy(dedupSameNumberV1230 = true)) }
+        }
+    }
+
+    /**
+     * v1.14.7 — déplace les attachments MMS reçus de `cacheDir/mms_incoming/` (volatile) vers
+     * `filesDir/mms_attachments/` (persistant) et réécrit les `AttachmentEntity.local_uri`.
+     *
+     * Corps déplacé verbatim ; `cacheDir`/`filesDir` deviennent `context.cacheDir`/`context.filesDir`.
+     */
+    private suspend fun migrateAttachmentsToFilesDirIfNeeded(advanced: AdvancedSettings) {
+        if (advanced.attachmentsMovedToFilesDirV147) return
+
+        val oldDir = File(context.cacheDir, "mms_incoming")
+        val newDir = File(context.filesDir, "mms_attachments").apply { mkdirs() }
+        // v1.14.7 audit S1 — canonicalFile sur newDir pour le path-traversal check ultérieur.
+        val newDirCanonical = runCatching { newDir.canonicalFile }.getOrNull() ?: run {
+            Timber.w("v1.14.7 migration: cannot canonicalize newDir %s", newDir.absolutePath)
+            return
+        }
+        val oldPrefixAbs = oldDir.absolutePath + File.separator
+
+        val candidates = runCatching {
+            attachmentDao.get().findByLocalUriPrefix(oldPrefixAbs)
+        }.getOrDefault(emptyList())
+
+        if (candidates.isEmpty()) {
+            // Pas de migration à faire — on flippe le flag pour éviter de re-tenter à chaque cold-start.
+            runCatching {
+                settings.update { s -> s.copy(advanced = s.advanced.copy(attachmentsMovedToFilesDirV147 = true)) }
+            }
+            return
+        }
+
+        Timber.i("v1.14.7 attachments migration: %d rows to move from cacheDir to filesDir", candidates.size)
+
+        var moved = 0
+        var skipped = 0
+        for (att in candidates) {
+            val srcFile = File(att.localUri)
+            val fileName = srcFile.name
+            val dstFile = File(newDir, fileName)
+            val dstCanonical = runCatching { dstFile.canonicalFile }.getOrNull()
+            if (dstCanonical == null || !dstCanonical.toPath().startsWith(newDirCanonical.toPath())) {
+                Timber.w("v1.14.7 migration: path traversal rejected for %s → %s", att.localUri, dstFile.absolutePath)
+                continue
+            }
+            runCatching {
+                if (!srcFile.exists()) {
+                    // Fichier source disparu (cache déjà clearé par Android) — on flippe quand même
+                    // le local_uri vers le nouveau chemin pour ne pas confondre ce row orphelin avec
+                    // les futurs MMS reçus qui iront direct dans filesDir.
+                    skipped++
+                    if (att.localUri != dstFile.absolutePath) {
+                        attachmentDao.get().updateLocalUri(att.id, dstFile.absolutePath)
+                    }
+                    return@runCatching
+                }
+                if (dstFile.exists()) {
+                    // Destination existe déjà (re-migration partielle, ou collision de nom) — on
+                    // garde la destination + supprime la source pour ne pas laisser de doublon.
+                    runCatching { srcFile.delete() }
+                    attachmentDao.get().updateLocalUri(att.id, dstFile.absolutePath)
+                    moved++
+                    return@runCatching
+                }
+                val renamed = srcFile.renameTo(dstFile)
+                if (!renamed) {
+                    // Fallback : copy + delete (cas partition différente, rare sur Android moderne).
+                    srcFile.inputStream().use { input ->
+                        dstFile.outputStream().use { output -> input.copyTo(output) }
+                    }
+                    runCatching { srcFile.delete() }
+                }
+                attachmentDao.get().updateLocalUri(att.id, dstFile.absolutePath)
+                moved++
+            }.onFailure { Timber.w(it, "v1.14.7 migration: failed to move %s", att.localUri) }
+        }
+
+        Timber.i("v1.14.7 attachments migration: moved=%d skipped=%d", moved, skipped)
+        runCatching {
+            settings.update { s -> s.copy(advanced = s.advanced.copy(attachmentsMovedToFilesDirV147 = true)) }
+        }
+    }
+}

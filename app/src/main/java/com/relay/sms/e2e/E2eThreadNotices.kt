@@ -1,0 +1,134 @@
+/*
+ * Copyright 2026 Relay Messaging. All rights reserved.
+ *
+ * This file is proprietary to Relay Messaging and is not licensed under the
+ * Apache License 2.0. See LICENSE-RELAY for the terms.
+ */
+
+package com.relay.sms.e2e
+
+import com.relay.sms.core.ext.canonicalPhone
+import com.relay.sms.data.local.db.entity.E2eNoticeKind
+import com.relay.sms.domain.model.Message
+
+/**
+ * One in-thread E2E notice, as the thread UI sees it (design §6.4).
+ *
+ * The wording lives in string resources (keyed by [kind]), so a notice
+ * renders in the user's current language; this model carries only the
+ * identity, the kind and the date — the date is its position in the
+ * thread. Mapped from [com.relay.sms.data.local.db.entity
+ * .E2eNoticeEntity] by the thread ViewModel.
+ */
+data class E2eNoticeUi(
+    /** The notice row id (the LazyColumn item key). */
+    val id: Long,
+    /** Which notice this is (wording comes from string resources). */
+    val kind: E2eNoticeKind,
+    /** Epoch ms the notice was recorded — its position in the thread. */
+    val date: Long,
+    /**
+     * Round 49 — the canonical address of the member the notice is
+     * about (the group kinds only): the name in the wording resolves
+     * from it via [memberDisplayName]. Null for the 1:1 kinds (the
+     * thread's contact name is used) and for GROUP_ACTIVATED (the
+     * wording names nobody).
+     */
+    val subject: String? = null,
+)
+
+/**
+ * Where a conversation's notices land among its messages.
+ *
+ * [before] is parallel to the message list: `before[i]` renders above
+ * message `i`, inside that message's LazyColumn item (the same slot the
+ * day separator uses). [trailing] holds the notices newer than the last
+ * message — they render after it, in a single item at the end of the
+ * list. Notices are never LazyColumn items of their own: the thread's
+ * scroll anchors, search jumps and sticky date all work in
+ * chronological message indices ([ThreadListIndexing] converts them to
+ * LazyColumn indices for the reversed list), and interleaved items
+ * would shift every index after the first notice.
+ */
+data class E2eNoticePlacement(
+    /** Notices rendering above each message, parallel to the message list. */
+    val before: List<List<E2eNoticeUi>>,
+    /** Notices newer than the last message: they render after it. */
+    val trailing: List<E2eNoticeUi>,
+)
+
+/**
+ * The E2E notices rendering above one message item, with the contact
+ * name their wording needs. One parameter for the thread item (which
+ * is near the Detekt parameter cap): the per-message list plus the
+ * shared name travel together.
+ */
+data class E2eNoticesForItem(
+    /** The notices dated at or before this message. */
+    val notices: List<E2eNoticeUi>,
+    /** The contact name the notice wording uses (title or number). */
+    val contactName: String,
+    /**
+     * Round 49 — the group members' names by RAW address (the
+     * thread state's `memberNames`): the group notice wording
+     * resolves a notice subject through [memberDisplayName], which
+     * canonicalizes the keys. Empty for a 1:1 thread.
+     */
+    val memberNames: Map<String, String> = emptyMap(),
+)
+
+/**
+ * Round 49 (design §13) — the display name for a group notice's
+ * subject: the contact name when the canonical address is a known
+ * member, the number itself otherwise. The member-name map is keyed
+ * by RAW address (as the thread state carries it), so its keys are
+ * canonicalized before the lookup — a member stored as `+1…` and a
+ * subject stored as the 10-digit form are the same person.
+ *
+ * Pure Kotlin, no Android APIs — fully unit testable.
+ */
+fun memberDisplayName(canonicalAddress: String, memberNames: Map<String, String>): String {
+    val byCanonical = memberNames.entries.associateBy({ it.key.canonicalPhone() }, { it.value })
+    return byCanonical[canonicalAddress] ?: canonicalAddress
+}
+
+/**
+ * Places a conversation's E2E notices among its loaded messages (design
+ * §6.4): a notice renders above the first message dated at or after it,
+ * or after the last message when it is newer than everything loaded.
+ *
+ * The merge is deliberately window-friendly, so it never disturbs the
+ * bounded-window paging: a notice older than the first loaded message
+ * renders above it (at the top of the window) instead of vanishing, and
+ * settles into its true position as older pages load; a notice newer
+ * than the window's last message renders after it. [messages] must be
+ * in display order (ascending by date, as the window query returns);
+ * [notices] are sorted by date here, so the caller need not sort them.
+ *
+ * Pure Kotlin, no Android APIs — fully unit testable.
+ */
+object E2eThreadNotices {
+
+    fun place(
+        messages: List<Message>,
+        notices: List<E2eNoticeUi>,
+    ): E2eNoticePlacement {
+        val before = Array(messages.size) { mutableListOf<E2eNoticeUi>() }
+        val trailing = mutableListOf<E2eNoticeUi>()
+        var messageIndex = 0
+        for (notice in notices.sortedBy { it.date }) {
+            while (messageIndex < messages.size && messages[messageIndex].date < notice.date) {
+                messageIndex++
+            }
+            if (messageIndex < messages.size) {
+                before[messageIndex].add(notice)
+            } else {
+                trailing.add(notice)
+            }
+        }
+        return E2eNoticePlacement(
+            before = before.map { it.toList() },
+            trailing = trailing,
+        )
+    }
+}

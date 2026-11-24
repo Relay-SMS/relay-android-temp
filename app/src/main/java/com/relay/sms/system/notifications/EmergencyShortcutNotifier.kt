@@ -1,0 +1,277 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.system.notifications
+
+import android.Manifest
+import android.app.PendingIntent
+import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
+import com.relay.sms.R
+import com.relay.sms.system.emergency.EmergencyNumbers
+import com.relay.sms.system.receiver.EmergencyShortcutReceiver
+import dagger.hilt.android.qualifiers.ApplicationContext
+import timber.log.Timber
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Raccourci d'urgence : notification persistante visible sur l'écran
+ * verrouillé. Sert de pont entre la situation d'urgence et l'écran in-app.
+ *
+ * **Historique** :
+ *  - v1.12.0 = 2 actions (URGENCE + 112). URGENCE = 1 tap → SMS aux contacts.
+ *  - v1.14.1 = ajout `setContentIntent` : tap sur le corps de la notif ouvre
+ *    la page Mode urgence in-app (au lieu d'une action seule).
+ *  - v1.14.2 HOTFIX = **quick action URGENCE RETIRÉE**. Risque mistap trop
+ *    élevé sur lock-screen (1 tap = SMS broadcasté aux contacts SafetyCall).
+ *    Le bouton URGENCE in-app (`EmergencyHoldButton`) reste, protégé par
+ *    hold-3s + drag detection. Pour déclencher URGENCE depuis lock-screen :
+ *    tap le corps de la notif → page in-app → hold 3 s sur le gros bouton.
+ *
+ * **Actions actuelles** : 112 (toujours visible) + le numéro de police du
+ * PAYS où le téléphone est enregistré (opt-in `emergencyCallPoliceEnabled`,
+ * table dans `EmergencyNumbers`). Les deux utilisent `ACTION_DIAL` (composeur
+ * pré-rempli, l'user confirme en appuyant sur le bouton vert du dialer —
+ * pas d'auto-call, pas de permission CALL_PHONE).
+ *
+ * **Politique d'affichage** :
+ *  - Canal [NotificationChannelInitializer.CHANNEL_EMERGENCY_SHORTCUT]
+ *    = `IMPORTANCE_LOW` : pas de heads-up, pas de son, pas de vibration.
+ *  - `setOngoing(true)` : impossible à dismiss par swipe.
+ *  - `setVisibility(VISIBILITY_PUBLIC)` : actions visibles sur lock screen.
+ *  - `setLocalOnly(true)` : pas de mirroring vers Wear OS / autre device.
+ *  - `setShowWhen(false)` : pas de timestamp (raccourci permanent).
+ *
+ * **Sécurité** :
+ *  - `setContentIntent` cible `MainActivity::class.java` explicitement,
+ *    action `ACTION_OPEN_EMERGENCY` (constante), `FLAG_IMMUTABLE`, et porte depuis
+ *    la v1.26.1 le secret [NotificationIntentToken] : `MainActivity` etant expose,
+ *    un Intent EXPLICITE d'une app tierce contournerait sinon tout intent-filter.
+ *  - Quick actions 112 / police = broadcast vers `EmergencyShortcutReceiver`
+ *    (`exported=false`). Aucune app tierce ne peut déclencher.
+ *  - v1.28.12 : `EmergencyCallHelper.ALLOWED_NUMBERS` n'est plus une liste FR
+ *    en dur, mais l'union FERMÉE, connue à la compilation, de tous les numéros
+ *    de `EmergencyNumbers`. La whitelist reste stricte.
+ *
+ * **Cycle de vie** :
+ *  - Posée par [MainApplication] au démarrage si `emergencyShortcutEnabled = true`.
+ *  - Re-posée par [com.relay.sms.system.receiver.BootReceiver] après reboot.
+ *  - Cancelée immédiatement par `MainApplication.combine` quand l'user
+ *    désactive le toggle OU entre en PanicDecoy. Cascade-disable via
+ *    `EmergencyViewModel.disableEmergencyMode()` (v1.14.2 hotfix).
+ */
+@Singleton
+class EmergencyShortcutNotifier @Inject constructor(
+    @ApplicationContext private val context: Context,
+    // v1.26.1 (audit SEC-A1) — authentifie l'intent d'ouverture du Mode urgence, exactement
+    // comme pour l'ouverture de conversation. Sans ce secret, une app tierce pouvait forger
+    // `ACTION_OPEN_EMERGENCY` sur `MainActivity`, qui est expose (role SMS) : un Intent
+    // EXPLICITE ignore les `<intent-filter>`, lesquels ne gouvernent que la resolution des
+    // intents implicites.
+    private val intentToken: NotificationIntentToken,
+) {
+
+    /**
+     * Affiche / met à jour la notification persistante. Idempotent — re-poste
+     * la même notif avec le même ID = update sans clignotement.
+     *
+     * @param policeEnabled si `true`, ajoute une 3ᵉ action qui compose le numéro
+     *   de police du pays où le téléphone est enregistré (v1.28.12 : ce n'est
+     *   plus le 17 français). Max 3 actions par notif Android.
+     */
+    suspend fun postShortcut(policeEnabled: Boolean = false) {
+        if (!hasPostPermission()) {
+            Timber.w("EmergencyShortcutNotifier: POST_NOTIFICATIONS not granted, skipping")
+            return
+        }
+        // v1.14.2 hotfix CRITIQUE — la quick action "URGENCE" qui déclenchait
+        // un envoi SMS direct sur 1 tap a été RETIRÉE. Risque : mistap accidentel
+        // (notif lock-screen, pocket-tap, dismiss confondu avec action) faisait
+        // partir un SMS à TOUS les contacts SafetyCall. Bug user remonté
+        // 2026-05-22 ("beaucoup de mms sans rien faire"). Le hold-3s
+        // anti-pocket-dial existe sur l'écran in-app (EmergencyHoldButton) mais
+        // pas sur une notif (notif actions = single tap par design Android).
+        // Solution : pour déclencher URGENCE depuis lock-screen, l'user tape
+        // le CORPS de la notif → ouvre la page in-app (setContentIntent,
+        // ACTION_OPEN_EMERGENCY) → hold 3s sur le gros bouton URGENCE. Trois
+        // gestes délibérés au lieu d'un mistap. Les quick actions d'appel
+        // restent (ACTION_DIAL ouvre composeur, user confirme dans dialer).
+        val dial112PI = PendingIntent.getBroadcast(
+            context,
+            REQUEST_DIAL_112,
+            EmergencyShortcutReceiver.intentDial112(context),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val dialPolicePI = if (policeEnabled) {
+            PendingIntent.getBroadcast(
+                context,
+                REQUEST_DIAL_POLICE,
+                EmergencyShortcutReceiver.intentDialPolice(context),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+        } else null
+
+        // v1.14.1 — Tap sur le corps de la notif (hors actions) → ouvre la page
+        // Mode urgence in-app. PendingIntent vers MainActivity avec un extra
+        // `ACTION_OPEN_EMERGENCY` que MainActivity.onNewIntent route vers
+        // `PendingNavHolder.set(openEmergency=true)` → AppRoot navigate Emergency.
+        val openEmergencyIntent = android.content.Intent(
+            context,
+            com.relay.sms.MainActivity::class.java,
+        ).apply {
+            action = EmergencyShortcutReceiver.ACTION_OPEN_EMERGENCY
+            // SINGLE_TOP + CLEAR_TOP : si MainActivity est déjà en haut, on évite
+            // de l'empiler. Si une autre Activity Relay est en haut, on la
+            // pop et on revient sur MainActivity (qui re-route Emergency).
+            flags = android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra(NotificationIntentToken.EXTRA_NAV_TOKEN, intentToken.current())
+        }
+        val openEmergencyPI = PendingIntent.getActivity(
+            context,
+            REQUEST_OPEN_EMERGENCY,
+            openEmergencyIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+
+        val builder = NotificationCompat.Builder(
+            context,
+            NotificationChannelInitializer.CHANNEL_EMERGENCY_SHORTCUT,
+        )
+            .setSmallIcon(R.drawable.ic_notification_message)
+            .setContentTitle(context.getString(R.string.emergency_shortcut_notif_title))
+            .setContentText(context.getString(R.string.emergency_shortcut_notif_text))
+            .setContentIntent(openEmergencyPI)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setOngoing(true)
+            .setShowWhen(false)
+            .setLocalOnly(true)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            // v1.14.2 hotfix CRITIQUE — quick action URGENCE retirée (cf. KDoc
+            // au-dessus). Pour déclencher l'urgence depuis le lock-screen,
+            // l'user tape le CORPS de la notif → setContentIntent ouvre la
+            // page in-app → hold 3s sur EmergencyHoldButton. Trois gestes
+            // délibérés au lieu d'un mistap dangereux. Les actions DIAL_112
+            // et DIAL_POLICE restent (ACTION_DIAL = composeur, user confirme).
+            // v1.28.12 — un seul libellé « Composer le %s » pour les deux actions : le numéro
+            // de police change de pays en pays, donc il ne peut plus être écrit dans la chaîne.
+            .addAction(
+                R.drawable.ic_notification_message,
+                context.getString(
+                    R.string.emergency_shortcut_action_dial,
+                    EmergencyShortcutReceiver.EMERGENCY_NUMBER_EU,
+                ),
+                dial112PI,
+            )
+        if (dialPolicePI != null) {
+            // v1.28.12 — le libellé nomme le SERVICE, pas le numéro, et ce n'est pas un détail.
+            //
+            // Il nommait le numéro, résolu ICI, au moment où la notification est postée. Or le
+            // receveur le résout À NOUVEAU au moment du tap. Cette notification est persistante :
+            // elle vit des jours, et les quatre choses qui la reposent (deux réglages, l'entrée en
+            // mode leurre, le redémarrage) n'incluent aucun changement de réseau. Traverser une
+            // frontière suffisait donc à ce que le texte affiché nomme un numéro et que le bouton
+            // en compose un autre — tous deux légitimes, mais l'un des deux mentait.
+            //
+            // Relevé par deux audits indépendants le 2026-09-17. Nommer le service supprime la
+            // classe entière de défaut au lieu de la rattraper : il n'y a plus rien à
+            // synchroniser. Et `emergency_call_police_label` existe déjà dans les cinq langues.
+            // v1.28.12 bis — le libellé nomme le service RÉELLEMENT composé dans CE pays.
+            // Au Royaume-Uni et en Irlande il n'existe pas de ligne de police distincte : le
+            // 999 est la ligne d'urgence générale, et l'étiqueter « Police » serait faux. Le
+            // repli du numéro et le choix du libellé lisent la MÊME fonction.
+            //
+            // ⚠️ v1.28.12 ter — « ils ne peuvent donc pas diverger » était écrit ici, et c'était
+            // TROP FORT. Ils lisent la même fonction, mais pas au même moment : le libellé est
+            // fixé à la POSE, le numéro est résolu au TAP. Deux choses peuvent bouger entre les
+            // deux, et cette notification vit des jours :
+            //
+            //   - le pays, si l'utilisateur voyage — résidu déjà assumé plus haut ;
+            //   - le VERDICT DE L'OS sur un numéro national, qui dépend du réseau courant. SIM
+            //     retirée ou hors couverture, `isEmergencyNumber("17")` peut répondre non : le
+            //     17 sort de la liste, `raccourciDans` retombe sur le 112, et l'action reste
+            //     étiquetée « Police » ;
+            //   - la SOUSCRIPTION ACTIVE, sans bouger d'un mètre : basculer sur une autre eSIM,
+            //     changer la SIM voix par défaut ou en retirer une change ce que
+            //     `networkCountryIso` répond. Relevé par une relecture externe le 2026-09-17 ;
+            //   - la LANGUE de l'application : le libellé est résolu à la pose, donc changer de
+            //     langue laisse l'ancienne affichée sur cette notification jusqu'à la prochaine
+            //     pose. Cosmétique, mais c'est la même cause.
+            //
+            // Ces résidus ne sont pas rattrapables depuis une notification persistante, et ils
+            // dégradent TOUJOURS vers le 112 — un numéro qui n'est jamais faux, et le seul qui
+            // fonctionne précisément dans les conditions qui provoquent la divergence. On le
+            // dit plutôt que de le nier.
+            //
+            // ⚠️ Ce qui repose réellement la notification, puisqu'une relecture externe s'est
+            // trompée dessus faute d'avoir le fichier : [com.relay.sms.MainApplication]
+            // combine `emergencyShortcutEnabled`, `emergencyCallPoliceEnabled` et
+            // `appLock.state is PanicDecoy`, en `distinctUntilChanged`. La SORTIE de session
+            // leurre repose donc bien la notification — ce n'est pas un jumeau oublié. Ce qui
+            // n'y figure pas, ce sont le réseau, la souscription et la langue, listés ci-dessus.
+            val raccourci = EmergencyNumbers.raccourciForcesDeLOrdre(context)
+            // v1.28.12 ter (audit S10) — dans un pays que la table ne couvre pas, le raccourci
+            // retombe sur le 112, et la notification affichait alors DEUX actions identiques :
+            // « Composer le 112 » et « Urgence nationale », toutes deux vers le 112. La seconde
+            // n'apportait rien et nommait un service que le pays n'a pas. Quand le raccourci EST
+            // le numéro européen, il n'y a pas de second numéro à proposer.
+            if (raccourci.service != EmergencyNumbers.Service.EUROPEAN) {
+                val libelleDuRaccourci = if (raccourci.service == EmergencyNumbers.Service.POLICE) {
+                    R.string.emergency_call_police_label
+                } else {
+                    R.string.emergency_call_national_label
+                }
+                builder.addAction(
+                    R.drawable.ic_notification_message,
+                    context.getString(libelleDuRaccourci),
+                    dialPolicePI,
+                )
+            }
+        }
+
+        // Audit lint v1.14.8 — `@SuppressLint("MissingPermission")` justifié : `hasPostPermission()`
+        // est vérifié au début de [postShortcut] (early-return si denied). Lint ne suit pas la
+        // helper, faux positif documenté Google issuetracker.google.com/138141627.
+        @android.annotation.SuppressLint("MissingPermission")
+        NotificationManagerCompat.from(context).notify(
+            EmergencyShortcutReceiver.NOTIF_ID_EMERGENCY_SHORTCUT,
+            builder.build(),
+        )
+        Timber.d("EmergencyShortcutNotifier: posted shortcut notification (police=%s)", policeEnabled)
+    }
+
+    fun cancelShortcut() {
+        NotificationManagerCompat.from(context).cancel(
+            EmergencyShortcutReceiver.NOTIF_ID_EMERGENCY_SHORTCUT,
+        )
+        Timber.d("EmergencyShortcutNotifier: cancelled shortcut notification")
+    }
+
+    private fun hasPostPermission(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return true
+        return ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.POST_NOTIFICATIONS,
+        ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    companion object {
+        // v1.14.2 — `REQUEST_TRIGGER` retiré : quick action URGENCE supprimée
+        // de la notif (cf. KDoc + postShortcut). Les codes restants sont
+        // les seules entrées légitimes vers `EmergencyShortcutReceiver`.
+        private const val REQUEST_DIAL_112 = 0x44313132 // 'D112'
+        private const val REQUEST_DIAL_POLICE = 0x44504f4c // 'DPOL'
+        // v1.14.1 — content-intent request code, distinct des actions DIAL.
+        private const val REQUEST_OPEN_EMERGENCY = 0x4f50454e // 'OPEN'
+    }
+}

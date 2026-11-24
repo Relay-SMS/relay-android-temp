@@ -1,0 +1,205 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.ui.components
+
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.dp
+import com.relay.sms.R
+import com.relay.sms.domain.model.Message
+import com.relay.sms.ui.theme.FixedTypeSize
+import com.relay.sms.ui.theme.RelayText
+import com.relay.sms.ui.theme.bubbleStatusColor
+import com.relay.sms.ui.theme.isTextOnColoredBubble
+import com.relay.sms.ui.util.rememberChatFormatters
+import java.util.Date
+
+/**
+ * Relay — la ligne « heure • statut » ne vit PLUS sous la bulle : elle est
+ * rendue en petit, en bas à droite, À L'INTÉRIEUR de la bulle, alignée sur la
+ * dernière ligne de texte. Le libellé vient de [libelleDeStatut].
+ *
+ * Feedback round 4 — l'heure et le statut ont des règles INDÉPENDANTES :
+ *
+ *  - l'heure suit [showTimestamp] (une par rafale, sur son dernier message) ;
+ *  - le statut suit [showStatus] (dernier message sortant d'une rafale).
+ *
+ * Avant, le statut ne s'affichait que là où l'heure s'affichait : une rafale
+ * cachait donc tous les « Delivered » sauf sur le message horodaté — et ce
+ * message est en général le plus récent, dont l'accusé de réception n'est pas
+ * encore arrivé, si bien que le fil n'affichait que « Sent », jamais
+ * « Delivered ». Un échec se dit toujours (heure + libellé), comme avant.
+ *
+ * Feedback round 4 — placement structurel : la ligne ne s'étire PLUS sur
+ * toute la largeur (`fillMaxWidth` supprimé) — elle se dimensionne à son
+ * contenu et l'appelant la cale à droite dans la bulle (`align(End)` dans la
+ * `Column` de la bulle, `align(BottomEnd)` en surimpression sur une vignette).
+ * C'est ce qui garantissait l'échappée hors bulle : la ligne pleine largeur
+ * forçait la bulle à 320dp quand elle s'affichait, et sortait du fond dès que
+ * la bulle restait étroite. [textColor] est la couleur du corps de la bulle
+ * appelante (blanc sur bulle sortante texte, `onSurfaceVariant` sur bulle
+ * vocale sortante sans fond…).
+ *
+ * Phase 8 — contraste et taille fixe :
+ *
+ *  - L'heure est du méta-texte de mise en page : style [RelayText.BubbleMeta]
+ *    (12sp, explicite — il échappe au coefficient « Taille du texte des messages »)
+ *    dans [FixedTypeSize] (il échappe aussi à l'échelle de police d'Android).
+ *    Avant, `labelSmall` (10sp) était multiplié par le coefficient, jusqu'à 21sp.
+ *  - L'atténuation `alpha = 0.75f` faisait tomber le méta sous le seuil AA presque
+ *    partout : blanc sur bulle sortante 4.44:1, `onSurfaceVariant` sur fond clair
+ *    3.19:1 (bulle vocale sortante, pièce jointe). Sur fond de bulle coloré (texte
+ *    blanc), on garde un léger retrait à 0.85f (5.26:1 sur `#1E4FD8`) ; partout
+ *    ailleurs le méta prend la couleur du corps à pleine opacité — la couleur de
+ *    base passe déjà (5.33:1 en clair sur fond blanc, 6.12:1 en sombre sur
+ *    `#1B1B1B`).
+ *  - Un échec ne passe PLUS par `error` : le rouge `#D7263D` donnait 1.34:1 sur la
+ *    bulle sortante bleue, 4.09:1 sur la bulle entrante claire, 2.89:1 en sombre —
+ *    illisible. Le libellé (« Échec », …) porte l'information, dans la couleur du
+ *    corps à pleine opacité ; le tap-pour-réessayer reste l'action. Un MMS en échec
+ *    n'y promet plus « appuyer pour réessayer » : un MMS ne se relance pas (cf.
+ *    [libelleDeStatut]).
+ *
+ * Round 41 — le libellé de statut (« Sent » / « Delivered » / « Read ») prend
+ * le gris de thème [bubbleStatusColor] (`#C9C9C9` en sombre, `#404040` en
+ * clair) au lieu de [metaColor] : l'heure garde la couleur du corps, le
+ * statut se détache en gris. Un libellé d'échec garde [metaColor] — ce
+ * n'est pas un statut de livraison, et le gris le rendrait illisible sur
+ * une bulle bleue en thème clair. Sur une bulle colorée (texte blanc), le
+ * statut garde [metaColor] lui aussi : `#404040` serait invisible sur le
+ * bleu en thème clair.
+ *
+ * Round 47 — « bulle colorée » couvre aussi le vert des messages en clair :
+ * leur texte est blanc (Kristin's call — white on `#3BA803` is 3.09:1,
+ * accepted by design, iMessage uses white on a lighter green), et le
+ * gris de thème y serait illisible (`#404040` 3.35:1, `#C9C9C9` 1.87:1) —
+ * le statut garde donc [metaColor] (blanc à 0.85, comme sur le bleu) là
+ * aussi, via [isTextOnColoredBubble].
+ *
+ * Round 49 — the lock is no longer text-only: every encrypted message
+ * carries it ([shouldShowLock]), so an encrypted MMS photo, voice clip
+ * or video shows the lock like an encrypted SMS does. Every bubble
+ * renders its timestamp line through [BubbleTimestamp], so the one rule
+ * covers all of them — text, media (overlay pill and caption), voice,
+ * and the incoming encrypted-media wrapper via those two.
+ */
+@Composable
+internal fun BubbleTimestamp(
+    message: Message,
+    showTimestamp: Boolean,
+    showStatus: Boolean = false,
+    textColor: Color,
+    modifier: Modifier = Modifier,
+) {
+    val label = libelleDeStatut(message)?.let { statut ->
+        statut.codeOperateur?.let { stringResource(statut.res, it) } ?: stringResource(statut.res)
+    }
+    // Un échec se dit toujours, heure + libellé, comme avant.
+    val isFailed = message.status == Message.Status.FAILED
+    val showTime = showTimestamp || isFailed
+    val showLabel = label != null && (showStatus || isFailed)
+    if (!showTime && !showLabel) return
+    val formatters = rememberChatFormatters()
+    // Audit P-Q7 (v1.2.0) : l'heure formatée est mise en cache, pas recalculée à chaque recomposition.
+    val time = remember(message.date) { formatters.time.format(Date(message.date)) }
+    // Blanc = texte sur bulle sortante colorée : léger retrait seulement. Toute autre
+    // couleur de corps (noir/blanc sur bulle entrante, secondaire sur fond clair) est
+    // déjà à pleine opacité AA — l'atténuer la ferait passer sous le seuil.
+    val metaColor = if (textColor == Color.White) textColor.copy(alpha = 0.85f) else textColor
+    // Round 41 — le statut prend le gris de thème, l'heure garde metaColor.
+    // Un libellé d'échec et une bulle colorée gardent metaColor (voir le KDoc).
+    // Round 47 — « colorée » inclut le vert des messages en clair (texte blanc) :
+    // le gris de thème y serait illisible (3.35:1 / 1.87:1).
+    val statusColor = if (isFailed || isTextOnColoredBubble(textColor)) {
+        metaColor
+    } else {
+        bubbleStatusColor(MaterialTheme.colorScheme)
+    }
+    val labelText = if (showLabel) label else null
+    val text = buildAnnotatedString {
+        if (showTime) append(time)
+        if (showTime && labelText != null) append(" • ")
+        labelText?.let { status ->
+            withStyle(SpanStyle(color = statusColor)) { append(status) }
+        }
+    }
+    FixedTypeSize {
+        Row(
+            modifier = Modifier.then(modifier),
+            horizontalArrangement = Arrangement.End,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = text,
+                color = metaColor,
+                style = RelayText.BubbleMeta,
+            )
+            // E2E — the lock glyph at the end of an encrypted message's
+            // timestamp line (sent and received, e.g. "8:10 PM •
+            // Delivered 🔒", per the encrypted-thread reference).
+            // Round 49 — every encrypted message, not just text-only
+            // SMS: media, voice and video carry the lock too (see
+            // [shouldShowLock]). Decorative for screen readers — the
+            // message is announced by its text, and a lock on every
+            // message would be noise. Round 41 — 6dp of air before
+            // the lock (was 4dp): a touch more left padding.
+            if (shouldShowLock(message)) {
+                Spacer(Modifier.width(6.dp))
+                Icon(
+                    painter = painterResource(R.drawable.ic_lock_encrypted),
+                    contentDescription = null,
+                    tint = metaColor,
+                    modifier = Modifier.size(9.dp, 11.dp),
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Round 49 — the single lock decision for every bubble: the lock rides
+ * [Message.encrypted] alone — text, media, voice, video, outgoing and
+ * incoming. Before, the gate was text-only SMS (`type == SMS &&
+ * attachments.isEmpty()`), so an encrypted MMS photo or voice clip
+ * showed no lock even though the colour already said blue (round 48
+ * ships encrypted media, and its KDoc already promised "the bubble
+ * shows the lock + blue"). Every bubble renders its timestamp line
+ * through [BubbleTimestamp] — [MessageBubble], [MediaAttachmentBubble]
+ * (the overlay pill on a caption-less thumbnail AND the caption block,
+ * so video is covered too: it renders through the media bubble), and
+ * [AudioMessageBubble] — and
+ * [com.relay.sms.ui.screens.thread.EncryptedMediaBubble] delegates
+ * to the media and audio bubbles, so this one rule covers all four
+ * paths with no per-bubble code.
+ *
+ * Notes — a note entry's display message carries `encrypted = true`
+ * ([com.relay.sms.domain.model.toDisplayMessage]), so note photos
+ * and voice show the lock too — deliberately: a note entry IS
+ * encrypted (whole-DB SQLCipher + the AES-256-GCM attachment
+ * envelope), and text-only entries already show the lock by design.
+ * The bubbles cannot tell a note from an E2E message anyway (they
+ * share the components, and the display message carries no note
+ * flag), and no distinction is needed: the lock means "this content
+ * is encrypted", which holds for both.
+ */
+internal fun shouldShowLock(message: Message): Boolean = message.encrypted

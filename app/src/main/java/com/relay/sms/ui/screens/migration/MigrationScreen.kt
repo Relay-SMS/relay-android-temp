@@ -1,0 +1,215 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.ui.screens.migration
+
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.ArrowBack
+import androidx.compose.material.icons.outlined.CloudUpload
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewModelScope
+import com.relay.sms.R
+import com.relay.sms.data.local.datastore.SettingsRepository
+import com.relay.sms.data.repository.ConversationMirror
+import com.relay.sms.data.sms.TelephonyReader
+import com.relay.sms.ui.components.RelayPrimaryButton
+import com.relay.sms.ui.theme.RelayText
+import com.relay.sms.ui.theme.brandBlue
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import timber.log.Timber
+import javax.inject.Inject
+
+@HiltViewModel
+class MigrationViewModel @Inject constructor(
+    private val reader: TelephonyReader,
+    private val mirror: ConversationMirror,
+    private val settings: SettingsRepository,
+) : ViewModel() {
+    // v1.6.1 (audit QUAL-17) — @Stable pour Compose recomposition skipping.
+    @androidx.compose.runtime.Stable
+    data class UiState(
+        val isRunning: Boolean = false,
+        val imported: Int = 0,
+        val done: Boolean = false,
+        /** v1.25.3 (audit M10) — l'import s'est interrompu sur une erreur. */
+        val failed: Boolean = false,
+    )
+
+    private val _state = MutableStateFlow(UiState())
+    val state = _state.asStateFlow()
+
+    /**
+     * v1.1.1: switched from per-message `upsertIncoming/OutgoingSms` to the bulk path. The old
+     * loop opened **one Room transaction per SMS** (so 2000 historical messages = 2000 tx
+     * + 2000 conversation touches), which:
+     *   - took minutes on Samsung One UI mid-range devices,
+     *   - flooded the conversations list `Flow` with 2000 invalidations,
+     *   - made the user think the import was looping ("ça s'arrete pas, 2000 messs etc").
+     *
+     * `bulkImportFromTelephony` groups inserts by system thread_id and commits one tx per page,
+     * with `OnConflictStrategy.IGNORE` on the `telephony_uri` UNIQUE index → safe to re-run.
+     *
+     * Also persists `lastSyncedSmsId` at the end so the periodic `TelephonySyncWorker` does not
+     * re-scan the historical set on its next tick.
+     *
+     * v1.25.3 (audit M10) — `readSmsBatched` n'était protégé par rien. Une `SecurityException`
+     * (permission révoquée en cours de route) ou un curseur système en erreur laissait
+     * `isRunning` à `true` pour toujours : barre de progression infinie, bouton grisé,
+     * aucun message — l'utilisateur ne pouvait que quitter l'écran sans savoir ce qui s'était
+     * passé. L'état terminal est désormais garanti par un `finally`, et l'échec est affiché.
+     */
+    fun run() {
+        if (_state.value.isRunning) return
+        _state.value = UiState(isRunning = true)
+        viewModelScope.launch {
+            var count = 0
+            try {
+                reader.readSmsBatched(pageSize = 500) { batch ->
+                    mirror.bulkImportFromTelephony(batch)
+                    count += batch.size
+                    _state.value = _state.value.copy(imported = count)
+                }
+                runCatching {
+                    val fp = reader.snapshotSmsFingerprint()
+                    if (fp.maxId > 0L) {
+                        settings.update { it.copy(advanced = it.advanced.copy(lastSyncedSmsId = fp.maxId)) }
+                        Timber.i("Migration: cursor advanced to id=%d", fp.maxId)
+                    }
+                }.onFailure { Timber.w(it, "Migration: failed to persist sync cursor") }
+                _state.value = _state.value.copy(done = true)
+            } catch (cancellation: CancellationException) {
+                // L'écran a été quitté : on laisse l'annulation se propager, sinon la coroutine
+                // continuerait après `onCleared`.
+                throw cancellation
+            } catch (t: Throwable) {
+                Timber.e(t, "Migration: import aborted after %d messages", count)
+                _state.value = _state.value.copy(failed = true)
+            } finally {
+                // Les lignes déjà importées le restent (une transaction par page, IGNORE sur
+                // l'index unique) : relancer reprend proprement là où on s'est arrêté.
+                _state.value = _state.value.copy(isRunning = false)
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun MigrationScreen(onBack: () -> Unit, viewModel: MigrationViewModel = hiltViewModel()) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Text(
+                        stringResource(R.string.migration_title),
+                        style = RelayText.ThreadTitle,
+                    )
+                },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(
+                            Icons.AutoMirrored.Outlined.ArrowBack,
+                            contentDescription = stringResource(R.string.action_back),
+                        )
+                    }
+                },
+            )
+        },
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .padding(horizontal = 32.dp, vertical = 24.dp),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Icon(
+                imageVector = Icons.Outlined.CloudUpload,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(64.dp),
+            )
+            Spacer(Modifier.size(24.dp))
+            Text(
+                text = stringResource(R.string.migration_title),
+                style = RelayText.ThreadTitle,
+                textAlign = TextAlign.Center,
+            )
+            Spacer(Modifier.size(8.dp))
+            Text(
+                text = stringResource(R.string.migration_body),
+                style = RelayText.Preview,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+            )
+            Spacer(Modifier.size(24.dp))
+            RelayPrimaryButton(
+                text = if (state.done) {
+                    stringResource(R.string.migration_rerun)
+                } else {
+                    stringResource(R.string.migration_run)
+                },
+                onClick = viewModel::run,
+                enabled = !state.isRunning,
+            )
+            if (state.isRunning || state.done || state.failed) {
+                Spacer(Modifier.size(16.dp))
+                // v1.25.3 (audit M10) — la barre indéterminée ne tourne plus que pendant
+                // l'import : elle restait affichée une fois terminé, ce qui donnait à un import
+                // fini l'apparence d'un import bloqué.
+                if (state.isRunning) {
+                    LinearProgressIndicator(
+                        modifier = Modifier.padding(vertical = 8.dp),
+                        color = brandBlue(),
+                    )
+                }
+                Text(
+                    text = stringResource(R.string.migration_imported, state.imported),
+                    style = RelayText.Preview,
+                    textAlign = TextAlign.Center,
+                )
+                if (state.failed) {
+                    Spacer(Modifier.size(8.dp))
+                    Text(
+                        text = stringResource(R.string.migration_failed),
+                        style = RelayText.Preview,
+                        color = MaterialTheme.colorScheme.error,
+                        textAlign = TextAlign.Center,
+                    )
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,719 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.ui.screens.emergency
+
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.annotation.StringRes
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.ArrowBack
+import androidx.compose.material.icons.outlined.Edit
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.google.accompanist.permissions.ExperimentalPermissionsApi
+import com.relay.sms.R
+import com.relay.sms.domain.emergency.EmergencyConfig
+import com.relay.sms.domain.location.GeoLocation
+import com.relay.sms.domain.location.lienCarte
+import com.relay.sms.domain.usecase.TriggerEmergencyUseCase
+import com.relay.sms.system.emergency.EmergencyCallHelper
+import com.relay.sms.system.emergency.EmergencyNumbers
+import com.relay.sms.system.safety.rememberSafetyMessageTexts
+import com.relay.sms.ui.components.BanniereRoleSmsManquant
+import com.relay.sms.ui.components.EmergencyHoldButton
+import com.relay.sms.ui.components.RelayDestructiveButton
+import com.relay.sms.ui.components.RelayDialog
+import com.relay.sms.ui.components.RelaySnackbarHost
+import com.relay.sms.ui.components.RelayTextButton
+import com.relay.sms.ui.components.rememberPermissionLocalisation
+import com.relay.sms.ui.components.showError
+import com.relay.sms.ui.theme.RelayColors
+import com.relay.sms.ui.theme.RelayText
+import kotlinx.coroutines.launch
+
+/**
+ * v1.10.0 — Écran principal du Mode urgence.
+ *
+ * Une seule action visible : le gros bouton circulaire rouge à maintenir
+ * 3 secondes pour déclencher l'envoi du SMS d'urgence aux contacts. Au-
+ * dessus : preview du message qui sera envoyé. Au-dessous : un lien
+ * discret vers le setup pour modifier le template / la géoloc.
+ *
+ * **Bouton désactivé** (grisé, sans réaction au touch) si :
+ *  - `state.enabled == false` (l'user a désactivé Mode urgence dans Setup)
+ *  - `safetyCallContactsCount == 0` (pas de contacts d'urgence configurés)
+ *  - Anti-spam cooldown actif (60s post-trigger récent)
+ *
+ * Le snackbar des résultats utilise le pattern marque (bleu = succès,
+ * rouge = pas de contacts / pas de location / panic suppressed).
+ */
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalPermissionsApi::class)
+@Composable
+fun EmergencyScreen(
+    onBack: () -> Unit,
+    onOpenSetup: () -> Unit,
+    viewModel: EmergencyViewModel = hiltViewModel(),
+) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    val contactsCount by viewModel.safetyCallContactsCount.collectAsStateWithLifecycle()
+    // v1.14.1 — liste complète SafetyCall pour le bouton "Appeler un proche".
+    // Audit SEC-1 fix : hoist au top-level pour respecter règle hooks Compose.
+    val safetyContacts by viewModel.safetyCallContacts.collectAsStateWithLifecycle()
+    val snackbarHost = remember { SnackbarHostState() }
+    val ctx = LocalContext.current
+    // v1.12.0 audit U2 — needed pour afficher un snackbar si aucun dialer
+    // n'est installé (ACTION_DIAL ActivityNotFoundException). Sinon le tap
+    // du bouton 112/17 reste silencieux et l'user croit que l'appel passe.
+    val scope = rememberCoroutineScope()
+    val noDialerMsg = stringResource(R.string.emergency_shortcut_no_app_to_dial)
+    val permDeniedMsg = stringResource(R.string.emergency_call_permission_denied)
+    val osErrorMsg = stringResource(R.string.emergency_call_os_error)
+
+    // v1.28.13 (balayage des permissions refusées, MR F-Droid !38458) — **une tuile d'appel
+    // aboutit TOUJOURS à un appel ou à un composeur.**
+    //
+    // Sans `CALL_PHONE`, le tap ne faisait que relancer la demande, et la réponse n'était lue par
+    // personne : refusée, la tuile 112 ne faisait RIEN ; après deux refus, Android n'affiche plus la
+    // boîte de dialogue et la tuile devenait inerte pour de bon, sans un mot. Les commentaires
+    // annonçaient pourtant un « fallback automatique au composeur » depuis la v1.14.1. La
+    // permission était en outre lue à la COMPOSITION : un accord pouvait rester sans effet tant que
+    // rien ne recomposait l'écran. Elle est désormais lue au moment du tap, et la réponse à la
+    // demande compose l'appel — ou ouvre le composeur, qui ne demande aucune permission.
+    //
+    // L'appel en attente est sauvegardé : la boîte de dialogue système peut survivre à une
+    // recréation de l'activité, et la réponse doit retrouver le numéro touché.
+    var numeroEnAttente by rememberSaveable { mutableStateOf<String?>(null) }
+    var procheEnAttente by rememberSaveable { mutableStateOf(false) }
+    fun appeler(numero: String, proche: Boolean, appelDirect: Boolean) {
+        val outcome = when {
+            appelDirect && proche -> EmergencyCallHelper.placeTrustedContactCall(ctx, numero)
+            appelDirect -> EmergencyCallHelper.placeCall(ctx, numero)
+            proche -> EmergencyCallHelper.openTrustedContactDialer(ctx, numero)
+            else -> EmergencyCallHelper.openDialer(ctx, numero)
+        }
+        handleCallOutcome(outcome, scope, snackbarHost, noDialerMsg, permDeniedMsg, osErrorMsg)
+        // Le composeur s'est ouvert À LA PLACE de l'appel direct : on dit pourquoi.
+        if (!appelDirect && outcome == EmergencyCallHelper.CallOutcome.SUCCESS) {
+            scope.launch { snackbarHost.showError(permDeniedMsg) }
+        }
+    }
+    // v1.14.1 audit PERF-2 — launcher hissé au top du Composable (vs body
+    // Scaffold conditionnel) pour respecter règle position hooks.
+    val callPhonePermLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestPermission(),
+    ) { accordee ->
+        val numero = numeroEnAttente ?: return@rememberLauncherForActivityResult
+        numeroEnAttente = null
+        appeler(numero, proche = procheEnAttente, appelDirect = accordee)
+    }
+    fun appelerOuDemander(numero: String, proche: Boolean) {
+        val accordee = ContextCompat.checkSelfPermission(ctx, Manifest.permission.CALL_PHONE) ==
+            PackageManager.PERMISSION_GRANTED
+        if (accordee) {
+            appeler(numero, proche, appelDirect = true)
+        } else {
+            numeroEnAttente = numero
+            procheEnAttente = proche
+            callPhonePermLauncher.launch(Manifest.permission.CALL_PHONE)
+        }
+    }
+    // v1.28.12 (audit 3 axes, U1) — meme raison de hissage : un lanceur ne se declare pas dans
+    // une branche. Pas de gestionnaire de resultat : [BanniereRoleSmsManquant] relit le role a
+    // chaque retour au premier plan, ce qui couvre le retour du selecteur systeme.
+    val lanceurRoleSms = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult(),
+    ) { }
+    // v1.10.0 audit U1 — preview reflète le statut RÉEL de la permission
+    // (pas juste la préférence config). Évite un faux sentiment de sécurité.
+    // v1.28.13 — exacte OU approximative, cf. [rememberPermissionLocalisation].
+    val localisation = rememberPermissionLocalisation()
+    val locationGranted = localisation.accordee
+
+    // v1.27.2 — résolu à la composition, comme les autres messages de cet écran.
+    val disableDoneMsg = stringResource(R.string.emergency_disable_done)
+    LaunchedEffect(Unit) {
+        viewModel.events.collect { event ->
+            when (event) {
+                is EmergencyViewModel.Event.Triggered -> handleTriggerResult(
+                    result = event.result,
+                    snackbarHost = snackbarHost,
+                    ctxGetter = { ctx },
+                )
+                is EmergencyViewModel.Event.Saved -> Unit // pas pertinent ici
+                // v1.27.2 — émis par l'interrupteur de l'écran de réglages, pas par celui-ci.
+                is EmergencyViewModel.Event.DisabledImmediately -> Unit
+                // v1.27.2 — la désactivation est écrite : on annonce, puis on quitte l'écran.
+                //
+                // Il restait affiché, avec son gros bouton rouge devenu inerte, sur un mode
+                // qui venait d'être coupé — rien ne disait que l'action avait porté au-delà du
+                // message. `showSnackbar` suspend jusqu'à sa disparition, donc le message est
+                // bien lu AVANT le retour ; c'est le même enchaînement que
+                // [EmergencySetupScreen] après un enregistrement.
+                EmergencyViewModel.Event.Disabled -> {
+                    snackbarHost.showSnackbar(disableDoneMsg)
+                    onBack()
+                }
+            }
+        }
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    Text(
+                        stringResource(R.string.emergency_title),
+                        style = RelayText.ThreadTitle,
+                    )
+                },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(
+                            Icons.AutoMirrored.Outlined.ArrowBack,
+                            contentDescription = stringResource(R.string.action_back),
+                        )
+                    }
+                },
+                actions = {
+                    IconButton(onClick = onOpenSetup) {
+                        Icon(
+                            Icons.Outlined.Edit,
+                            contentDescription = stringResource(R.string.action_edit),
+                        )
+                    }
+                },
+            )
+        },
+        snackbarHost = { RelaySnackbarHost(snackbarHost) },
+    ) { inner ->
+        // v1.14.1 — refonte page complète. Toutes les actions urgence visibles
+        // en une seule page, gros boutons couleurs, scroll vertical si besoin.
+        // Ordre : (a) section Appel direct (4 tuiles + bouton proche),
+        // (b) section SMS aux proches (hold-3s + preview), (c) actions
+        // secondaires (Tester sans envoyer, Désactiver mode).
+        val cooldownActive = state.isInAntiSpamWindow()
+        val canTrigger = state.enabled && contactsCount > 0 && !cooldownActive
+
+        // Numéros d'urgence : `placeCall` / `openDialer` (liste blanche). Proche SafetyCall :
+        // `placeTrustedContactCall` / `openTrustedContactDialer`. Cf. [appelerOuDemander].
+        val callEmergency: (String) -> Unit = { number -> appelerOuDemander(number, proche = false) }
+        val callRelative: (String) -> Unit = { phone -> appelerOuDemander(phone, proche = true) }
+
+        // Scroll vertical au cas où l'écran est petit (< 360dp height utile).
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(inner)
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp, vertical = 16.dp),
+        ) {
+            // ── SECTION 1 — Appel direct d'urgence ──
+            Text(
+                text = stringResource(R.string.emergency_section_call_title),
+                style = RelayText.ConvoName,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Spacer(Modifier.height(12.dp))
+
+            // v1.28.12 — les tuiles suivent le PAYS OÙ LE TÉLÉPHONE EST ENREGISTRÉ, et non la
+            // langue de l'application : un germanophone à Paris doit voir le 17, pas le 110.
+            // Le 112 y est toujours, et toujours en premier. Cf. [EmergencyNumbers].
+            //
+            // `remember` parce que la résolution interroge la téléphonie (IPC) : inutile de la
+            // repayer à chaque recomposition. Un changement de pays en cours de route est repris
+            // au retour sur l'écran, ce qui suffit — on ne traverse pas une frontière sans que
+            // l'écran soit quitté.
+            val numerosDUrgence = remember(ctx) { EmergencyNumbers.pour(ctx) }
+            numerosDUrgence.forEachIndexed { index, dial ->
+                if (index > 0) Spacer(Modifier.height(8.dp))
+                EmergencyCallTile(
+                    number = dial.number,
+                    label = stringResource(libelleDuService(dial.service)),
+                    containerColor = couleurDuService(dial.service),
+                    onClick = { callEmergency(dial.number) },
+                )
+            }
+
+            // v1.14.1 — Bouton "Appeler un proche" : visible si au moins 1
+            // contact SafetyCall configuré. Si 1 contact → call direct, si
+            // ≥2 → picker dialog. Pas de whitelist sur le numéro (vient de
+            // SafetyCallContact configuré par l'user).
+            if (safetyContacts.isNotEmpty()) {
+                Spacer(Modifier.height(8.dp))
+                var pickerOpen by remember { mutableStateOf(false) }
+                EmergencyCallTile(
+                    number = "★",
+                    label = stringResource(R.string.emergency_call_close_label),
+                    containerColor = MaterialTheme.colorScheme.primary,
+                    onClick = {
+                        if (safetyContacts.size == 1) {
+                            callRelative(safetyContacts.first().phoneNumber)
+                        } else {
+                            pickerOpen = true
+                        }
+                    },
+                )
+                if (pickerOpen) {
+                    RelativePickerDialog(
+                        contacts = safetyContacts,
+                        onPick = { phone ->
+                            pickerOpen = false
+                            callRelative(phone)
+                        },
+                        onDismiss = { pickerOpen = false },
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(28.dp))
+
+            // ── SECTION 2 — SMS d'urgence aux proches (hold-3s) ──
+
+            // v1.28.12 (audit 3 axes, U1) — **c'est ICI que l'on déclenche, et c'est ici que
+            // l'avertissement manquait.**
+            //
+            // Le rôle d'application SMS par défaut a été câblé le matin même sur les deux écrans
+            // d'ARMEMENT ([EmergencySetupScreen], [SafetyCallSetupScreen]) et pas sur celui-ci.
+            // Or `SendSmsUseCase` refuse tout envoi sans ce rôle, et cet écran est atteint
+            // DIRECTEMENT depuis la notification de l'écran verrouillé — sans jamais passer par
+            // l'écran de configuration. C'est le chemin réel en situation d'urgence.
+            //
+            // Sans elle, `canTrigger` reste vrai, le bouton reste plein et coloré, et le statut
+            // en dessous annonce « prêt ». L'utilisateur tient trois secondes en croyant l'alerte
+            // partie ; le seul filet est le message d'échec, APRÈS coup.
+            //
+            // L'argument est déjà écrit vingt lignes plus bas, pour la permission de
+            // localisation : « l'avertissement de l'écran de configuration ne suffit pas —
+            // celui-ci est là où l'on déclenche ». Il n'avait pas été appliqué à la précondition
+            // voisine, le même jour.
+            //
+            // ⚠️ Placée devant la SECTION 2 et non devant la 1 : les appels directs (112, police)
+            // ne passent pas par SMS et fonctionnent sans ce rôle. L'annoncer plus haut ferait
+            // croire que le numéro d'urgence lui-même est hors service.
+            //
+            // ⚠️ Le bouton n'est PAS désactivé, délibérément : en situation d'urgence, un bouton
+            // qui refuse de répondre est pire qu'un bouton qui tente et le dit. On avertit, on
+            // ne bloque pas.
+            BanniereRoleSmsManquant(
+                aLeRole = { viewModel.defaultAppManager.isDefault() },
+                onCorriger = {
+                    viewModel.defaultAppManager.buildChangeDefaultIntent()
+                        ?.let { lanceurRoleSms.launch(it) }
+                },
+            )
+
+            Text(
+                text = stringResource(R.string.emergency_section_sms_title),
+                style = RelayText.ConvoName,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Spacer(Modifier.height(12.dp))
+
+            // Preview du SMS qui partira.
+            MessagePreviewCard(
+                config = state,
+                includeLocationGranted = state.includeLocation && locationGranted,
+                positionApproximative = !localisation.exacte,
+            )
+
+            // v1.25.5 — avertissement EXPLICITE quand la position est armée sans la permission.
+            //
+            // L'aperçu ci-dessus reflétait déjà l'état réel (audit U1, v1.10.0) : il s'affichait
+            // sans lien de carte. Mais repérer une absence dans un exemple demande de savoir ce
+            // qu'on devrait y voir — signal trop faible pour un écran d'urgence. Constaté à
+            // l'usage : le réglage était armé, la permission jamais accordée, et rien sur cet
+            // écran ne le disait. Le message serait parti sans position, en croyant l'envoyer.
+            //
+            // L'avertissement de l'écran de configuration ne suffit pas : on peut armer l'option
+            // une fois et ne plus jamais rouvrir cette page. Celui-ci est là où l'on déclenche,
+            // et il propose d'accorder la permission sur place plutôt que de renvoyer aux
+            // réglages Android.
+            if (state.includeLocation && !locationGranted) {
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    text = stringResource(R.string.emergency_setup_location_permission_warning),
+                    style = RelayText.Preview,
+                    color = MaterialTheme.colorScheme.error,
+                )
+                Spacer(Modifier.height(8.dp))
+                RelayTextButton(
+                    text = stringResource(R.string.emergency_location_grant),
+                    onClick = localisation.demander,
+                )
+            } else if (state.includeLocation && !localisation.exacte) {
+                // v1.28.13 — position approximative : elle part, avec sa marge, et on le dit ici.
+                Spacer(Modifier.height(12.dp))
+                Text(
+                    text = stringResource(R.string.emergency_location_approximate),
+                    style = RelayText.Preview,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(8.dp))
+                RelayTextButton(
+                    text = stringResource(R.string.emergency_location_grant_precise),
+                    onClick = localisation.demander,
+                )
+            }
+            Spacer(Modifier.height(16.dp))
+
+            // Le bouton hold 3s (centré).
+            Box(
+                modifier = Modifier.fillMaxWidth(),
+                contentAlignment = Alignment.Center,
+            ) {
+                EmergencyHoldButton(
+                    onTrigger = viewModel::trigger,
+                    enabled = canTrigger,
+                )
+            }
+            Spacer(Modifier.height(12.dp))
+            // Statut explicatif sous le bouton.
+            val statusRes = when {
+                !state.enabled -> R.string.emergency_status_disabled
+                contactsCount == 0 -> R.string.emergency_status_no_contacts
+                cooldownActive -> R.string.emergency_status_cooldown
+                else -> R.string.emergency_status_ready
+            }
+            Text(
+                text = stringResource(statusRes),
+                style = RelayText.Preview,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.align(Alignment.CenterHorizontally),
+            )
+            if (state.enabled && contactsCount == 0) {
+                Spacer(Modifier.height(8.dp))
+                RelayTextButton(
+                    text = stringResource(R.string.emergency_setup_contacts_cta),
+                    onClick = onOpenSetup,
+                    modifier = Modifier.align(Alignment.CenterHorizontally),
+                )
+            }
+
+            Spacer(Modifier.height(28.dp))
+
+            // ── SECTION 3 — Actions secondaires ──
+            Text(
+                text = stringResource(R.string.emergency_section_other_title),
+                style = RelayText.ConvoName,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+            Spacer(Modifier.height(12.dp))
+
+            // v1.14.5 — bouton "Tester sans envoyer" retiré sur demande user
+            // (encombrait la page urgence — le mode actif est déjà visible via
+            // la section recap au-dessus). Le dry-run reste accessible via
+            // SettingsScreen → Mode urgence pour debug avancé.
+
+            // "Désactiver le mode urgence" — confirm dialog.
+            var disableConfirmOpen by remember { mutableStateOf(false) }
+            androidx.compose.material3.OutlinedButton(
+                onClick = { disableConfirmOpen = true },
+                colors = androidx.compose.material3.ButtonDefaults.outlinedButtonColors(
+                    contentColor = RelayColors.Error,
+                ),
+                shape = RoundedCornerShape(50),
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text(stringResource(R.string.emergency_disable_button)) }
+            if (disableConfirmOpen) {
+                RelayDialog(
+                    onDismissRequest = { disableConfirmOpen = false },
+                    title = stringResource(R.string.emergency_disable_confirm_title),
+                    content = {
+                        Text(
+                            text = stringResource(R.string.emergency_disable_confirm_body),
+                            style = RelayText.Preview,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    },
+                    confirmButton = {
+                        RelayDestructiveButton(
+                            text = stringResource(R.string.emergency_disable_button),
+                            onClick = {
+                                disableConfirmOpen = false
+                                // v1.27.2 — le message est désormais posé par le gestionnaire
+                                // d'événement, à la CONFIRMATION de l'écriture, et non ici sur
+                                // la seule intention. Il précède le retour à l'écran précédent.
+                                viewModel.disableEmergencyMode()
+                            },
+                        )
+                    },
+                    dismissButton = {
+                        RelayTextButton(
+                            text = stringResource(R.string.action_cancel),
+                            onClick = { disableConfirmOpen = false },
+                        )
+                    },
+                )
+            }
+            Spacer(Modifier.height(24.dp))
+        }
+    }
+
+    // v1.14.5 — dry-run dialog + composable EmergencyDryRunDialog supprimés
+    // (le bouton "Tester sans envoyer" était la seule entrée vers eux).
+}
+
+/**
+ * v1.14.0 — gère le résultat d'un `EmergencyCallHelper.openDialer` ou
+ * `placeCall` côté UI : un seul snackbar différentié selon l'outcome.
+ * SUCCESS = silencieux (l'OS prend le relais et affiche le dialer/call).
+ */
+private fun handleCallOutcome(
+    outcome: com.relay.sms.system.emergency.EmergencyCallHelper.CallOutcome,
+    scope: kotlinx.coroutines.CoroutineScope,
+    snackbarHost: androidx.compose.material3.SnackbarHostState,
+    noDialerMsg: String,
+    permDeniedMsg: String,
+    osErrorMsg: String,
+) {
+    when (outcome) {
+        com.relay.sms.system.emergency.EmergencyCallHelper.CallOutcome.SUCCESS -> Unit
+        com.relay.sms.system.emergency.EmergencyCallHelper.CallOutcome.NO_DIALER ->
+            scope.launch { snackbarHost.showError(noDialerMsg) }
+        com.relay.sms.system.emergency.EmergencyCallHelper.CallOutcome.PERMISSION_DENIED ->
+            scope.launch { snackbarHost.showError(permDeniedMsg) }
+        com.relay.sms.system.emergency.EmergencyCallHelper.CallOutcome.OS_ERROR,
+        com.relay.sms.system.emergency.EmergencyCallHelper.CallOutcome.INVALID_NUMBER ->
+            scope.launch { snackbarHost.showError(osErrorMsg) }
+    }
+}
+
+/**
+ * v1.28.12 — le libellé tient au SERVICE appelé, plus au numéro : le même service porte le 17
+ * en France, le 110 en Allemagne, le 091 en Espagne. Quatre libellés suffisent donc pour tous
+ * les pays de la table, là où il fallait une chaîne par numéro français.
+ */
+@StringRes
+private fun libelleDuService(service: EmergencyNumbers.Service): Int = when (service) {
+    EmergencyNumbers.Service.EUROPEAN -> R.string.emergency_call_eu_label
+    EmergencyNumbers.Service.NATIONAL -> R.string.emergency_call_national_label
+    EmergencyNumbers.Service.POLICE -> R.string.emergency_call_police_label
+    EmergencyNumbers.Service.FIRE -> R.string.emergency_call_fire_label
+    EmergencyNumbers.Service.MEDICAL -> R.string.emergency_call_medical_label
+}
+
+/**
+ * Les couleurs d'origine, rattachées elles aussi au service et non plus au numéro français.
+ * Toutes vérifiées WCAG AA ≥ 4.5:1 contre blanc — voir [EmergencyCallTile].
+ */
+private fun couleurDuService(service: EmergencyNumbers.Service): Color = when (service) {
+    EmergencyNumbers.Service.EUROPEAN -> com.relay.sms.ui.theme.BrandDanger
+    // Le numéro d'urgence général d'un pays fait la même chose que le 112 : même couleur,
+    // parce qu'une couleur différente laisserait croire à un service différent.
+    EmergencyNumbers.Service.NATIONAL -> com.relay.sms.ui.theme.BrandDanger
+    EmergencyNumbers.Service.MEDICAL -> Color(0xFF00796B) // teal médical
+    EmergencyNumbers.Service.POLICE -> Color(0xFF1565C0) // navy police
+    EmergencyNumbers.Service.FIRE -> Color(0xFFE65100) // orange pompiers
+}
+
+/**
+ * v1.14.1 — Tuile d'appel d'urgence : un gros bouton plein couleur, numéro
+ * en gras à gauche + label à droite. Tap → onClick (caller décide direct
+ * call vs dialer fallback selon permission). Hauteur fixe 72dp pour tap
+ * target accessible + uniformité visuelle.
+ *
+ * Couleur de fond fournie par caller, texte blanc systématique. Toutes les
+ * couleurs utilisées (BrandDanger / 00796B / 1565C0 / E65100 / primary)
+ * vérifiées WCAG AA ≥ 4.5:1 contre blanc.
+ */
+@Composable
+private fun EmergencyCallTile(
+    number: String,
+    label: String,
+    containerColor: Color,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    androidx.compose.material3.Button(
+        onClick = onClick,
+        colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+            containerColor = containerColor,
+            // Phase 8 — le premier plan est dérivé du fond (voir
+            // [com.relay.sms.ui.theme.onBrandContainer]) : blanc sur la tuile
+            // orange pompiers `#E65100` ne donnait que 3.79:1 — le noir donne 5.54:1.
+            // Blanc sur le sarcelle `#00796B` (5.32:1) et sur le bleu `#1565C0`
+            // (5.75:1) est conservé.
+            contentColor = com.relay.sms.ui.theme.onBrandContainer(containerColor),
+        ),
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(
+            horizontal = 16.dp, vertical = 18.dp,
+        ),
+        shape = RoundedCornerShape(50),
+        modifier = modifier.fillMaxWidth(),
+    ) {
+        androidx.compose.foundation.layout.Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(
+                text = number,
+                style = RelayText.LargeTitle,
+            )
+            Spacer(Modifier.size(16.dp))
+            Text(
+                text = label,
+                style = RelayText.ConvoName,
+            )
+        }
+    }
+}
+
+/**
+ * v1.14.1 — Dialog picker quand l'user a ≥2 contacts SafetyCall et tape
+ * "Appeler un proche". Liste cliquable des contacts, tap → callRelative.
+ * Si 1 seul contact, ce dialog n'est pas montré (call direct).
+ */
+@Composable
+private fun RelativePickerDialog(
+    contacts: List<com.relay.sms.domain.safetycall.SafetyCallContact>,
+    onPick: (phone: String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    RelayDialog(
+        onDismissRequest = onDismiss,
+        title = stringResource(R.string.emergency_call_close_picker_title),
+        content = {
+            Column {
+                contacts.forEach { c ->
+                    val name = c.displayName?.takeIf { it.isNotBlank() } ?: c.phoneNumber
+                    androidx.compose.material3.ListItem(
+                        headlineContent = { Text(name) },
+                        supportingContent = if (c.displayName?.isNotBlank() == true) {
+                            { Text(c.phoneNumber) }
+                        } else null,
+                        modifier = Modifier.clickable { onPick(c.phoneNumber) },
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            RelayTextButton(
+                text = stringResource(R.string.action_cancel),
+                onClick = onDismiss,
+            )
+        },
+    )
+}
+
+/**
+ * Lien des aperçus : Paris, avec la marge d'une position approximative (~2 km sous Android 12+).
+ * Partagé avec les exemples de modèles de [EmergencySetupScreen] : un seul lien d'exemple.
+ */
+internal fun lienDExemple(approximative: Boolean): String =
+    GeoLocation(48.85661, 2.35222, precisionMetres = if (approximative) 2_000f else null).lienCarte()
+
+@Composable
+private fun MessagePreviewCard(
+    config: EmergencyConfig,
+    includeLocationGranted: Boolean,
+    positionApproximative: Boolean,
+) {
+    // v1.28.12 — MEME source que l'envoi (`TriggerEmergencyUseCase`) : un apercu qui mentirait
+    // sur le contenu d'un SMS d'urgence serait la pire occurrence du motif « correctif pose sur
+    // un seul des chemins jumeaux ».
+    // v1.28.13 — le lien d'exemple passe lui aussi par `lienCarte`, marge comprise.
+    val textes = rememberSafetyMessageTexts()
+    val previewBody = remember(config.template, includeLocationGranted, positionApproximative, textes) {
+        val sampleUrl = if (includeLocationGranted) lienDExemple(positionApproximative) else null
+        textes.emergencyBody(config.template, sampleUrl)
+    }
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant,
+        ),
+        shape = RoundedCornerShape(10.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+        ) {
+            Text(
+                text = stringResource(R.string.emergency_preview_title),
+                style = RelayText.Timestamp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = previewBody,
+                style = RelayText.Preview,
+                color = MaterialTheme.colorScheme.onSurface,
+            )
+        }
+    }
+}
+
+private suspend fun handleTriggerResult(
+    result: TriggerEmergencyUseCase.Result,
+    snackbarHost: SnackbarHostState,
+    ctxGetter: () -> android.content.Context,
+) {
+    val ctx = ctxGetter()
+    when (result) {
+        is TriggerEmergencyUseCase.Result.Triggered -> {
+            if (result.sent == 0 && result.failed > 0) {
+                snackbarHost.showError(
+                    ctx.getString(R.string.emergency_triggered_all_failed, result.failed),
+                )
+            } else if (!result.hadLocation) {
+                // Succès partiel — SMS partis mais sans géoloc.
+                snackbarHost.showError(
+                    ctx.getString(R.string.emergency_triggered_no_location, result.sent),
+                )
+            } else {
+                snackbarHost.showSnackbar(
+                    ctx.getString(R.string.emergency_triggered_ok, result.sent),
+                )
+            }
+        }
+        is TriggerEmergencyUseCase.Result.NoContacts ->
+            snackbarHost.showError(ctx.getString(R.string.emergency_status_no_contacts))
+        is TriggerEmergencyUseCase.Result.Disabled ->
+            snackbarHost.showError(ctx.getString(R.string.emergency_status_disabled))
+        is TriggerEmergencyUseCase.Result.EmptyBody,
+        is TriggerEmergencyUseCase.Result.PanicSuppressed ->
+            snackbarHost.showError(ctx.getString(R.string.snack_generic_error))
+    }
+}

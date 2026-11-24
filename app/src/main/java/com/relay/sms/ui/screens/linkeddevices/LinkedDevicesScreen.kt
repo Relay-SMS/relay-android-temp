@@ -1,0 +1,1604 @@
+/*
+ * Copyright 2026 Relay Messaging. All rights reserved.
+ *
+ * This file is proprietary to Relay Messaging and is not licensed under the
+ * Apache License 2.0. See LICENSE-RELAY for the terms.
+ */
+
+package com.relay.sms.ui.screens.linkeddevices
+
+import android.Manifest
+import android.os.SystemClock
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.ArrowBack
+import androidx.compose.material.icons.outlined.Call
+import androidx.compose.material.icons.outlined.Computer
+import androidx.compose.material.icons.outlined.Contacts
+import androidx.compose.material.icons.outlined.Devices
+import androidx.compose.material.icons.outlined.Link
+import androidx.compose.material.icons.outlined.Lock
+import androidx.compose.material.icons.outlined.Person
+import androidx.compose.material.icons.outlined.PhoneAndroid
+import androidx.compose.material.icons.outlined.QrCodeScanner
+import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.Smartphone
+import androidx.compose.material.icons.outlined.Tablet
+import androidx.compose.material.icons.outlined.Wifi
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.Stable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableLongStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
+import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.google.accompanist.permissions.ExperimentalPermissionsApi
+import com.google.accompanist.permissions.PermissionStatus
+import com.google.accompanist.permissions.rememberMultiplePermissionsState
+import com.google.accompanist.permissions.rememberPermissionState
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.BinaryBitmap
+import com.google.zxing.DecodeHintType
+import com.google.zxing.MultiFormatReader
+import com.google.zxing.PlanarYUVLuminanceSource
+import com.google.zxing.common.HybridBinarizer
+import com.relay.sms.R
+import com.relay.sms.domain.settings.DeviceMode
+import com.relay.sms.sync.DeviceKind
+import com.relay.sms.sync.QrPairing
+import com.relay.sms.sync.SyncProtocol
+import com.relay.sms.sync.client.AutoLinkPhase
+import com.relay.sms.sync.client.AutoLinkViewState
+import com.relay.sms.sync.client.ClientConnectionState
+import com.relay.sms.sync.client.ClientLink
+import com.relay.sms.sync.client.ClientLinkViewModel
+import com.relay.sms.sync.client.ClientSyncPhase
+import com.relay.sms.sync.client.NoSimNudgeCard
+import com.relay.sms.sync.client.QrDisplay
+import com.relay.sms.sync.client.deviceKindFor
+import com.relay.sms.system.settings.ouvrirLaFicheDeLApplication
+import com.relay.sms.ui.components.RelayDestructiveButton
+import com.relay.sms.ui.components.RelayDialog
+import com.relay.sms.ui.components.RelayEmptyState
+import com.relay.sms.ui.components.RelayHint
+import com.relay.sms.ui.components.RelayPrimaryButton
+import com.relay.sms.ui.components.RelaySectionLabel
+import com.relay.sms.ui.components.RelaySettingRow
+import com.relay.sms.ui.components.RelaySettingsGroup
+import com.relay.sms.ui.components.RelaySnackbarHost
+import com.relay.sms.ui.components.RelaySwitchRow
+import com.relay.sms.ui.components.RelayTextButton
+import timber.log.Timber
+import java.util.Date
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * GLUE — the Linked devices screen. The mode decides which branch
+ * renders: the hub branch (the server toggle, the linked devices,
+ * the QR scanner) or the client branch (this device's identity, the
+ * hub link status, the pairing QR). Each branch creates only its
+ * own ViewModel, so the hub graph is never built in client mode and
+ * vice versa. While the settings hydrate the screen shows nothing
+ * rather than the wrong branch.
+ *
+ * Seca-style grouped Settings like the rest of the app: a normal top
+ * bar WITH the title, no big headline.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun LinkedDevicesScreen(
+    onBack: () -> Unit,
+    clientViewModel: ClientLinkViewModel = hiltViewModel(),
+) {
+    // Client mode — the branch follows the stored mode.
+    val mode by clientViewModel.mode.collectAsStateWithLifecycle()
+    when (mode) {
+        null -> Unit
+        DeviceMode.HUB -> HubLinkedDevicesScreen(
+            onBack = onBack,
+            clientViewModel = clientViewModel,
+        )
+        DeviceMode.CLIENT -> ClientLinkedDevicesScreen(
+            onBack = onBack,
+            viewModel = clientViewModel,
+        )
+    }
+}
+
+/**
+ * GLUE — the hub branch of the Linked devices screen: the server
+ * toggle, the linked devices, the QR scanner. It reuses the app's
+ * theme and settings components (the third glue point in
+ * SYNC_PROTOCOL.md); all protocol, crypto, transport and storage
+ * work lives in the standalone `sync` package.
+ *
+ * Client mode adds two things here: the no-SIM nudge card (a SIM-less
+ * device with no default-SMS role) and the mode row at the bottom
+ * ("Link this device to another phone"), both confirmed before any
+ * switch.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun HubLinkedDevicesScreen(
+    onBack: () -> Unit,
+    clientViewModel: ClientLinkViewModel,
+    viewModel: LinkedDevicesViewModel = hiltViewModel(),
+) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    var scannerOpen by rememberSaveable { mutableStateOf(false) }
+    var deviceToRemove by remember { mutableStateOf<LinkedDeviceUi?>(null) }
+    // Client mode — the mode-switch confirm (from the mode row, or
+    // from the no-SIM nudge, which opens the QR after the switch).
+    var modeSwitchConfirmOpen by remember { mutableStateOf(false) }
+    var openQrAfterSwitch by remember { mutableStateOf(false) }
+    val snackbarHost = remember { SnackbarHostState() }
+    val linkedFmt = stringResource(R.string.linked_devices_linked)
+    val removedFmt = stringResource(R.string.linked_devices_removed)
+    // Round 3, item 9 — WRITE_CONTACTS, so a linked device can
+    // set a contact's photo. Asked when the server is switched on
+    // (the toggle below), never at launch. A denial is remembered
+    // (the ViewModel persists it) so the row can offer it again.
+    val contactsWrite = rememberPermissionContactsWrite(
+        onDenied = { viewModel.setContactsWriteDenied(true) },
+    )
+    // Live calls — READ_CALL_LOG + CALL_PHONE, so a linked device
+    // can see incoming calls (with the number) and place calls
+    // from this phone. Asked from the row below, never at launch
+    // and never at server-enable (which already asks
+    // WRITE_CONTACTS — three dialogs at once would be too much).
+    // The row shows while the server is on and either permission
+    // is missing, so a denial leaves the way back in visible.
+    val callsPermission = rememberPermissionCalls()
+
+    LaunchedEffect(Unit) {
+        viewModel.events.collect { event ->
+            when (event) {
+                is LinkedDevicesViewModel.Event.Linked ->
+                    snackbarHost.showSnackbar(linkedFmt.format(event.name))
+                is LinkedDevicesViewModel.Event.Removed ->
+                    snackbarHost.showSnackbar(removedFmt.format(event.name))
+            }
+        }
+    }
+
+    if (scannerOpen) {
+        QrScannerScreen(
+            scanError = state.scanError,
+            scannerEnabled = state.pendingInvite == null,
+            snackbarHost = snackbarHost,
+            onQrScanned = viewModel::onQrScanned,
+            onClose = {
+                viewModel.clearScanError()
+                scannerOpen = false
+            },
+        )
+    } else {
+        LinkedDevicesList(
+            state = state,
+            snackbarHost = snackbarHost,
+            onBack = onBack,
+            onOpenScanner = { scannerOpen = true },
+            onToggleServer = { enabled ->
+                viewModel.setServerEnabled(enabled)
+                // Enabling the server is what makes contact-photo
+                // setting possible, so the WRITE_CONTACTS grant is
+                // asked here — once, and only before the first
+                // denial; after that the row is the way back in.
+                if (enabled && !contactsWrite.granted && !state.contactsWriteDenied) {
+                    contactsWrite.request()
+                }
+            },
+            onRemove = { deviceToRemove = it },
+            contactsWriteGranted = contactsWrite.granted,
+            onRequestContactsWrite = contactsWrite.request,
+            callsGranted = callsPermission.granted,
+            onRequestCalls = callsPermission.request,
+            showNudge = clientViewModel.showNudge,
+            onNudgeLink = {
+                openQrAfterSwitch = true
+                modeSwitchConfirmOpen = true
+            },
+            onSwitchMode = {
+                openQrAfterSwitch = false
+                modeSwitchConfirmOpen = true
+            },
+        )
+    }
+
+    // The confirm dialog renders above the scanner: the code is still
+    // in frame behind it, and dismissing returns to scanning.
+    val pendingInvite = state.pendingInvite
+    if (pendingInvite != null) {
+        val kindLabel = kindLabel(pendingInvite.kind)
+        RelayDialog(
+            onDismissRequest = viewModel::dismissInvite,
+            title = stringResource(R.string.linked_devices_confirm_title),
+            content = {
+                Text(
+                    stringResource(
+                        R.string.linked_devices_confirm_body,
+                        pendingInvite.displayName,
+                        kindLabel,
+                    ),
+                )
+            },
+            confirmButton = {
+                RelayTextButton(
+                    text = stringResource(R.string.linked_devices_confirm_action),
+                    confirm = true,
+                    onClick = {
+                        viewModel.confirmLink()
+                        scannerOpen = false
+                    },
+                )
+            },
+            dismissButton = {
+                RelayTextButton(
+                    text = stringResource(R.string.action_cancel),
+                    onClick = viewModel::dismissInvite,
+                )
+            },
+        )
+    }
+
+    val toRemove = deviceToRemove
+    if (toRemove != null) {
+        RelayDialog(
+            onDismissRequest = { deviceToRemove = null },
+            title = stringResource(
+                R.string.linked_devices_remove_title,
+                toRemove.device.displayName,
+            ),
+            content = { Text(stringResource(R.string.linked_devices_remove_body)) },
+            confirmButton = {
+                RelayDestructiveButton(
+                    text = stringResource(R.string.linked_devices_remove_action),
+                    onClick = {
+                        viewModel.removeDevice(
+                            toRemove.device.deviceId,
+                            toRemove.device.displayName,
+                        )
+                        deviceToRemove = null
+                    },
+                )
+            },
+            dismissButton = {
+                RelayTextButton(
+                    text = stringResource(R.string.action_cancel),
+                    onClick = { deviceToRemove = null },
+                )
+            },
+        )
+    }
+
+    // Client mode — the mode switch asks first: switching clears the
+    // messages stored on this device.
+    if (modeSwitchConfirmOpen) {
+        ModeSwitchConfirmDialog(
+            target = DeviceMode.CLIENT,
+            onConfirm = {
+                modeSwitchConfirmOpen = false
+                if (openQrAfterSwitch) {
+                    clientViewModel.switchToClientAndOpenQr()
+                } else {
+                    clientViewModel.switchMode(DeviceMode.CLIENT)
+                }
+            },
+            onDismiss = { modeSwitchConfirmOpen = false },
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun LinkedDevicesList(
+    state: LinkedDevicesState,
+    snackbarHost: SnackbarHostState,
+    onBack: () -> Unit,
+    onOpenScanner: () -> Unit,
+    onToggleServer: (Boolean) -> Unit,
+    onRemove: (LinkedDeviceUi) -> Unit,
+    /** WRITE_CONTACTS granted — the photo row hides itself when true. */
+    contactsWriteGranted: Boolean,
+    /** Request WRITE_CONTACTS (the photo row's tap). */
+    onRequestContactsWrite: () -> Unit,
+    /** READ_CALL_LOG + CALL_PHONE granted — the calls row hides itself when true. */
+    callsGranted: Boolean,
+    /** Request READ_CALL_LOG + CALL_PHONE (the calls row's tap). */
+    onRequestCalls: () -> Unit,
+    /** Client mode — the no-SIM nudge shows on a SIM-less device with no default-SMS role. */
+    showNudge: Boolean,
+    /** Client mode — the nudge tap: switch to client mode, then open the QR. */
+    onNudgeLink: () -> Unit,
+    /** Client mode — the mode row tap: switch to client mode. */
+    onSwitchMode: () -> Unit,
+) {
+    Scaffold(
+        containerColor = MaterialTheme.colorScheme.surface,
+        topBar = {
+            TopAppBar(
+                title = { Text(stringResource(R.string.linked_devices_title)) },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(
+                            Icons.AutoMirrored.Outlined.ArrowBack,
+                            contentDescription = stringResource(R.string.action_back),
+                        )
+                    }
+                },
+            )
+        },
+        snackbarHost = { RelaySnackbarHost(snackbarHost) },
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .verticalScroll(rememberScrollState()),
+        ) {
+            // Client mode — the no-SIM nudge: a SIM-less device with no
+            // default-SMS role cannot message on its own.
+            if (showNudge) {
+                NoSimNudgeCard(
+                    onLink = onNudgeLink,
+                    modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 16.dp),
+                )
+            }
+            RelaySectionLabel(stringResource(R.string.linked_devices_section_server))
+            // The photo row shows only after a denial (never before
+            // the first ask): key the group on the gating values, as
+            // the Settings screen keys its conditional groups —
+            // without it the rows would never appear or disappear
+            // when the gating state changes.
+            val showContactsWriteRow =
+                !contactsWriteGranted && state.contactsWriteDenied
+            // Live calls — the row shows while the server is on and
+            // either call permission is missing: the grant is asked
+            // from here, so the row is both the prompt and the way
+            // back in after a denial.
+            val showCallsRow = state.serverEnabled && !callsGranted
+            key(showContactsWriteRow, showCallsRow) {
+                RelaySettingsGroup {
+                    item {
+                        RelaySwitchRow(
+                            icon = Icons.Outlined.Wifi,
+                            title = stringResource(R.string.linked_devices_server_title),
+                            subtitle = stringResource(R.string.linked_devices_server_subtitle),
+                            checked = state.serverEnabled,
+                            onCheckedChange = onToggleServer,
+                        )
+                    }
+                    // The device link is encrypted end to end (TLS with
+                    // a pinned certificate + Ed25519 device keys, no
+                    // server in the middle on the local network) —
+                    // stated here so it is visible on the page that
+                    // manages the link. It says nothing about the
+                    // messages' trip to the other person: SMS/MMS
+                    // travel the carrier network as plain text.
+                    item {
+                        RelaySettingRow(
+                            icon = Icons.Outlined.Lock,
+                            title = stringResource(R.string.linked_devices_encryption_title),
+                            subtitle = stringResource(R.string.linked_devices_encryption_subtitle),
+                        )
+                    }
+                    // Round 3, item 9 — WRITE_CONTACTS, so a linked
+                    // device can set a contact's photo (the camera
+                    // badge on the desktop detail pane). The grant
+                    // is asked when the server is switched on; this
+                    // row appears only after a denial, so the user
+                    // is never stuck with it — tapping asks again,
+                    // and a permanent denial opens the app's system
+                    // page instead (see rememberPermissionContactsWrite).
+                    if (showContactsWriteRow) {
+                        item(onClick = onRequestContactsWrite) {
+                            RelaySettingRow(
+                                icon = Icons.Outlined.Person,
+                                title = stringResource(R.string.linked_devices_contacts_write_title),
+                                subtitle = stringResource(R.string.linked_devices_contacts_write_subtitle),
+                                chevron = true,
+                            )
+                        }
+                    }
+                    // Live calls — READ_CALL_LOG + CALL_PHONE, so a
+                    // linked device can see incoming calls (with
+                    // the number) and place calls from this phone.
+                    // Tapping asks for both at once, and a
+                    // permanent denial opens the app's system page
+                    // instead (see rememberPermissionCalls).
+                    if (showCallsRow) {
+                        item(onClick = onRequestCalls) {
+                            RelaySettingRow(
+                                icon = Icons.Outlined.Call,
+                                title = stringResource(R.string.linked_devices_calls_title),
+                                subtitle = stringResource(R.string.linked_devices_calls_subtitle),
+                                chevron = true,
+                            )
+                        }
+                    }
+                }
+            }
+            RelayHint(stringResource(R.string.linked_devices_server_hint))
+            val startError = state.lastStartError
+            if (startError != null &&
+                shouldShowStartError(state.serverEnabled, state.serverRunning, startError)
+            ) {
+                StartErrorCard(
+                    error = startError,
+                    modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 12.dp),
+                )
+            }
+
+            // One link button before linking: with no devices yet
+            // the whole section (title + Link row) hides and only
+            // the centered empty state offers the link action.
+            if (state.devices.isNotEmpty()) {
+                RelaySectionLabel(stringResource(R.string.linked_devices_section_devices))
+                // Keyed on the device list, as the Settings screen keys its
+                // conditional groups: without it the group's content lambda
+                // is reused and a freshly linked (or removed) row never
+                // appears until the next unrelated recomposition.
+                key(state.devices) {
+                    RelaySettingsGroup {
+                        item(onClick = onOpenScanner) {
+                            RelaySettingRow(
+                                icon = Icons.Outlined.QrCodeScanner,
+                                title = stringResource(R.string.linked_devices_link_action),
+                                chevron = true,
+                            )
+                        }
+                        state.devices.forEach { ui ->
+                            item {
+                                RelaySettingRow(
+                                    icon = kindIcon(ui.device.kind),
+                                    title = ui.device.displayName,
+                                    subtitle = deviceSubtitle(ui),
+                                    trailing = {
+                                        IconButton(onClick = { onRemove(ui) }) {
+                                            Icon(
+                                                painterResource(R.drawable.ic_trash),
+                                                contentDescription = stringResource(
+                                                    R.string.linked_devices_remove_content_desc,
+                                                ),
+                                            )
+                                        }
+                                    },
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            if (state.devices.isEmpty()) {
+                RelayEmptyState(
+                    icon = Icons.Outlined.Devices,
+                    headline = stringResource(R.string.linked_devices_empty_title),
+                    body = stringResource(R.string.linked_devices_empty_body),
+                    buttonText = stringResource(R.string.linked_devices_link_action),
+                    onButtonClick = onOpenScanner,
+                    modifier = Modifier.padding(top = 32.dp),
+                )
+            }
+            // Client mode — the mode row: this device becomes a linked
+            // device instead of a phone (the switch asks first).
+            RelaySectionLabel(stringResource(R.string.client_mode_section))
+            RelaySettingsGroup {
+                item(onClick = onSwitchMode) {
+                    RelaySettingRow(
+                        icon = Icons.Outlined.Link,
+                        title = stringResource(R.string.client_mode_link_title),
+                        subtitle = stringResource(R.string.client_mode_link_subtitle),
+                        chevron = true,
+                    )
+                }
+            }
+            Spacer(Modifier.size(32.dp))
+        }
+    }
+}
+
+/**
+ * TEMP-DIAG for the "Not linked" investigation: which fields of the
+ * collected link record are present — booleans only, never values.
+ * Mirrors ClientLinkStore.describeLink; remove together with it.
+ */
+private fun describeCollectedLink(link: ClientLink?): String =
+    "isLinked=${link?.isLinked} deviceId=${link?.deviceId != null} " +
+        "displayName=${link?.displayName != null} hubId=${link?.hubId != null} " +
+        "hubName=${link?.hubName != null} hubHost=${link?.hubHost != null} " +
+        "hubPort=${link?.hubPort != null} lastSeen=${link?.lastSeen}"
+
+/**
+ * Client mode — the client branch of the Linked devices screen:
+ * this device's identity, the hub link status, the pairing QR, and
+ * Unlink. No server toggle, no device list, no scanner — those are
+ * the hub's.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ClientLinkedDevicesScreen(
+    onBack: () -> Unit,
+    viewModel: ClientLinkViewModel,
+) {
+    // TEMP-DIAG "Not linked" fix attempt (candidate A, a guess):
+    // collect the link directly instead of lifecycle-gated — the
+    // destination is only composed when visible, so the gating adds
+    // nothing, and the conditionally-composed child branch may not
+    // be delivering StateFlow updates.
+    val link by viewModel.link.collectAsState()
+    val connectionState by viewModel.connectionState.collectAsStateWithLifecycle()
+    // TEMP-DIAG "Not linked": what the composition actually sees —
+    // presence only, never values. One line per collected value.
+    // The connection state rides along: the hub row read "Offline"
+    // after the QR dance, and this shows what the screen held.
+    LaunchedEffect(link) {
+        Timber.d(
+            "ClientLinkedDevicesScreen: link collected %s connection=%s",
+            describeCollectedLink(link),
+            connectionState::class.simpleName,
+        )
+    }
+    val qrOpen by viewModel.qrOpen.collectAsStateWithLifecycle()
+    val pairUri by viewModel.pairUri.collectAsStateWithLifecycle()
+    val identityError by viewModel.identityError.collectAsStateWithLifecycle()
+    val autoLink by viewModel.autoLinkState.collectAsStateWithLifecycle()
+    val syncUi by viewModel.syncUi.collectAsStateWithLifecycle()
+    var unlinkConfirmOpen by remember { mutableStateOf(false) }
+    var switchConfirmOpen by remember { mutableStateOf(false) }
+    var resyncConfirmOpen by remember { mutableStateOf(false) }
+
+    if (qrOpen) {
+        ClientQrScreen(
+            pairUri = pairUri,
+            identityError = identityError,
+            autoLink = autoLink,
+            onClose = viewModel::closeQr,
+        )
+    } else {
+        ClientLinkedDevicesList(
+            link = link,
+            connectionState = connectionState,
+            contactsErrorCode = syncUi.contactsErrorCode,
+            contactsErrorMessage = syncUi.contactsErrorMessage,
+            onBack = onBack,
+            onOpenQr = viewModel::openQr,
+            onUnlink = { unlinkConfirmOpen = true },
+            onResync = { resyncConfirmOpen = true },
+            onRetryContacts = viewModel::retryContacts,
+            onSwitchBack = { switchConfirmOpen = true },
+        )
+    }
+
+    // Client mode C2 — the sync-mode prompt, on first connect after
+    // linking (and after a Re-sync). It waits for the QR to close:
+    // the prompt belongs to the connected state, not the pairing
+    // flow. Non-dismissible by design — see SyncModePromptDialog.
+    if (syncUi.phase == ClientSyncPhase.Prompting && !qrOpen) {
+        SyncModePromptDialog(onChooseMode = viewModel::chooseSyncMode)
+    }
+
+    // Re-sync asks twice (the row, then this dialog): it clears the
+    // messages stored on this device and asks how much to sync
+    // again. Nothing is deleted from the phone; the link survives.
+    if (resyncConfirmOpen) {
+        RelayDialog(
+            onDismissRequest = { resyncConfirmOpen = false },
+            title = stringResource(R.string.client_resync_title),
+            content = { Text(stringResource(R.string.client_resync_body)) },
+            confirmButton = {
+                RelayTextButton(
+                    text = stringResource(R.string.client_resync_action),
+                    confirm = true,
+                    onClick = {
+                        viewModel.resync()
+                        resyncConfirmOpen = false
+                    },
+                )
+            },
+            dismissButton = {
+                RelayTextButton(
+                    text = stringResource(R.string.action_cancel),
+                    onClick = { resyncConfirmOpen = false },
+                )
+            },
+        )
+    }
+
+    // Unlink asks twice (the row, then this dialog): it drops the hub
+    // link, the TOFU pin and the cache. The mode stays client.
+    if (unlinkConfirmOpen) {
+        RelayDialog(
+            onDismissRequest = { unlinkConfirmOpen = false },
+            title = stringResource(R.string.client_unlink_title),
+            content = { Text(stringResource(R.string.client_unlink_body)) },
+            confirmButton = {
+                RelayDestructiveButton(
+                    text = stringResource(R.string.client_unlink_action),
+                    onClick = {
+                        viewModel.unlink()
+                        unlinkConfirmOpen = false
+                    },
+                )
+            },
+            dismissButton = {
+                RelayTextButton(
+                    text = stringResource(R.string.action_cancel),
+                    onClick = { unlinkConfirmOpen = false },
+                )
+            },
+        )
+    }
+    if (switchConfirmOpen) {
+        ModeSwitchConfirmDialog(
+            target = DeviceMode.HUB,
+            onConfirm = {
+                switchConfirmOpen = false
+                viewModel.switchMode(DeviceMode.HUB)
+            },
+            onDismiss = { switchConfirmOpen = false },
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ClientLinkedDevicesList(
+    link: ClientLink?,
+    connectionState: ClientConnectionState,
+    contactsErrorCode: String?,
+    contactsErrorMessage: String?,
+    onBack: () -> Unit,
+    onOpenQr: () -> Unit,
+    onUnlink: () -> Unit,
+    onResync: () -> Unit,
+    onRetryContacts: () -> Unit,
+    onSwitchBack: () -> Unit,
+) {
+    val kind = deviceKindFor(LocalConfiguration.current.smallestScreenWidthDp)
+    Scaffold(
+        containerColor = MaterialTheme.colorScheme.surface,
+        topBar = {
+            TopAppBar(
+                title = { Text(stringResource(R.string.linked_devices_title)) },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(
+                            Icons.AutoMirrored.Outlined.ArrowBack,
+                            contentDescription = stringResource(R.string.action_back),
+                        )
+                    }
+                },
+            )
+        },
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .verticalScroll(rememberScrollState()),
+        ) {
+            // This device — only once the identity exists (it is
+            // created at the first link, not before).
+            if (link != null) {
+                RelaySectionLabel(stringResource(R.string.client_this_device_section))
+                RelaySettingsGroup {
+                    item {
+                        RelaySettingRow(
+                            icon = kindIcon(kind),
+                            title = link.displayName,
+                            subtitle = kindLabel(kind),
+                        )
+                    }
+                }
+            }
+            RelaySectionLabel(stringResource(R.string.client_link_section))
+            // Keyed on the linked boolean, as the hub branch keys its
+            // device group and Settings keys its conditional groups:
+            // without it the group's content lambda is hoisted/reused
+            // and the "Not linked" row registered on the first
+            // composition (link still null) never goes away when the
+            // link arrives. Keyed on the boolean, not the record —
+            // the record changes every minute (last-seen touch),
+            // the boolean only on link/unlink.
+            key(link?.isLinked) {
+                RelaySettingsGroup {
+                    // TEMP-DIAG "Not linked": proves the group content
+                    // lambda re-runs when the link arrives — before
+                    // the fix this logged once with null, never again.
+                    Timber.d(
+                        "ClientLinkedDevicesList: Your-phone group evaluating isLinked=%s",
+                        link?.isLinked,
+                    )
+                    if (link?.isLinked == true) {
+                        item {
+                            RelaySettingRow(
+                                icon = Icons.Outlined.PhoneAndroid,
+                                title = link.hubName
+                                    ?: stringResource(R.string.linked_devices_kind_phone),
+                                subtitle = linkStatusText(connectionState),
+                            )
+                        }
+                        // The device link is encrypted end to end —
+                        // same row as the hub branch (see the server
+                        // group above for what the claim covers).
+                        item {
+                            RelaySettingRow(
+                                icon = Icons.Outlined.Lock,
+                                title = stringResource(R.string.linked_devices_encryption_title),
+                                subtitle = stringResource(R.string.linked_devices_encryption_subtitle),
+                            )
+                        }
+                        // Removed: the hub deleted this device, so the QR
+                        // entry comes back for a fresh pairing.
+                        if (connectionState is ClientConnectionState.Removed) {
+                            item(onClick = onOpenQr) {
+                                RelaySettingRow(
+                                    icon = Icons.Outlined.QrCodeScanner,
+                                    title = stringResource(R.string.client_link_qr_title),
+                                    chevron = true,
+                                )
+                            }
+                        }
+                        // Client mode C2 — Re-sync, only while linked:
+                        // clears the messages stored on this device and
+                        // asks how much to sync again. The second tap
+                        // (the confirm dialog) does the work.
+                        item(onClick = onResync) {
+                            RelaySettingRow(
+                                icon = Icons.Outlined.Refresh,
+                                title = stringResource(R.string.client_resync_row),
+                                subtitle = stringResource(R.string.client_resync_subtitle),
+                            )
+                        }
+                        // Client mode C4 — contacts sync failed (the
+                        // phone can't read its address book): the reason
+                        // + Retry. Message sync proceeds regardless.
+                        if (contactsErrorCode != null) {
+                            item {
+                                RelaySettingRow(
+                                    icon = Icons.Outlined.Contacts,
+                                    title = stringResource(R.string.client_contacts_error_title),
+                                    subtitle = contactsErrorText(
+                                        contactsErrorCode,
+                                        contactsErrorMessage,
+                                    ),
+                                    titleColor = MaterialTheme.colorScheme.error,
+                                    trailing = {
+                                        RelayTextButton(
+                                            text = stringResource(R.string.action_retry),
+                                            onClick = onRetryContacts,
+                                        )
+                                    },
+                                )
+                            }
+                        }
+                        item(onClick = onUnlink) {
+                            RelaySettingRow(
+                                iconPainter = painterResource(R.drawable.ic_trash),
+                                title = stringResource(R.string.client_unlink_row),
+                                titleColor = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                    } else {
+                        item(onClick = onOpenQr) {
+                            RelaySettingRow(
+                                icon = Icons.Outlined.QrCodeScanner,
+                                title = stringResource(R.string.client_link_qr_title),
+                                subtitle = stringResource(R.string.client_link_status_not_linked),
+                                chevron = true,
+                            )
+                        }
+                    }
+                }
+            }
+            RelayHint(stringResource(R.string.client_link_hint))
+            RelaySectionLabel(stringResource(R.string.client_mode_section))
+            RelaySettingsGroup {
+                item(onClick = onSwitchBack) {
+                    RelaySettingRow(
+                        icon = Icons.Outlined.Smartphone,
+                        title = stringResource(R.string.client_mode_switch_back_title),
+                        chevron = true,
+                    )
+                }
+            }
+            Spacer(Modifier.size(32.dp))
+        }
+    }
+}
+
+/** Client mode — the hub link status line: Connected / Reconnecting… / Offline / removed. */
+@Composable
+private fun linkStatusText(state: ClientConnectionState): String = when (state) {
+    is ClientConnectionState.Connected ->
+        stringResource(R.string.client_link_status_connected)
+    is ClientConnectionState.Connecting,
+    is ClientConnectionState.Failed,
+    -> stringResource(R.string.client_link_status_reconnecting)
+    is ClientConnectionState.Disconnected ->
+        stringResource(R.string.client_link_status_offline)
+    is ClientConnectionState.Removed ->
+        stringResource(R.string.client_link_status_removed)
+}
+
+/**
+ * Client mode C4 — the contacts error line: the known code gets
+ * local words; anything else shows the hub's message when it has
+ * one, else the local default.
+ */
+@Composable
+private fun contactsErrorText(code: String, hubMessage: String?): String = when (code) {
+    SyncProtocol.ContactsError.HUB_NO_CONTACTS_ACCESS ->
+        stringResource(R.string.client_contacts_error_no_access)
+    else -> hubMessage?.takeIf { it.isNotBlank() }
+        ?: stringResource(R.string.client_contacts_error_default)
+}
+
+/**
+ * Client mode — the pairing QR: the code the hub phone scans, the
+ * instruction for it, and the auto-link status underneath (the loop
+ * keeps trying while the screen is open). Closing the screen stops
+ * the loop; a link closes it on its own.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ClientQrScreen(
+    pairUri: String?,
+    identityError: String?,
+    autoLink: AutoLinkViewState,
+    onClose: () -> Unit,
+) {
+    Scaffold(
+        containerColor = MaterialTheme.colorScheme.surface,
+        topBar = {
+            TopAppBar(
+                title = { Text(stringResource(R.string.client_link_qr_title)) },
+                navigationIcon = {
+                    IconButton(onClick = onClose) {
+                        Icon(
+                            Icons.AutoMirrored.Outlined.ArrowBack,
+                            contentDescription = stringResource(R.string.action_back),
+                        )
+                    }
+                },
+            )
+        },
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 32.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Spacer(Modifier.size(32.dp))
+            if (identityError != null) {
+                Text(
+                    text = stringResource(R.string.client_link_qr_error),
+                    style = MaterialTheme.typography.bodyLarge,
+                    textAlign = TextAlign.Center,
+                )
+                Spacer(Modifier.size(12.dp))
+                Text(
+                    text = identityError,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
+            } else if (pairUri != null) {
+                QrDisplay(
+                    content = pairUri,
+                    contentDescription = stringResource(R.string.client_qr_content_desc),
+                )
+                Spacer(Modifier.size(24.dp))
+                Text(
+                    text = stringResource(R.string.client_link_qr_hint),
+                    style = MaterialTheme.typography.bodyMedium,
+                    textAlign = TextAlign.Center,
+                )
+                Spacer(Modifier.size(24.dp))
+                val statusLine = autoLinkStatusLine(autoLink)
+                if (statusLine.isNotEmpty()) {
+                    Text(
+                        text = statusLine,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        textAlign = TextAlign.Center,
+                    )
+                }
+                val waitDetail = autoLink.waitDetail
+                if (waitDetail != null) {
+                    Spacer(Modifier.size(8.dp))
+                    Text(
+                        text = waitDetail,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center,
+                    )
+                }
+                autoLink.errors.forEach { error ->
+                    Spacer(Modifier.size(8.dp))
+                    Text(
+                        text = error,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        textAlign = TextAlign.Center,
+                    )
+                }
+            } else {
+                CircularProgressIndicator()
+            }
+            Spacer(Modifier.size(32.dp))
+        }
+    }
+}
+
+/**
+ * Client mode — the auto-link status line (the desktop's
+ * `autoLinkStatusLine`, rendered from string resources so all five
+ * locales carry it).
+ */
+@Composable
+private fun autoLinkStatusLine(state: AutoLinkViewState): String = when (state.phase) {
+    AutoLinkPhase.SCANNING -> if (state.noPhonesFound) {
+        stringResource(R.string.client_autolink_no_phones)
+    } else {
+        stringResource(R.string.client_autolink_scanning)
+    }
+    AutoLinkPhase.CONNECTING -> state.phoneName?.let {
+        stringResource(R.string.client_autolink_connecting, it)
+    } ?: stringResource(R.string.client_autolink_connecting_generic)
+    AutoLinkPhase.WAITING -> stringResource(R.string.client_autolink_waiting)
+    AutoLinkPhase.ERROR -> stringResource(R.string.client_autolink_error)
+    AutoLinkPhase.IDLE -> ""
+}
+
+/**
+ * Client mode — the mode-switch confirm, shared by the hub branch
+ * (switching to a linked device) and the client branch (switching
+ * back to a phone). The body states the wipe in both directions:
+ * switching clears the messages stored on this device, and nothing
+ * is deleted from the phone.
+ */
+@Composable
+private fun ModeSwitchConfirmDialog(
+    target: DeviceMode,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    RelayDialog(
+        onDismissRequest = onDismiss,
+        title = stringResource(R.string.client_mode_switch_title),
+        content = {
+            Text(
+                stringResource(
+                    if (target == DeviceMode.CLIENT) {
+                        R.string.client_mode_switch_to_client_body
+                    } else {
+                        R.string.client_mode_switch_to_hub_body
+                    },
+                ),
+            )
+        },
+        confirmButton = {
+            RelayTextButton(
+                text = stringResource(R.string.client_mode_switch_action),
+                confirm = true,
+                onClick = onConfirm,
+            )
+        },
+        dismissButton = {
+            RelayTextButton(
+                text = stringResource(R.string.action_cancel),
+                onClick = onDismiss,
+            )
+        },
+    )
+}
+
+/**
+ * Whether the start-failure card shows: only while the server is
+ * enabled, not running, and a failure was recorded. A stale error
+ * must not linger after the user turns the server off — the card
+ * hides with the toggle, and a fresh failure shows again if the
+ * server is re-enabled and fails. Pure, so the rule is unit-tested
+ * without Compose.
+ */
+internal fun shouldShowStartError(
+    serverEnabled: Boolean,
+    serverRunning: Boolean,
+    startError: String?,
+): Boolean = serverEnabled && !serverRunning && startError != null
+
+/**
+ * The start-failure diagnostic card (§6 of the release
+ * investigation): when the server is not running and a start failure
+ * was recorded, the stored error shows here — the release build logs
+ * nothing, so this is the only way the failure is visible at all.
+ * No dismiss button: a successful start clears the stored error and
+ * the card goes away on its own. A BindException gets the
+ * port-conflict hint (two Relay installs cannot share the port).
+ */
+@Composable
+private fun StartErrorCard(error: String, modifier: Modifier = Modifier) {
+    Card(
+        modifier = modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.errorContainer,
+            contentColor = MaterialTheme.colorScheme.onErrorContainer,
+        ),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(
+                text = stringResource(R.string.linked_devices_start_error_title),
+                style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold),
+            )
+            Text(
+                text = error,
+                style = MaterialTheme.typography.bodySmall,
+            )
+            if ("BindException" in error) {
+                Text(
+                    text = stringResource(R.string.linked_devices_start_error_bind_hint),
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun kindLabel(kind: DeviceKind): String = when (kind) {
+    DeviceKind.DESKTOP -> stringResource(R.string.linked_devices_kind_desktop)
+    DeviceKind.PHONE -> stringResource(R.string.linked_devices_kind_phone)
+    DeviceKind.TABLET -> stringResource(R.string.linked_devices_kind_tablet)
+}
+
+private fun kindIcon(kind: DeviceKind): ImageVector = when (kind) {
+    DeviceKind.DESKTOP -> Icons.Outlined.Computer
+    DeviceKind.PHONE -> Icons.Outlined.PhoneAndroid
+    DeviceKind.TABLET -> Icons.Outlined.Tablet
+}
+
+@Composable
+private fun deviceSubtitle(ui: LinkedDeviceUi): String {
+    val context = LocalContext.current
+    val linkedDate = remember(ui.device.linkedAt) {
+        android.text.format.DateFormat.getMediumDateFormat(context)
+            .format(Date(ui.device.linkedAt))
+    }
+    val status = if (ui.connected) {
+        stringResource(R.string.linked_devices_connected)
+    } else {
+        stringResource(R.string.linked_devices_linked_on, linkedDate)
+    }
+    return "${kindLabel(ui.device.kind)} · $status"
+}
+
+@Composable
+private fun scanErrorText(failure: QrPairing.Failure): String = when (failure) {
+    QrPairing.Failure.NotAPairingCode -> stringResource(R.string.linked_devices_scan_invalid)
+    QrPairing.Failure.UnsupportedVersion -> stringResource(R.string.linked_devices_scan_unsupported)
+    is QrPairing.Failure.InvalidField -> stringResource(R.string.linked_devices_scan_damaged)
+}
+
+/**
+ * The QR scanner: a full-screen black view with the camera preview, a
+ * centred frame to aim with, and the hint (or the scan error) at the
+ * bottom. The camera permission is requested here, at the moment it is
+ * needed — never earlier.
+ */
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalPermissionsApi::class)
+@Composable
+private fun QrScannerScreen(
+    scanError: QrPairing.Failure?,
+    scannerEnabled: Boolean,
+    snackbarHost: SnackbarHostState,
+    onQrScanned: (String) -> Unit,
+    onClose: () -> Unit,
+) {
+    val camera = rememberPermissionCamera()
+    Scaffold(
+        containerColor = Color.Black,
+        topBar = {
+            TopAppBar(
+                title = {
+                    Text(
+                        stringResource(R.string.linked_devices_scan_title),
+                        color = Color.White,
+                    )
+                },
+                navigationIcon = {
+                    IconButton(onClick = onClose) {
+                        Icon(
+                            Icons.AutoMirrored.Outlined.ArrowBack,
+                            contentDescription = stringResource(R.string.action_back),
+                            tint = Color.White,
+                        )
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Black),
+            )
+        },
+        snackbarHost = { RelaySnackbarHost(snackbarHost) },
+    ) { padding ->
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .background(Color.Black),
+            contentAlignment = Alignment.Center,
+        ) {
+            if (camera.granted) {
+                CameraQrPreview(
+                    enabled = scannerEnabled,
+                    onQrText = onQrScanned,
+                    modifier = Modifier.fillMaxSize(),
+                )
+                // The aim frame: a bordered square in the middle of the
+                // preview. It is a guide only — ZXing reads the whole
+                // frame, so a code slightly off-centre still scans.
+                Box(
+                    modifier = Modifier
+                        .size(SCAN_FRAME_SIZE_DP.dp)
+                        .border(2.dp, Color.White.copy(alpha = 0.8f), RoundedCornerShape(24.dp)),
+                )
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .padding(start = 32.dp, end = 32.dp, bottom = 48.dp),
+                ) {
+                    if (scanError != null) {
+                        Text(
+                            text = scanErrorText(scanError),
+                            color = Color.White,
+                            style = MaterialTheme.typography.bodyMedium,
+                            textAlign = TextAlign.Center,
+                        )
+                        Spacer(Modifier.size(12.dp))
+                    }
+                    Text(
+                        text = stringResource(R.string.linked_devices_scan_hint),
+                        color = Color.White.copy(alpha = 0.7f),
+                        style = MaterialTheme.typography.bodyMedium,
+                        textAlign = TextAlign.Center,
+                    )
+                }
+            } else {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.padding(horizontal = 32.dp),
+                ) {
+                    Text(
+                        text = stringResource(R.string.linked_devices_scan_camera_needed),
+                        color = Color.White,
+                        style = MaterialTheme.typography.bodyLarge,
+                        textAlign = TextAlign.Center,
+                    )
+                    Spacer(Modifier.size(24.dp))
+                    RelayPrimaryButton(
+                        text = stringResource(R.string.linked_devices_scan_allow_camera),
+                        onClick = camera.request,
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** The CAMERA permission, requested at scan time (accompanist, as elsewhere in the app). */
+@Stable
+private class CameraPermission(
+    val granted: Boolean,
+    val request: () -> Unit,
+)
+
+/** The WRITE_CONTACTS permission, requested from this screen (round 3, item 9 — accompanist, as for the camera). */
+@Stable
+private class ContactsWritePermission(
+    val granted: Boolean,
+    val request: () -> Unit,
+)
+
+/**
+ * Mirrors [rememberPermissionCamera]: after two denials Android
+ * answers instantly without showing a dialog, so a denial that
+ * arrives faster than a human could tap it means the permission
+ * can only be granted from the app's system page — open it instead
+ * of leaving a dead button. Every denial also reports through
+ * [onDenied] (the screen remembers it, so the row can offer the
+ * grant again later).
+ */
+@OptIn(ExperimentalPermissionsApi::class)
+@Composable
+private fun rememberPermissionContactsWrite(
+    onDenied: () -> Unit,
+): ContactsWritePermission {
+    val context = LocalContext.current
+    val requestStarted = remember { mutableLongStateOf(0L) }
+    val state = rememberPermissionState(
+        permission = Manifest.permission.WRITE_CONTACTS,
+        onPermissionResult = { granted ->
+            if (!granted) {
+                onDenied()
+                val instant = SystemClock.elapsedRealtime() - requestStarted.longValue <
+                    SEUIL_SANS_DIALOGUE_MS
+                if (instant) {
+                    ouvrirLaFicheDeLApplication(context)
+                }
+            }
+        },
+    )
+    return ContactsWritePermission(
+        granted = state.status == PermissionStatus.Granted,
+        request = {
+            requestStarted.longValue = SystemClock.elapsedRealtime()
+            state.launchPermissionRequest()
+        },
+    )
+}
+
+/** The call permissions, requested from this screen (live calls — accompanist, as for the camera). */
+@Stable
+private class CallsPermission(
+    val granted: Boolean,
+    val request: () -> Unit,
+)
+
+/**
+ * Live calls — READ_CALL_LOG (the incoming number, gated on it
+ * since Android 9) + CALL_PHONE (dialing from the desktop),
+ * requested together, like the location pair in
+ * `rememberPermissionLocalisation`. `granted` is true only when
+ * BOTH are granted: with only one, the row stays — a phone with
+ * CALL_PHONE but no READ_CALL_LOG can dial but never shows who
+ * is calling, and the row is the way to finish the grant.
+ *
+ * Same instant-denial rule as [rememberPermissionContactsWrite]:
+ * after two denials Android answers instantly without showing a
+ * dialog, so a denial that arrives faster than a human could tap
+ * it means the permissions can only be granted from the app's
+ * system page — open it instead of leaving a dead button.
+ */
+@OptIn(ExperimentalPermissionsApi::class)
+@Composable
+private fun rememberPermissionCalls(): CallsPermission {
+    val context = LocalContext.current
+    val requestStarted = remember { mutableLongStateOf(0L) }
+    val state = rememberMultiplePermissionsState(
+        permissions = listOf(
+            Manifest.permission.READ_CALL_LOG,
+            Manifest.permission.CALL_PHONE,
+        ),
+        onPermissionsResult = { grantedByPermission ->
+            val instant = SystemClock.elapsedRealtime() - requestStarted.longValue <
+                SEUIL_SANS_DIALOGUE_MS
+            if (instant && grantedByPermission.values.any { !it }) {
+                ouvrirLaFicheDeLApplication(context)
+            }
+        },
+    )
+    return CallsPermission(
+        granted = state.permissions.all { it.status == PermissionStatus.Granted },
+        request = {
+            requestStarted.longValue = SystemClock.elapsedRealtime()
+            state.launchMultiplePermissionRequest()
+        },
+    )
+}
+
+/**
+ * Mirrors [com.relay.sms.ui.components.rememberPermissionLocalisation]:
+ * after two denials Android answers instantly without showing a dialog,
+ * so a denial that arrives faster than a human could tap it means the
+ * permission can only be granted from the app's system page — open it
+ * instead of leaving a dead button.
+ */
+@OptIn(ExperimentalPermissionsApi::class)
+@Composable
+private fun rememberPermissionCamera(): CameraPermission {
+    val context = LocalContext.current
+    val requestStarted = remember { mutableLongStateOf(0L) }
+    val state = rememberPermissionState(
+        permission = Manifest.permission.CAMERA,
+        onPermissionResult = { granted ->
+            val instant = SystemClock.elapsedRealtime() - requestStarted.longValue <
+                SEUIL_SANS_DIALOGUE_MS
+            if (!granted && instant) {
+                ouvrirLaFicheDeLApplication(context)
+            }
+        },
+    )
+    return CameraPermission(
+        granted = state.status == PermissionStatus.Granted,
+        request = {
+            requestStarted.longValue = SystemClock.elapsedRealtime()
+            state.launchPermissionRequest()
+        },
+    )
+}
+
+/**
+ * CameraX preview + ZXing decoding. The preview binds to the activity
+ * lifecycle, the analyzer runs on its own thread, and both are torn
+ * down when the scanner leaves composition — the camera must not keep
+ * running (and draining the battery) after the user closes the
+ * scanner. Decoding pauses while [enabled] is false (a code is already
+ * waiting for the user's confirm), and resumes when it is dismissed.
+ */
+@Composable
+private fun CameraQrPreview(
+    enabled: Boolean,
+    onQrText: (String) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val previewView = remember {
+        PreviewView(context).apply {
+            scaleType = PreviewView.ScaleType.FILL_CENTER
+        }
+    }
+    val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
+    val enabledState = rememberUpdatedState(enabled)
+    val onQrTextState = rememberUpdatedState(onQrText)
+    var cameraProvider by remember { mutableStateOf<ProcessCameraProvider?>(null) }
+    var bindFailed by remember { mutableStateOf(false) }
+    val disposed = remember { AtomicBoolean(false) }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            disposed.set(true)
+            cameraProvider?.unbindAll()
+            analysisExecutor.shutdown()
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        val providerFuture = ProcessCameraProvider.getInstance(context)
+        providerFuture.addListener(
+            {
+                if (disposed.get()) return@addListener
+                val provider = runCatching { providerFuture.get() }.getOrNull()
+                if (provider == null) {
+                    bindFailed = true
+                    return@addListener
+                }
+                cameraProvider = provider
+                val preview = Preview.Builder().build().also {
+                    it.setSurfaceProvider(previewView.surfaceProvider)
+                }
+                val analysis = ImageAnalysis.Builder()
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .build()
+                    .also {
+                        it.setAnalyzer(
+                            analysisExecutor,
+                            QrCodeAnalyzer(
+                                isEnabled = { enabledState.value },
+                                onQrText = { text -> onQrTextState.value(text) },
+                            ),
+                        )
+                    }
+                runCatching {
+                    provider.unbindAll()
+                    provider.bindToLifecycle(
+                        lifecycleOwner,
+                        CameraSelector.DEFAULT_BACK_CAMERA,
+                        preview,
+                        analysis,
+                    )
+                }.onFailure {
+                    bindFailed = true
+                }
+            },
+            ContextCompat.getMainExecutor(context),
+        )
+    }
+
+    Box(modifier = modifier, contentAlignment = Alignment.Center) {
+        AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
+        if (bindFailed) {
+            Text(
+                text = stringResource(R.string.linked_devices_scan_camera_error),
+                color = Color.White,
+                style = MaterialTheme.typography.bodyMedium,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.padding(horizontal = 32.dp),
+            )
+        }
+    }
+}
+
+/** Y-plane bytes plus their dimensions after a rotation. */
+internal data class RotatedYuv(
+    val data: ByteArray,
+    val width: Int,
+    val height: Int,
+)
+
+/**
+ * Rotates compacted Y-plane bytes 90 degrees counter-clockwise.
+ * Returns the rotated bytes with swapped dimensions (new width is the
+ * old height, new height is the old width). Pure function, no Android
+ * APIs — the regression test drives it directly.
+ *
+ * This exists because ZXing's `PlanarYUVLuminanceSource` does not
+ * support `rotateCounterClockwise()`: it inherits the base method,
+ * which unconditionally throws `UnsupportedOperationException` — and
+ * calling it on a portrait frame killed the app on the first frame
+ * (2026-11-13). Never rotate via the source; rotate the bytes.
+ */
+internal fun rotateYuv90CounterClockwise(
+    data: ByteArray,
+    width: Int,
+    height: Int,
+): RotatedYuv {
+    val newWidth = height
+    val rotated = ByteArray(data.size)
+    for (y in 0 until height) {
+        for (x in 0 until width) {
+            // Source pixel (x, y) lands at (y, width - 1 - x).
+            rotated[(width - 1 - x) * newWidth + y] = data[y * width + x]
+        }
+    }
+    return RotatedYuv(rotated, newWidth, width)
+}
+
+/**
+ * Decodes QR codes from the camera's YUV frames with ZXing core —
+ * pure Java, on-device, no Play Services (ML Kit is forbidden here:
+ * the phone has no Play Services, and the app claims no tracking).
+ *
+ * Only the Y (luminance) plane is read, and only QR codes are looked
+ * for: the pairing code is the only thing this scanner is for.
+ * Frames are rotated back to upright from
+ * `imageInfo.rotationDegrees` before decoding, so the code scans in
+ * any orientation. The rotation is done on the Y bytes themselves
+ * ([rotateYuv90CounterClockwise]): ZXing's `PlanarYUVLuminanceSource`
+ * does NOT support `rotateCounterClockwise()` — it inherits the base
+ * method, which unconditionally throws — so the source must be built
+ * from already-upright bytes.
+ */
+private class QrCodeAnalyzer(
+    private val isEnabled: () -> Boolean,
+    private val onQrText: (String) -> Unit,
+) : ImageAnalysis.Analyzer {
+
+    private val reader = MultiFormatReader().apply {
+        setHints(mapOf(DecodeHintType.POSSIBLE_FORMATS to listOf(BarcodeFormat.QR_CODE)))
+    }
+
+    override fun analyze(image: ImageProxy) {
+        try {
+            if (isEnabled()) {
+                // A bad frame must never kill the app: the analyzer
+                // runs on a background executor thread, where an
+                // uncaught exception kills the whole process. A
+                // failed frame is just skipped — the next frame
+                // follows in milliseconds.
+                runCatching { decode(image) }.getOrNull()?.let(onQrText)
+            }
+        } finally {
+            // Every frame must be closed, decoded or not — a leaked
+            // frame stalls the pipeline.
+            image.close()
+        }
+    }
+
+    private fun decode(image: ImageProxy): String? {
+        val plane = image.planes[0]
+        val width = image.width
+        val height = image.height
+        val rowStride = plane.rowStride
+        val buffer = plane.buffer
+        if (buffer.remaining() < rowStride * height) return null
+        val yuv = ByteArray(buffer.remaining())
+        buffer.get(yuv)
+        // The Y plane's rows may be padded (rowStride > width): compact
+        // them before handing the bytes to ZXing.
+        var data = if (rowStride == width) {
+            yuv
+        } else {
+            val compact = ByteArray(width * height)
+            for (y in 0 until height) {
+                yuv.copyInto(compact, y * width, y * rowStride, y * rowStride + width)
+            }
+            compact
+        }
+        var frameWidth = width
+        var frameHeight = height
+        // Rotate the Y bytes back to upright BEFORE building the
+        // source: ZXing's PlanarYUVLuminanceSource throws on
+        // rotateCounterClockwise(), so the source must be built from
+        // already-upright bytes.
+        repeat(image.imageInfo.rotationDegrees / 90) {
+            val rotated = rotateYuv90CounterClockwise(data, frameWidth, frameHeight)
+            data = rotated.data
+            frameWidth = rotated.width
+            frameHeight = rotated.height
+        }
+        val source = PlanarYUVLuminanceSource(
+            data,
+            frameWidth,
+            frameHeight,
+            0,
+            0,
+            frameWidth,
+            frameHeight,
+            false,
+        )
+        return runCatching {
+            reader.decode(BinaryBitmap(HybridBinarizer(source))).text
+        }.getOrNull()
+    }
+}
+
+/** Side of the square aim frame in the scanner, in dp. */
+private const val SCAN_FRAME_SIZE_DP = 264
+
+/**
+ * A dialog shown and refused by a human takes far longer than this —
+ * see [com.relay.sms.ui.components.rememberPermissionLocalisation]
+ * for why the threshold exists.
+ */
+private const val SEUIL_SANS_DIALOGUE_MS = 400L

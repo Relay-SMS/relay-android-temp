@@ -1,0 +1,984 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.ui
+
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.stringResource
+import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.navigation.NavBackStackEntry
+import androidx.navigation.NavController
+import androidx.navigation.NavGraphBuilder
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.rememberNavController
+import androidx.navigation.toRoute
+import com.relay.sms.R
+import com.relay.sms.crashlog.SessionMarker
+import com.relay.sms.crashlog.SessionMarkerTracker
+import com.relay.sms.security.AppLockManager
+import com.relay.sms.system.notifications.SafetyCallAckHolder
+import com.relay.sms.ui.components.RelaySnackbarHost
+import com.relay.sms.ui.navigation.About
+import com.relay.sms.ui.navigation.Advanced
+import com.relay.sms.ui.navigation.Backup
+import com.relay.sms.ui.navigation.Blocked
+import com.relay.sms.ui.navigation.Compose
+import com.relay.sms.ui.navigation.Conversations
+import com.relay.sms.ui.navigation.Emergency
+import com.relay.sms.ui.navigation.EmergencySetup
+import com.relay.sms.ui.navigation.Encryption
+import com.relay.sms.ui.navigation.ErrorLog
+import com.relay.sms.ui.navigation.Help
+import com.relay.sms.ui.navigation.License
+import com.relay.sms.ui.navigation.LinkedDevices
+import com.relay.sms.ui.navigation.Lock
+import com.relay.sms.ui.navigation.MediaGallery
+import com.relay.sms.ui.navigation.Migration
+import com.relay.sms.ui.navigation.NoteThread
+import com.relay.sms.ui.navigation.SafetyCallSetup
+import com.relay.sms.ui.navigation.ScheduledMessages
+import com.relay.sms.ui.navigation.Settings
+import com.relay.sms.ui.navigation.Thread
+import com.relay.sms.ui.navigation.Vault
+import com.relay.sms.ui.screens.about.AboutScreen
+import com.relay.sms.ui.screens.about.HelpScreen
+import com.relay.sms.ui.screens.backup.BackupScreen
+import com.relay.sms.ui.screens.blocked.BlockedNumbersScreen
+import com.relay.sms.ui.screens.clientcall.ClientCallPopupOverlay
+import com.relay.sms.ui.screens.compose.ComposeScreen
+import com.relay.sms.ui.screens.conversations.ConversationsScreen
+import com.relay.sms.ui.screens.linkeddevices.LinkedDevicesScreen
+import com.relay.sms.ui.screens.lock.LockScreen
+import com.relay.sms.ui.screens.media.MediaGalleryScreen
+import com.relay.sms.ui.screens.migration.MigrationScreen
+import com.relay.sms.ui.screens.notes.NoteThreadScreen
+import com.relay.sms.ui.screens.settings.AdvancedScreen
+import com.relay.sms.ui.screens.settings.EncryptionScreen
+import com.relay.sms.ui.screens.settings.ErrorLogScreen
+import com.relay.sms.ui.screens.settings.SettingsScreen
+import com.relay.sms.ui.screens.splash.SplashScreen
+import com.relay.sms.ui.screens.thread.ThreadScreen
+import com.relay.sms.ui.screens.vault.VaultScreen
+
+@androidx.compose.runtime.Composable
+fun AppRoot() {
+    val rootViewModel: AppRootViewModel = hiltViewModel()
+
+    // v1.24.0 SEC-CRIT — rien ne se compose tant que la base n'est pas prête. `installSplashScreen`
+    // ne retarde que le DESSIN, pas la composition : sans cette garde, `ConversationsViewModel` et
+    // consorts seraient instanciés sur le main thread et y provisionneraient `AppDatabase`, donc la
+    // réparation zéro-clé. Le splash système reste affiché pendant ce temps (même condition).
+    val databaseReady by rootViewModel.databaseReady.collectAsStateWithLifecycle()
+    val databaseFailure by rootViewModel.databaseFailure.collectAsStateWithLifecycle()
+    if (!databaseReady) return
+    databaseFailure?.let { cause ->
+        // La base est inouvrable : composer le graphe de navigation ferait instancier des
+        // ViewModels qui la redemanderaient, donc relèveraient — boucle de crash sans explication.
+        com.relay.sms.ui.screens.recovery.DatabaseRecoveryScreen(cause)
+        return
+    }
+
+    val appLock: AppLockManager = rootViewModel.appLock
+    val incomingShare = rootViewModel.incomingShare
+    val pendingNav = rootViewModel.pendingNav
+    val nav = rememberNavController()
+
+    // Session marker — record the current screen (see
+    // `TrackSessionMarkerScreen` below).
+    TrackSessionMarkerScreen(nav)
+
+    val lockState by appLock.state.collectAsStateWithLifecycle()
+    // Fail-closed: anything that is NOT an explicit "open" state requires the lock screen.
+    // This fixes F1 (cold-start bypass) and the panic-decoy edge case (F28 mitigation: decoy is
+    // an explicit unlock state, treated as "open" until we ship a second decoy DB in v1.1).
+    val showLock = !appLock.isOpenForUi(lockState)
+
+    LockScreenNavEffect(nav, showLock)
+
+    // Audit S-P0-1: the panic-decoy session must never reach the Vault route. Combined with the
+    // data-layer gate in ConversationRepositoryImpl.observeVault, this gives two independent
+    // backstops — navigation refuses to land on the screen, and even if a saved nav state forces
+    // it, the screen renders empty.
+    val isPanicDecoy = lockState is AppLockManager.LockState.PanicDecoy
+
+    // Panic-decoy nav guard: if we land on the Vault route while in decoy state (saved nav,
+    // share-target shortcut, app-link, future deep-link), pop it immediately back to the list.
+    // v1.10.0 audit SEC-1 — étendu aux routes Emergency / EmergencySetup : un agresseur
+    // en session decoy ne doit même pas SAVOIR que l'app dispose d'un Mode urgence (l'illusion
+    // "app SMS ordinaire" doit tenir). Le UseCase a déjà une garde PanicDecoy pour le trigger,
+    // mais ce guard navigation empêche d'arriver sur l'écran et de voir le bouton URGENCE.
+    LaunchedEffect(isPanicDecoy, nav.currentDestination?.route) {
+        if (!isPanicDecoy) return@LaunchedEffect
+        val route = nav.currentDestination?.route ?: return@LaunchedEffect
+        when {
+            route.contains("Vault") ->
+                nav.popBackStack(route = Vault, inclusive = true)
+            // v1.26.1 (audit M4) — Safety call manquait, alors que les Réglages masquent sa
+            // section avec EXACTEMENT la même garde que celle du Mode urgence (même motif :
+            // ne pas révéler à un agresseur l'existence des fonctions de sécurité
+            // personnelle). Seule l'urgence avait ce second filet ; l'argument qui le
+            // justifie — état de navigation restauré, raccourci, lien — vaut à l'identique
+            // pour l'écran Safety call, qui affiche les contacts de confiance et le délai.
+            route.contains("SafetyCallSetup") ->
+                nav.popBackStack(route = SafetyCallSetup, inclusive = true)
+            route.contains("EmergencySetup") ->
+                nav.popBackStack(route = EmergencySetup, inclusive = true)
+            route.contains("Emergency") ->
+                nav.popBackStack(route = Emergency, inclusive = true)
+            // Slice 1 — same guard for Linked devices: the screen names
+            // the user's other devices, which a decoy session must not
+            // reveal (Settings hides the entry with the same guard).
+            route.contains("LinkedDevices") ->
+                nav.popBackStack(route = LinkedDevices, inclusive = true)
+        }
+    }
+
+    // v1.4.1 — auto-route share-target arrivals to the contact picker. Without this,
+    // a `Pending` posted by [MainActivity.handleSharedIntent] silently sat in
+    // [IncomingShareHolder] until the user happened to open a thread, which felt
+    // like the share had been dropped (especially when the app was already in the
+    // foreground on an existing thread — the user just saw their previous
+    // conversation and assumed nothing happened).
+    //
+    // Flow now matches iMessage / Google Messages :
+    //   ACTION_SEND → Pending posted → AppRoot navigates to ComposeScreen → user
+    //   picks a contact → conversation created → ThreadScreen opens →
+    //   `consumeIncomingShareIfAny` stages the attachment into the composer.
+    //
+    // Guard rails :
+    //   - skip if the lock screen is up (user must unlock first; the Pending TTL
+    //     of 60 s covers a quick unlock),
+    //   - skip if we're already on Compose / Thread (the user is mid-flow),
+    //   - skip in panic-decoy state (sharing into the decoy session is forbidden
+    //     by design — the user's real conversations are not available there).
+    val pendingShare by incomingShare.pending.collectAsStateWithLifecycle()
+    LaunchedEffect(pendingShare, showLock, isPanicDecoy) {
+        val current = pendingShare ?: return@LaunchedEffect
+        if (showLock || isPanicDecoy) return@LaunchedEffect
+        if (current.isExpired()) return@LaunchedEffect
+        val route = nav.currentDestination?.route
+        val alreadyInFlow = route?.contains("Compose") == true ||
+            route?.contains("Thread") == true
+        if (alreadyInFlow) {
+            // v1.4.1 (SEC-03) — privacy fix : when a share arrives while the user is
+            // already inside a Thread (or in Compose), the Pending used to linger up to
+            // its 60 s TTL. If the user then navigated to ANOTHER thread within that
+            // window, `ThreadViewModel.consumeIncomingShareIfAny` would silently stage
+            // the shared attachment into that wrong conversation's composer — risking
+            // an accidental send to the wrong recipient. Clearing the Pending here is
+            // a small UX cost (the user has to share again) for a real privacy guard.
+            incomingShare.clear()
+            return@LaunchedEffect
+        }
+        nav.navigate(Compose())
+    }
+
+    // v1.8.0 (bug 4 fix) — auto-navigate to Thread on notification tap.
+    //
+    // `PendingNavHolder` is posted by `MainActivity.handleSharedIntent` whenever
+    // the activity is launched/resumed with an `OPEN_CONVERSATION` intent. Before
+    // v1.8.0, the action fell into the `else` branch of `handleSharedIntent` and
+    // no handler navigated anywhere — the user tapped a notification, the app
+    // opened on the conversations list, and the tap felt broken.
+    //
+    // Guard rails — strictly mirror the `incomingShare` flow above :
+    //   - skip if the lock screen is up (user must unlock first; the 30 s TTL
+    //     on `PendingNavHolder.Pending` covers a quick biometric unlock),
+    //   - skip in panic-decoy state (sharing/navigating into the decoy session
+    //     is forbidden by design — the user's real conversations are not
+    //     available there, navigating to a real conv id would crash or leak),
+    //   - skip if already on the target Thread (avoid double-push that would
+    //     create a redundant backstack entry).
+    val pendingNavValue by pendingNav.pending.collectAsStateWithLifecycle()
+    LaunchedEffect(pendingNavValue, showLock, isPanicDecoy) {
+        val current = pendingNavValue ?: return@LaunchedEffect
+        if (showLock || isPanicDecoy) return@LaunchedEffect
+        if (current.isExpired()) {
+            // Holder oublié (user a déverrouillé après >30 s) — on nettoie.
+            pendingNav.clear()
+            return@LaunchedEffect
+        }
+        // v1.14.1 — branche openEmergency : tap sur le corps de la notif
+        // persistante raccourci urgence → nav vers Emergency. Si on est
+        // déjà sur Emergency, consomme sans push.
+        if (current.openEmergency) {
+            val currentRoute = nav.currentDestination?.route
+            if (currentRoute?.contains("Emergency") == true) {
+                pendingNav.clear()
+                return@LaunchedEffect
+            }
+            // v1.26.1 (audit SEC-A1) — meme authentification que la branche conversation.
+            if (!rootViewModel.isNotificationIntentAuthentic(current.navToken)) {
+                pendingNav.clear()
+                return@LaunchedEffect
+            }
+            pendingNav.consume() ?: return@LaunchedEffect
+            nav.navigate(Emergency)
+            return@LaunchedEffect
+        }
+        // v1.14.8 (bug fix "Message" depuis Phone app) — branche sendToAddress :
+        // un deep-link `sms:`/`smsto:`/`mms:`/`mmsto:` a été reçu, MainActivity a
+        // posé l'adresse. On résout (find or create conv) en coroutine via
+        // [AppRootViewModel.resolveSendToAddress] puis on navigue directement vers
+        // le thread cible. Le body éventuel est staged dans incomingShare et sera
+        // consommé par ThreadViewModel.consumeIncomingShareIfAny pour pré-remplir
+        // le composer.
+        val sendToAddress = current.sendToAddress
+        if (!sendToAddress.isNullOrBlank()) {
+            // Consomme avant le résolveur async pour éviter un double-tap qui
+            // re-déclencherait le même pending pendant la coroutine.
+            val consumed = pendingNav.consume() ?: return@LaunchedEffect
+            rootViewModel.resolveSendToAddress(consumed.sendToAddress.orEmpty()) { resolvedId ->
+                if (resolvedId == null || resolvedId <= 0L) {
+                    // Fallback : on bascule sur ComposeScreen avec l'adresse pré-remplie.
+                    // L'user peut alors valider manuellement (ou ajouter d'autres
+                    // destinataires pour un groupe MMS).
+                    nav.navigate(Compose(initialAddress = consumed.sendToAddress))
+                } else {
+                    // Pas de `launchSingleTop` ici non plus : un deep-link `sms:` peut
+                    // arriver alors qu'un autre thread est déjà ouvert (cf. note plus
+                    // bas sur la comparaison par identité de destination). Ce callback
+                    // est single-fire de toute façon — `pendingNav.consume()` a vidé
+                    // l'état avant l'appel async, donc aucun double-push possible.
+                    nav.navigate(Thread(conversationId = resolvedId))
+                }
+            }
+            return@LaunchedEffect
+        }
+        // Si on est déjà sur ce thread précis, on consomme sans push (évite
+        // doublon backstack). Le check est best-effort : `currentDestination
+        // .arguments` peut être null pendant une transition de nav.
+        //
+        // v1.23.2 — NE PAS remplacer ce check par `launchSingleTop = true`, malgré
+        // la ressemblance avec les sites Conversations/Vault. Vérifié dans le bytecode
+        // de navigation-runtime 2.9.8 (`NavControllerImpl.launchSingleTopInternal`) :
+        // la recherche est un `indexOfLast { it.destination === node }` sur TOUT le
+        // backQueue, avec comparaison d'IDENTITÉ sur la `NavDestination` — les
+        // ARGUMENTS sont ignorés. Or avec les routes type-safe, `Thread(A)` et
+        // `Thread(B)` partagent la même et unique `NavDestination` (un seul
+        // `composable<Thread>`). `launchSingleTop` ici écraserait donc le thread
+        // courant au lieu d'en empiler un nouveau : depuis une notif pour B alors
+        // qu'on lit A, le retour ramènerait à la liste au lieu de A.
+        // Règle : `launchSingleTop` sur Thread n'est valide QUE depuis une source
+        // dont on sait qu'aucun Thread n'est dans le backstack (liste, Coffre) ;
+        // les chemins thread → thread exigent ce check précis sur l'argument.
+        val currentRoute = nav.currentDestination?.route
+        if (currentRoute?.contains("Thread") == true) {
+            val args = nav.currentBackStackEntry?.arguments
+            val currentId = args?.getLong("conversationId", -1L) ?: -1L
+            if (currentId == current.conversationId) {
+                pendingNav.clear()
+                return@LaunchedEffect
+            }
+        }
+        // v1.26.1 (audit H2) — AUTHENTIFICATION de l'intent avant toute navigation.
+        //
+        // `MainActivity` est `exported="true"` (rôle SMS), donc n'importe quelle application peut
+        // l'atteindre par un Intent EXPLICITE portant `ACTION_OPEN_CONVERSATION` — action et
+        // extras sont des constantes publiques, et les identifiants Room sont séquentiels, donc
+        // triviaux à énumérer. Sans ce contrôle, un tiers forçait l'affichage d'une conversation
+        // arbitraire, y compris via un pending qui survit 30 s au verrouillage.
+        //
+        // La vérification est ici et non dans `MainActivity` parce que la lecture du secret est
+        // suspendue : l'attendre dans `onCreate` bloquerait le démarrage à froid, c'est-à-dire
+        // exactement le cas d'un tap sur notification quand le processus est mort.
+        if (!rootViewModel.isNotificationIntentAuthentic(current.navToken)) {
+            pendingNav.clear()
+            return@LaunchedEffect
+        }
+        // Consomme via `.consume()` qui re-vérifie expiration + clear atomique.
+        val consumed = pendingNav.consume() ?: return@LaunchedEffect
+        nav.navigate(Thread(conversationId = consumed.conversationId))
+    }
+
+    // v1.25.2 — startDestination = Conversations (et non Splash). Garder Conversations comme
+    // destination de départ du NavHost garantit que le back stack ne peut JAMAIS être vidé : le
+    // NavController ne dépile jamais sa destination de départ, donc un Retour à la racine termine
+    // proprement l'activité (retour à l'accueil) au lieu de laisser un NavHost vide → page blanche
+    // suivie d'une relance en cold-start. C'est la cause racine du bug « Coffre → mot de passe →
+    // Retour rapides → page blanche » : la cascade de Retour dépilait Conversations (racine
+    // dépilable car Splash était retiré via popUpTo inclusive), l'activité se terminait et le
+    // process était tué (« remove task ») puis relancé. Le splash de 1ʳᵉ ouverture est désormais un
+    // OVERLAY rendu APRÈS le NavHost (voir plus bas), plus une destination de navigation.
+    // v1.27.12 (rapport d'un testeur, 2026-09-07) — TRANSITIONS EXPLICITES ET COURTES.
+    //
+    // Le `NavHost` n'en declarait aucune, il heritait donc du fondu par defaut de
+    // navigation-compose. Or l'ecran qui REVIENT ne recoit pas les gestes tant que la
+    // transition court : en sortant d'une conversation, la liste s'affichait mais ignorait le
+    // premier glissement. Le testeur l'a decrit precisement — le defaut ne touche que le
+    // `popEnter`, l'ouverture d'une conversation restant interactive pendant son animation.
+    // Reproduit ici : un glissement envoye juste apres le retour ne deplace pas la liste,
+    // le meme glissement une seconde plus tard la deplace.
+    //
+    // Ce que ce correctif fait, et ce qu'il ne fait pas : il ne rend pas l'ecran entrant
+    // interactif pendant l'animation — `NavHost` n'expose rien pour cela, le blocage est dans
+    // la bibliotheque. Il RACCOURCIT la fenetre, de plusieurs centaines de millisecondes a
+    // moins de cent, ce qui la fait passer sous le seuil du perceptible. C'est une attenuation
+    // assumee, pas une correction de la cause.
+    //
+    // Un fondu tres bref plutot que `EnterTransition.None` : la continuite visuelle entre les
+    // deux ecrans se perd completement sans animation, et 80 ms suffisent a la preserver.
+    val fonduEntrant = fadeIn(animationSpec = tween(NAV_TRANSITION_MS))
+    val fonduSortant = fadeOut(animationSpec = tween(NAV_TRANSITION_MS))
+    // Round 4 — the thread slides in from the right when a conversation opens
+    // and slides back out to the right on back, like other messaging apps.
+    // Scoped to the Thread destination only (see `composable<Thread>` below):
+    // every other destination keeps the 80 ms fade above. The round-3
+    // smooth-open gating (the list stays hidden until scrolled to the bottom)
+    // lives inside ThreadScreen and is untouched — the slide animates the whole
+    // destination around it. 300 ms FastOutSlowIn is the Material 3 standard
+    // for screen transitions.
+    val glissementEntrant = slideInHorizontally(
+        animationSpec = tween(THREAD_TRANSITION_MS, easing = FastOutSlowInEasing),
+    ) { it }
+    val glissementSortant = slideOutHorizontally(
+        animationSpec = tween(THREAD_TRANSITION_MS, easing = FastOutSlowInEasing),
+    ) { it }
+    // Feedback round 5 — the missing half of the round-4 slide. Round 4 set
+    // the thread's enter (slide in from the right) and popExit (slide back
+    // out to the right), but the screen coming BACK — the conversation list —
+    // kept the NavHost-level popEnter, an 80 ms fade. The pair was asymmetric:
+    // the thread slid away while the list just faded in underneath, so going
+    // back read as a snap instead of the mirrored slide. This is the list's
+    // slide back in from the left, same 300 ms easing; it is applied only
+    // when popping from a Thread (see `composable<Conversations>` below), so
+    // every other return to the list keeps its 80 ms fade.
+    val glissementRetourEntrant = slideInHorizontally(
+        animationSpec = tween(THREAD_TRANSITION_MS, easing = FastOutSlowInEasing),
+    ) { -it }
+    NavHost(
+        navController = nav,
+        startDestination = Conversations(),
+        enterTransition = { fonduEntrant },
+        exitTransition = { fonduSortant },
+        popEnterTransition = { fonduEntrant },
+        popExitTransition = { fonduSortant },
+    ) {
+        composable<Conversations>(
+            // Feedback round 10 — Archived slides in from the right like
+            // the thread and Settings (Kristin). The main list is the start
+            // destination and keeps its fade; only the archived variant
+            // slides. The branch lives in [listEnterTransition] so it does
+            // not push AppRoot over the Detekt complexity threshold.
+            enterTransition = { listEnterTransition(targetState, glissementEntrant, fonduEntrant) },
+            // Feedback round 5 — pop back from a thread slides the list back
+            // in from the left, mirroring the thread's slide out to the right
+            // (same 300 ms easing). The `initialState` here is the entry being
+            // popped, so the slide applies only to returns from a Thread;
+            // returns from the vault, Compose and the rest keep the
+            // NavHost-level 80 ms fade. Both the toolbar back arrow and the
+            // system back gesture/button pop through the NavController, so both
+            // take this same pop pair (no BackHandler in the thread screen
+            // intercepts back first).
+            // Feedback round 8 — same mirror for Settings, which now slides
+            // in from the right like the thread: popping back from Settings
+            // slides the list back in from the left, so the return reads as
+            // the reverse of the open instead of a fade under a slide.
+            // Feedback round 10 — same mirror for Archived and the Vault,
+            // which now slide in too. The branch lives in
+            // [slideBackInTransition] so it does not push AppRoot over the
+            // Detekt complexity threshold.
+            popEnterTransition = {
+                slideBackInTransition(initialState, glissementRetourEntrant, fonduEntrant)
+            },
+        ) { entry ->
+            val args = entry.toRoute<Conversations>()
+            ConversationsScreen(
+                archived = args.archived,
+                // v1.23.2 — `launchSingleTop` : filet de sécurité contre l'empilement de
+                // destinations Thread(id) identiques. La liste peut émettre plusieurs fois
+                // l'ouverture pour un seul geste (swipe gauche = « répondre »), et chaque
+                // doublon en backstack forçait un appui « retour » supplémentaire pour
+                // revenir à la liste. Le verrou côté row corrige la racine ; ceci garantit
+                // qu'aucune autre source d'événement ne puisse re-produire le symptôme.
+                // Sans risque de collision d'arguments : Conversations est forcément au
+                // sommet quand ce callback est invoqué, donc le 1er appel pousse toujours.
+                onOpenThread = { id -> nav.navigate(Thread(id)) { launchSingleTop = true } },
+                // Notes — a note row opens the note thread (same
+                // single-top guard as a conversation row: a double
+                // tap must not stack two copies of the note).
+                onOpenNote = { id -> nav.navigate(NoteThread(id)) { launchSingleTop = true } },
+                onCompose = { nav.navigate(Compose()) },
+                onComposeGroup = { nav.navigate(Compose(groupe = true)) },
+                onOpenSettings = { nav.navigate(Settings) },
+                // Client mode — direct route to Linked devices for the
+                // no-SIM nudge card on the empty conversation list.
+                onOpenLinkedDevices = { nav.navigate(LinkedDevices) },
+                onOpenVault = { nav.navigate(Vault) },
+                onOpenArchived = { nav.navigate(Conversations(archived = true)) },
+                onOpenBlocked = { nav.navigate(Blocked) },
+                // Feedback round 8 — Scheduled messages moved here from
+                // Settings: it lives in the main menu under "New group".
+                onOpenScheduledMessages = { nav.navigate(ScheduledMessages) },
+                onBack = if (args.archived) ({ nav.popBackStack() }) else null,
+            )
+        }
+        // Feedback round 10 — the Vault slides in from the right like the
+        // thread and Settings (Kristin), 300 ms, and slides back out to the
+        // right on back. Returning to it from a thread opened inside it
+        // slides it back in from the left, mirroring the thread's slide
+        // out — the same mirror the conversation list uses.
+        composable<Vault>(
+            enterTransition = { glissementEntrant },
+            popExitTransition = { glissementSortant },
+            popEnterTransition = {
+                slideBackInTransition(initialState, glissementRetourEntrant, fonduEntrant)
+            },
+        ) {
+            VaultScreen(
+                onBack = { nav.popBackStack() },
+                // v1.23.2 — aligné sur la liste principale : le Coffre partage le même
+                // composant `ConversationRow` (`combinedClickable`, qui ne débounce pas
+                // un double-tap rapide avant que la destination ne soit committée). Pas
+                // de swipe ici, donc risque plus faible, mais la garde doit être la même
+                // des deux côtés — un doublon `Thread(id)` en backstack coûte à l'user un
+                // appui « retour » supplémentaire.
+                onOpenThread = { id -> nav.navigate(Thread(id)) { launchSingleTop = true } },
+            )
+        }
+        composable<Blocked> { BlockedNumbersScreen(onBack = { nav.popBackStack() }) }
+        // Feedback round 8 — Settings slides in from the right like the
+        // thread (300 ms horizontal slide, see `glissementEntrant` above),
+        // instead of the NavHost-level 80 ms fade that read as a snap.
+        composable<Settings>(
+            enterTransition = { glissementEntrant },
+            popExitTransition = { glissementSortant },
+        ) {
+            SettingsScreen(
+                onBack = { nav.popBackStack() },
+                onOpenAbout = { nav.navigate(About) },
+                // Feedback round 5 — Help lives on its own screen now (was
+                // the "Quick help" section of About).
+                onOpenHelp = { nav.navigate(Help) },
+                // Feedback round 6 — Advanced lives on its own screen now
+                // (was the "Advanced" section of this list).
+                onOpenAdvanced = { nav.navigate(Advanced) },
+                onOpenBackup = { nav.navigate(Backup) },
+                onOpenMigration = { nav.navigate(Migration) },
+                onOpenBlocked = { nav.navigate(Blocked) },
+                onOpenSafetyCall = { nav.navigate(SafetyCallSetup) },
+                onOpenEmergency = { nav.navigate(Emergency) },
+                onOpenEmergencySetup = { nav.navigate(EmergencySetup) },
+                // Slice 1 — Linked devices (LAN server + QR pairing).
+                onOpenLinkedDevices = { nav.navigate(LinkedDevices) },
+                // E2E — Encryption (Security & Privacy → Encryption).
+                onOpenEncryption = { nav.navigate(Encryption) },
+            )
+        }
+        // Slice 1 — Linked devices slides in from the right like the
+        // other Settings sub-screens (300 ms), instead of the NavHost
+        // default fade.
+        composable<LinkedDevices>(
+            enterTransition = { glissementEntrant },
+            popExitTransition = { glissementSortant },
+        ) {
+            LinkedDevicesScreen(onBack = { nav.popBackStack() })
+        }
+        // v1.15.1 — Liste + annulation des messages programmés.
+        // Round 17 — Scheduled Messages slides in from the right like the
+        // thread and Settings (300 ms), instead of the NavHost-level 80 ms
+        // fade that read as a snap in and out.
+        composable<ScheduledMessages>(
+            enterTransition = { glissementEntrant },
+            popExitTransition = { glissementSortant },
+        ) {
+            com.relay.sms.ui.screens.scheduled.ScheduledMessagesScreen(
+                onBack = { nav.popBackStack() },
+            )
+        }
+        composable<SafetyCallSetup> {
+            // 🔴 v1.27.3 (relecture Codex du 2026-08-06, SC-1273-03) — GARDE SYNCHRONE, EN PLUS DU
+            // DÉPILAGE.
+            //
+            // Le dépilage ci-dessus vit dans un `LaunchedEffect` : c'est une réaction
+            // **post-composition**, pas une interdiction d'accès. Quand le mode leurre s'engage alors
+            // que cet écran est déjà ouvert — ou qu'il est restauré sous l'écran de verrouillage —
+            // le ViewModel est créé et l'écran composé AVANT que la route soit retirée. Depuis
+            // v1.27.3 cet écran affiche l'historique des déclenchements : sous contrainte, les dates
+            // et les noms du réseau de soutien pouvaient donc être révélés le temps d'une frame.
+            //
+            // Ne rien composer est la seule garde qui porte sur l'ACCÈS. Le dépilage reste, pour
+            // ramener l'utilisateur à la liste des conversations.
+            if (!isPanicDecoy) {
+                com.relay.sms.ui.screens.safetycall.SafetyCallSetupScreen(
+                    onBack = { nav.popBackStack() },
+                )
+            }
+        }
+        composable<Emergency> {
+            com.relay.sms.ui.screens.emergency.EmergencyScreen(
+                onBack = { nav.popBackStack() },
+                onOpenSetup = { nav.navigate(EmergencySetup) },
+            )
+        }
+        composable<EmergencySetup> {
+            com.relay.sms.ui.screens.emergency.EmergencySetupScreen(
+                onBack = { nav.popBackStack() },
+                onOpenSafetyCallSetup = { nav.navigate(SafetyCallSetup) },
+            )
+        }
+        composable<Backup> { BackupScreen(onBack = { nav.popBackStack() }) }
+        composable<Migration> { MigrationScreen(onBack = { nav.popBackStack() }) }
+        // v1.26.1 (audit C4) — `isPanicDecoy` est passé sans valeur par défaut, volontairement :
+        // un défaut `false` serait un repli permissif (l'écran nommerait le coffre et le mode
+        // panique tant que l'état n'est pas transmis). Le compilateur exige donc que tout futur
+        // point d'entrée tranche explicitement.
+        // Feedback round 8 — About slides like the other screens (Help,
+        // Advanced, Settings, thread): it used to snap in/out on the
+        // NavHost default fade.
+        composable<About>(
+            enterTransition = { glissementEntrant },
+            popExitTransition = { glissementSortant },
+        ) {
+            AboutScreen(
+                onBack = { nav.popBackStack() },
+                isPanicDecoy = isPanicDecoy,
+                onOpenLicense = { nav.navigate(License) },
+            )
+        }
+        // Feedback round 8 — License / copyright notice screen, reached
+        // from the License link on About. Same slide as Help and About.
+        composable<License>(
+            enterTransition = { glissementEntrant },
+            popExitTransition = { glissementSortant },
+        ) {
+            com.relay.sms.ui.screens.about.LicenseScreen(
+                onBack = { nav.popBackStack() },
+            )
+        }
+        // Feedback round 5 — Help screen: same slide-in transition as the
+        // thread (300 ms horizontal slide, see `glissementEntrant` above),
+        // so opening Help from Settings feels like opening a thread.
+        composable<Help>(
+            enterTransition = { glissementEntrant },
+            popExitTransition = { glissementSortant },
+        ) {
+            HelpScreen(onBack = { nav.popBackStack() }, isPanicDecoy = isPanicDecoy)
+        }
+        // Feedback round 6 — Advanced screen: same slide-in transition as
+        // Help, so opening Advanced from Settings feels the same.
+        composable<Advanced>(
+            enterTransition = { glissementEntrant },
+            popExitTransition = { glissementSortant },
+        ) {
+            AdvancedScreen(
+                onBack = { nav.popBackStack() },
+                onOpenErrorLog = { nav.navigate(ErrorLog) },
+            )
+        }
+        // Error log screen, reached from Advanced: same slide-in
+        // transition as Advanced itself.
+        composable<ErrorLog>(
+            enterTransition = { glissementEntrant },
+            popExitTransition = { glissementSortant },
+        ) {
+            ErrorLogScreen(onBack = { nav.popBackStack() })
+        }
+        // E2E — Encryption screen, reached from Settings → Security
+        // & Privacy: same slide-in transition as the other Settings
+        // sub-screens.
+        composable<Encryption>(
+            enterTransition = { glissementEntrant },
+            popExitTransition = { glissementSortant },
+        ) {
+            EncryptionScreen(onBack = { nav.popBackStack() })
+        }
+        composable<Lock> {
+            LockScreen(
+                onUnlocked = { nav.popBackStack(route = Lock, inclusive = true) },
+            )
+        }
+        composable<Thread>(
+            // Round 4 — slide over from the right on open, back out to the right
+            // on back. Only `enter` / `popExit` are overridden: leaving the thread
+            // forward (e.g. to the media gallery) and coming back to it keep the
+            // NavHost-level fade, so the change stays scoped to open/back. The
+            // list's half of the back slide — sliding back in from the left —
+            // lives on `composable<Conversations>` (feedback round 5): it is the
+            // returning destination's `popEnter`, not this destination's.
+            enterTransition = { glissementEntrant },
+            popExitTransition = { glissementSortant },
+        ) { backStackEntry ->
+            val args = backStackEntry.toRoute<Thread>()
+            ThreadScreen(
+                conversationId = args.conversationId,
+                onBack = { nav.popBackStack() },
+                // v1.4.0 (F5 forward feature) — forward to existing conversation. Pop the source thread
+                // so the back stack reads [Conversations -> Thread(dest)] instead of
+                // [Conversations -> Thread(source) -> Thread(dest)] which would surprise
+                // the user on back press.
+                onForwardToConversation = { destId ->
+                    nav.popBackStack()
+                    nav.navigate(Thread(destId))
+                },
+                // v1.4.0 (F5 forward feature) — forward to a new recipient: route to ComposeScreen.
+                // The IncomingShareHolder payload posted by `stageForward` is still
+                // present when ComposeScreen's `onConversationCreated` navigates to
+                // the newly-created thread, where `consumeIncomingShareIfAny` picks it
+                // up at hydration.
+                onForwardToNewContact = {
+                    nav.popBackStack()
+                    nav.navigate(Compose())
+                },
+            )
+        }
+        composable<MediaGallery> { MediaGalleryScreen(onBack = { nav.popBackStack() }) }
+        composeAndNoteThreadDestinations(
+            nav = nav,
+            enterTransition = glissementEntrant,
+            popExitTransition = glissementSortant,
+        )
+    }
+
+    // Client mode — tablet calls: the incoming-call dropdown,
+    // rendered as an overlay AFTER the `NavHost` (the same pattern
+    // as the Safety call ack below), so a ringing call is visible
+    // from any screen — a thread, Settings, the list — not just the
+    // list. Hub mode renders nothing (the overlay's ViewModel gates
+    // on the device mode).
+    ClientCallPopupOverlay(
+        showLock = showLock,
+        onOpenThread = { id -> nav.navigate(Thread(id)) { launchSingleTop = true } },
+    )
+
+    // v1.27.4 — CONFIRMATION D'UN GESTE SAFETY CALL VENU D'UNE NOTIFICATION.
+    //
+    // # Pourquoi ici, au niveau du graphe, et pas dans un écran
+    //
+    // Le geste est fait dans le volet de notifications ; l'application s'ouvre ensuite sur la
+    // destination courante, qui n'est pas connue d'avance. Brancher la confirmation sur
+    // `ConversationsScreen` — la destination observée par Patrice le 2026-08-06 — aurait produit
+    // exactement le défaut que ce dépôt rencontre le plus : une garde correcte sur LE chemin
+    // testé, muette sur les autres. Quelqu'un qui tape la notification alors que l'application est
+    // déjà ouverte sur les Réglages n'aurait rien vu.
+    //
+    // Rendu en overlay APRÈS le `NavHost`, sur le pattern déjà documenté pour `SplashScreen` :
+    // le `Surface` parent empile ses enfants. Aucun des vingt écrans n'est modifié.
+    //
+    // # Les deux gardes
+    //
+    // ⚠️ `isPanicDecoy` n'est pas une précaution de forme. Une confirmation « Safety call
+    // désactivé » affichée en session leurre révélerait à qui tient le téléphone qu'une fonction
+    // d'alerte existe — c'est la raison d'être de `SafetyCallNotice` et de la garde de navigation
+    // ci-dessus. On **efface** alors le porteur au lieu de le laisser en attente : le garder
+    // ferait surgir la phrase à la sortie du leurre.
+    //
+    // `showLock` fait l'inverse : on ne consomme pas, on attend. La confirmation est vraie et le
+    // TTL de 2 min de [SafetyCallAckHolder] couvre un déverrouillage lent, précisément pour que
+    // l'attente aboutisse au lieu d'avaler le message.
+    SafetyCallAckOverlay(
+        holder = rootViewModel.safetyCallAck,
+        showLock = showLock,
+        isPanicDecoy = isPanicDecoy,
+    )
+
+    // Splash de première ouverture, rendu EN OVERLAY au-dessus du graphe (le Surface parent empile
+    // ses enfants). N'apparaît qu'à la 1ʳᵉ ouverture (SplashViewModel.shouldShow) ; pour toutes les
+    // suivantes, SplashScreen ne rend rien. Il n'est plus une destination du NavHost afin que
+    // Conversations reste la racine non-dépilable (cf. startDestination ci-dessus).
+    SplashScreen(onFinished = {})
+}
+
+/**
+ * Notes — the note-thread destination plus the compose destination,
+ * extracted from [AppRoot] so the screen stays under the Detekt
+ * long-method limit. The note thread slides in from the right like the
+ * conversation thread (300 ms, same pair); the list's slide back in
+ * from the left applies too: `isSlideReturnRoute` matches on
+ * `route.contains("Thread")`, which "NoteThread" satisfies. Compose
+ * rides along because the notes round gave it the `onNoteCreated`
+ * navigation (a created note pops compose and opens the note thread).
+ */
+private fun NavGraphBuilder.composeAndNoteThreadDestinations(
+    nav: NavController,
+    enterTransition: EnterTransition,
+    popExitTransition: ExitTransition,
+) {
+    composable<NoteThread>(
+        enterTransition = { enterTransition },
+        popExitTransition = { popExitTransition },
+    ) {
+        // The ViewModel reads the note id from the SavedStateHandle —
+        // the screen takes no id parameter.
+        NoteThreadScreen(
+            onBack = { nav.popBackStack() },
+        )
+    }
+    // Feedback round 9 — Compose slides in from the right like the
+    // thread and Settings (300 ms horizontal slide), instead of the
+    // NavHost-level 80 ms fade that read as a snap.
+    composable<Compose>(
+        enterTransition = { enterTransition },
+        popExitTransition = { popExitTransition },
+    ) { backStackEntry ->
+        val args = backStackEntry.toRoute<Compose>()
+        ComposeScreen(
+            initialAddress = args.initialAddress,
+            groupe = args.groupe,
+            onBack = { nav.popBackStack() },
+            onConversationCreated = { id ->
+                nav.popBackStack()
+                nav.navigate(Thread(id))
+            },
+            // Notes — a created note pops compose and opens the
+            // note thread, like a created conversation.
+            onNoteCreated = { id ->
+                nav.popBackStack()
+                nav.navigate(NoteThread(id))
+            },
+        )
+    }
+}
+
+/**
+ * v1.27.4 — affiche la confirmation posée par
+ * [com.relay.sms.MainActivity] après un geste Safety call fait depuis une notification.
+ *
+ * Composant séparé pour une raison précise : il porte son propre `SnackbarHostState`, aligné en bas
+ * de l'écran par-dessus le graphe. L'application n'a pas d'hôte de snackbar global — chaque écran
+ * `remember` le sien — et en introduire un aurait demandé de toucher les vingt écrans.
+ *
+ * Les libellés sont **ceux des Réglages** pour deux des trois cas, volontairement : le même geste
+ * doit se lire de la même façon selon qu'il est fait dans l'application ou depuis le volet. C'est
+ * la moitié « visible » du jumeau asymétrique que ce lot referme.
+ */
+@Composable
+private fun SafetyCallAckOverlay(
+    holder: SafetyCallAckHolder,
+    showLock: Boolean,
+    isPanicDecoy: Boolean,
+) {
+    val pendingAck by holder.pending.collectAsStateWithLifecycle()
+    val host = remember { SnackbarHostState() }
+
+    // Hissés hors du `LaunchedEffect` : un `stringResource` ne s'appelle pas depuis une coroutine,
+    // et une chaîne résolue au moment du geste ne suivrait pas un changement de langue.
+    val timerResetMessage = stringResource(R.string.settings_safety_call_im_ok_snack)
+    val disarmedMessage = stringResource(R.string.settings_safety_call_im_ok_stops_relances)
+    val rearmedMessage = stringResource(R.string.safety_call_ack_rearmed)
+
+    // ⚠️ L'ORDRE EST TOUT : ON AFFICHE, PUIS ON CONSOMME. Jamais l'inverse.
+    //
+    // # Le premier piège — consommer avant d'afficher n'affiche rien
+    //
+    // `holder.consume()` remet le porteur à `null`, donc `pendingAck` change, donc cet effet
+    // **se relance et annule sa coroutine précédente**. Or `showSnackbar` suspend pendant toute la
+    // durée d'affichage. Consommer d'abord, c'est donc annuler l'affichage qu'on vient de décider :
+    // le code s'exécute, la gate passe, et rien ne paraît. Motif du chemin mort, version fourbe —
+    // l'effet est défait par sa propre condition de déclenchement.
+    //
+    // # Le second piège — un état local ne survit pas à une rotation
+    //
+    // (relecture Gemini du 2026-08-06, SC-ACK-LOSS, CONFIRMÉ) Une première correction scindait ce
+    // bloc en deux effets et gardait la phrase dans un `remember`. Ça marchait, sauf sur recréation
+    // d'activité : rotation, pliage, bascule de thème, changement de taille de police. Le porteur
+    // avait déjà été consommé, `remember` était perdu, et la confirmation disparaissait
+    // **définitivement** — rétablissant exactement le silence que ce lot corrige.
+    //
+    // La relecture proposait `rememberSaveable`. Ne pas le suivre : ce serait ajouter un second
+    // dépositaire de la même information, à durée de vie différente de celle du porteur, donc
+    // capable de ressortir une phrase que le TTL de 2 minutes aurait dû périmer. Deux sources de
+    // vérité pour un même fait, c'est le doublon que la doctrine interdit.
+    //
+    // # Ce que l'ordre inverse donne, sans aucun état local
+    //
+    // Le porteur reste la seule source. Il n'est vidé qu'une fois la phrase réellement affichée :
+    //
+    //  - rotation en cours d'affichage → le porteur est encore plein, la nouvelle activité réaffiche ;
+    //  - processus tué → le porteur meurt avec lui, et c'est correct : plus personne n'attend ;
+    //  - verrou levé en cours de route → l'effet est relancé, l'affichage reprend après
+    //    déverrouillage ;
+    //  - péremption → tranchée par le porteur lui-même, pas par une copie.
+    LaunchedEffect(pendingAck, showLock, isPanicDecoy) {
+        val current = pendingAck ?: return@LaunchedEffect
+        if (isPanicDecoy) {
+            // Voir la note d'appel : en session leurre on efface, on n'attend pas.
+            holder.clear()
+            return@LaunchedEffect
+        }
+        if (showLock) return@LaunchedEffect
+        // La péremption est tranchée ici parce qu'on ne consomme plus en tête. Effacer plutôt que
+        // laisser en place : un porteur périmé qui resterait plein rejouerait cette évaluation à
+        // chaque recomposition, sans jamais rien afficher.
+        if (current.isExpired()) {
+            holder.clear()
+            return@LaunchedEffect
+        }
+        host.showSnackbar(
+            when (current.ack) {
+                SafetyCallAckHolder.Ack.TIMER_RESET -> timerResetMessage
+                SafetyCallAckHolder.Ack.DISARMED -> disarmedMessage
+                SafetyCallAckHolder.Ack.REARMED -> rearmedMessage
+            },
+        )
+        // Affiché : le porteur peut être vidé. Cette ligne re-clé l'effet, mais elle est la
+        // dernière — il n'y a plus rien à annuler.
+        holder.consume()
+    }
+
+    // `fillMaxSize` + alignement bas : l'hôte se place là où tous les autres écrans posent le leur.
+    // Le `Box` ne capte aucun geste — un `SnackbarHost` vide ne dessine rien et ne consomme pas les
+    // touches, donc l'overlay est transparent à l'usage tant qu'aucune confirmation n'est en cours.
+    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
+        RelaySnackbarHost(host)
+    }
+}
+
+/**
+ * v1.27.12 — duree des transitions du [NavHost], en millisecondes.
+ *
+ * L'ecran qui entre n'accepte pas les gestes tant que la transition court (limite de
+ * navigation-compose, cf. le commentaire au-dessus du `NavHost`). Cette duree est donc AUSSI la
+ * fenetre pendant laquelle l'application parait figee au retour d'une conversation : la garder
+ * courte n'est pas un choix esthetique, c'est ce qui rend le blocage imperceptible.
+ *
+ * 80 ms preserve la continuite visuelle entre deux ecrans tout en restant sous le seuil ou un
+ * geste ignore se remarque. Ne pas l'allonger sans reverifier le glissement immediat apres un
+ * retour, sur un appareil reel.
+ */
+private const val NAV_TRANSITION_MS = 80
+
+/**
+ * Round 4 — duration of the Thread destination's slide (open / back), in milliseconds.
+ * 300 ms with FastOutSlowIn is the Material 3 standard for screen transitions (it is
+ * also the duration of the bottom-sheet animation spec in material3 1.4.0). Deliberately
+ * NOT the 80 ms of [NAV_TRANSITION_MS]: a slide that fast would read as a glitch, not a
+ * transition.
+ *
+ * Trade-off, cf. the v1.27.12 note above: the screen that comes back ignores gestures
+ * while a transition runs, so the first swipe on the list right after going back may be
+ * ignored for up to ~300 ms. Re-check the immediate swipe after back on a real device.
+ */
+private const val THREAD_TRANSITION_MS = 300
+
+/**
+ * Session marker — records the current screen so a death without
+ * a crash still says where the app was. The route PATTERN is
+ * recorded (see [SessionMarker.screenName]), never the filled-in
+ * arguments, so no conversation id or address ever reaches the
+ * marker. The current destination is recorded at once (the
+ * listener only fires on changes). Top-level helper, not inline
+ * in [AppRoot], so AppRoot stays under the Detekt method-length
+ * threshold.
+ */
+@Composable
+private fun TrackSessionMarkerScreen(nav: NavController) {
+    DisposableEffect(nav) {
+        val listener = NavController.OnDestinationChangedListener { _, destination, _ ->
+            SessionMarkerTracker.current?.updateScreen(SessionMarker.screenName(destination.route))
+        }
+        nav.addOnDestinationChangedListener(listener)
+        SessionMarkerTracker.current?.updateScreen(SessionMarker.screenName(nav.currentDestination?.route))
+        onDispose { nav.removeOnDestinationChangedListener(listener) }
+    }
+}
+
+/**
+ * Pushes the Lock screen when the lock state requires it, and
+ * pops it when the state flips back to an open state. Top-level
+ * helper, not inline in [AppRoot], so AppRoot stays under the
+ * Detekt method-length threshold.
+ */
+@Composable
+private fun LockScreenNavEffect(nav: NavController, showLock: Boolean) {
+    LaunchedEffect(showLock) {
+        val isOnLock = nav.currentDestination?.route?.contains("Lock") == true
+        // R2 fix: pop the Lock screen when the state flips back to an "open" state — e.g. on a
+        // fresh install where _state starts Locked (fail-closed) and resolveInitialState()
+        // immediately downgrades to Disabled. Without this branch the user is stranded on
+        // LockScreen with no PIN configured.
+        if (!showLock && isOnLock) {
+            nav.popBackStack(route = Lock, inclusive = true)
+        } else if (showLock && !isOnLock) {
+            nav.navigate(Lock) {
+                popUpTo(Conversations()) { inclusive = false }
+            }
+        }
+    }
+}
+
+/**
+ * Feedback round 8 — destinations whose return to the conversation list
+ * mirrors their slide-out (the list slides back in from the left): the
+ * thread and Settings, which both slide in from the right on open. Kept as
+ * a top-level helper (not inline in [AppRoot]) so the `||` does not push
+ * `AppRoot` over the Detekt cyclomatic-complexity threshold.
+ */
+private fun isSlideReturnRoute(route: String?): Boolean {
+    // Feedback round 9 — Compose slides in from the right like the thread
+    // and Settings, so popping back from it slides the list back in from
+    // the left too.
+    // Feedback round 10 — the Vault slides in from the right too, so
+    // popping back from it slides the list back in from the left as well.
+    // Round 17 — Scheduled Messages slides in now, so the return mirrors
+    // it too.
+    return route?.contains("Thread") == true || route?.contains("Settings") == true ||
+        route?.contains("Compose") == true || route?.contains("Vault") == true ||
+        route?.contains("ScheduledMessages") == true
+}
+
+/**
+ * Whether this back-stack entry is the Archived conversations list.
+ * Archived shares the Conversations route with the main list, so the route
+ * string alone cannot tell them apart — the `archived` argument does.
+ * Guarded by the route check, since `toRoute` only works on a
+ * Conversations entry.
+ */
+private fun isArchivedConversations(entry: NavBackStackEntry): Boolean {
+    return entry.destination.route?.contains("Conversations") == true &&
+        runCatching { entry.toRoute<Conversations>().archived }.getOrDefault(false)
+}
+
+/**
+ * The list's enter transition: Archived slides in from the right, the main
+ * list (the start destination) keeps its fade. Top-level helper so the
+ * branch does not push [AppRoot] over the Detekt complexity threshold.
+ */
+private fun listEnterTransition(
+    target: NavBackStackEntry,
+    slideIn: EnterTransition,
+    fadeIn: EnterTransition,
+): EnterTransition {
+    return if (isArchivedConversations(target)) slideIn else fadeIn
+}
+
+/**
+ * A pop-enter transition: slide back in from the left when returning from a
+ * screen that slid in (thread, Settings, Compose, Vault, Archived,
+ * Scheduled Messages), else fade. Top-level helper so the branch does not
+ * push [AppRoot] over the Detekt complexity threshold. Shared by the list
+ * and the Vault.
+ */
+private fun slideBackInTransition(
+    popped: NavBackStackEntry,
+    slideIn: EnterTransition,
+    fadeIn: EnterTransition,
+): EnterTransition {
+    return if (isSlideReturnRoute(popped.destination.route) || isArchivedConversations(popped)) {
+        slideIn
+    } else {
+        fadeIn
+    }
+}

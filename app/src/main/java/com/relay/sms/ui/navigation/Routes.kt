@@ -1,0 +1,71 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.ui.navigation
+
+import kotlinx.serialization.Serializable
+
+@Serializable sealed interface Route
+
+@Serializable data class Conversations(val archived: Boolean = false) : Route
+@Serializable data object Vault : Route
+@Serializable data object Blocked : Route
+@Serializable data object Settings : Route
+@Serializable data object Backup : Route
+@Serializable data object Migration : Route
+@Serializable data object About : Route
+
+// Feedback round 5 — Help screen, reached from Settings (above About).
+@Serializable data object Help : Route
+
+// Feedback round 8 — License / copyright notice screen, reached from the
+// License link on About. Shows Relay's proprietary-components notice and
+// the upstream attribution (see THIRD_PARTY_NOTICES.md).
+@Serializable data object License : Route
+
+// Feedback round 6 — Advanced screen, reached from Settings (between App
+// Language and Help). Was the "Advanced" section of the Settings list.
+@Serializable data object Advanced : Route
+
+// Error log screen, reached from Advanced. Lists the locally saved
+// crash reports (see `crashlog`); nothing here leaves the device
+// unless the user shares one.
+@Serializable data object ErrorLog : Route
+
+// v1.23.2 — route `Onboarding` retirée : injoignable depuis v1.2.0 (aucun
+// `navigate(Onboarding)`, pas de startDestination), l'accueil passe par Splash.
+// L'écran et ses 9 strings FR/EN sont récupérables via `git show 9b553d3`.
+@Serializable data object Splash : Route
+@Serializable data object Lock : Route
+@Serializable data object SafetyCallSetup : Route
+@Serializable data object Emergency : Route
+@Serializable data object EmergencySetup : Route
+@Serializable data class Thread(val conversationId: Long) : Route
+
+/** Notes — one note's thread. The name contains "Thread" on purpose: AppRoot's
+ * `route.contains("Thread")` checks (slide-back mirror, share/nav guards) treat
+ * a note thread like a conversation thread. */
+@Serializable data class NoteThread(val noteId: Long) : Route
+
+/**
+ * Issue #59 — les photos et vidéos d'une conversation. Pas de « Thread » dans le nom : `AppRoot` repère
+ * l'écran de fil par `route.contains("Thread")`.
+ */
+@Serializable data class MediaGallery(val conversationId: Long) : Route
+
+/** v1.28.3 — `groupe` : le composeur s'ouvre en mode groupe, toucher un contact ajoute une puce. */
+@Serializable data class Compose(val initialAddress: String? = null, val groupe: Boolean = false) : Route
+
+// v1.15.1 — Écran liste des messages programmés (accessible depuis Settings).
+@Serializable data object ScheduledMessages : Route
+
+// Slice 1 — Linked devices screen (LAN server toggle, linked devices,
+// QR pairing), reached from Settings.
+@Serializable data object LinkedDevices : Route
+
+// E2E — Encryption screen, reached from Settings → Security & Privacy.
+// Status, own fingerprint, verified contacts (design §7.1).
+@Serializable data object Encryption : Route

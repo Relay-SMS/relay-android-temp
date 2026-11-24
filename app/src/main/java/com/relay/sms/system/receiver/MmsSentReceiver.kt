@@ -1,0 +1,250 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.system.receiver
+
+import android.app.Activity
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.telephony.SmsManager
+import com.relay.sms.data.local.datastore.SettingsRepository
+import com.relay.sms.data.local.db.dao.MessageDao
+import com.relay.sms.data.mms.MmsSender
+import com.relay.sms.data.mms.MmsSystemWriteback
+import com.relay.sms.data.mms.VerdictOperateur
+import com.relay.sms.data.mms.lireVerdictOperateur
+import com.relay.sms.data.mms.statutDeReponseMms
+import com.relay.sms.di.ApplicationScope
+import com.relay.sms.domain.model.MessageStatus
+import com.relay.sms.domain.model.SendErrorCode
+import com.relay.sms.domain.repository.OutgoingMessageMirror
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import timber.log.Timber
+import java.io.File
+import javax.inject.Inject
+
+/**
+ * Receives the dispatch result of an outgoing MMS sent via `SmsManager.sendMultimediaMessage`.
+ *
+ * On `RESULT_OK` — unless the carrier's m-send-conf explicitly refuses the message, which is a
+ * failure since 2026-10-29 (issue #53, cf. [issueDeLEnvoiMms]) :
+ *   1. Flip the Room mirror row to SENT.
+ *   2. Promote the `content://mms` row from OUTBOX to SENT.
+ *   3. Replace the placeholder FROM address with the user's MSISDN (audit F4) so other SMS
+ *      apps don't display `"insert-address-token"` literally.
+ *
+ * On failure :
+ *   1. Flip Room to FAILED (keeping `mmsSystemId` so the next retry can purge the stale row).
+ *   2. Delete the system OUTBOX row.
+ *
+ * Always (regardless of outcome): delete the transient PDU file the OS no longer needs.
+ *
+ * v1.2.6: flattened (audit Q10) — onReceive is now a thin dispatcher that delegates the async
+ * branches to [handleOk] / [handleFailure].
+ */
+@AndroidEntryPoint
+class MmsSentReceiver : BroadcastReceiver() {
+
+    // v1.24.0 SEC-CRIT — `Lazy` : ce collaborateur atteint un DAO, donc `AppDatabase`, donc la
+    // réparation zéro-clé. L'injection de champ Hilt précède le corps de `onReceive`, sur le main
+    // thread : en eager, la reconstruction de la base y tournait sous un timeout ANR de 10 s.
+    @Inject lateinit var mirrorLazy: dagger.Lazy<OutgoingMessageMirror>
+
+    @Inject lateinit var systemWriteback: MmsSystemWriteback
+
+    @Inject lateinit var messageDaoLazy: dagger.Lazy<MessageDao>
+
+    @Inject lateinit var settings: SettingsRepository
+
+    @Inject @ApplicationScope lateinit var scope: CoroutineScope
+
+    override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action != MmsSender.ACTION_MMS_SENT) return
+
+        // Audit F5 (v1.2.3) defense-in-depth: PendingIntent uses explicit `setClass` and the
+        // receiver is `exported = false`. We still verify the resolved component package
+        // matches ours so a future drift (accidental export) can't let a forged broadcast
+        // mutate row state via mmsSystemId.
+        intent.component
+            ?.takeIf { it.packageName != context.packageName }
+            ?.let {
+                Timber.w("MmsSentReceiver: rejecting broadcast for foreign package %s", it.packageName)
+                return
+            }
+
+        val localId = intent.getLongExtra(MmsSender.EXTRA_LOCAL_ID, -1L)
+        val pduPath = intent.getStringExtra(MmsSender.EXTRA_PDU_FILE)
+        val mmsSystemId = intent.getLongExtra(MmsSender.EXTRA_MMS_SYSTEM_ID, -1L)
+        // 2026-10-29 (issue #53) — la réponse de l'opérateur, jointe par Android au résultat.
+        val issue = issueDeLEnvoiMms(resultCode, intent.getByteArrayExtra(SmsManager.EXTRA_MMS_DATA))
+
+        val pending = goAsync()
+        scope.launch {
+            try {
+                if (localId >= 0) {
+                    when (issue) {
+                        IssueEnvoiMms.Envoye -> handleOk(localId, mmsSystemId)
+                        is IssueEnvoiMms.Echec -> handleFailure(
+                            localId,
+                            mmsSystemId,
+                            issue.code,
+                            issue.responseStatus,
+                        )
+                    }
+                }
+                // The OS keeps its own copy of the PDU through the dispatch pipeline; ours
+                // is no longer needed regardless of outcome.
+                pduPath?.let { runCatching { File(it).delete() } }
+            } finally {
+                pending.finish()
+            }
+        }
+    }
+
+    private suspend fun handleOk(localId: Long, mmsSystemId: Long) {
+        // v1.2.7 audit Q5 — anti-broadcast-tardif. Sous Doze ou throttling Samsung One UI, un
+        // result-broadcast d'une PREMIÈRE tentative peut arriver APRÈS qu'un retry a déjà
+        // succès et que Room pointe sur un autre mmsSystemId. Sans ce check, on flippe SENT
+        // → FAILED (ou pire) en se basant sur une row historique. On confronte l'mmsSystemId
+        // du broadcast à celui actuellement persisté en Room : pas match = broadcast obsolète,
+        // on ignore silencieusement.
+        if (mmsSystemId > 0L && !matchesCurrentRow(localId, mmsSystemId)) {
+            Timber.i("handleOk(local=%d, sys=%d) skipped — stale broadcast vs current Room row", localId, mmsSystemId)
+            return
+        }
+
+        mirrorLazy.get().updateOutgoingStatus(localId, MessageStatus.SENT)
+        if (mmsSystemId <= 0L) return
+
+        runCatching { systemWriteback.markSent(mmsSystemId) }
+            .onFailure { Timber.w(it, "markSent(%d) failed", mmsSystemId) }
+
+        // Audit F4 (v1.2.6) — replace the FROM placeholder with the user-configured MSISDN
+        // if one was provided in Settings. No-op silencieux sinon — la convention AOSP de
+        // skipper le token à l'import couvre déjà le cas dégradé.
+        //
+        // v1.2.7 audit Q9 : DataStore peut stall plusieurs secondes au boot froid. Le receiver
+        // a un budget de 10 s avant que le system reaper le kill ; on cap à 3 s pour cette
+        // lecture non-critique et on skip silencieusement si timeout — pas de finalize, mais
+        // le MMS reste correctement SENT.
+        val msisdn = withTimeoutOrNull(SETTINGS_READ_TIMEOUT_MS) {
+            runCatching { settings.flow.first().sending.userMsisdn }.getOrNull()
+        }
+        if (!msisdn.isNullOrBlank()) {
+            runCatching { systemWriteback.finalizeFromAddress(mmsSystemId, msisdn) }
+                .onFailure { Timber.w(it, "finalizeFromAddress(%d) failed", mmsSystemId) }
+        }
+    }
+
+    /**
+     * v1.2.7 audit Q5 — compare l'`mmsSystemId` reçu par broadcast à la valeur actuellement
+     * persistée dans Room. Si différentes, le broadcast vient d'une tentative antérieure et
+     * doit être ignoré (la row Room a été reprise par un retry ultérieur). Retourne `true` si
+     * on peut traiter (id matche ou Room n'a plus de valeur → broadcast peut être traité).
+     */
+    private suspend fun matchesCurrentRow(localId: Long, broadcastSystemId: Long): Boolean {
+        val current = runCatching { messageDaoLazy.get().findMmsSystemId(localId) }.getOrNull()
+        // current == null : la row Room n'a plus de mmsSystemId (rollback ou clear panic).
+        //   Dans ce cas on ne devrait pas mettre à jour, donc on retourne false.
+        // current == broadcastSystemId : match, on peut traiter.
+        return current != null && current == broadcastSystemId
+    }
+
+    private companion object {
+        /** Budget anti-ANR pour lire le `userMsisdn` du DataStore (audit Q9). */
+        const val SETTINGS_READ_TIMEOUT_MS: Long = 3_000L
+    }
+
+    private suspend fun handleFailure(localId: Long, mmsSystemId: Long, rc: Int, responseStatus: Int?) {
+        // v1.2.7 audit Q5 — même garde que handleOk. Un broadcast FAILED retardé venant d'une
+        // tentative ancienne ne doit pas flipper l'état actuel (qui peut être déjà SENT pour
+        // un retry plus récent).
+        if (mmsSystemId > 0L && !matchesCurrentRow(localId, mmsSystemId)) {
+            Timber.i("handleFailure(local=%d, sys=%d, rc=%d) skipped — stale broadcast", localId, mmsSystemId, rc)
+            return
+        }
+
+        // Group-send own-number fix (MMS failure logging) — the
+        // carrier's response status joins the result code, so the
+        // next group-send failure can be diagnosed from a
+        // tag-filtered logcat. No content, no recipients, no numbers.
+        Timber.w(
+            "MMS sent failed for id=%d code=%d responseStatus=%s",
+            localId,
+            rc,
+            responseStatus?.let { "0x%02X".format(it) } ?: "none",
+        )
+        mirrorLazy.get().updateOutgoingStatus(localId, MessageStatus.FAILED, errorCode = rc)
+        if (mmsSystemId > 0L) {
+            // Important : on garde `mmsSystemId` côté Room pour que le prochain retry puisse
+            // purger cette row stale avant d'en insérer une nouvelle (audit F2 idempotence).
+            // C'est la suppression côté system-provider qui se fait ici.
+            runCatching { systemWriteback.delete(mmsSystemId) }
+                .onFailure { Timber.w(it, "delete(%d) failed", mmsSystemId) }
+        }
+    }
+}
+
+/** Ce que devient un MMS sortant au retour d'Android. */
+internal sealed interface IssueEnvoiMms {
+    data object Envoye : IssueEnvoiMms
+
+    /**
+     * [code] est stocké dans `error_code` : code d'Android, ou [SendErrorCode.mmscRefused].
+     * [responseStatus] est l'octet `X-Mms-Response-Status` quand un m-send-conf lisible est
+     * revenu avec le résultat, `null` sinon — il ne sert qu'à la ligne de log d'échec.
+     */
+    data class Echec(val code: Int, val responseStatus: Int? = null) : IssueEnvoiMms
+}
+
+/**
+ * 2026-10-29 (issue #53) — `RESULT_OK` ne veut dire que « la requête HTTP vers le serveur MMS de
+ * l'opérateur a abouti » ; le verdict de l'opérateur est dans [reponse]. Un refus EXPLICITE devient
+ * un échec qui garde son statut ; une réponse absente ou illisible garde le comportement d'avant
+ * (envoyé). Cf. [lireVerdictOperateur].
+ */
+internal fun issueDeLEnvoiMms(resultCode: Int, reponse: ByteArray?): IssueEnvoiMms {
+    // Group-send own-number fix (MMS failure logging) — even on an
+    // Android failure the carrier may have answered, so the status
+    // is extracted for the log line either way.
+    if (resultCode != Activity.RESULT_OK) return IssueEnvoiMms.Echec(resultCode, statutDeReponseMms(reponse))
+    return when (val verdict = lireVerdictOperateur(reponse)) {
+        is VerdictOperateur.Refuse -> {
+            Timber.w("MMS refused by the carrier: X-Mms-Response-Status=0x%02X", verdict.statut)
+            IssueEnvoiMms.Echec(SendErrorCode.mmscRefused(verdict.statut), verdict.statut)
+        }
+        VerdictOperateur.Accepte -> {
+            Timber.i("MMS accepted by the carrier: X-Mms-Response-Status=0x80")
+            IssueEnvoiMms.Envoye
+        }
+        VerdictOperateur.Inconnu -> {
+            Timber.i("MMS sent: no readable m-send-conf (%s), kept as sent", apercuDeReponse(reponse))
+            IssueEnvoiMms.Envoye
+        }
+    }
+}
+
+/**
+ * Ce qu'on peut dire d'une réponse illisible sans rien en divulguer d'utile : absente, ou sa taille
+ * et ses premiers octets — des en-têtes MMS (type, transaction, version), jamais le contenu d'un
+ * message. Mesuré le 2026-10-29 sur un S24 (Android 16) : la réponse d'un envoi ACCEPTÉ y était
+ * déclarée illisible, et il faut savoir si elle manquait ou si le décodeur l'a manquée.
+ */
+private fun apercuDeReponse(reponse: ByteArray?): String = when {
+    reponse == null -> "absent"
+    reponse.isEmpty() -> "empty"
+    else -> "%d bytes: %s".format(
+        reponse.size,
+        reponse.take(APERCU_OCTETS).joinToString(" ") { "%02X".format(it.toInt() and 0xFF) },
+    )
+}
+
+private const val APERCU_OCTETS = 32

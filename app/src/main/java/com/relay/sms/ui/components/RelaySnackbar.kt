@@ -1,0 +1,101 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.ui.components
+
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Snackbar
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarVisuals
+import androidx.compose.runtime.Composable
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.unit.dp
+import com.relay.sms.ui.theme.BrandDanger
+
+/**
+ * v1.9.0 — Composables Snackbar partagés à l'échelle de l'app.
+ *
+ * **Pourquoi un fichier dédié** : avant v1.9.0, ce pattern vivait en
+ * `private` dans `ThreadScreen.kt` et chaque autre écran (Settings,
+ * Backup, SafetyCallSetup…) utilisait le `SnackbarHost` Material 3 par
+ * défaut, qui rend en `inverseSurface` = `BrandBlue` (slate-blue marque)
+ * — donc les snackbars d'erreur de ces écrans ressemblaient à des
+ * confirmations positives. Demande user 2026-05-21 : aligner toute l'app
+ * sur le pattern bleu pour les confirmations + **rouge marque
+ * [BrandDanger] pour les suppressions / erreurs**.
+ *
+ * **Pattern** :
+ *  - call site qui veut une confirmation positive : `hostState.showSnackbar(msg)`
+ *    → rendu bleu marque (default).
+ *  - call site qui veut une alerte rouge : `hostState.showError(msg)` ou
+ *    `hostState.showSnackbar(RelaySnackbarVisuals(msg, isError = true))`.
+ *
+ * Pour que le rouge soit effectivement appliqué, l'écran DOIT utiliser
+ * [RelaySnackbarHost] dans son `Scaffold(snackbarHost = …)` au lieu du
+ * `SnackbarHost(hostState)` standard. Si un écran continue à utiliser
+ * `SnackbarHost`, ses erreurs ressortiront en bleu (sans crasher).
+ */
+data class RelaySnackbarVisuals(
+    override val message: String,
+    val isError: Boolean,
+    override val actionLabel: String? = null,
+    override val duration: SnackbarDuration =
+        if (isError) SnackbarDuration.Long else SnackbarDuration.Short,
+    override val withDismissAction: Boolean = false,
+) : SnackbarVisuals
+
+/**
+ * Helper pour les call sites qui veulent signaler une erreur ou une
+ * suppression sans reconstruire [RelaySnackbarVisuals] à la main.
+ * Préfère cette fonction à `showSnackbar(message)` pour tout message
+ * destructif / d'échec — sinon le snackbar s'affichera en bleu
+ * (confirmation) au lieu de rouge (alerte).
+ */
+suspend fun SnackbarHostState.showError(message: String) {
+    showSnackbar(RelaySnackbarVisuals(message = message, isError = true))
+}
+
+// v1.28.12 (audit B2) — `showDestructive()` a été SUPPRIMÉE. Aucun appelant, et son propre
+// KDoc la déclarait « sémantiquement équivalente à showError » : le refacto qui devait un jour
+// les distinguer n'est jamais venu. Elle se réécrira en deux lignes le jour où il viendra.
+
+/**
+ * [SnackbarHost] custom qui rend les [RelaySnackbarVisuals] avec :
+ *  - `isError = true` → fond [BrandDanger] (`#C62828`, le rouge fort
+ *    cohérent avec les boutons destructifs partout dans l'app), texte
+ *    blanc, action blanche. Contraste 5.5:1 → WCAG AA ✓.
+ *  - `isError = false` ou non-[RelaySnackbarVisuals] (legacy
+ *    `showSnackbar(message)` direct) → fond `inverseSurface`
+ *    (`BrandBlue` slate via le thème) + texte/action `inverseOnSurface`
+ *    /`inversePrimary`.
+ *
+ * À substituer dans tous les `Scaffold` à la place du `SnackbarHost(
+ * hostState)` standard.
+ *
+ * Round 17 — the bar is rounded ([SNACKBAR_CORNER_DP]), like the rest of
+ * the UI, instead of the near-square Material default.
+ */
+private const val SNACKBAR_CORNER_DP = 16
+
+@Composable
+fun RelaySnackbarHost(hostState: SnackbarHostState) {
+    SnackbarHost(hostState = hostState) { data ->
+        val isError = (data.visuals as? RelaySnackbarVisuals)?.isError == true
+        Snackbar(
+            snackbarData = data,
+            shape = RoundedCornerShape(SNACKBAR_CORNER_DP.dp),
+            containerColor = if (isError) BrandDanger
+                else MaterialTheme.colorScheme.inverseSurface,
+            contentColor = if (isError) Color.White
+                else MaterialTheme.colorScheme.inverseOnSurface,
+            actionColor = if (isError) Color.White
+                else MaterialTheme.colorScheme.inversePrimary,
+        )
+    }
+}
