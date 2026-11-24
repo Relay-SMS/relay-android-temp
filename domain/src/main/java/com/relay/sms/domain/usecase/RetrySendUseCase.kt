@@ -1,0 +1,147 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.domain.usecase
+
+import com.relay.sms.core.result.AppError
+import com.relay.sms.core.result.Outcome
+import com.relay.sms.domain.e2e.E2eSendGate
+import com.relay.sms.domain.model.Message
+import com.relay.sms.domain.model.MessageStatus
+import com.relay.sms.domain.model.SendErrorCode
+import com.relay.sms.domain.repository.BlockedNumberRepository
+import com.relay.sms.domain.repository.ConversationRepository
+import com.relay.sms.domain.repository.OutgoingMessageMirror
+import com.relay.sms.domain.sender.SmsSender
+import timber.log.Timber
+import javax.inject.Inject
+
+/**
+ * Re-dispatches a previously [MessageStatus.FAILED] outgoing message.
+ *
+ * Idempotence note (audit M-1): when the previous failure was tagged with
+ * [SendErrorCode.WATCHDOG_TIMEOUT], the message *may* in fact have been delivered by the radio
+ * — we simply never received the sent-broadcast confirmation. Retrying in that case can
+ * produce a duplicate SMS at the recipient. We log a clear warning so the dev surfaces this
+ * in telemetry; the UI layer is expected to display a confirmation dialog on those retries
+ * (covered in v1.1 UX polish, the data side is already wired here).
+ *
+ * E2E (design §3.4) — retrying an encrypted message re-sends the FULL
+ * fragment set with the SAME message id (the receiver dedupes by
+ * sender + id + index): the gate re-sends the stored ciphertext bytes
+ * when the row still holds them, so the retry is byte-identical to the
+ * first attempt. A failed encrypted message is NEVER retried in plain.
+ */
+class RetrySendUseCase @Inject constructor(
+    private val conversationRepo: ConversationRepository,
+    private val sender: SmsSender,
+    private val mirror: OutgoingMessageMirror,
+    // v1.27.2 (audit de cohérence 2026-08-04) — cf. la garde de liste noire ci-dessous.
+    private val blockedRepo: BlockedNumberRepository,
+    /**
+     * E2E send gate. Default [E2eSendGate.NoOp] keeps the existing
+     * tests compiling untouched; Hilt always provides the real gate
+     * (bound in `E2eModule`).
+     */
+    private val e2eGate: E2eSendGate = E2eSendGate.NoOp,
+) {
+    suspend operator fun invoke(messageId: Long): Outcome<Unit> {
+        val msg = conversationRepo.findMessageForResend(messageId)
+            ?: return Outcome.Failure(AppError.NotFound("message"))
+        refusPrealable(msg)?.let { return Outcome.Failure(it) }
+        if (msg.errorCode == SendErrorCode.WATCHDOG_TIMEOUT) {
+            Timber.w(
+                "Retry of watchdog-timed-out message %d: previous attempt may have reached the recipient",
+                messageId,
+            )
+        }
+        // v1.26.1 (audit M8) — rétrogradation DÉLIBÉRÉE : `updateOutgoingStatus` est désormais
+        // monotone et refuserait ce retour en arrière depuis `FAILED`.
+        //
+        // v1.28.3 (F23) — et c'est précisément cette rétrogradation qui rouvrait la porte. En
+        // ramenant la ligne au bas de l'échelle monotone, elle rendait de nouveau applicable
+        // l'accusé TARDIF de la tentative précédente : un `FAILED` en retard d'une minute
+        // écrivait `3`, sommet de l'échelle, que le succès réel de cette nouvelle tentative ne
+        // pouvait plus jamais promouvoir — bulle rouge définitive sur un message reçu. La
+        // rétrogradation ouvre donc désormais une TENTATIVE numérotée, et c'est ce numéro que
+        // l'on transmet à la pile téléphonie pour que ses accusés soient reconnaissables.
+        val attempt = mirror.resetOutgoingForRetry(messageId)
+            ?: return Outcome.Failure(AppError.NotFound("message"))
+        return dispatcher(msg, messageId, attempt)
+    }
+
+    /**
+     * Les deux refus qui précèdent toute écriture, regroupés en une décision — comme
+     * `refusPrealable` dans les trois use cases d'envoi. Tous deux sont posés AVANT
+     * `resetOutgoingForRetry` : rétrograder puis refuser laisserait la ligne en `PENDING`, ni
+     * envoyée ni en échec.
+     *
+     * 1. **v1.28.3 (audit global B-1) — ce chemin ne sait renvoyer qu'un SMS**, et rien ne l'en
+     *    avertissait. La bulle rouge d'un MMS arrivait ici comme n'importe quelle autre :
+     *    `sender.send` repartait avec `msg.body` — la légende, souvent vide — par `SmsManager`,
+     *    sans la pièce jointe. Avec une légende, elle partait en SMS et la ligne passait `SENT`
+     *    sous une vignette jamais envoyée ; sans légende, `divideMessage("")` échouait sans un
+     *    mot. `SECURITY.md` le documentait depuis la v1.3.9 (« tap to retry is dead for MMS »).
+     *    Le vrai renvoi MMS demande `MmsDispatcher` et un `requestCode` porteur du numéro de
+     *    tentative comme F23 l'a fait côté SMS — un chantier à vérifier sur appareil.
+     * 2. **v1.27.2 (audit de cohérence 2026-08-04) — la liste noire garde aussi le RENVOI.** Les
+     *    trois chemins d'envoi la consultent ; ce quatrième ne le faisait pas : bloquer un
+     *    correspondant puis toucher une bulle rouge antérieure ré-émettait vers le numéro tout
+     *    juste bloqué. Inconditionnelle, comme l'est en pratique celle des trois jumeaux.
+     *    v1.28.3 (F21) — erreur TYPÉE, pour que l'écran puisse dire pourquoi rien ne repart.
+     */
+    private suspend fun refusPrealable(msg: Message): AppError? {
+        // v1.28.3 (groupes) — l'écho d'un groupe porte la liste des membres pour adresse : rien
+        // n'a jamais été envoyé à « a;b », et rien ne doit l'être.
+        if (';' in msg.address) {
+            Timber.i("Retry refused: message %d is the local copy kept in a group thread", msg.id)
+            return AppError.GroupEchoRetryUnsupported
+        }
+        if (msg.type == Message.Type.MMS) {
+            Timber.i("Retry refused: message %d is an MMS, this path only re-dispatches SMS", msg.id)
+            return AppError.MmsRetryUnsupported
+        }
+        if (blockedRepo.isBlocked(msg.address)) {
+            Timber.i("Retry refused: recipient is blocked")
+            return AppError.RecipientBlocked
+        }
+        return null
+    }
+
+    private suspend fun dispatcher(msg: Message, messageId: Long, attempt: Int): Outcome<Unit> {
+        // E2E — the mirror holds the PLAINTEXT for an encrypted message;
+        // the gate re-sends the stored ciphertext bytes (same fragment
+        // set, same id) and never falls back to plain. A plain message
+        // keeps the historical path byte-identically.
+        val result = if (msg.encrypted) {
+            e2eGate.sendEncrypted(
+                localMessageId = messageId,
+                address = msg.address,
+                body = msg.body,
+                date = msg.date,
+                subId = msg.subId,
+                requestDeliveryReport = false,
+                attempt = attempt,
+            )
+        } else {
+            sender.send(messageId, msg.address, msg.body, msg.subId, attempt = attempt)
+        }
+        return when (result) {
+            is Outcome.Success -> Outcome.Success(Unit)
+            is Outcome.Failure -> {
+                // `attempt` explicite : cet échec-ci est bien celui de la tentative qu'on vient
+                // d'ouvrir, et il ne doit pas s'appliquer si une relance l'a déjà remplacée.
+                mirror.updateOutgoingStatus(
+                    messageId,
+                    MessageStatus.FAILED,
+                    errorCode = SendErrorCode.SYNCHRONOUS,
+                    attempt = attempt,
+                )
+                result
+            }
+        }
+    }
+}

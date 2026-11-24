@@ -1,0 +1,211 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.data.repository
+
+import com.relay.sms.core.result.AppError
+import com.relay.sms.core.result.Outcome
+import com.relay.sms.data.local.db.ScheduledAttachmentCodec
+import com.relay.sms.data.local.db.dao.ScheduledMessageDao
+import com.relay.sms.data.local.db.entity.ScheduledMessageEntity
+import com.relay.sms.data.local.db.mapper.toDomain
+import com.relay.sms.di.IoDispatcher
+import com.relay.sms.domain.model.PhoneAddress
+import com.relay.sms.domain.model.PhoneAddress.Companion.toCsv
+import com.relay.sms.domain.model.ScheduledMessage
+import com.relay.sms.domain.model.ScheduledState
+import com.relay.sms.domain.repository.ScheduledMessageRepository
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.withContext
+import timber.log.Timber
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class ScheduledMessageRepositoryImpl @Inject constructor(
+    private val dao: ScheduledMessageDao,
+    // v1.28.3 (F02) — la visibilité du coffre s'applique enfin ici aussi. Les deux mêmes
+    // collaborateurs que `ConversationRepositoryImpl`, pour la même règle : ce qui est protégé
+    // ne doit pas se lire par une autre porte que celle qui demande le second facteur.
+    private val appLock: com.relay.sms.security.AppLockManager,
+    private val vaultSession: com.relay.sms.security.VaultSessionState,
+    // v1.28.9 (septième note d'Andrew, constat 1) — les messages produits par l'envoi citent les
+    // mêmes fichiers que la ligne programmée : on ne les efface plus sans compter.
+    private val fichiers: FichiersDePiecesJointes,
+    @IoDispatcher private val io: CoroutineDispatcher,
+) : ScheduledMessageRepository {
+
+    override fun observePending(): Flow<List<ScheduledMessage>> =
+        masquerLeCoffre(dao.observePending())
+
+    override fun observeFailed(): Flow<List<ScheduledMessage>> =
+        masquerLeCoffre(dao.observeFailed())
+
+    /**
+     * v1.28.3 (F20) — délibérément **non masqué**, contrairement aux deux flux ci-dessus.
+     *
+     * Rien de ce que rend cette fonction n'est affiché : elle sert au filet de replanification
+     * du démarrage, qui a besoin de savoir ce qui doit partir, pas de ce que l'utilisateur a le
+     * droit de lire. Masquer ici reviendrait à ne plus jamais rattraper un envoi programmé
+     * depuis le coffre — le second facteur n'ayant, au boot, évidemment pas été donné.
+     */
+    override suspend fun allUnsettled(): List<ScheduledMessage> = withContext(io) {
+        dao.allUnsettled().map { it.toDomain() }
+    }
+
+    /**
+     * v1.28.3 (F02) — applique au flux des envois programmés la politique de visibilité du
+     * coffre, mot pour mot celle de `ConversationRepositoryImpl.observeOne`.
+     *
+     * Un message programmé porte son corps et ses destinataires en clair. L'écran « Messages
+     * programmés » les affichait sans jamais demander le second facteur, et sans distinguer la
+     * session leurre — alors que la conversation d'où ils viennent, elle, reste masquée. Le
+     * contenu protégé se lisait donc par une porte dérobée.
+     *
+     * La règle est celle des conversations, et elle doit le rester : masqué tant que le coffre
+     * n'a pas été ouvert DANS CETTE SESSION, et masqué en session leurre quoi qu'il arrive.
+     * `vaultSession.unlocked` est un `StateFlow` pour que la liste se révèle au moment même où
+     * l'utilisateur ouvre son coffre, et se referme quand `AutoLockObserver` le referme.
+     */
+    private fun masquerLeCoffre(
+        source: Flow<List<com.relay.sms.data.local.db.dao.ScheduledWithVaultFlag>>,
+    ): Flow<List<ScheduledMessage>> =
+        kotlinx.coroutines.flow.combine(
+            source,
+            appLock.state,
+            vaultSession.unlocked,
+        ) { lignes, lockState, coffreOuvert ->
+            val leurre = lockState is com.relay.sms.security.AppLockManager.LockState.PanicDecoy
+            lignes
+                .filterNot { it.inVault && (leurre || !coffreOuvert) }
+                .map { it.message.toDomain() }
+        }.flowOn(io)
+
+    override suspend fun schedule(
+        conversationId: Long?,
+        addresses: List<PhoneAddress>,
+        body: String,
+        scheduledAt: Long,
+        subId: Int?,
+        attachments: List<com.relay.sms.domain.usecase.SendMediaMmsUseCase.AttachmentPayload>,
+        clientMessageId: String?,
+    ): Outcome<Long> = withContext(io) {
+        // v1.26.0 — un corps vide est desormais valide s'il y a une piece jointe : un MMS ne
+        // portant qu'une image, sans legende, est un envoi parfaitement normal. La regle
+        // d'origine (`body.isBlank()` rejete) datait d'un planificateur qui ne savait envoyer
+        // que du texte.
+        if (addresses.isEmpty() || (body.isBlank() && attachments.isEmpty())) {
+            return@withContext Outcome.Failure(AppError.Validation("addresses or payload invalid"))
+        }
+        val now = System.currentTimeMillis()
+        if (scheduledAt <= now) {
+            return@withContext Outcome.Failure(AppError.Validation("scheduledAt must be in the future"))
+        }
+        val id = dao.upsert(
+            ScheduledMessageEntity(
+                conversationId = conversationId,
+                addressesCsv = addresses.toCsv(),
+                body = body,
+                scheduledAt = scheduledAt,
+                subId = subId,
+                attachmentsJson = ScheduledAttachmentCodec.encode(attachments),
+                state = ScheduledState.PENDING,
+                createdAt = now,
+                clientMessageId = clientMessageId,
+            ),
+        )
+        Outcome.Success(id)
+    }
+
+    override suspend fun findByClientMessageId(clientMessageId: String): ScheduledMessage? =
+        withContext(io) {
+            dao.findByClientMessageId(clientMessageId)?.toDomain()
+        }
+
+    // Client mode C3 — one scheduled row by id (the cancel/retry wire branches need its client key).
+    override suspend fun findById(id: Long): ScheduledMessage? =
+        withContext(io) {
+            dao.findById(id)?.toDomain()
+        }
+
+    override suspend fun cancel(id: Long): Outcome<Boolean> = withContext(io) {
+        // v1.26.1 (audit B2) — transition CONDITIONNELLE : on n'annule que si l'envoi est
+        // encore `PENDING`. Un `setState` inconditionnel ecrasait l'etat d'un envoi deja
+        // revendique par le worker, et l'appelant supprimait ensuite ses fichiers pendant que
+        // le PDU etait en cours de construction.
+        Outcome.Success(dao.cancelIfPending(id) == 1)
+    }
+    override suspend fun markSent(id: Long) = withContext(io) { dao.setState(id, ScheduledState.SENT) }
+    override suspend fun markFailed(id: Long) = withContext(io) { dao.setState(id, ScheduledState.FAILED) }
+    override suspend fun rearmPending(id: Long, scheduledAt: Long) = withContext(io) {
+        dao.rearmPending(id, scheduledAt)
+    }
+    override suspend fun delete(id: Long) = withContext(io) { dao.delete(id) }
+
+    /**
+     * v1.26.0 — efface la ligne ET ses pieces jointes durables.
+     *
+     * Ordre volontaire : les fichiers d'abord, la ligne ensuite. Si le processus meurt entre les
+     * deux, il reste une ligne dont les fichiers ont disparu — l'envoi echoue proprement a la
+     * validation et l'utilisateur le voit dans « Echecs ». L'ordre inverse laisserait des fichiers
+     * orphelins que plus rien ne reference, donc que plus rien ne pourra jamais supprimer.
+     *
+     * Chaque suppression est isolee : un fichier deja disparu ou verrouille ne doit pas empecher
+     * d'effacer la ligne.
+     *
+     * v1.28.9 (septième note d'Andrew, constat 1) — les fichiers ne partent que si plus rien ne
+     * les cite. Les messages que cet envoi a déjà produits — tentatives en échec, envoi partiel —
+     * citent les MÊMES fichiers : les effacer vidait leurs bulles. Et une ligne illisible n'est
+     * pas une ligne sans pièce jointe : on n'efface alors rien, la ligne reste à l'écran et la
+     * suppression peut être retentée, au lieu d'emporter la seule référence à ses fichiers.
+     */
+    override suspend fun deleteWithAttachments(id: Long) = withContext(io) {
+        val entity = com.relay.sms.core.result.runCatchingCancellable { dao.findById(id) }
+            .getOrElse {
+                Timber.w(it, "Scheduled: lecture de #%d echouee, rien n'est supprime", id)
+                return@withContext
+            }
+        if (entity != null) {
+            val echecs = fichiers.effacerSiPlusCites(
+                cheminsDesPieces(entity),
+                FichiersDePiecesJointes.Exclusion.EnvoiProgramme(id),
+            )
+            if (echecs > 0) Timber.w("Scheduled: %d piece(s) jointe(s) de #%d non effacee(s)", echecs, id)
+        }
+        dao.delete(id)
+    }
+
+    /**
+     * v1.26.0 — supprime les fichiers ET vide la colonne, pour que la ligne conservee ne pointe
+     * plus vers des chemins morts. Voir le contrat pour la raison d'etre de ce menage.
+     *
+     * v1.28.9 — mêmes deux règles que [deleteWithAttachments]. La colonne n'est vidée que si aucun
+     * fichier n'a résisté : la vider quand même effacerait la dernière citation d'un fichier
+     * resté sur le disque, que plus rien ne permettrait de retrouver.
+     */
+    override suspend fun clearAttachments(id: Long) = withContext(io) {
+        val entity = com.relay.sms.core.result.runCatchingCancellable { dao.findById(id) }
+            .getOrNull() ?: return@withContext
+        val echecs = fichiers.effacerSiPlusCites(
+            cheminsDesPieces(entity),
+            FichiersDePiecesJointes.Exclusion.EnvoiProgramme(id),
+        )
+        if (echecs > 0) {
+            Timber.w("Scheduled: %d piece(s) jointe(s) de #%d non effacee(s), colonne conservee", echecs, id)
+            return@withContext
+        }
+        if (entity.attachmentsJson != null) {
+            com.relay.sms.core.result.runCatchingCancellable { dao.upsert(entity.copy(attachmentsJson = null)) }
+                .onFailure { Timber.w(it, "Scheduled: purge attachmentsJson #%d echouee", id) }
+        }
+    }
+
+    private fun cheminsDesPieces(entity: ScheduledMessageEntity): List<String> =
+        ScheduledAttachmentCodec.decode(entity.attachmentsJson).map { it.file.absolutePath }
+}

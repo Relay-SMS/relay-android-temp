@@ -1,0 +1,127 @@
+# Datenschutzerklärung — Relay
+
+_Zuletzt aktualisiert: 13. November 2026_ · 🇬🇧 [English](PRIVACY.md) · 🇫🇷 [Français](PRIVACY.fr.md) · 🇮🇹 [Italiano](PRIVACY.it.md) · 🇪🇸 [Español](PRIVACY.es.md)
+
+> **Übersetzung.** Diese deutsche Fassung ist eine Übersetzung, die zur Information bereitgestellt
+> wird. Verbindlich sind die [englische](PRIVACY.md) und die [französische](PRIVACY.fr.md) Fassung
+> dieser Erklärung; bei Abweichungen gehen diese beiden Fassungen vor.
+
+Relay (`com.relay.sms`) wird von **Relay Messaging** herausgegeben. Siehe auch die [Nutzungsbedingungen](TERMS.de.md).
+
+## Was wir erheben
+
+**Nichts.** Relay erhebt, übermittelt und aggregiert keinerlei personenbezogene Daten — mit
+zwei Ausnahmen, beide von Ihnen ausgelöst: Wenn Sie nach einem GIF suchen, werden die eingegebenen
+Wörter an Klipy gesendet, damit es passende GIFs zurückgibt, und wenn eine Nachricht einen Link
+enthält, ruft Relay diese Seite einmal ab, um eine Vorschau anzuzeigen (siehe
+[Netzwerk](#netzwerk) unten). Relay behält aus diesen Vorgängen nichts außer dem GIF, das Sie
+senden, und der Vorschau, die es Ihnen zeigt. Das Verknüpfen eines Computers ändert daran nichts:
+Telefon und Computer sprechen direkt miteinander über Ihr lokales WLAN — kein Relay-Server, keine
+Cloud, nichts verlässt das Netzwerk.
+
+Kein Analyse-SDK, kein Absturzmelder, kein Telemetrie-Endpunkt, keine Werbe-ID, keine
+Fingerprinting-Bibliothek. Die Binärdatei enthält keinen Tracking-Code von Dritten.
+
+## Was auf Ihrem Gerät bleibt
+
+- Ihre SMS und MMS, in einer verschlüsselten Room-Datenbank (SQLCipher), geschützt durch einen
+  Schlüssel, der vom AndroidKeyStore umhüllt wird.
+- Die Metadaten der Unterhaltungen (Entwürfe, Anheften, Archivieren, Tresor, Präferenzen pro
+  Unterhaltung).
+- Die Einstellungen, in Android DataStore Preferences.
+- Ein gesalzener PBKDF2-HMAC-SHA512-Hash Ihrer PIN (die PIN wird nie im Klartext gespeichert).
+- Etwaige MMS-Anhänge, in `<files>/mms_attachments/`.
+- Etwaige lokal erzeugte PDF-Dateien von Unterhaltungen, in `<files>/exports/`.
+- Sofern Sie sie einrichten, Ihre Notfallkontakte sowie die Einstellungen des Notfallmodus und von
+  Safety call.
+- Wenn Sie ein Gerät verknüpfen, seinen Eintrag: Geräte-ID, Art (Computer, Telefon oder Tablet),
+  Anzeigename, öffentlicher Schlüssel und Verknüpfungsdatum. Der passende private Schlüssel
+  verlässt das verknüpfte Gerät nie, und der Eintrag wird gelöscht, wenn Sie das Gerät entfernen.
+  Das Telefon behält außerdem seine eigene Hub-ID sowie das TLS-Zertifikat und den privaten
+  Schlüssel, die der lokale Server verknüpften Geräten vorlegt (der private Schlüssel liegt im
+  AndroidKeyStore).
+
+Wie jede Standard-SMS-App schreibt Relay Ihre Nachrichten außerdem in den Nachrichtenspeicher des
+Android-Systems, der sie unabhängig von der App aufbewahrt.
+
+Die Android-Systemsicherung ist **deaktiviert**: Ohne Ihre ausdrückliche Zustimmung werden diese
+Daten weder auf Google Drive übertragen noch bei einer Geräteübertragung mitgenommen.
+
+## Netzwerk
+
+Relay besitzt die Berechtigung `INTERNET` für drei Zwecke. (1) GIF-Suche: Wenn Sie den
+GIF-Tab öffnen und eine Suche eingeben, werden die eingegebenen Wörter an Klipy (`api.klipy.com`)
+gesendet, das passende GIFs zurückgibt; das Antippen eines GIFs lädt es von Klipy herunter, und
+die Vorschaubilder im Raster stammen ebenfalls von Klipy. Klipy sieht Ihre Suchwörter und Ihre
+IP-Adresse, wie jeder Dienst, den Sie kontaktieren. (2) Link-Vorschauen: Wenn eine Nachricht eine
+URL enthält, ruft Relay diese Seite einmal auf dem Gerät ab und liest ihren Open-Graph-Titel und
+ihr Bild nur zur Anzeige — die verlinkte Seite sieht die Anfrage und Ihre IP-Adresse, wie bei
+jedem Besuch; das Vorschaubild wird nie als Anhang gesendet. (3) Verknüpfte Geräte: Das Telefon
+betreibt einen TLS-Server im lokalen Netzwerk (Port 47831, angekündigt per mDNS als
+`_relay._tcp.`), damit ein von Ihnen verknüpfter Computer es finden und sich verbinden kann. Der
+Server akzeptiert nur Geräte, deren öffentlichen Schlüssel Sie durch Scannen ihres Kopplungscodes
+gespeichert haben, und nur nachdem sie bewiesen haben, dass sie den passenden privaten Schlüssel
+besitzen; der Datenverkehr verlässt Ihr WLAN nie, und es ist kein Relay-Server und kein
+Cloud-Konto beteiligt. Der Server lässt sich in Einstellungen → Verknüpfte Geräte abschalten;
+die App arbeitet dann vollständig eigenständig. Das ist die einzige Netzwerknutzung der App:
+keine Update-Prüfung, keine Fernkonfiguration, kein Analyse-Ping, keine Absturzmeldung. Wenn die
+Berechtigung blockiert ist, funktioniert die App weiterhin — die GIF-Suche liefert dann einfach
+nichts, Links zeigen keine Vorschau, und kein Computer kann sich verknüpfen. (Die Berechtigung
+wurde in 1.28.13 entfernt, als die App noch keine Netzwerkanfragen stellte; sie kam für die
+GIF-Suche zurück, dann für Link-Vorschauen und jetzt für verknüpfte Geräte.)
+
+MMS werden über den MMS-Dienst von Android übertragen, der das MMSC Ihres Mobilfunkanbieters
+kontaktiert, wenn Sie eine MMS senden oder empfangen. MMS haben die Berechtigung `INTERNET` nie
+gebraucht und nutzen sie auch weiterhin nicht.
+
+Die Nachrichten, die Sie senden, laufen wie bei jeder SMS-App über das Netz Ihres
+Mobilfunkanbieters. Der Entwickler erhält sie nie.
+
+## Notfallfunktionen (inaktiv, solange Sie sie nicht aktivieren)
+
+- **Notfallmodus.** Wenn Sie die Notruf-Schaltfläche drei Sekunden lang gedrückt halten, sendet SMS
+  Tech eine SMS an die Notfallkontakte, die **Sie** ausgewählt haben. Wenn Sie die
+  Standortberechtigung erteilt haben, genau oder ungefähr, und „GPS in die Notfall-SMS aufnehmen“
+  eingeschaltet gelassen haben (in diesem Modus standardmäßig aktiviert), fragt die App Android in
+  diesem Moment nach **einem** Standort: Sie übernimmt einen Standort, der weniger als fünf Minuten
+  alt ist, sofern Android einen hat; andernfalls wartet sie höchstens acht Sekunden auf eine neue
+  Standortbestimmung, und gelingt das nicht, übernimmt sie den letzten bekannten Standort, sofern er
+  weniger als dreißig Minuten alt ist. Keine Ortung im Hintergrund und keine fortlaufende Ortung. Der
+  Standort wird der SMS als Link `https://maps.google.com/?q=…` hinzugefügt; ist er nur ungefähr,
+  verschiebt Android ihn um etwa zwei Kilometer, und die SMS weist darauf mit „(+/-N km)“ nach dem
+  Link hin. Öffnet ein Kontakt diesen Link, ist es sein Browser, der Google Maps kontaktiert; die App
+  selbst sendet nichts an Google. Wird der Standort verweigert oder ist er nicht verfügbar, weist die
+  SMS darauf hin und wird ohne Koordinaten gesendet.
+- **Safety call.** Wenn Sie die App nicht vor Ablauf der von Ihnen festgelegten Frist verwenden,
+  sendet Relay eine Kontroll-SMS an dieselben Kontakte. Sie enthält keinen Standort.
+- **Notruf.** Die Anrufkacheln der Notrufseite bieten die Notrufnummern des Landes an, in dem Ihr
+  Telefon im Netz registriert ist (die 112 ist immer dabei). Wenn Sie eine davon antippen, fragt die
+  App nach der Anrufberechtigung (`CALL_PHONE`) und führt den Anruf, wenn Sie sie erteilen, selbst
+  aus; wenn Sie sie verweigern, öffnet sie die Telefon-App mit bereits eingetragener Nummer, wofür
+  keine Berechtigung nötig ist. Die Verknüpfung auf dem Sperrbildschirm öffnet immer die Telefon-App.
+- Keine dieser Funktionen läuft im Tarnmodus, der durch die Tarn-PIN geöffnet wird.
+- Diese Nachrichten sind gewöhnliche SMS: Ihr Mobilfunkanbieter kann sie gemäß Ihrem Tarif
+  berechnen.
+
+## Berechtigungen
+
+Die Begründung jeder Berechtigung finden Sie in [PERMISSIONS.md](PERMISSIONS.md).
+
+## Ihre Rechte
+
+Da keine personenbezogenen Daten Ihr Gerät verlassen, gibt es bei keinem entfernten System etwas
+einzusehen, zu berichtigen oder zu löschen. So löschen Sie Ihre Daten in Relay: Deinstallieren
+Sie die App (Android löscht ihre Daten automatisch) oder verwenden Sie **Einstellungen → Alle meine
+Daten löschen**; dies löscht die verschlüsselte Datenbank, die Keystore-Aliase, die
+zwischengespeicherten Anhänge und die exportierten PDF-Dateien. Die im Nachrichtenspeicher des
+Android-Systems aufbewahrten Nachrichten verwalten Sie über Android oder über jede SMS-App.
+
+## Kontakt
+
+Bei allen Fragen: **support@getrelaysms.com**.
+
+Der Herausgeber erhält keine Daten von der App. Ihn erreicht nur eine E-Mail, die Sie ihm schreiben
+möchten: Sie dient nur dazu, Ihnen zu antworten, wird für die Dauer des Austauschs aufbewahrt und
+dann gelöscht. Sie können unter derselben Adresse Auskunft darüber oder ihre Löschung verlangen und
+sich bei der CNIL, der französischen Datenschutzbehörde (www.cnil.fr), beschweren, wenn Sie Ihre
+Rechte nicht gewahrt sehen.

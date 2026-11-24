@@ -1,0 +1,120 @@
+# Politique de confidentialité — Relay
+
+_Dernière mise à jour : 13 novembre 2026_ · 🇬🇧 [English](PRIVACY.md) · 🇩🇪 [Deutsch](PRIVACY.de.md) · 🇮🇹 [Italiano](PRIVACY.it.md) · 🇪🇸 [Español](PRIVACY.es.md)
+
+> **Versions de référence.** Les versions française et anglaise de cette politique font foi. Les
+> traductions allemande, italienne et espagnole sont fournies à titre d'information ; en cas de
+> divergence, ce sont les versions française et anglaise qui prévalent.
+
+Relay (`com.relay.sms`) est éditée par **Relay Messaging**. Voir aussi les [conditions d'utilisation](TERMS.fr.md).
+
+## Ce que nous collectons
+
+**Rien.** Relay ne collecte, ne transmet ni n'agrège aucune donnée personnelle — avec deux
+exceptions, toutes deux à votre initiative : lorsque vous recherchez un GIF, les mots tapés sont
+envoyés à Klipy pour qu'il renvoie des GIF correspondants, et lorsqu'un message contient un lien,
+Relay récupère cette page une fois pour afficher une carte d'aperçu (voir
+[Réseau](#réseau) ci-dessous). Relay ne conserve rien de ces échanges au-delà du GIF que vous
+choisissez d'envoyer et de l'aperçu qu'il vous montre. Lier un ordinateur ne change rien à cela :
+le téléphone et l'ordinateur se parlent directement sur votre réseau Wi-Fi local — aucun serveur
+Relay, aucun cloud, rien ne quitte le réseau.
+
+Aucun SDK d'analytique, aucun rapporteur de crash, aucun endpoint de télémétrie, aucun identifiant
+publicitaire, aucune bibliothèque de fingerprinting. Le binaire ne contient aucun code de pistage
+tiers.
+
+## Ce qui reste sur votre appareil
+
+- Vos SMS et MMS, dans une base Room chiffrée (SQLCipher) protégée par une clé enrobée par
+  l'AndroidKeyStore.
+- Les métadonnées de conversation (brouillons, épinglage, archivage, coffre-fort, préférences par
+  conversation).
+- Les réglages, dans Android DataStore Preferences.
+- Un hash salé PBKDF2-HMAC-SHA512 de votre code PIN (le PIN n'est jamais stocké en clair).
+- Les pièces jointes MMS éventuelles, dans `<files>/mms_attachments/`.
+- Les éventuels PDF de conversation générés localement, dans `<files>/exports/`.
+- Si vous les configurez, vos contacts d'urgence et les réglages du mode urgence et du Safety call.
+- Si vous liez un appareil, sa fiche : l'identifiant de l'appareil, son type (ordinateur,
+  téléphone ou tablette), son nom affiché, sa clé publique et sa date de liaison. La clé privée
+  correspondante ne quitte jamais l'appareil lié, et la fiche est supprimée quand vous retirez
+  l'appareil. Le téléphone conserve aussi son propre identifiant de hub ainsi que le certificat
+  TLS et la clé privée que le serveur local présente aux appareils liés (la clé privée vit dans
+  l'AndroidKeyStore).
+
+Comme toute application de SMS par défaut, Relay écrit aussi vos messages dans la messagerie
+système d'Android, qui les conserve indépendamment de l'application.
+
+La sauvegarde Android système est **désactivée** : ces données ne partent ni sur Google Drive ni
+lors d'un transfert d'appareil sans votre accord explicite.
+
+## Réseau
+
+Relay détient la permission `INTERNET` pour trois usages. (1) Recherche de GIF : lorsque vous
+ouvrez l'onglet GIF et tapez une recherche, les mots tapés sont envoyés à Klipy
+(`api.klipy.com`), qui renvoie des GIF correspondants ; en toucher un le télécharge depuis Klipy,
+et les vignettes de la grille viennent aussi de Klipy. Klipy voit vos mots de recherche et votre
+adresse IP, comme tout service contacté. (2) Aperçus de liens : lorsqu'un message contient une
+URL, Relay récupère cette page une fois, sur l'appareil, et lit son titre et son image Open Graph
+pour l'affichage uniquement — le site lié voit la requête et votre adresse IP, comme lors de toute
+visite ; l'image d'aperçu n'est jamais envoyée en pièce jointe. (3) Appareils liés : le téléphone
+fait tourner un serveur TLS sur le réseau local (port 47831, annoncé via mDNS sous
+`_relay._tcp.`) pour qu'un ordinateur que vous avez lié puisse le trouver et se connecter. Le
+serveur n'accepte que les appareils dont vous avez enregistré la clé publique en scannant leur
+code d'appariement, et seulement après qu'ils ont prouvé détenir la clé privée correspondante ;
+le trafic ne quitte jamais votre réseau Wi-Fi, et aucun serveur Relay ni aucun compte cloud
+n'intervient. Le serveur se désactive dans Réglages → Appareils liés ; l'application fonctionne
+alors pleinement seule. C'est la seule utilisation réseau de l'application : aucune vérification
+de mise à jour, aucune configuration distante, aucun ping analytique, aucun rapport de plantage.
+Si la permission est bloquée, l'application fonctionne toujours — la recherche de GIF ne renvoie
+simplement rien, les liens n'affichent pas d'aperçu, et aucun ordinateur ne peut se lier. (La
+permission avait été retirée en 1.28.13, lorsque l'application n'émettait aucune requête réseau ;
+elle est revenue pour la recherche de GIF, puis pour les aperçus de liens, et maintenant pour les
+appareils liés.)
+
+Les messages que vous envoyez passent par le réseau de votre opérateur, comme avec toute application
+de SMS. Le développeur ne les reçoit jamais.
+
+## Fonctions d'urgence (inactives tant que vous ne les activez pas)
+
+- **Mode urgence.** Quand vous maintenez le bouton d'urgence trois secondes, Relay envoie un SMS
+  aux contacts d'urgence que **vous** avez choisis. Si vous avez accordé la permission de
+  localisation, exacte ou approximative, et laissé « inclure ma position » (activé par défaut dans
+  ce mode), l'application demande à Android **une** position à cet instant : elle reprend une
+  position datant de moins de cinq minutes si Android en a une, sinon elle attend un nouveau relevé
+  pendant huit secondes au plus, et à défaut reprend la dernière position connue si elle date de
+  moins de trente minutes. Aucun suivi en arrière-plan ni continu. La position est ajoutée au SMS
+  sous forme de lien `https://maps.google.com/?q=…` ; quand elle n'est qu'approximative, Android la
+  décale d'environ deux kilomètres et le SMS l'indique par « (+/-N km) » après le lien. Si un contact
+  ouvre ce lien, c'est son navigateur qui contacte Google Maps ; l'application, elle, n'envoie rien
+  à Google. Si la position est refusée ou indisponible, le SMS le dit et part sans coordonnées.
+- **Safety call.** Si vous n'utilisez pas l'application avant le délai que vous avez fixé, Relay
+  envoie un SMS de vérification aux mêmes contacts. Il ne contient aucune position.
+- **Appel d'urgence.** Les tuiles d'appel de l'écran Urgence proposent les numéros d'urgence du pays
+  où votre téléphone est enregistré sur le réseau (le 112 figure toujours). Quand vous en touchez une,
+  l'application demande la permission d'appel (`CALL_PHONE`) et, si vous l'accordez, passe l'appel
+  elle-même ; si vous la refusez, elle ouvre le composeur pré-rempli, qui ne demande aucune
+  permission. Le raccourci de l'écran verrouillé ouvre toujours le composeur.
+- Aucune de ces fonctions ne s'exécute dans la session leurre ouverte par le code panique.
+- Ces messages sont des SMS ordinaires : votre opérateur peut les facturer selon votre forfait.
+
+## Permissions
+
+Voir [PERMISSIONS.md](PERMISSIONS.md) pour la justification de chaque permission.
+
+## Vos droits
+
+Aucune donnée personnelle ne quittant votre appareil, il n'y a rien à consulter, rectifier ou
+supprimer auprès d'un système distant. Pour effacer vos données dans Relay : désinstallez
+l'application (Android purge ses données automatiquement) ou utilisez **Réglages → Supprimer
+toutes mes données**, qui efface la base chiffrée, les alias Keystore, les pièces jointes en
+cache et les PDF exportés. Les messages conservés par la messagerie système d'Android se gèrent
+depuis Android ou depuis toute application de SMS.
+
+## Contact
+
+Pour toute question : **support@getrelaysms.com**.
+
+L'éditeur ne reçoit aucune donnée de l'application. Seul un e-mail que vous choisissez de lui écrire
+lui parvient : il sert uniquement à vous répondre, il est gardé le temps de l'échange, puis effacé.
+Vous pouvez en demander l'accès ou l'effacement à la même adresse, et saisir la CNIL (www.cnil.fr)
+si vous estimez que vos droits ne sont pas respectés.

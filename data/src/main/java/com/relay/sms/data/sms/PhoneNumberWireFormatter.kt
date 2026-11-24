@@ -1,0 +1,121 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.data.sms
+
+import android.content.Context
+import android.os.Build
+import android.telephony.PhoneNumberUtils
+import android.telephony.SubscriptionManager
+import android.telephony.TelephonyManager
+import com.relay.sms.core.ext.WireAddress
+import com.relay.sms.data.local.datastore.SettingsRepository
+import dagger.hilt.android.qualifiers.ApplicationContext
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Single choke point that turns a recipient's stored address into the **E.164 wire form** just
+ * before it is handed to the telephony stack ([SmsSenderImpl], [com.relay.sms.data.mms.MmsSender]).
+ *
+ * Why it exists: an SMS/MMS sent from a **foreign SIM** with a destination in national form (a
+ * Luxembourg SIM texting a French `06…` number) is not routable — the network needs the
+ * international `+33…` form, otherwise the recipient never gets the message. Reference SMS apps
+ * (Google Messages) all normalise the destination to E.164 before sending.
+ *
+ * Scope is intentionally minimal: **only the wire address changes**. The Room mirror and the
+ * `content://sms` / `content://mms` provider rows keep the user's original raw string, so
+ * conversation threading, contact display and history are untouched — no regression on the
+ * common domestic case (a French SIM sending `06…` still works, and is now additionally
+ * hardened to `+33…`).
+ *
+ * The region defaults to the **SIM country** of the target subscription (falling back to the
+ * network country). When the region can't be determined, or the number is a short code /
+ * alphanumeric sender / not valid for that region, the raw string is returned unchanged — the
+ * pure decision logic lives in [WireAddress].
+ */
+@Singleton
+class PhoneNumberWireFormatter @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val settings: SettingsRepository,
+) {
+
+    /**
+     * @param raw the recipient address as stored/displayed (national or international).
+     * @param subId the subscription the message is dispatched on (multi-SIM aware); null uses the
+     *   device default subscription.
+     * @return the E.164 form when it can be derived, otherwise [raw] verbatim.
+     */
+    fun toWireFormat(raw: String, subId: Int?): String =
+        WireAddress.toE164OrRaw(raw, resolveRegion(subId)) { number, region ->
+            PhoneNumberUtils.formatNumberToE164(number, region)
+        }
+
+    /**
+     * v1.22.x — expose la région par défaut résolue (réglage « Indicatif pays par défaut » sinon
+     * pays de la SIM par défaut). Permet à un consommateur qui normalise plusieurs numéros en lot
+     * (ex. la dédup des conversations du même numéro) de résoudre la région **une seule fois** au
+     * lieu d'un binder `simCountryIso` par numéro. `subId = null` = souscription par défaut.
+     */
+    fun defaultRegionIso(): String? = resolveRegion(null)
+
+    /**
+     * 🔴 v1.27.2 (audit Codex final du 2026-08-05, F-01) — la meme region, mais **apres la barriere
+     * d'hydratation**.
+     *
+     * [defaultRegionIso] lit `settings.state.value`, dont la valeur INITIALE est la configuration
+     * par defaut : l'override « Indicatif pays par defaut » y vaut `null` tant que DataStore n'a
+     * pas repondu. Sur un chemin reveille par le systeme — import a froid, worker — la region
+     * retombait donc silencieusement sur celle de la SIM, et une SIM etrangere canonicalisait les
+     * numeros nationaux avec le mauvais pays.
+     *
+     * C'est le meme piege que celui qui rendait le Safety call muet, et le depot le documente
+     * lui-meme : tout chemin reveille par le systeme doit passer par `hydratedOrNull()`.
+     *
+     * Reservee aux decisions d'identite, qui sont suspendables. Le chemin d'ENVOI garde
+     * [defaultRegionIso] : il est appele depuis un contexte deja hydrate, et le rendre suspendable
+     * n'apporterait rien.
+     */
+    suspend fun hydratedDefaultRegionIso(): String? {
+        // v1.28.5 — une annulation remonte : figer un instantane d'identite sur la region de la
+        // SIM au lieu de l'override rouvrirait F-01 par un autre chemin.
+        val hydrated = com.relay.sms.core.result.runCatchingCancellable { settings.hydratedOrNull() }.getOrNull()
+        return hydrated?.sending?.defaultRegionIso?.takeIf { it.isNotBlank() }
+            ?: simRegionIso(null)
+    }
+
+    /**
+     * The default region for national numbers: the user's explicit override (Settings → Envoi →
+     * "Indicatif pays par défaut") when set, otherwise the SIM country. The override is what lets
+     * someone on a foreign SIM keep texting national numbers of another country (e.g. a Luxembourg
+     * SIM writing French `06…` with the override set to `FR`). `state.value` is the eagerly-hydrated
+     * hot snapshot — zero-I/O on the send path.
+     */
+    private fun resolveRegion(subId: Int?): String? =
+        settings.state.value.sending.defaultRegionIso?.takeIf { it.isNotBlank() }
+            ?: simRegionIso(subId)
+
+    /**
+     * ISO country of the SIM for [subId] (uppercased downstream). Falls back to the network
+     * country when the SIM ISO is blank (no SIM record yet, some MVNOs). Every access is wrapped
+     * so a telephony read that throws (rare OEM quirk, airplane mode transitions) can never break
+     * an outgoing send.
+     */
+    private fun simRegionIso(subId: Int?): String? = runCatching {
+        val base = context.getSystemService(TelephonyManager::class.java) ?: return null
+        val tm = if (
+            subId != null &&
+            subId != SubscriptionManager.INVALID_SUBSCRIPTION_ID &&
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.N
+        ) {
+            runCatching { base.createForSubscriptionId(subId) }.getOrNull() ?: base
+        } else {
+            base
+        }
+        tm.simCountryIso?.takeIf { it.isNotBlank() }
+            ?: tm.networkCountryIso?.takeIf { it.isNotBlank() }
+    }.getOrNull()
+}

@@ -1,0 +1,799 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.data.repository
+
+import android.content.Context
+import androidx.room.Room
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
+import com.google.common.truth.Truth.assertThat
+import com.relay.sms.data.local.db.AppDatabase
+import com.relay.sms.data.local.db.entity.ConversationEntity
+import com.relay.sms.data.local.db.entity.MessageEntity
+import com.relay.sms.data.sms.SystemCopyEraser
+import com.relay.sms.domain.model.MessageDirection
+import com.relay.sms.domain.model.MessageStatus
+import com.relay.sms.domain.model.MessageType
+import kotlinx.coroutines.runBlocking
+import org.junit.After
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+
+/**
+ * v1.28.1 (revue externe GitLab !38458, 3e passe) — **la porte du coffre ne s'ouvre pas au second
+ * essai**.
+ *
+ * # Ce que le testeur a reproduit sur emulateur, et que ce test fige
+ *
+ * Andrew Pozdnakov a injecte un refus d'ecriture cote fournisseur, puis a choisi deux fois
+ * « PIN du coffre oublie → Vider et retirer ». Le premier essai refusait correctement de retirer
+ * le PIN — mais avait **deja efface la ligne Room**. Au second essai `idsInVault()` etait vide,
+ * `VaultPurgeResult` valait `0/0/0`, et `isComplete` etait vrai **par vacuite** : le PIN partait,
+ * la copie systeme survivait, et la resynchronisation suivante la ressuscitait en clair.
+ *
+ * La v1.27.11 avait rendu la purge HONNETE — elle disait ce qui avait echoue. Elle ne l'avait pas
+ * rendue REPRENABLE : rendre compte d'un echec ne sert a rien si l'on detruit au passage l'etat
+ * dont la reprise a besoin.
+ *
+ * # L'injection de faute est explicite, et c'est tout l'interet de l'extraction
+ *
+ * [RefusSystematique] refuse toute suppression systeme. Aucun role SMS, aucun vrai message, aucun
+ * comportement d'appareil dans l'equation : le refus est une donnee du test et non une propriete
+ * d'environnement qui le rendrait vert un jour et rouge le lendemain. C'est exactement le
+ * scenario du testeur, ramene a sa cause.
+ *
+ * [leCoffreSeVideQuandLaCopieSystemeEstBienPartie] est le **controle negatif** sans lequel ce
+ * fichier ne prouverait rien : un effaceur casse ferait passer le premier test tout seul.
+ */
+@RunWith(AndroidJUnit4::class)
+class VaultPurgeRetryTest {
+
+    private lateinit var db: AppDatabase
+
+    private val context: Context
+        get() = InstrumentationRegistry.getInstrumentation().targetContext
+
+    /** Le fournisseur refuse tout : c'est la faute injectee par le testeur. */
+    private object RefusSystematique : SystemCopyEraser {
+        override fun erase(message: MessageEntity): Boolean = false
+    }
+
+    /** Le fournisseur cooperant, pour le controle negatif. */
+    private object ToutSEfface : SystemCopyEraser {
+        override fun erase(message: MessageEntity): Boolean = true
+    }
+
+    @Before
+    fun setUp() {
+        db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+    }
+
+    @After
+    fun tearDown() = db.close()
+
+    @Test
+    fun leSecondEssaiNAnnoncePasUnCoffreVideApresUnRefusDuFournisseur() = runBlocking<Unit> {
+        seedVaultConversation()
+        val eraser = eraserAvec(RefusSystematique)
+
+        val premier = eraser.purgeVault()
+
+        assertThat(premier.deleted).isEqualTo(0)
+        assertThat(premier.systemResidue).isEqualTo(1)
+        assertThat(premier.isComplete).isFalse()
+        // Le coeur du correctif : la conversation est CONSERVEE. C'est elle, et rien d'autre, qui
+        // fait office de journal de purge en attente — elle survit au redemarrage parce qu'elle
+        // est en base, la ou un compteur en memoire ne survivrait pas.
+        assertThat(db.conversationDao().idsInVault()).containsExactly(VAULT_ID)
+
+        val second = eraser.purgeVault()
+
+        // La regression exacte du rapport : ici, avant le correctif, `0/0/0` et `isComplete` vrai.
+        assertThat(second.isComplete).isFalse()
+        assertThat(second.systemResidue).isEqualTo(1)
+        assertThat(second.remaining).isEqualTo(1)
+        assertThat(db.conversationDao().idsInVault()).containsExactly(VAULT_ID)
+    }
+
+    /**
+     * Le point que le testeur souleve derriere le sien : la reprise doit survivre a un
+     * redemarrage. Un nouvel [ConversationEraser] — donc aucun etat en memoire conserve — reprend
+     * la ou le precedent s'est arrete, parce que la ligne du coffre est en base.
+     */
+    @Test
+    fun laReprisePasseParLaBaseEtNonParUnEtatEnMemoire() = runBlocking<Unit> {
+        seedVaultConversation()
+        eraserAvec(RefusSystematique).purgeVault()
+
+        // Le fournisseur se remet a cooperer, et c'est un objet neuf qui reprend.
+        val apresRedemarrage =
+            eraserAvec(ToutSEfface).purgeVault()
+
+        assertThat(apresRedemarrage.deleted).isEqualTo(1)
+        assertThat(apresRedemarrage.isComplete).isTrue()
+        assertThat(db.conversationDao().idsInVault()).isEmpty()
+    }
+
+    @Test
+    fun leCoffreSeVideQuandLaCopieSystemeEstBienPartie() = runBlocking<Unit> {
+        // Controle negatif : sans lui, un `purgeVault` casse satisferait le premier test.
+        seedVaultConversation()
+        val eraser = eraserAvec(ToutSEfface)
+
+        val resultat = eraser.purgeVault()
+
+        assertThat(resultat.deleted).isEqualTo(1)
+        assertThat(resultat.systemResidue).isEqualTo(0)
+        assertThat(resultat.isComplete).isTrue()
+        assertThat(db.conversationDao().idsInVault()).isEmpty()
+    }
+
+    /**
+     * La suppression ORDINAIRE garde son contrat oppose : l'utilisateur qui efface un fil le voit
+     * disparaitre, meme si la copie systeme resiste. Sans ce test, un correctif zele finirait par
+     * aligner les deux chemins et laisserait a l'ecran une conversation que l'on vient
+     * d'effacer.
+     *
+     * v1.28.9 — ce contrat est celui d'`erase` en mode ordinaire, qu'emploie la purge totale. Le
+     * geste « Supprimer » de l'utilisateur passe par `supprimer`, qui CONSERVE une conversation du
+     * coffre dont la copie resiste : cf. `SuppressionConversationCoffreTest`.
+     */
+    @Test
+    fun laSuppressionOrdinaireEffaceLaLigneLocaleMemeSiLeSystemeRefuse() = runBlocking<Unit> {
+        seedVaultConversation()
+        val eraser = eraserAvec(RefusSystematique)
+
+        val systemeParti = eraser.erase(VAULT_ID).systemCopyGone
+
+        assertThat(systemeParti).isFalse()
+        assertThat(db.conversationDao().idsInVault()).isEmpty()
+    }
+
+    /**
+     * v1.28.1 (relecture externe GPT, point 4) — un message **arrive pendant le balayage** n'a
+     * jamais ete presente au fournisseur. Sans le controle ajoute, la conversation partait avec
+     * lui, sa copie systeme restait, et la purge se declarait complete : la meme fuite, par une
+     * autre porte.
+     *
+     * L'effaceur sert ici de point d'injection temporel : il insere un second message au moment
+     * ou le premier est traite, c'est-a-dire exactement dans la fenetre de la course.
+     */
+    @Test
+    fun unMessageArriveEnCoursDeBalayage_empecheDeDeclarerLaPurgeComplete() = runBlocking<Unit> {
+        seedVaultConversation()
+        val intrus = object : SystemCopyEraser {
+            var dejaInsere = false
+            override fun erase(message: MessageEntity): Boolean {
+                if (!dejaInsere) {
+                    dejaInsere = true
+                    runBlocking { db.messageDao().insert(message.copy(id = 0, telephonyUri = null)) }
+                }
+                return true // le fournisseur COOPERE : seule la course doit faire echouer.
+            }
+        }
+
+        val resultat = eraserAvec(intrus).purgeVault()
+
+        assertThat(resultat.isComplete).isFalse()
+        assertThat(resultat.systemResidue).isEqualTo(1)
+        assertThat(db.conversationDao().idsInVault()).containsExactly(VAULT_ID)
+    }
+
+    /**
+     * v1.28.2 — la SORTIE ASSUMEE. Le refus prudent de la v1.28.1 est juste tant que l'echec est
+     * passager ; il devient une impasse definitive quand la liaison est durablement fausse — un
+     * `telephony_uri` restaure d'un autre telephone. `force` rend son coffre a l'utilisateur, en
+     * lui disant ce qui subsiste.
+     */
+    @Test
+    fun laSortieAssumeeEffaceLaLigneLocaleMaisContinueDeCompterLEchec() = runBlocking<Unit> {
+        seedVaultConversation()
+
+        val resultat = eraserAvec(RefusSystematique).purgeVault(force = true)
+
+        // Le coffre est vide : l'utilisateur retrouve l'acces.
+        assertThat(db.conversationDao().idsInVault()).isEmpty()
+        // Mais l'echec n'est PAS efface du compte-rendu — l'appelant doit pouvoir le dire.
+        assertThat(resultat.systemResidue).isEqualTo(1)
+        assertThat(resultat.deleted).isEqualTo(0)
+    }
+
+    /**
+     * Controle negatif : `force` est un choix de l'appelant, jamais un defaut. Sans lui, la garde
+     * de la v1.28.1 tient — c'est le meme appel, au drapeau pres.
+     */
+    @Test
+    fun sansLeDrapeauLaGardeDeLaVersionPrecedenteTientToujours() = runBlocking<Unit> {
+        seedVaultConversation()
+
+        val resultat = eraserAvec(RefusSystematique).purgeVault()
+
+        assertThat(db.conversationDao().idsInVault()).containsExactly(VAULT_ID)
+        assertThat(resultat.isComplete).isFalse()
+    }
+
+    // ──────── F03 / F04 : ce qui survivait a la purge sans etre dans `conversations` ────────
+
+    /**
+     * v1.28.3 (F03) — **un envoi programme depuis une conversation du coffre partait apres la
+     * purge**, avec son corps et ses destinataires, alors que l'application venait d'annoncer le
+     * coffre vide et de retirer le PIN.
+     *
+     * `scheduled_messages.conversation_id` n'est pas une cle etrangere : aucune cascade ne
+     * l'emportait, et rien dans le chemin de purge ne le regardait. Ce test verifie les deux
+     * moities du correctif — la ligne part, ET le travail `WorkManager` est annule, sans quoi un
+     * worker se reveillerait sur une ligne absente.
+     */
+    @Test
+    fun laPurgeAnnuleLesEnvoisProgrammesDuCoffre(): Unit = runBlocking {
+        seedVaultConversation()
+        val programme = db.scheduledMessageDao().upsert(
+            com.relay.sms.data.local.db.entity.ScheduledMessageEntity(
+                conversationId = VAULT_ID,
+                addressesCsv = "+33600000009",
+                body = "contenu du coffre, programme",
+                scheduledAt = System.currentTimeMillis() + 3_600_000L,
+                subId = null,
+                attachmentsJson = null,
+                createdAt = System.currentTimeMillis(),
+            ),
+        )
+        val ordonnanceur = OrdonnanceurEspion()
+
+        eraserAvec(ToutSEfface, ordonnanceur).purgeVault()
+
+        assertThat(db.scheduledMessageDao().findById(programme)).isNull()
+        assertThat(ordonnanceur.annules).containsExactly(programme)
+    }
+
+    /**
+     * v1.28.3 (F04) — **les FICHIERS des pieces jointes survivaient a la purge.**
+     *
+     * `AttachmentEntity` est en `ForeignKey.CASCADE` : ses lignes partaient bien, mais
+     * `local_uri` designe un fichier de `filesDir` que plus rien ne referencait ensuite. Les
+     * images et l'audio d'une conversation purgee du coffre restaient en clair sur l'appareil.
+     *
+     * Le fichier est REELLEMENT cree sur disque : verifier la seule disparition de la ligne
+     * Room reproduirait exactement l'erreur qui a produit le defaut.
+     */
+    @Test
+    fun laPurgeEffaceLesFichiersDesPiecesJointes(): Unit = runBlocking {
+        seedVaultConversation()
+        val fichier = java.io.File(context.filesDir, "mms_attachments").let { dossier ->
+            dossier.mkdirs()
+            java.io.File(dossier, "secret-${System.nanoTime()}.jpg").apply { writeBytes(ByteArray(16)) }
+        }
+        val messageId = db.messageDao().insert(messageDuCoffre())
+        db.attachmentDao().insert(
+            com.relay.sms.data.local.db.entity.AttachmentEntity(
+                messageId = messageId,
+                mimeType = "image/jpeg",
+                fileName = fichier.name,
+                sizeBytes = fichier.length(),
+                localUri = fichier.absolutePath,
+            ),
+        )
+        assertThat(fichier.exists()).isTrue()
+
+        eraserAvec(ToutSEfface).purgeVault()
+
+        assertThat(fichier.exists()).isFalse()
+    }
+
+    /**
+     * **Controle negatif du test ci-dessus.** Une partie de MMS du fournisseur systeme porte un
+     * `local_uri` en `content://` : ce n'est pas notre fichier, et son sort releve de
+     * `SystemCopyEraser`. Un correctif qui effacerait sans distinguer passerait le test
+     * precedent tout en tentant des suppressions qui n'ont pas de sens.
+     */
+    @Test
+    fun laPurgeNeTouchePasAuxPartiesDuFournisseur(): Unit = runBlocking {
+        seedVaultConversation()
+        val messageId = db.messageDao().insert(messageDuCoffre())
+        db.attachmentDao().insert(
+            com.relay.sms.data.local.db.entity.AttachmentEntity(
+                messageId = messageId,
+                mimeType = "image/jpeg",
+                fileName = "part.jpg",
+                sizeBytes = 16L,
+                localUri = "content://mms/part/42",
+            ),
+        )
+
+        // Ne doit ni lever ni tenter d'ouvrir un fichier : la purge aboutit normalement.
+        val resultat = eraserAvec(ToutSEfface).purgeVault()
+
+        assertThat(resultat.isComplete).isTrue()
+    }
+
+    private fun messageDuCoffre() = MessageEntity(
+        conversationId = VAULT_ID,
+        telephonyUri = null,
+        address = "+33600000009",
+        body = "avec piece jointe",
+        type = MessageType.MMS,
+        direction = MessageDirection.INCOMING,
+        date = 1_700_000_000_000L,
+        dateSent = null,
+        read = true,
+        starred = false,
+        status = MessageStatus.RECEIVED,
+        errorCode = null,
+        subId = null,
+        scheduledAt = null,
+        attachmentsCount = 1,
+    )
+
+    /** Retient ce qu'on lui demande d'annuler — F03 porte sur l'annulation autant que sur la ligne. */
+    private class OrdonnanceurEspion : com.relay.sms.domain.scheduler.ScheduledMessageScheduler {
+        val annules = mutableListOf<Long>()
+        override fun scheduleAt(scheduledMessageId: Long, epochMillis: Long) = Unit
+        override fun cancel(scheduledMessageId: Long) { annules += scheduledMessageId }
+    }
+
+    /** Un seul point de construction : la signature a deja bouge une fois. */
+    private fun eraserAvec(
+        systemCopy: SystemCopyEraser,
+        ordonnanceur: com.relay.sms.domain.scheduler.ScheduledMessageScheduler =
+            OrdonnanceurEspion(),
+        barriere: com.relay.sms.security.VaultPurgeBarrier = com.relay.sms.security.VaultPurgeBarrier(),
+        annulateur: AnnulateurDeNotificationsEspion = AnnulateurDeNotificationsEspion(),
+    ) =
+        ConversationEraser(
+            db,
+            db.conversationDao(),
+            db.messageDao(),
+            systemCopy,
+            // v1.28.3 (F03/F04) — la suppression emporte desormais les envois programmes et les
+            // FICHIERS des pieces jointes. Ces tests-ci ne les exercent pas : les DAO reels de la
+            // base en memoire rendent des listes vides, et l'ordonnanceur factice ne fait rien.
+            db.scheduledMessageDao(),
+            ordonnanceur,
+            db.attachmentDao(),
+            FichiersDePiecesJointes(
+                db.attachmentDao(),
+                db.scheduledMessageDao(),
+                InstrumentationRegistry.getInstrumentation().targetContext,
+            ),
+            barriere,
+            annulateur,
+            db.e2eNoticeDao(),
+        )
+
+    // ───── v1.28.5 (sixième note d'Andrew, point 1) — `force` ne lève QUE la condition « copie système » ─────
+
+    /**
+     * Le cas d'Andrew, avec le vrai producteur d'échec et non un résultat préconstruit : sous
+     * `force`, un `delete()` mesuré à `false` gardait le parent ? NON en 1.28.4 — le drapeau
+     * `preserveOnSystemFailure = !force` gardait aussi le compte des dépendants, le parent
+     * partait, `localeComplete = true`. Ma note à Andrew affirmait le contraire du code.
+     */
+    @Test
+    fun force_unFichierQueDeleteRefuse_gardeLeParentEtCompteLEchec(): Unit = runBlocking {
+        seedVaultConversation()
+        val dossier = java.io.File(context.filesDir, "mms_attachments/force-${System.nanoTime()}").apply { mkdirs() }
+        val fichier = java.io.File(dossier, "secret.jpg").apply { writeBytes(ByteArray(16)) }
+        val messageId = db.messageDao().insert(messageDuCoffre())
+        db.attachmentDao().insert(
+            com.relay.sms.data.local.db.entity.AttachmentEntity(
+                messageId = messageId,
+                mimeType = "image/jpeg",
+                fileName = fichier.name,
+                sizeBytes = fichier.length(),
+                localUri = fichier.absolutePath,
+            ),
+        )
+        android.system.Os.chmod(dossier.path, 0b101_000_000) // 0500
+        try {
+            assertThat(fichier.delete()).isFalse()
+
+            val refuse = eraserAvec(ToutSEfface).purgeVault(force = true)
+
+            assertThat(refuse.localFailures).isEqualTo(1)
+            assertThat(refuse.residuSystemeSeul).isFalse()
+            assertThat(refuse.isComplete).isFalse()
+            assertThat(db.conversationDao().idsInVault()).containsExactly(VAULT_ID)
+            assertThat(fichier.exists()).isTrue()
+        } finally {
+            android.system.Os.chmod(dossier.path, 0b111_000_000) // 0700
+        }
+
+        val reprise = eraserAvec(ToutSEfface).purgeVault(force = true)
+
+        assertThat(reprise.isComplete).isTrue()
+        assertThat(fichier.exists()).isFalse()
+        dossier.delete()
+    }
+
+    @Test
+    fun force_uneAnnulationQuiLeve_gardeLeParentEtCompteLEchec(): Unit = runBlocking {
+        seedVaultConversation()
+        val programme = db.scheduledMessageDao().upsert(
+            com.relay.sms.data.local.db.entity.ScheduledMessageEntity(
+                conversationId = VAULT_ID,
+                addressesCsv = "+33600000009",
+                body = "contenu du coffre, programme",
+                scheduledAt = System.currentTimeMillis() + 3_600_000L,
+                subId = null,
+                attachmentsJson = null,
+                createdAt = System.currentTimeMillis(),
+            ),
+        )
+        val ordonnanceurEnPanne = object : com.relay.sms.domain.scheduler.ScheduledMessageScheduler {
+            override fun scheduleAt(scheduledMessageId: Long, epochMillis: Long) = Unit
+            override fun cancel(scheduledMessageId: Long): Unit = error("FORCE_ANNULATION_REFUSEE")
+        }
+
+        val refuse = eraserAvec(ToutSEfface, ordonnanceurEnPanne).purgeVault(force = true)
+
+        assertThat(refuse.localFailures).isEqualTo(1)
+        assertThat(refuse.isComplete).isFalse()
+        assertThat(db.conversationDao().idsInVault()).containsExactly(VAULT_ID)
+        assertThat(db.scheduledMessageDao().findById(programme)).isNotNull()
+    }
+
+    /**
+     * Sous `force`, un message arrivé pendant le balayage PART avec le parent — c'est ce que
+     * l'utilisateur a accepté — mais sa copie système n'a jamais été présentée au fournisseur :
+     * il compte en résidu système, pas en « supprimé ». En 1.28.4 il comptait en `deleted`.
+     */
+    @Test
+    fun force_unMessageArriveTard_partMaisCompteEnResiduSysteme(): Unit = runBlocking {
+        seedVaultConversation()
+        val intrus = object : SystemCopyEraser {
+            var dejaInsere = false
+            override fun erase(message: MessageEntity): Boolean {
+                if (!dejaInsere) {
+                    dejaInsere = true
+                    runBlocking { db.messageDao().insert(message.copy(id = 0, telephonyUri = null)) }
+                }
+                return true
+            }
+        }
+
+        val resultat = eraserAvec(intrus).purgeVault(force = true)
+
+        assertThat(db.conversationDao().idsInVault()).isEmpty()
+        assertThat(resultat.deleted).isEqualTo(0)
+        assertThat(resultat.systemResidue).isEqualTo(1)
+    }
+
+    /**
+     * Contrôle positif des trois tests ci-dessus : ce que `force` lève encore. Copie système qui
+     * résiste, aucun dépendant — la ligne locale part, le résidu est dit. Inchangé depuis 1.28.2.
+     */
+    @Test
+    fun force_leveToujoursLaSeuleConditionCopieSysteme(): Unit = runBlocking {
+        seedVaultConversation()
+
+        val resultat = eraserAvec(RefusSystematique).purgeVault(force = true)
+
+        assertThat(db.conversationDao().idsInVault()).isEmpty()
+        assertThat(resultat.residuSystemeSeul).isTrue()
+    }
+
+    /**
+     * v1.28.5 (audit de cohérence C1) — **supprimer UN message emporte son fichier**, comme
+     * supprimer la conversation (F04). Le fichier est réellement créé sur disque ; avant, seule
+     * la ligne `attachments` partait en cascade et l'image restait en clair dans `filesDir`.
+     */
+    @Test
+    fun laSuppressionDUnMessageEffaceSonFichier(): Unit = runBlocking {
+        seedVaultConversation()
+        val fichier = java.io.File(context.filesDir, "mms_attachments").let { dossier ->
+            dossier.mkdirs()
+            java.io.File(dossier, "seul-${System.nanoTime()}.jpg").apply { writeBytes(ByteArray(16)) }
+        }
+        val messageId = db.messageDao().insert(messageDuCoffre())
+        db.attachmentDao().insert(
+            com.relay.sms.data.local.db.entity.AttachmentEntity(
+                messageId = messageId,
+                mimeType = "image/jpeg",
+                fileName = fichier.name,
+                sizeBytes = fichier.length(),
+                localUri = fichier.absolutePath,
+            ),
+        )
+
+        eraserAvec(ToutSEfface).eraseMessage(messageId)
+
+        assertThat(db.messageDao().findById(messageId)).isNull()
+        assertThat(fichier.exists()).isFalse()
+        // La conversation, elle, reste : on n'a supprimé qu'un message.
+        assertThat(db.conversationDao().idsInVault()).containsExactly(VAULT_ID)
+    }
+
+    /**
+     * v1.28.5 (point 2) — ce que l'appelant décide APRÈS la purge — retirer le PIN — s'exécute
+     * SOUS la barrière : une entrée au coffre ne peut pas se glisser entre la relecture de
+     * `remaining` et le retrait.
+     */
+    @Test
+    fun laDecisionDApresPurgeSExecuteSousLaBarriere(): Unit = runBlocking {
+        seedVaultConversation()
+        val barriere = com.relay.sms.security.VaultPurgeBarrier()
+        var barriereLeveeAuMomentDeDecider: Boolean? = null
+
+        eraserAvec(ToutSEfface, barriere = barriere).purgeVault { barriereLeveeAuMomentDeDecider = barriere.enCours }
+
+        assertThat(barriereLeveeAuMomentDeDecider).isTrue()
+        assertThat(barriere.enCours).isFalse()
+    }
+
+    /**
+     * v1.28.4 — **R01, second volet : une annulation qui LÈVE compte comme un échec.** Le test
+     * voisin refuse le `DELETE`, qui vit dans la transaction finale ; ici c'est l'aide elle-même
+     * (`annulerLesTravauxProgrammes`) qui échoue, et c'est SON compte qui doit garder le parent.
+     * Trouvé par le contrôle négatif : le compte remis à zéro ne faisait tomber aucun test.
+     */
+    @Test
+    fun r01_uneAnnulationQuiLeve_gardeLeParentEtCompteLEchec(): Unit = runBlocking {
+        seedVaultConversation()
+        val programme = db.scheduledMessageDao().upsert(
+            com.relay.sms.data.local.db.entity.ScheduledMessageEntity(
+                conversationId = VAULT_ID,
+                addressesCsv = "+33600000009",
+                body = "contenu du coffre, programme",
+                scheduledAt = System.currentTimeMillis() + 3_600_000L,
+                subId = null,
+                attachmentsJson = null,
+                createdAt = System.currentTimeMillis(),
+            ),
+        )
+        val ordonnanceurEnPanne = object : com.relay.sms.domain.scheduler.ScheduledMessageScheduler {
+            override fun scheduleAt(scheduledMessageId: Long, epochMillis: Long) = Unit
+            override fun cancel(scheduledMessageId: Long): Unit = error("R01_ANNULATION_REFUSEE")
+        }
+
+        val refuse = eraserAvec(ToutSEfface, ordonnanceurEnPanne).purgeVault()
+
+        assertThat(refuse.isComplete).isFalse()
+        assertThat(refuse.localFailures).isEqualTo(1)
+        assertThat(db.conversationDao().idsInVault()).containsExactly(VAULT_ID)
+        assertThat(db.scheduledMessageDao().findById(programme)).isNotNull()
+
+        // L'ordonnanceur répond de nouveau : la reprise part du parent conservé et finit.
+        val reprise = eraserAvec(ToutSEfface).purgeVault()
+
+        assertThat(reprise.isComplete).isTrue()
+        assertThat(db.scheduledMessageDao().findById(programme)).isNull()
+        assertThat(db.conversationDao().idsInVault()).isEmpty()
+    }
+
+    /**
+     * v1.28.4 — **R01 (relecture externe, mesuré par Andrew sur émulateur) : un envoi programmé
+     * dont le DELETE est refusé ne doit pas laisser la purge se dire complète.** Avant, l'échec
+     * était gobé, le parent partait, et l'orphelin devenait invisible ET visible hors coffre.
+     * Ici le refus est un `TRIGGER` restreint à cette ligne ; le parent est CONSERVÉ, l'échec
+     * compté, et une fois le refus levé, la reprise retrouve l'orphelin par son parent.
+     */
+    @Test
+    fun r01_unEnvoiProgrammeDontLeDeleteEstRefuse_gardeLeParentEtCompteLEchec(): Unit = runBlocking {
+        seedVaultConversation()
+        val programme = db.scheduledMessageDao().upsert(
+            com.relay.sms.data.local.db.entity.ScheduledMessageEntity(
+                conversationId = VAULT_ID,
+                addressesCsv = "+33600000009",
+                body = "contenu du coffre, programme",
+                scheduledAt = System.currentTimeMillis() + 3_600_000L,
+                subId = null,
+                attachmentsJson = null,
+                createdAt = System.currentTimeMillis(),
+            ),
+        )
+        db.openHelper.writableDatabase.execSQL(
+            "CREATE TRIGGER r01_refus BEFORE DELETE ON scheduled_messages WHEN OLD.id = $programme " +
+                "BEGIN SELECT RAISE(ABORT, 'R01_DELETE_REFUSE'); END;",
+        )
+
+        val refuse = eraserAvec(ToutSEfface).purgeVault()
+
+        assertThat(refuse.isComplete).isFalse()
+        assertThat(refuse.localFailures).isEqualTo(1)
+        assertThat(db.conversationDao().idsInVault()).containsExactly(VAULT_ID)
+        assertThat(db.scheduledMessageDao().findById(programme)).isNotNull()
+
+        // Le refus levé, la reprise part du parent conservé et finit le travail.
+        db.openHelper.writableDatabase.execSQL("DROP TRIGGER r01_refus")
+        val reprise = eraserAvec(ToutSEfface).purgeVault()
+
+        assertThat(reprise.isComplete).isTrue()
+        assertThat(db.scheduledMessageDao().findById(programme)).isNull()
+        assertThat(db.conversationDao().idsInVault()).isEmpty()
+    }
+
+    /**
+     * v1.28.4 — **R02 : un fichier possédé que `delete()` refuse ne doit pas laisser la purge se
+     * dire complète.** Le dossier est rendu non inscriptible (0500) : `delete()` rend `false`,
+     * sans exception — le cas que `onFailure` ne voyait pas. Le parent reste, l'échec compte ;
+     * droits rétablis, la reprise efface le fichier et complète.
+     */
+    @Test
+    fun r02_unFichierQueDeleteRefuse_gardeLeParentEtCompteLEchec(): Unit = runBlocking {
+        seedVaultConversation()
+        val dossier = java.io.File(context.filesDir, "mms_attachments/r02-${System.nanoTime()}").apply { mkdirs() }
+        val fichier = java.io.File(dossier, "secret.jpg").apply { writeBytes(ByteArray(16)) }
+        val messageId = db.messageDao().insert(messageDuCoffre())
+        db.attachmentDao().insert(
+            com.relay.sms.data.local.db.entity.AttachmentEntity(
+                messageId = messageId,
+                mimeType = "image/jpeg",
+                fileName = fichier.name,
+                sizeBytes = fichier.length(),
+                localUri = fichier.absolutePath,
+            ),
+        )
+        android.system.Os.chmod(dossier.path, 0b101_000_000) // 0500
+        try {
+            // Précondition mesurée, pas supposée : le refus est réel.
+            assertThat(fichier.delete()).isFalse()
+
+            val refuse = eraserAvec(ToutSEfface).purgeVault()
+
+            assertThat(refuse.isComplete).isFalse()
+            assertThat(refuse.localFailures).isEqualTo(1)
+            assertThat(db.conversationDao().idsInVault()).containsExactly(VAULT_ID)
+            assertThat(fichier.exists()).isTrue()
+        } finally {
+            android.system.Os.chmod(dossier.path, 0b111_000_000) // 0700
+        }
+
+        val reprise = eraserAvec(ToutSEfface).purgeVault()
+
+        assertThat(reprise.isComplete).isTrue()
+        assertThat(fichier.exists()).isFalse()
+        dossier.delete()
+    }
+
+    /**
+     * v1.28.4 — **R03 : un message qui commet APRÈS la relecture d'avant et AVANT la suppression
+     * du parent** était emporté par la cascade, sa copie système intacte, purge « complète ».
+     * L'annulation de l'ordonnanceur est le point d'injection : elle a lieu après le balayage et
+     * avant la transaction finale — exactement l'ancienne fenêtre. La relecture vit désormais
+     * DANS la transaction de suppression : le message est vu, le parent reste, rien n'est perdu.
+     */
+    @Test
+    fun r03_unMessageQuiCommetApresLeBalayage_estVuParLaTransactionFinale(): Unit = runBlocking {
+        seedVaultConversation()
+        db.scheduledMessageDao().upsert(
+            com.relay.sms.data.local.db.entity.ScheduledMessageEntity(
+                conversationId = VAULT_ID,
+                addressesCsv = "+33600000009",
+                body = "point d'injection",
+                scheduledAt = System.currentTimeMillis() + 3_600_000L,
+                subId = null,
+                attachmentsJson = null,
+                createdAt = System.currentTimeMillis(),
+            ),
+        )
+        val tardif = object : com.relay.sms.domain.scheduler.ScheduledMessageScheduler {
+            var insere: Long = -1L
+            override fun scheduleAt(scheduledMessageId: Long, epochMillis: Long) = Unit
+            override fun cancel(scheduledMessageId: Long) {
+                if (insere < 0L) {
+                    insere = runBlocking { db.messageDao().insert(messageDuCoffre().copy(body = "B, arrive tard")) }
+                }
+            }
+        }
+
+        val resultat = eraserAvec(ToutSEfface, tardif).purgeVault()
+
+        assertThat(resultat.isComplete).isFalse()
+        assertThat(resultat.systemResidue).isEqualTo(1)
+        assertThat(db.conversationDao().idsInVault()).containsExactly(VAULT_ID)
+        assertThat(db.messageDao().findById(tardif.insere)?.body).isEqualTo("B, arrive tard")
+
+        // La reprise, sans nouvel intrus, présente B au fournisseur et complète.
+        val reprise = eraserAvec(ToutSEfface).purgeVault()
+
+        assertThat(reprise.isComplete).isTrue()
+        assertThat(db.conversationDao().idsInVault()).isEmpty()
+    }
+
+    /**
+     * v1.28.6 — **ce qui est supprime ne doit plus s'afficher.**
+     *
+     * Aucun chemin de suppression n'annulait les notifications deja posees : le seul appel
+     * d'annulation du depot vivait dans « marquer comme lu ». Supprimer une conversation non lue
+     * laissait donc son expediteur et son texte dans le volet systeme, et « Supprimer toutes mes
+     * donnees » les y laissait TOUS — apres un dialogue qui promet l'irreversible, et au pire
+     * moment, puisqu'on purge parce que quelqu'un va prendre le telephone.
+     *
+     * Controle negatif fait le 2026-09-12 : sans l'appel pose dans l'effaceur, ce test tombe
+     * (la liste de l'espion reste vide).
+     */
+    @Test
+    fun uneConversationSupprimeeVoitSesNotificationsAnnulees() = runBlocking<Unit> {
+        seedVaultConversation()
+        val espion = AnnulateurDeNotificationsEspion()
+
+        eraserAvec(ToutSEfface, annulateur = espion).erase(VAULT_ID)
+
+        assertThat(db.conversationDao().idsInVault()).isEmpty()
+        assertThat(espion.conversations).containsExactly(VAULT_ID)
+    }
+
+    /**
+     * v1.28.6 — le pendant, et il compte autant : un parent CONSERVE garde ses notifications.
+     *
+     * Les trois sorties qui conservent le parent le font pour permettre la reprise. Annuler leurs
+     * notifications aurait masque une conversation toujours presente — l'inverse du contrat, et
+     * une purge qui se croit faite parce que l'ecran ne montre plus rien.
+     */
+    @Test
+    fun unParentConserveGardeSesNotifications() = runBlocking<Unit> {
+        seedVaultConversation()
+        val espion = AnnulateurDeNotificationsEspion()
+
+        val issue = eraserAvec(RefusSystematique, annulateur = espion)
+            .erase(VAULT_ID, ConversationEraser.Mode.COFFRE)
+
+        assertThat(issue.systemCopyGone).isFalse()
+        assertThat(db.conversationDao().idsInVault()).containsExactly(VAULT_ID)
+        assertThat(espion.conversations).isEmpty()
+    }
+
+    /**
+     * v1.28.6 — et la notification d'UN message supprime, qui portait son texte.
+     *
+     * Le jumeau du defaut ci-dessus, sur le chemin le plus frequent : supprimer un seul message
+     * genant plutot que tout le fil. La v1.28.5 avait deja du rattacher `eraseMessage` aux
+     * fichiers des pieces jointes pour cette meme raison.
+     */
+    @Test
+    fun laSuppressionDUnMessageAnnuleSaNotification() = runBlocking<Unit> {
+        seedVaultConversation()
+        val espion = AnnulateurDeNotificationsEspion()
+        val messageId = db.messageDao().findByConversation(VAULT_ID).first().id
+
+        eraserAvec(ToutSEfface, annulateur = espion).eraseMessage(messageId)
+
+        assertThat(db.messageDao().findById(messageId)).isNull()
+        assertThat(espion.messages).containsExactly(VAULT_ID to messageId)
+    }
+
+    private suspend fun seedVaultConversation() {
+        db.conversationDao().insert(
+            ConversationEntity(
+                id = VAULT_ID,
+                threadId = VAULT_ID,
+                addressesCsv = "+33612345678",
+                displayName = null,
+                lastMessagePreview = "",
+                lastMessageAt = 0L,
+                unreadCount = 0,
+                inVault = true,
+            ),
+        )
+        db.messageDao().insert(
+            MessageEntity(
+                conversationId = VAULT_ID,
+                telephonyUri = "content://sms/9164",
+                address = "+33612345678",
+                body = "Message du coffre",
+                type = MessageType.SMS,
+                direction = MessageDirection.INCOMING,
+                date = 1_700_000_000_000L,
+                dateSent = 1_700_000_000_000L,
+                read = true,
+                starred = false,
+                status = MessageStatus.RECEIVED,
+                errorCode = null,
+                subId = null,
+                scheduledAt = null,
+                attachmentsCount = 0,
+            ),
+        )
+    }
+
+    private companion object {
+        const val VAULT_ID = 1L
+    }
+}

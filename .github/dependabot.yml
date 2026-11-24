@@ -1,0 +1,89 @@
+# v1.3.2 — Dependabot : alertes + PR automatiques sur les vulnérabilités des
+# dépendances et sur les versions obsolètes. Le seul fait d'avoir ce fichier
+# active les Dependabot version-update PRs (la partie "alertes de sécurité"
+# nécessite en plus le toggle "Dependabot alerts" dans Settings → Code security
+# du repo — geste manuel one-shot).
+
+version: 2
+
+updates:
+  # Gradle dependencies (libs.versions.toml + build.gradle.kts)
+  - package-ecosystem: "gradle"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Europe/Paris"
+    open-pull-requests-limit: 5
+    # Group minor + patch bumps into a single PR per ecosystem to reduce noise.
+    # Major bumps stay individual (breaking changes need careful review).
+    groups:
+      kotlin-and-compose:
+        patterns:
+          - "org.jetbrains.kotlin*"
+          - "androidx.compose*"
+          - "androidx.activity*"
+        update-types:
+          - "minor"
+          - "patch"
+      androidx-core:
+        patterns:
+          - "androidx.core*"
+          - "androidx.lifecycle*"
+          - "androidx.work*"
+          - "androidx.room*"
+        update-types:
+          - "minor"
+          - "patch"
+      tests:
+        patterns:
+          - "org.junit*"
+          - "*truth*"
+          - "*mockito*"
+          - "*mockk*"
+          - "*robolectric*"
+        update-types:
+          - "minor"
+          - "patch"
+    # Les onze regles `ignore` posees les 2026-09-08 et 09-14 sont RETIREES : elles plafonnaient
+    # core-ktx, lifecycle, Kotlin, Hilt, le wrapper Gradle, les trois plugins AGP, le BOM Compose
+    # et SQLCipher parce que tous exigeaient AGP >= 9. La migration AGP 9.4 / Gradle 9.7.1 /
+    # compileSdk 37 du 2026-09-16 leve ce plafond, et les laisser MASQUERAIT desormais les
+    # montees de version — leur propre commentaire le disait.
+    ignore:
+      # Seul plafond qui subsiste, et par precaution : CodeQL 2.27 refuse de compiler Kotlin
+      # >= 2.4.20 (« currently supports versions below 2.4.20 »), MESURE sur Agenda Tech (PR #14),
+      # dont le workflow CodeQL compile. Celui de ce depot tourne en `build-mode: none`, donc
+      # l'extracteur ne passe peut-etre pas par la : non verifie ici. Le projet est en 2.4.10, la
+      # regle ne coute rien, et la premiere PR CodeQL de ce depot tranchera.
+      - dependency-name: "org.jetbrains.kotlin:*"
+        versions: [">= 2.4.20"]
+      - dependency-name: "org.jetbrains.kotlin.*"
+        versions: [">= 2.4.20"]
+      # Limite assumee de ce plafond : depuis AGP 9, une partie de la chaine Kotlin est apportee
+      # par AGP lui-meme, et ces deux regles ne la couvrent pas. Une montee d'AGP pourrait donc
+      # embarquer un Kotlin >= 2.4.20 sans etre bloquee ici. On NE plafonne PAS AGP pour autant :
+      # ce serait re-geler toute la chaine pour une contrainte non verifiee sur ce depot. Le jour
+      # ou une PR AGP echoue sur CodeQL, la cause sera connue d'avance.
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    labels:
+      - "dependencies"
+
+  # GitHub Actions used in .github/workflows/*.yml (codeql, android, etc.)
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "Europe/Paris"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    labels:
+      - "dependencies"
+      - "github-actions"

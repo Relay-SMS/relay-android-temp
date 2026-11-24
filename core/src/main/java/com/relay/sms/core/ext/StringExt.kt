@@ -1,0 +1,526 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.core.ext
+
+import java.text.Normalizer
+
+/**
+ * Feedback round 10 — display-only US phone formatting for the thread header.
+ *
+ * - Exactly 10 digits → `(xxx) xxx-xxxx`.
+ * - Exactly 11 digits starting with `1` → `1 (xxx) xxx-xxxx`.
+ * - A number beginning with `+` is returned untouched: it is explicitly
+ *   international, and forcing US formatting on it would be wrong.
+ * - Anything else (short code, partial number, alphanumeric sender) is
+ *   returned as-is, so a half-typed number in an input field is never
+ *   mangled — the formatter is safe to call on any string, including a
+ *   contact name (no digits → unchanged).
+ *
+ * Display only: the stored number is never modified. Formatting characters
+ * already present (`(555) 123-4567`, `555-123-4567`) are stripped and the
+ * number is re-formatted, so the function is idempotent.
+ */
+/**
+ * Display-only formatting of a US phone number: `5551234567` -> `(555) 123-4567`,
+ * `15551234567` -> `1 (555) 123-4567`, `+15551234567` -> `+1 (555) 123-4567`.
+ * Only numbers that plausibly ARE North-American are formatted: a 10-digit number
+ * must start with 2-9 (an area code never starts with 0 or 1), so a French number
+ * like `0617332729` or any other non-NANP number is left untouched, as are partial
+ * numbers, names, and other international numbers.
+ */
+fun String.formatPhoneNumberForDisplay(): String {
+    val trimmed = trim()
+    val digits = trimmed.filter { it.isDigit() }
+    // Area code = the first 3 digits of the 10-digit national number.
+    val areaStartsValid = digits.length == 10 && digits[0] in '2'..'9'
+    val withCountryCode = digits.length == 11 && digits.startsWith("1") && digits[1] in '2'..'9'
+    return when {
+        // US number with the +1 country code: "+1" + 10 digits.
+        // (Kristin's 2026-11-10 ask: "+1xxxxxxxxxx" showed unformatted.)
+        trimmed.startsWith("+1") && withCountryCode ->
+            "+1 (${digits.substring(1, 4)}) ${digits.substring(4, 7)}-${digits.substring(7)}"
+        // Any other international number: leave untouched.
+        trimmed.startsWith("+") -> trimmed
+        areaStartsValid ->
+            "(${digits.substring(0, 3)}) ${digits.substring(3, 6)}-${digits.substring(6)}"
+        withCountryCode ->
+            "1 (${digits.substring(1, 4)}) ${digits.substring(4, 7)}-${digits.substring(7)}"
+        else -> trimmed
+    }
+}
+
+/**
+ * Telephony-friendly normalization of a phone number: keeps leading '+', digits and '*#'.
+ * Strips spaces, dashes, parentheses. Does not enforce country format (left to libphonenumber if needed).
+ */
+fun String.normalizePhone(): String {
+    val sb = StringBuilder()
+    for ((i, c) in this.withIndex()) {
+        when {
+            c.isDigit() -> sb.append(c)
+            c == '+' && i == 0 -> sb.append(c)
+            c == '*' || c == '#' -> sb.append(c)
+            else -> Unit // skip
+        }
+    }
+    return sb.toString()
+}
+
+/**
+ * Round 46 — the canonical key for one peer, shared by every store
+ * that keys rows by address: start from [normalizePhone], then
+ * reunite the two NANP spellings of the same number.
+ *
+ * `normalizePhone` strips formatting but does NOT reconcile the
+ * E.164 form (`"+16108423232"`) with the national form
+ * (`"6108423232"`) — different keys for the same peer. Round 42
+ * canonicalized the peer repository on `normalizePhone` alone,
+ * and the session store did no normalization at all, so the
+ * carrier-delivered E.164 form and the conversation's national
+ * form landed under different keys: the bundle arrived under
+ * `"+1…"`, the UI and the send path read `"610…"`, the thread
+ * stayed PROBING, the message went out plain, and the peer
+ * never flipped (device-proven 2026-11-23).
+ *
+ * The rule, on the normalized form:
+ * - an 11-digit string starting with `1` → its 10-digit form
+ *   (`"16108423232"` → `"6108423232"`, `"+16108423232"` →
+ *   `"6108423232"`); country code 1 is exclusively NANP, the
+ *   same rule [numbersMatchStrict] applies;
+ * - anything else keeps its normalized form: non-NANP numbers
+ *   stay E.164 (`"+33612345678"`), short codes stay as-is.
+ *
+ * An alphanumeric sender (`normalizePhone()` → empty) keeps the
+ * existing fallback: the trimmed raw string, the same fallback
+ * `PhoneAddress.of` makes. A number carrying `*`/`#` is never
+ * NANP-stripped — the strip applies to plain digits only.
+ *
+ * Known limitation, shared with [numbersMatchStrict]: an
+ * international number stored in national format (trunk `0`,
+ * no country code — `"06 12 34 56 78"`) does NOT reunite with
+ * its E.164 form (`"+33612345678"`): only a region-aware
+ * canonicalisation could reunite them. Accepted deliberately —
+ * the failure mode is a missing match, never a wrong match.
+ */
+fun String.canonicalPhone(): String {
+    val normalized = normalizePhone()
+    if (normalized.isEmpty()) {
+        return trim()
+    }
+    val digits = normalized.filter { it.isDigit() }
+    val isPlainDigits = normalized == digits || normalized == "+$digits"
+    if (!isPlainDigits) {
+        return normalized
+    }
+    return if (digits.length == 11 && digits.startsWith("1")) {
+        digits.substring(1)
+    } else {
+        normalized
+    }
+}
+
+/**
+ * Round 44 — do two spellings denote the **same phone number**, compared
+ * on the FULL number, never on a suffix?
+ *
+ * Android's `PhoneLookup` provider matches on the last 7 digits only
+ * (its `min_match` column), so a lookup for `(610) 842-3232` happily
+ * returns the contact whose number is `(215) 842-3232` — and Relay
+ * cached that wrong name on the conversation permanently. Every
+ * `PhoneLookup` hit must therefore be verified against the queried
+ * number with this strict comparison before the contact is accepted.
+ *
+ * The rule, on the digit strings (everything else stripped):
+ * - equal digits → the same number, whatever the formatting
+ *   (`"+1 (610) 842-3232"` == `"(610) 842-3232"` == `"6108423232"`);
+ * - an 11-digit string starting with `1` == its 10-digit form (the
+ *   NANP country code is the only prefix dropped — country code 1
+ *   is exclusively NANP, the same trade-off the client-mode
+ *   NANP-equivalent-forms fallback makes);
+ * - anything else → different numbers. In particular a shared
+ *   7-digit suffix with a different area code is NOT a match.
+ *
+ * An empty digit string on either side never matches, and
+ * neither does any string containing a letter: an alphanumeric
+ * sender (`"Free"`, `"SFR 123"`) is a label, not a number, and
+ * must never match a number even when its digits coincide with a
+ * short code (the same letter-based switch [blockKey] makes —
+ * `"SFR 123"` strips to `"123"`, which must not match the short
+ * code `123`). Two empty strings are not a number at all.
+ *
+ * Known limitation: an international number stored in national
+ * format (trunk `0`, no country code — `"06 12 34 56 78"`) does
+ * NOT match its E.164 form (`"+33612345678"`): the digits differ
+ * and only a region-aware canonicalisation could reunite them.
+ * Accepted deliberately — the failure mode is a missing name,
+ * never a wrong name.
+ */
+fun numbersMatchStrict(a: String, b: String): Boolean {
+    val digitsA = a.filter { it.isDigit() }
+    val digitsB = b.filter { it.isDigit() }
+    // A string with a letter is a label ("Free", "SFR 123"), not a
+    // number — and an empty digit string is not a number at all.
+    // Either side uncomparable means no match.
+    val comparable = !a.any { it.isLetter() } && !b.any { it.isLetter() } &&
+        digitsA.isNotEmpty() && digitsB.isNotEmpty()
+    if (!comparable) {
+        return false
+    }
+    if (digitsA == digitsB) {
+        return true
+    }
+    // NANP: an 11-digit number starting with 1 is the 10-digit
+    // national form with its country code — the same number.
+    return (digitsA.length == 11 && digitsA.startsWith("1") && digitsA.substring(1) == digitsB) ||
+        (digitsB.length == 11 && digitsB.startsWith("1") && digitsB.substring(1) == digitsA)
+}
+
+/** Pré-compilé une fois : marques diacritiques combinantes (catégorie Unicode Mn). */
+private val COMBINING_MARKS_REGEX = Regex("\\p{Mn}+")
+
+/**
+ * Replie une chaîne pour une recherche insensible à la **casse ET aux accents**.
+ *
+ * Procédé : décomposition Unicode NFD (`é` → `e` + accent aigu combinant, `ç` → `c` +
+ * cédille combinante, `à` → `a` + accent grave…), suppression des marques combinantes
+ * (catégorie `Mn`), puis passage en minuscules **locale-indépendant** (pas de piège
+ * « i turc » : `lowercase()` sans argument utilise la locale invariante).
+ *
+ * Ainsi « MAÏTÉ », « maite », « Maïté » se replient tous vers « maite » et se matchent
+ * mutuellement. À utiliser des DEUX côtés d'un `contains` (requête et cible) pour que le
+ * repli soit symétrique.
+ *
+ * Limite connue : les ligatures sans décomposition canonique (`œ`, `æ`, `ß`) ne sont pas
+ * dépliées (`œ` reste `œ`, pas `oe`) — cas rares en pratique, laissés tels quels.
+ */
+fun String.foldForSearch(): String =
+    Normalizer.normalize(this, Normalizer.Form.NFD)
+        .replace(COMBINING_MARKS_REGEX, "")
+        .lowercase()
+
+// v1.28.12 (audit B2) — `phonesMatchLoose()` et `String.phoneSuffix8()` ont été SUPPRIMÉS.
+//
+// Aucun appelant depuis la v1.25.4, qui a unifié le rapprochement des numéros sur [blockKey].
+// Ce n'était pas du code mort inoffensif : leur KDoc affirmait que « le risque de faux positif
+// est négligeable à 8 chiffres de suffixe », ce que le KDoc de
+// [BLOCK_KEY_SIGNIFICANT_DIGITS], vingt lignes plus bas, RÉFUTE — c'est justement à 8 chiffres
+// que `0612345678` et `0712345678` partageaient leur clé. Une fonction disponible, documentée
+// comme sûre et démentie par sa voisine est une invitation à refaire le défaut de la v1.25.3.
+
+/**
+ * Nombre de chiffres significatifs retenus pour rapprocher deux écritures d'un même numéro.
+ *
+ * **9 et non 8.** Le numéro national significatif français fait 9 chiffres (`612345678` pour
+ * « 06 12 34 56 78 ») : s'arrêter à 8 amputait le premier, celui-là même qui sépare un mobile
+ * `06…` d'un `07…`. `0612345678` et `0712345678` partageaient donc leur clé — c'est ce qui avait
+ * fait écarter le rapprochement permissif du filtrage réel, et donc laissé l'affichage et
+ * l'application diverger. À 9 chiffres les deux formes se distinguent, tout en continuant
+ * d'absorber le passage international ↔ national (`+33612345678` → `612345678`).
+ */
+private const val BLOCK_KEY_SIGNIFICANT_DIGITS = 9
+
+/**
+ * Clé canonique d'un expéditeur dans la liste noire — **la seule**, côté stockage comme côté
+ * affichage.
+ *
+ * v1.25.4 — l'unicité est le correctif. La v1.25.3 avait deux règles : `normalizePhone()` pour
+ * écrire et lire en base (égalité stricte), un suffixe de 8 chiffres pour teinter la liste. Une
+ * conversation pouvait donc s'afficher « Bloqué » alors que le filtre de réception, lui, ne
+ * reconnaissait pas le numéro et laissait passer les messages. Une même fonction des deux côtés
+ * rend cette divergence structurellement impossible.
+ *
+ * Deux régimes, selon la nature de l'expéditeur :
+ * - **alphanumérique** (« SFR », « SFR 123 », « Free ») → le libellé en minuscules. `normalizePhone`
+ *   n'y gardait que les chiffres : « SFR » se réduisait à la chaîne vide et « SFR 123 » au code
+ *   court « 123 », si bien que bloquer l'un bloquait l'autre.
+ * - **numérique** → les [BLOCK_KEY_SIGNIFICANT_DIGITS] derniers chiffres, ou le nombre exact de
+ *   chiffres s'il y en a moins (codes courts : « 123 » reste « 123 »).
+ *
+ * La bascule se fait sur la **présence d'une lettre**, avant tout retrait de caractères : c'est ce
+ * qui distingue « SFR 123 » du code court « 123 ». Appliquer cette fonction à une chaîne déjà
+ * normalisée la priverait de cette information — elle attend la forme brute.
+ */
+/**
+ * v1.26.1 (audit H5) — retire le suffixe `/TYPE=PLMN` (ou similaire) que les passerelles MMS
+ * ajoutent aux numéros dans l'en-tête `From:` d'un PDU.
+ *
+ * Centralisé ici parce que la garde de liste noire des MMS entrants en a besoin des DEUX côtés
+ * du pipeline ([MmsWapPushReceiver] avant le téléchargement, [MmsDownloadedReceiver] après), et
+ * qu'oublier ce nettoyage rend la garde SILENCIEUSEMENT INOPÉRANTE : `"+33612345678/TYPE=PLMN"`
+ * contient des lettres, donc [blockKey] le traite comme un expéditeur alphanumérique et rend
+ * `"+33612345678/type=plmn"` au lieu de `"612345678"` — aucune correspondance possible.
+ */
+fun String.stripMmsAddressSuffix(): String {
+    val idx = indexOf('/')
+    return if (idx > 0) substring(0, idx) else this
+}
+
+fun String.blockKey(): String {
+    val trimmed = trim()
+    if (trimmed.any { it.isLetter() }) return trimmed.lowercase()
+    val digits = trimmed.filter { it.isDigit() }
+    if (digits.isEmpty()) return trimmed
+    return if (digits.length <= BLOCK_KEY_SIGNIFICANT_DIGITS) {
+        digits
+    } else {
+        digits.takeLast(BLOCK_KEY_SIGNIFICANT_DIGITS)
+    }
+}
+
+/**
+ * v1.27.2 (audit Codex du 2026-08-05, P-11) — deux écritures brutes désignent-elles le **même
+ * correspondant** ? La seule règle de rapprochement de conversation, des quatre côtés.
+ *
+ * # 🔴 Le défaut que ça ferme
+ *
+ * [blockKey] retient les neuf derniers chiffres. C'est ce qu'il faut pour réunir les deux écritures
+ * d'un même numéro français — `06 12 34 56 78` composé, `+33612345678` stocké — mais neuf chiffres
+ * ne portent aucune information de pays :
+ *
+ * ```
+ * "+33 6 12 34 56 78"  →  612345678
+ * "+1 561 234 5678"    →  612345678     ← MÊME CLÉ, DEUX PERSONNES
+ * ```
+ *
+ * Quand l'égalité stricte du CSV échouait, le repli prenait **la première conversation portant
+ * cette clé**. Composer vers le numéro américain pouvait donc ouvrir la conversation française, et
+ * le message rédigé partait au mauvais destinataire ; à l'import, les deux historiques
+ * fusionnaient, avec divulgation d'un message privé à la clé.
+ *
+ * # 🔴 La première correction était INCOMPLÈTE (audit Codex du 2026-08-05, C-07)
+ *
+ * Elle n'exigeait l'égalité des chiffres que lorsque **les deux** écritures portaient un `+`.
+ * Dès qu'une seule était nationale, le suffixe de neuf chiffres redevenait seul juge :
+ *
+ * ```
+ * "+1 212 345 6789"  →  123456789
+ * "01 23 45 67 89"   →  123456789     ← ENCORE LA MÊME CLÉ
+ * ```
+ *
+ * Un correspondant américain enregistré en international et un fixe français reçu au format
+ * national : paire parfaitement plausible, et le mauvais destinataire revenait par la fenêtre.
+ * J'avais fermé une moitié de l'espace de collision en croyant l'avoir fermé en entier — le motif
+ * du **jumeau asymétrique**, dans le correctif censé le traiter.
+ *
+ * # La règle
+ *
+ * Même seau ([blockKey]) pour écarter vite, **puis** égalité **E.164** : deux numéros complets ne
+ * se rapprochent que si leur forme canonique internationale est identique. C'est la seule preuve
+ * qu'ils désignent la même personne, et elle traite d'un coup les quatre combinaisons
+ * national/international.
+ *
+ * [toE164] est injecté — `core` reste sans dépendance Android — et rend `null` quand la
+ * canonicalisation est impossible : région inconnue, numéro invalide pour cette région.
+ *
+ * ⚠️ **Dans ce cas on ÉCHOUE FERMÉ**, volontairement. Ne pas rapprocher crée au pire une
+ * conversation en double, visible et réparable. Rapprocher à tort envoie un message privé à
+ * quelqu'un d'autre. Les deux erreurs ne se valent pas.
+ *
+ * ⚠️ [stripMmsAddressSuffix] est appliqué ici, aux deux bords : l'en-tête `From:` d'un PDU porte
+ * `/TYPE=PLMN`, et [blockKey] bascule en mode alphanumérique dès qu'il voit une lettre. L'oublier
+ * d'un seul côté rend le rapprochement silencieusement inopérant — c'est déjà arrivé.
+ */
+fun phoneAddressesMatch(a: String, b: String, toE164: (String) -> String?): Boolean {
+    val keyA = phoneIdentityKey(a, toE164)
+    return keyA.isNotEmpty() && keyA == phoneIdentityKey(b, toE164)
+}
+
+/**
+ * v1.27.2 (audit Codex final du 2026-08-05, F-02 / F-03 / F-05) — **l'identité d'un correspondant,
+ * sous forme d'une clé unique et stockable.**
+ *
+ * # 🔴 Les trois défauts que ça ferme
+ *
+ * La version précédente comparait d'abord les deux [blockKey] et rendait `false` s'ils
+ * différaient — **avant même de consulter l'E.164**. Elle n'était donc « région-aware » que pour
+ * les plans de numérotation dont le numéro national significatif fait neuf chiffres, c'est-à-dire
+ * la France, celle sur laquelle je l'avais testée :
+ *
+ * ```
+ * Singapour  national "65218000"    -> blockKey 65218000    ┐ même E.164 +6565218000,
+ *            international "+6565218000" -> blockKey 565218000   ┘ et pourtant REFUSÉS
+ * ```
+ *
+ * Elle imposait ensuite une canonicalisation réussie **des deux côtés**, si bien que deux chaînes
+ * **identiques** mais non canonicalisables — code long avec `*`/`#`, format OEM — ne se
+ * reconnaissaient plus : un expéditeur affiché comme bloqué passait quand même (F-05).
+ *
+ * Enfin, la clé de neuf chiffres était **stockée** dans `blocked_numbers`, sous un index UNIQUE.
+ * Deux correspondants de pays différents ne pouvaient donc pas y coexister : bloquer le second
+ * évinçait silencieusement le premier (F-03). Une clé E.164 les sépare, et l'index redevient
+ * correct **sans migration** — le rekey existant convertit les entrées héritées.
+ *
+ * # La règle, dans l'ordre
+ *
+ * 1. **Libellé alphanumérique** (« Free », « SFR 123 ») → le libellé en minuscules. Il n'y a pas
+ *    de pays à départager, et `+`/E.164 n'ont aucun sens ici.
+ * 2. **E.164 si on peut la calculer** → c'est l'identité, complète et non ambiguë. Elle réunit
+ *    d'elle-même le national et l'international du même numéro, dans **tous** les plans.
+ * 3. **Forme explicitement internationale non canonicalisable** → ses propres chiffres, préfixés.
+ *    ⚠️ Surtout pas le suffixe de neuf chiffres : `+1 212 345 6789` percuterait le fixe français
+ *    `01 23 45 67 89`, et le message partirait au mauvais destinataire.
+ * 4. **Sinon** (national ou ambigu, région inconnue) → [blockKey], le repli historique.
+ *
+ * Deux formes non canonicalisables et **identiques** rendent donc la même clé : elles se
+ * reconnaissent, ce que l'échec fermé interdisait à tort.
+ */
+fun phoneIdentityKey(raw: String, toE164: (String) -> String?): String {
+    val trimmed = raw.stripMmsAddressSuffix().trim()
+    if (trimmed.isEmpty()) return ""
+    if (trimmed.any { it.isLetter() }) return trimmed.lowercase()
+    toE164(trimmed)?.takeIf { it.isNotBlank() }?.let { return it }
+    // Non canonicalisable. Une forme explicitement internationale garde SES chiffres — la rabattre
+    // sur neuf ferait percuter `+1 212 345 6789` et le fixe francais `01 23 45 67 89`.
+    return if (trimmed.startsWith('+')) {
+        "+" + trimmed.filter { it.isDigit() }
+    } else {
+        trimmed.blockKey()
+    }
+}
+
+/**
+ * Avatar initials: first letter of first two words, uppercased. Falls back to '?'.
+ */
+fun String.avatarInitials(maxChars: Int = 2): String {
+    if (isBlank()) return "?"
+    val parts = trim().split(Regex("\\s+"))
+    val sb = StringBuilder()
+    for (p in parts) {
+        if (p.isEmpty()) continue
+        sb.append(p[0])
+        if (sb.length >= maxChars) break
+    }
+    return sb.toString().uppercase()
+}
+
+/**
+ * Deterministic hash → color hue index in 0..359.
+ */
+fun String.deterministicHue(): Int {
+    var hash = 0
+    for (c in this) hash = (hash * 31 + c.code) and 0x7FFFFFFF
+    return hash % 360
+}
+
+// v1.28.12 (audit B2) — `String.extractOtp()` a été SUPPRIMÉ. Aucun appelant : l'application
+// n'a jamais eu de fonction « copier le code reçu ». Son seul lecteur était son propre test,
+// lequel affirmait « 6 digit code » sur une expression qui en acceptait de 4 à 8.
+
+/**
+ * Strips invisible bidi / zero-width / replacement characters often present in spam SMS.
+ *
+ * **v1.4.1 (SEC-02)** : widened beyond the original zero-width / bidi set to also cover
+ * Unicode invisibles that previously slipped through the `looksLikeEmojiOnly` heuristic in
+ * [com.relay.sms.domain.reaction.IncomingReactionDecoder] — a body like
+ * `­❤` (soft-hyphen + heart) used to look like a pure-emoji body and could be
+ * forged by an attacker to push a reaction badge onto the victim's most recent outgoing
+ * message. Cleaning the body upstream (in `SmsDeliverReceiver`) closes the bypass for
+ * every consumer at once.
+ *
+ * Ranges and code-points covered :
+ *   - `­`       — SOFT HYPHEN (formerly invisible)
+ *   - `͏`       — COMBINING GRAPHEME JOINER
+ *   - `؜`       — ARABIC LETTER MARK (bidi)
+ *   - `᠎`       — MONGOLIAN VOWEL SEPARATOR (formerly whitespace, now zero-width)
+ *   - `​`       — ZERO WIDTH SPACE
+ *   - `‎`, `‏` — LRM / RLM (bidi)
+ *   - `‪-‮` — bidi explicit formatting (LRE/RLE/PDF/LRO/RLO)
+ *   - `⁠-⁤` — word joiner + invisible operators
+ *   - `⁦-⁩` — bidi isolates (LRI/RLI/FSI/PDI)
+ *   - `﻿`       — ZWNBSP / BOM
+ *   - `￼-�` — object replacement + replacement character
+ *
+ * # v1.28.3 (F28) — ZWJ et ZWNJ ne sont PLUS retirés
+ *
+ * La plage d'origine s'écrivait `​-‏`, qui englobe **U+200C ZERO WIDTH NON-JOINER**
+ * et **U+200D ZERO WIDTH JOINER**. Ce ne sont pas des invisibles trompeurs : ce sont les
+ * liants qui CONSTRUISENT le texte. Les retirer avant stockage altérait irréversiblement des
+ * messages parfaitement légitimes, à chaque réception :
+ *
+ *  - `👨‍👩‍👧` (deux ZWJ) était stocké comme trois emoji séparés, `🏳️‍🌈` comme `🏳️🌈` ;
+ *  - en persan, `می‌روم` devenait `میروم` ; même effet en hindi et dans plusieurs écritures
+ *    indiennes, où le ZWNJ change le mot et non son style.
+ *
+ * Irréversible parce que le corps nettoyé était écrit AUX DEUX endroits — `content://sms` et
+ * Room — sans qu'aucune copie du transport ne subsiste. Le fichier se contredisait d'ailleurs
+ * lui-même : [splitGraphemeClusters], vingt lignes plus bas, traite U+200D comme le liant
+ * atomique d'un cluster emoji. L'application savait que ZWJ construit un emoji, et le
+ * supprimait à l'entrée.
+ *
+ * **Le motif SEC-02 est préservé.** Le contournement qu'il fermait reposait sur le SOFT HYPHEN
+ * (`U+00AD`), toujours retiré, comme tous les bidi. Conserver ZWJ/ZWNJ ne donne rien de neuf à
+ * un attaquant : `looksLikeEmojiOnly` accepte déjà `❤` seul, donc un corps `ZWJ❤` ne lui ouvre
+ * aucun pouvoir qu'un `❤` ne lui donnait pas. Et un emoji ZWJ légitime est un emoji : le
+ * laisser reconnaître comme tel est le comportement juste, pas un relâchement.
+ */
+fun String.stripInvisibleChars(): String =
+    this.replace(INVISIBLE_CHARS_REGEX, "")
+
+/**
+ * Compiled once at class-load — never re-allocated per call.
+ *
+ * ⚠️ `​‎‏` énumérés un par un, et NON `​-‏` : la plage engloberait
+ * ZWNJ (`‌`) et ZWJ (`‍`), qui doivent être conservés. Cf. le KDoc ci-dessus — c'est
+ * une plage qui a coûté tous les emoji composés reçus depuis la v1.4.1.
+ */
+private val INVISIBLE_CHARS_REGEX = Regex(
+    "[\\u00AD\\u034F\\u061C\\u180E\\u200B\\u200E\\u200F\\u202A-\\u202E" +
+        "\\u2060-\\u2064\\u2066-\\u2069\\uFEFF\\uFFFC\\uFFFD]"
+)
+
+/**
+ * v1.6.1 (audit QUAL-13, déplacé depuis `ui.components.EmojiReactionPickerSheet`) —
+ * découpe une chaîne en clusters de graphèmes Unicode (ZWJ family, drapeau, emoji +
+ * variation selector, skin-tone modifier restent ATOMIQUES). Implémentation maison
+ * naïve mais suffisante pour les emojis courants : on regroupe surrogate pairs +
+ * ZWJ (U+200D) + variation selectors (U+FE00..U+FE0F) + skin-tone modifiers
+ * (U+1F3FB..U+1F3FF). Pas de dépendance ICU.
+ *
+ * Utilisé par le picker emoji multi-sélection (cap à 3 clusters) ET par le cap UX
+ * du custom emoji dialog côté ThreadScreen — c'est donc une fonction utilitaire
+ * partagée qui appartient à `core/ext/` plutôt qu'à un composant UI.
+ */
+fun String.splitGraphemeClusters(): MutableList<String> {
+    val out = mutableListOf<String>()
+    if (isEmpty()) return out
+    var i = 0
+    while (i < length) {
+        val sb = StringBuilder()
+        // Base char : surrogate pair (BMP supplementary) ou simple BMP char.
+        if (i < length - 1 && this[i].isHighSurrogate() && this[i + 1].isLowSurrogate()) {
+            sb.append(this[i]); sb.append(this[i + 1]); i += 2
+        } else {
+            sb.append(this[i]); i++
+        }
+        // Glob ZWJ continuations + variation selectors + further surrogate pairs.
+        while (i < length) {
+            val c = this[i]
+            val code = c.code
+            val isZwj = code == 0x200D
+            val isVs = code in 0xFE00..0xFE0F
+            val isSkinTone = i < length - 1 && c.isHighSurrogate() &&
+                this[i + 1].isLowSurrogate() &&
+                ((code - 0xD800) * 0x400 + (this[i + 1].code - 0xDC00) + 0x10000) in 0x1F3FB..0x1F3FF
+            if (isZwj || isVs) {
+                sb.append(c); i++
+                if (isZwj && i < length) {
+                    if (i < length - 1 && this[i].isHighSurrogate() && this[i + 1].isLowSurrogate()) {
+                        sb.append(this[i]); sb.append(this[i + 1]); i += 2
+                    } else {
+                        sb.append(this[i]); i++
+                    }
+                }
+            } else if (isSkinTone) {
+                sb.append(this[i]); sb.append(this[i + 1]); i += 2
+            } else {
+                break
+            }
+        }
+        out += sb.toString()
+    }
+    return out
+}

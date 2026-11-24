@@ -1,0 +1,33 @@
+package com.relay.sms.data.repository
+
+import com.relay.sms.domain.notification.ConversationNotificationCanceller
+
+/**
+ * v1.28.6 — retient ce qu'on lui demande d'annuler, pour les tests de [ConversationEraser].
+ *
+ * Partagé par les deux fichiers qui construisent l'effaceur : la même classe écrite deux fois
+ * aurait divergé, et c'est précisément le motif de défaut que ces tests surveillent.
+ *
+ * Aucun `NotificationManager` dans l'équation : ce qu'il faut prouver est que l'effaceur DEMANDE
+ * l'annulation quand la ligne locale est partie, et qu'il ne la demande PAS quand il conserve le
+ * parent. Ce que le système fait ensuite du tag est déjà tenu par
+ * [com.relay.sms.system.notifications.IncomingMessageNotifier].
+ */
+internal class AnnulateurDeNotificationsEspion : ConversationNotificationCanceller {
+
+    val conversations = mutableListOf<Long>()
+    val messages = mutableListOf<Pair<Long, Long>>()
+    val lots = mutableListOf<Map<Long, Collection<Long>>>()
+
+    override fun cancelAllForConversation(conversationId: Long) {
+        conversations += conversationId
+    }
+
+    override fun cancelForMessage(conversationId: Long, messageId: Long) {
+        messages += conversationId to messageId
+    }
+
+    override fun cancelForMessages(messagesByConversation: Map<Long, Collection<Long>>) {
+        lots += messagesByConversation
+    }
+}

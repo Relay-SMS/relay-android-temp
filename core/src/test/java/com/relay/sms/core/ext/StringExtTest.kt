@@ -1,0 +1,237 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.core.ext
+
+import com.google.common.truth.Truth.assertThat
+import org.junit.jupiter.api.Test
+
+class StringExtTest {
+
+    @Test fun `normalizePhone keeps leading plus, digits, star, hash`() {
+        // Function preserves the original ordering of allowed characters — it strips spaces,
+        // parentheses and dashes but does NOT re-sort. Expected value reflects the actual
+        // behaviour after dropping " ", "(", ")", "-": +,33,6,12,34,56,*,78,#,9.
+        assertThat("+33 (6) 12-34 56*78#9".normalizePhone()).isEqualTo("+336123456*78#9")
+    }
+
+    @Test fun `normalizePhone strips a leading plus when not first`() {
+        assertThat("06 + 12 34".normalizePhone()).isEqualTo("0612 34".replace(" ", ""))
+    }
+
+    @Test fun `formatPhoneNumberForDisplay formats a 10-digit US number`() {
+        assertThat("5551234567".formatPhoneNumberForDisplay()).isEqualTo("(555) 123-4567")
+    }
+
+    @Test fun `formatPhoneNumberForDisplay formats an 11-digit number starting with 1`() {
+        assertThat("15551234567".formatPhoneNumberForDisplay()).isEqualTo("1 (555) 123-4567")
+    }
+
+    @Test fun `formatPhoneNumberForDisplay leaves a non-North-American 10-digit number unchanged`() {
+        // A 10-digit number starting with 0 or 1 cannot be a US number (an area code
+        // starts with 2-9) — e.g. a French number must not be US-formatted.
+        assertThat("0617332729".formatPhoneNumberForDisplay()).isEqualTo("0617332729")
+        assertThat("15551234567".formatPhoneNumberForDisplay()).isEqualTo("1 (555) 123-4567")
+        assertThat("1111111111".formatPhoneNumberForDisplay()).isEqualTo("1111111111")
+    }
+
+    @Test fun `formatPhoneNumberForDisplay formats a US number with the plus-one country code`() {
+        assertThat("+15551234567".formatPhoneNumberForDisplay()).isEqualTo("+1 (555) 123-4567")
+        assertThat("+1 555 123 4567".formatPhoneNumberForDisplay()).isEqualTo("+1 (555) 123-4567")
+    }
+
+    @Test fun `formatPhoneNumberForDisplay preserves a non-US international number starting with plus`() {
+        assertThat("+33612345678".formatPhoneNumberForDisplay()).isEqualTo("+33612345678")
+        assertThat("+442071234567".formatPhoneNumberForDisplay()).isEqualTo("+442071234567")
+    }
+
+    @Test fun `formatPhoneNumberForDisplay leaves partial numbers and names unchanged`() {
+        assertThat("555123".formatPhoneNumberForDisplay()).isEqualTo("555123")
+        assertThat("Curt".formatPhoneNumberForDisplay()).isEqualTo("Curt")
+        assertThat("123".formatPhoneNumberForDisplay()).isEqualTo("123")
+    }
+
+    @Test fun `formatPhoneNumberForDisplay is idempotent on an already formatted number`() {
+        assertThat("(555) 123-4567".formatPhoneNumberForDisplay()).isEqualTo("(555) 123-4567")
+        assertThat("555-123-4567".formatPhoneNumberForDisplay()).isEqualTo("(555) 123-4567")
+    }
+
+    @Test fun `avatarInitials returns first letters of first two words`() {
+        assertThat("Patrice Haltaya".avatarInitials()).isEqualTo("PH")
+        assertThat("alice".avatarInitials()).isEqualTo("A")
+        assertThat("".avatarInitials()).isEqualTo("?")
+    }
+
+    @Test fun `stripInvisibleChars removes bidi controls`() {
+        val sneaky = "hello​‮world"
+        assertThat(sneaky.stripInvisibleChars()).isEqualTo("helloworld")
+    }
+
+    // ──────────── F28 : ZWJ et ZWNJ construisent le texte, ils ne le masquent pas ────────────
+
+    /**
+     * v1.28.3 (F28) — relecture externe sur la MR F-Droid !38458.
+     *
+     * La plage d'origine `​-‏` englobait U+200D ZWJ. Tout emoji composé reçu était
+     * donc DÉCOMPOSÉ avant d'être stocké, des deux côtés — `content://sms` et Room — sans
+     * qu'aucune copie du transport ne subsiste. Irréversible, et à chaque message.
+     */
+    @Test fun `stripInvisibleChars garde le ZWJ qui compose un emoji`() {
+        // 👨‍👩‍👧 = 👨 ZWJ 👩 ZWJ 👧. Sans le ZWJ, trois personnes cote a cote au lieu d'une famille.
+        val famille = "👨‍👩‍👧"
+        assertThat(famille.stripInvisibleChars()).isEqualTo(famille)
+
+        // 🏳️‍🌈 = 🏳 VS16 ZWJ 🌈. Meme mecanisme, resultat visuellement tout autre.
+        val drapeau = "🏳️‍🌈"
+        assertThat(drapeau.stripInvisibleChars()).isEqualTo(drapeau)
+    }
+
+    /**
+     * v1.28.3 (F28) — le ZWNJ n'est pas décoratif dans les écritures qui l'emploient : il
+     * change le mot, pas son style. En persan `می‌روم` (« je vais ») devenait `میروم`.
+     */
+    @Test fun `stripInvisibleChars garde le ZWNJ des ecritures qui en dependent`() {
+        val persan = "می‌روم"
+        assertThat(persan.stripInvisibleChars()).isEqualTo(persan)
+    }
+
+    /**
+     * **Contrôle négatif du test ci-dessus.** Conserver ZWJ et ZWNJ ne doit rien relâcher
+     * d'autre : le motif SEC-02 v1.4.1 visait le SOFT HYPHEN, et tous les contrôles bidi —
+     * ceux qui permettent d'usurper l'origine visuelle d'un message — restent retirés.
+     *
+     * Sans ce test, un correctif qui viderait la regex entière passerait pour bon.
+     */
+    @Test fun `stripInvisibleChars retire toujours le soft hyphen et les controles bidi`() {
+        // Le contournement exact que SEC-02 a ferme : soft hyphen + coeur passant pour un
+        // corps purement emoji.
+        assertThat("­❤".stripInvisibleChars()).isEqualTo("❤")
+
+        // Bidi : LRM, RLM, les cinq formatages explicites, les isolats, le BOM.
+        val bidi = "a‎b‏c‪d‮e⁦f⁩g﻿h؜i᠎j͏k​l"
+        assertThat(bidi.stripInvisibleChars()).isEqualTo("abcdefghijkl")
+    }
+
+    @Test fun `deterministicHue is stable`() {
+        val a = "alice".deterministicHue()
+        val b = "alice".deterministicHue()
+        assertThat(a).isEqualTo(b)
+    }
+
+    @Test fun `foldForSearch strips case and accents`() {
+        // Un même nom saisi de plusieurs façons se replie vers la même clé → la recherche
+        // devient insensible à la casse ET aux accents.
+        assertThat("Maïté".foldForSearch()).isEqualTo("maite")
+        assertThat("MAITE".foldForSearch()).isEqualTo("maite")
+        assertThat("maïté".foldForSearch()).isEqualTo("maite")
+        assertThat("Élodie".foldForSearch()).isEqualTo("elodie")
+        assertThat("François".foldForSearch()).isEqualTo("francois")
+        assertThat("Amélie-Noël".foldForSearch()).isEqualTo("amelie-noel")
+    }
+
+    @Test fun `foldForSearch makes a query match an accented name symmetrically`() {
+        // Usage réel : les DEUX côtés du contains sont repliés, donc une requête sans accent
+        // matche une cible avec accent (et inversement).
+        assertThat("Maïté Fructus".foldForSearch()).contains("maite")
+        assertThat("Vanessa".foldForSearch()).contains("VaNeSsA".foldForSearch())
+    }
+
+    @Test fun `foldForSearch preserves spaces and non-accented text`() {
+        assertThat("Jean Dupont".foldForSearch()).isEqualTo("jean dupont")
+        assertThat("".foldForSearch()).isEqualTo("")
+    }
+
+    @Test fun `foldForSearch leaves unrecomposable ligatures folded to lowercase only`() {
+        // Limite connue documentée : `œ`/`æ`/`ß` n'ont pas de décomposition canonique NFD,
+        // donc seule la casse est repliée (pas de dépliage vers "oe"/"ae"/"ss").
+        assertThat("Œuf".foldForSearch()).isEqualTo("œuf")
+        assertThat("CŒUR".foldForSearch()).isEqualTo("cœur")
+    }
+
+    // ──────────── Round 44 : numbersMatchStrict ────────────
+
+    @Test fun `numbersMatchStrict matches the same number across formats`() {
+        assertThat(numbersMatchStrict("+1 (610) 842-3232", "(610) 842-3232")).isTrue()
+        assertThat(numbersMatchStrict("6108423232", "+16108423232")).isTrue()
+        assertThat(numbersMatchStrict("16108423232", "610-842-3232")).isTrue()
+        assertThat(numbersMatchStrict("+33612345678", "+33 6 12 34 56 78")).isTrue()
+    }
+
+    @Test fun `numbersMatchStrict rejects a number sharing only the last 7 digits`() {
+        // The round-44 bug: Android's PhoneLookup matches on the last
+        // 7 digits, so (610) 842-3232 returned the contact stored as
+        // (215) 842-3232. The area code is part of the number.
+        assertThat(numbersMatchStrict("(610) 842-3232", "(215) 842-3232")).isFalse()
+        assertThat(numbersMatchStrict("+16108423232", "2158423232")).isFalse()
+    }
+
+    @Test fun `numbersMatchStrict never matches an alphanumeric sender`() {
+        assertThat(numbersMatchStrict("Free", "123")).isFalse()
+        assertThat(numbersMatchStrict("SFR 123", "123")).isFalse()
+        assertThat(numbersMatchStrict("", "6108423232")).isFalse()
+        assertThat(numbersMatchStrict("", "")).isFalse()
+    }
+
+    @Test fun `numbersMatchStrict matches equal short codes only`() {
+        assertThat(numbersMatchStrict("12345", "12345")).isTrue()
+        assertThat(numbersMatchStrict("12345", "54321")).isFalse()
+        assertThat(numbersMatchStrict("123", "12345")).isFalse()
+    }
+
+    @Test fun `numbersMatchStrict rejects different numbers`() {
+        assertThat(numbersMatchStrict("6108423232", "6108423233")).isFalse()
+        assertThat(numbersMatchStrict("+33612345678", "+33612345679")).isFalse()
+    }
+
+    @Test fun `numbersMatchStrict does not reunite national and E164 forms internationally`() {
+        // Documented limitation: without a region there is no way to
+        // know "06 12 34 56 78" is "+33612345678". The failure mode
+        // is a missing name, never a wrong one.
+        assertThat(numbersMatchStrict("06 12 34 56 78", "+33612345678")).isFalse()
+    }
+
+    // ──────────── Round 46 : canonicalPhone ────────────
+
+    @Test fun `canonicalPhone unifies E164 and national NANP forms to one key`() {
+        // The round-46 failure: the carrier delivered "+1…" while
+        // the conversation stored "610…", and the two forms keyed
+        // different rows. All four spellings are the same peer.
+        assertThat("+1 (610) 842-3232".canonicalPhone()).isEqualTo("6108423232")
+        assertThat("(610) 842-3232".canonicalPhone()).isEqualTo("6108423232")
+        assertThat("6108423232".canonicalPhone()).isEqualTo("6108423232")
+        assertThat("16108423232".canonicalPhone()).isEqualTo("6108423232")
+        assertThat("+16108423232".canonicalPhone()).isEqualTo("6108423232")
+    }
+
+    @Test fun `canonicalPhone strips formatting from non-NANP numbers`() {
+        assertThat("+33 6 12 34 56 78".canonicalPhone()).isEqualTo("+33612345678")
+        assertThat("(0)6 12-34 56 78".canonicalPhone()).isEqualTo("0612345678")
+    }
+
+    @Test fun `canonicalPhone leaves non-NANP numbers untouched`() {
+        assertThat("+33612345678".canonicalPhone()).isEqualTo("+33612345678")
+        assertThat("+442071234567".canonicalPhone()).isEqualTo("+442071234567")
+        // Documented limitation, shared with numbersMatchStrict:
+        // a national-form international number does NOT reunite
+        // with its E.164 form — the failure mode is a missing
+        // match, never a wrong one.
+        assertThat("0612345678".canonicalPhone()).isEqualTo("0612345678")
+    }
+
+    @Test fun `canonicalPhone leaves alphanumeric senders untouched`() {
+        // normalizePhone() collapses "Free" to empty, so the
+        // trimmed raw string is kept — the PhoneAddress.of fallback.
+        assertThat("Free".canonicalPhone()).isEqualTo("Free")
+        assertThat("  Free  ".canonicalPhone()).isEqualTo("Free")
+    }
+
+    @Test fun `canonicalPhone leaves short codes and 11-digit numbers not starting with 1 untouched`() {
+        assertThat("123".canonicalPhone()).isEqualTo("123")
+        assertThat("12345".canonicalPhone()).isEqualTo("12345")
+        assertThat("26108423232".canonicalPhone()).isEqualTo("26108423232")
+        assertThat("+26108423232".canonicalPhone()).isEqualTo("+26108423232")
+    }
+}

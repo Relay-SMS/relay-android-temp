@@ -1,0 +1,373 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.data.mms
+
+import android.content.Context
+import androidx.annotation.VisibleForTesting
+import com.relay.sms.data.local.db.dao.AttachmentDao
+import com.relay.sms.data.local.db.dao.MessageDao
+import com.relay.sms.data.repository.ConversationMirror
+import com.relay.sms.data.repository.FichiersDePiecesJointes
+import com.relay.sms.data.repository.IncomingAttachment
+import com.relay.sms.data.sms.SystemThreadResolver
+import com.relay.sms.domain.mms.MmsAttachment
+import com.relay.sms.domain.model.PhoneAddress
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
+import timber.log.Timber
+import java.io.File
+import java.util.UUID
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * v1.28.9 (F17, septième note d'Andrew sur la MR !38458) — **l'écriture d'un MMS reçu, idempotente**, que
+ * le receveur l'écrive à l'arrivée ou que la reprise rejoue un PDU gardé.
+ *
+ * # Ce qui manquait
+ *
+ * Le receveur gardait le PDU quand une pièce jointe n'avait pas pu être écrite, ou quand le traitement
+ * échouait — c'est la seule copie du message, aucun MMS entrant n'étant écrit dans `content://mms` —, mais
+ * personne ne le rouvrait : il partait au bout de 24 h. Rejouer demande de savoir si le message a déjà été
+ * écrit, sinon on le duplique ; d'où la clé de transaction ([PdusEnAttente]) cherchée dans la transaction
+ * d'écriture ([ConversationMirror.inscrireMmsRecu]).
+ *
+ * Round 16 — un MMS de groupe entrant EST désormais écrit dans `content://mms`
+ * ([MmsSystemWriteback.insertInbox]), et le fil qu'Android lui assigne sert au
+ * routage (voir [integrer]). La déduplication par clé de transaction reste la
+ * garde contre les rejouements : elle tranche AVANT l'écriture fournisseur,
+ * donc un PDU rejoué n'écrit jamais une seconde ligne système.
+ *
+ * # Les issues
+ *
+ * - message nouveau, toutes les parties écrites : [Resultat.Ecrit] ;
+ * - message nouveau, une partie non écrite : [Resultat.EcritIncomplet] — la légende et la trace valent mieux
+ *   que rien, mais le PDU doit être gardé ;
+ * - message déjà présent, pièces complètes : [Resultat.DejaComplet] — second exemplaire, ou reprise après un
+ *   commit ;
+ * - message déjà présent, pièces incomplètes : la COMPLÉTION réécrit toutes les parties et les substitue d'un
+ *   bloc ([Resultat.Complete]) ; si une partie échoue encore, rien ne change ([Resultat.ToujoursIncomplet]) ;
+ * - message supprimé pendant le travail — pendant la complétion, ou avec son PDU pendant l'écriture des
+ *   pièces : [Resultat.Disparu]. Rien n'est écrit pour lui.
+ *
+ * Une exception remonte : l'appelant garde alors le PDU. Tout fichier écrit pour une ligne qui n'a pas été
+ * écrite est effacé par la règle de citation — il n'est cité par rien.
+ */
+@Singleton
+class IntegrationMmsRecu @VisibleForTesting constructor(
+    private val mirror: ConversationMirror,
+    private val attachmentDao: AttachmentDao,
+    private val messageDao: MessageDao,
+    private val fichiers: FichiersDePiecesJointes,
+    private val ecrivain: EcrivainDePieces,
+    // Round 13 — the system thread-ID resolver, for group MMS. Nullable + defaulted so
+    // existing constructions (notably the instrumented test) keep working without one:
+    // without it no thread ID is resolved and routing is exactly as before.
+    private val threadResolver: SystemThreadResolver? = null,
+    // Round 16 — the system-provider writer, for group MMS. Same nullable +
+    // defaulted shape as the resolver: without it no provider row is written
+    // and routing falls back to the round-13 resolution.
+    private val systemWriteback: MmsSystemWriteback? = null,
+) {
+
+    @Inject constructor(
+        @ApplicationContext context: Context,
+        mirror: ConversationMirror,
+        attachmentDao: AttachmentDao,
+        messageDao: MessageDao,
+        fichiers: FichiersDePiecesJointes,
+        threadResolver: SystemThreadResolver,
+        systemWriteback: MmsSystemWriteback,
+    ) : this(
+        mirror,
+        attachmentDao,
+        messageDao,
+        fichiers,
+        EcrivainDePiecesSurDisque(context),
+        threadResolver,
+        systemWriteback,
+    )
+
+    sealed interface Resultat {
+        data class Ecrit(val messageId: Long) : Resultat
+        data class EcritIncomplet(val messageId: Long) : Resultat
+        data class DejaComplet(val messageId: Long) : Resultat
+        data class Complete(val messageId: Long) : Resultat
+        data class ToujoursIncomplet(val messageId: Long) : Resultat
+        data object Disparu : Resultat
+    }
+
+    /**
+     * Écrit une partie sur le disque, ou rend `null`. Un point d'injection pour les tests : sans lui, la
+     * complétion PARTIELLE — une pièce écrite, l'autre non — serait du code que rien n'atteint.
+     */
+    fun interface EcrivainDePieces {
+        fun ecrire(partie: PartieMms): IncomingAttachment?
+    }
+
+    /**
+     * @param membres les membres du groupe reconstitués depuis l'en-tête, ou `null` pour une conversation
+     *   ordinaire — cf. `GroupMmsMembers`.
+     * @param inclutSoi v1.28.10 — `true` quand [membres] porte l'utilisateur lui-même (« Mon numéro » non
+     *   renseigné) : le miroir rapproche alors d'un groupe existant « moins un » au lieu de créer un
+     *   groupe qui compterait l'utilisateur comme membre.
+     * @param cle la clé de transaction, lue dans le nom du PDU ; `null` : aucune reconnaissance possible.
+     * @param pduPresent la porte de [ConversationMirror.inscrireMmsRecu] : le PDU existe-t-il encore ? Il
+     *   part avec son message quand l'utilisateur supprime celui-ci.
+     */
+    suspend fun integrer(
+        contenu: ContenuMmsRecu,
+        subId: Int?,
+        membres: List<PhoneAddress>?,
+        inclutSoi: Boolean = false,
+        cle: String?,
+        pduPresent: () -> Boolean,
+    ): Resultat {
+        if (cle != null) {
+            // Lecture rapide hors transaction : épargne l'écriture des pièces d'un doublon complet. Elle ne
+            // fait pas foi — c'est `inscrireMmsRecu`, dans sa transaction, qui tranche.
+            messageDao.findIdByTransactionKey(cle)?.let { return completer(it, contenu) }
+        }
+        val pieces = ecrire(contenu.parties)
+        // Round 16 — the system thread ID, for a GROUP MMS only, from the
+        // provider row itself: the message is written into `content://mms`
+        // first and the thread Android assigned to that row is read back
+        // (see `MmsSystemWriteback.insertInbox`). The provider keys a thread
+        // by its recipient set, so the same group always lands in the same
+        // thread — the sent side of the group resolves identically — even
+        // when Relay has never seen the group, and even when our own number
+        // is unknown (no `userMsisdn` needed for the read-back). The write
+        // runs here, OUTSIDE the mirror's transaction: it is a
+        // ContentResolver call to another provider. When the write is
+        // unavailable (not the default SMS app) or fails, the round-13
+        // resolution (thread from the recipient set, no provider row) is
+        // the fallback, and `0L` still means "no thread ID". The provider
+        // URI is passed to the mirror so the later bulk import recognises
+        // this message by its UNIQUE `telephony_uri` and never duplicates
+        // it — and so deleting it in Relay also removes the system row.
+        // 1:1 messages deliberately keep `0L` and no provider row — their
+        // routing is untouched.
+        val systemWrite = if (membres != null) ecrireDansFournisseur(contenu, membres, pieces) else null
+        val systemThreadId = systemWrite?.threadId
+            ?: if (membres != null) threadResolver?.resolve(membres.map { it.raw }) ?: 0L else 0L
+        val telephonyUri = systemWrite?.let { "content://mms/${it.mmsId}" }
+        // Round 48 — an encrypted-media MMS: 1:1 only (`membres ==
+        // null`) with at least one ciphertext part. The part SHAPE
+        // is the signal — the receiver does not gate on the
+        // sender's capability flag, which could be stale if a
+        // bundle was missed. Groups stay plain even with an
+        // encrypted-looking part (v1 encrypts 1:1 only).
+        val encrypted = membres == null &&
+            contenu.parties.any { RelayMediaFilename.isEncryptedPart(it.mime, it.name) }
+        val inscription = try {
+            mirror.inscrireMmsRecu(
+                address = contenu.expediteur,
+                pieces = pieces,
+                caption = contenu.legende,
+                previewLabel = contenu.libelleApercu,
+                date = contenu.date,
+                telephonyUri = telephonyUri,
+                subId = subId,
+                groupMembers = membres,
+                inclutSoi = inclutSoi,
+                transactionKey = cle,
+                encoreVoulu = pduPresent,
+                systemThreadId = systemThreadId,
+                encrypted = encrypted,
+            )
+        } catch (t: Throwable) {
+            // Transaction annulée : aucune ligne ne cite ces fichiers.
+            effacerMalgreAnnulation(pieces)
+            throw t
+        }
+        if (inscription == null) {
+            // Le PDU est parti pendant l'écriture des pièces : son message venait d'être supprimé.
+            effacer(pieces)
+            return Resultat.Disparu
+        }
+        if (!inscription.nouveau) {
+            // Une autre écriture de ce MMS l'a emporté entre la lecture rapide et la transaction.
+            effacer(pieces)
+            return completer(inscription.messageId, contenu)
+        }
+        return if (pieces.size < contenu.parties.size) {
+            Timber.w("MMS: piece jointe non persistee — PDU conserve")
+            Resultat.EcritIncomplet(inscription.messageId)
+        } else {
+            Resultat.Ecrit(inscription.messageId)
+        }
+    }
+
+    /**
+     * Round 16 — writes a received group MMS into the system provider and
+     * returns the row id + the thread Android assigned, or `null` when the
+     * write is unavailable (no writeback, not the default SMS app) or fails.
+     * The thread recipients are the group members as reconstructed from the
+     * PDU header — ourselves already excluded when our number is known, the
+     * full participant list otherwise (the provider still keys a stable
+     * thread on it, so every reply in the group lands in the same thread).
+     * The parts are the files just written to disk: the provider row streams
+     * the same bytes Relay keeps, so both copies agree. Never throws.
+     */
+    private suspend fun ecrireDansFournisseur(
+        contenu: ContenuMmsRecu,
+        membres: List<PhoneAddress>,
+        pieces: List<IncomingAttachment>,
+    ): MmsSystemWriteback.InboxWrite? {
+        val writeback = systemWriteback ?: return null
+        return runCatching {
+            writeback.insertInbox(
+                sender = contenu.expediteur,
+                to = contenu.destinataires,
+                cc = contenu.copies,
+                threadRecipients = membres.map { it.raw },
+                attachments = pieces.map { piece ->
+                    MmsAttachment(
+                        file = piece.file,
+                        mimeType = piece.mimeType,
+                        kind = kindFor(piece.mimeType),
+                    )
+                },
+                textBody = contenu.legende,
+                dateMs = contenu.date,
+            )
+        }.onFailure {
+            Timber.w(it, "MMS: ecriture fournisseur echouee — repli sur la resolution de fil")
+        }.getOrNull()
+    }
+
+    /**
+     * La complétude d'un message déjà écrit : autant de pièces que de parties RETENUES par
+     * [LecteurRetrieveConf.partiesMedia] — la légende et la mise en page n'en sont pas —, et chaque fichier
+     * présent. Incomplet, il est complété d'un bloc.
+     */
+    private suspend fun completer(messageId: Long, contenu: ContenuMmsRecu): Resultat {
+        val presentes = attachmentDao.findForMessage(messageId)
+        val complet = presentes.size >= contenu.parties.size &&
+            presentes.all { it.localUri.startsWith("content://") || File(it.localUri).exists() }
+        if (complet) return Resultat.DejaComplet(messageId)
+        val pieces = ecrire(contenu.parties)
+        if (pieces.size < contenu.parties.size) {
+            effacer(pieces)
+            return Resultat.ToujoursIncomplet(messageId)
+        }
+        val anciennes = try {
+            mirror.remplacerPiecesMmsRecu(messageId, pieces)
+        } catch (t: Throwable) {
+            effacerMalgreAnnulation(pieces)
+            throw t
+        }
+        if (anciennes == null) {
+            effacer(pieces)
+            return Resultat.Disparu
+        }
+        // Les anciennes lignes sont remplacées : leurs fichiers ne partent que s'ils ne sont plus cités.
+        val echecs = fichiers.effacerSiPlusCites(anciennes)
+        if (echecs > 0) Timber.w("MMS: %d ancienne(s) piece(s) de %d non effacee(s)", echecs, messageId)
+        return Resultat.Complete(messageId)
+    }
+
+    private fun ecrire(parties: List<PartieMms>): List<IncomingAttachment> = parties.mapNotNull(ecrivain::ecrire)
+
+    /**
+     * Round 16 — the SMIL kind of a received part, for the provider write.
+     * Only the file and the mime type reach the provider row; the kind is
+     * carried for symmetry with the outgoing [MmsAttachment] shape.
+     */
+    private fun kindFor(mime: String): MmsAttachment.Kind =
+        when {
+            mime.startsWith("audio/", ignoreCase = true) -> MmsAttachment.Kind.AUDIO
+            mime.startsWith("image/", ignoreCase = true) -> MmsAttachment.Kind.IMAGE
+            mime.startsWith("video/", ignoreCase = true) -> MmsAttachment.Kind.VIDEO
+            else -> MmsAttachment.Kind.OTHER
+        }
+
+    private suspend fun effacer(pieces: List<IncomingAttachment>) {
+        if (pieces.isEmpty()) return
+        val echecs = fichiers.effacerSiPlusCites(pieces.map { it.file.absolutePath })
+        if (echecs > 0) Timber.w("MMS: %d piece(s) ecrite(s) pour rien non effacee(s)", echecs)
+    }
+
+    /**
+     * Le ménage d'une écriture qui a levé va au bout, même quand c'est une annulation qui l'interrompt, et
+     * ne remplace jamais l'exception d'origine.
+     */
+    private suspend fun effacerMalgreAnnulation(pieces: List<IncomingAttachment>) {
+        withContext(NonCancellable) {
+            runCatching { effacer(pieces) }.onFailure { Timber.w(it, "MMS: menage des pieces echoue") }
+        }
+    }
+}
+
+/**
+ * Écrit une partie dans `filesDir/mms_attachments/`, par `.tmp` + renommage.
+ *
+ * **v1.3.10 (Q5)** — atomique : un processus tué en pleine écriture laissait un fichier tronqué que la
+ * visionneuse faisait planter. **v1.14.7** — `filesDir` et non plus `cacheDir`, que le système vide.
+ * **v1.28.9** (septième note d'Andrew, point mineur 2) — le `.tmp` d'une écriture qui LÈVE est effacé :
+ * seul l'échec du renommage le faisait, et un disque plein laissait un fichier à moitié écrit, sans ligne
+ * pour y mener.
+ *
+ * Rend `null` sur tout échec : c'est à l'appelant de voir qu'une partie manque.
+ */
+class EcrivainDePiecesSurDisque(private val context: Context) : IntegrationMmsRecu.EcrivainDePieces {
+
+    override fun ecrire(partie: PartieMms): IncomingAttachment? {
+        var temporaire: File? = null
+        return try {
+            // Racine durable des pièces, UNE constante pour les envois et les réceptions (audit de cohérence, C4).
+            val dossier = File(context.filesDir, OutgoingAttachmentStoreImpl.ATTACHMENTS_DIR).apply { mkdirs() }
+            // Round 48 — a relay-media part keeps its PDU name
+            // (`relay-media-<id>.bin`): the filename is the key
+            // lookup for the encrypted part, and a generated name
+            // would sever the only link to the key message. Every
+            // other part keeps its generated name, as before.
+            val nom = if (RelayMediaFilename.parse(partie.name) != null) {
+                checkNotNull(partie.name)
+            } else {
+                "in-${System.currentTimeMillis()}-${UUID.randomUUID().toString().take(8)}." +
+                    extension(partie.mime)
+            }
+            val final = File(dossier, nom)
+            val tmp = File(dossier, "$nom.tmp")
+            temporaire = tmp
+            tmp.writeBytes(partie.octets)
+            if (tmp.renameTo(final)) {
+                IncomingAttachment(file = final, mimeType = partie.mime)
+            } else {
+                tmp.delete()
+                Timber.w("MMS: renommage refuse pour %s", final.name)
+                null
+            }
+        } catch (t: Throwable) {
+            temporaire?.let { runCatching { it.delete() } }
+            Timber.w(t, "MMS: ecriture de piece jointe echouee mime=%s", partie.mime)
+            null
+        }
+    }
+
+    private fun extension(mime: String): String = when (mime.lowercase()) {
+        "audio/mp4", "audio/aac", "audio/mp4a-latm" -> "m4a"
+        "audio/amr", "audio/3gpp" -> "amr"
+        "audio/mpeg", "audio/mp3" -> "mp3"
+        "audio/ogg", "audio/opus" -> "ogg"
+        "image/jpeg", "image/jpg" -> "jpg"
+        "image/png" -> "png"
+        "image/gif" -> "gif"
+        "image/webp" -> "webp"
+        "image/heic" -> "heic"
+        "video/mp4" -> "mp4"
+        "video/3gpp" -> "3gp"
+        "video/webm" -> "webm"
+        "application/pdf" -> "pdf"
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" -> "docx"
+        "application/msword" -> "doc"
+        "application/zip" -> "zip"
+        else -> "bin"
+    }
+}

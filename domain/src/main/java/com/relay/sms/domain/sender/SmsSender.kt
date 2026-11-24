@@ -1,0 +1,73 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.domain.sender
+
+import com.relay.sms.core.result.Outcome
+
+/**
+ * Port domaine de l'envoi d'un SMS via la pile téléphonie Android.
+ *
+ * Les use-cases d'envoi ([com.relay.sms.domain.usecase.SendSmsUseCase],
+ * [com.relay.sms.domain.usecase.RetrySendUseCase]) dépendent de cette abstraction et non de la
+ * couche `data` : c'est ce qui rend `domain/` indépendant de `data/` (Étage 2.1, inversion de
+ * dépendance). L'implémentation [com.relay.sms.data.sms.SmsSenderImpl] enveloppe `SmsManager`
+ * et rattache l'id Room aux `PendingIntent` de suivi.
+ */
+interface SmsSender {
+
+    /**
+     * Découpe [text] en parts multipartes et l'envoie à [destination] via la pile téléphonie.
+     *
+     * @param localMessageId id Room du message miroir, encodé dans les `PendingIntent` de suivi
+     *   pour que les receivers (`SmsSentReceiver` / `SmsDeliveredReceiver`) puissent mettre à jour
+     *   la ligne à `SENT` / `DELIVERED` / `FAILED`.
+     * @param destination numéro brut du destinataire (l'impl le normalise en E.164 pour le fil).
+     * @param subId `subscriptionId` de la SIM à utiliser (multi-SIM) ; `null` = SIM par défaut.
+     * @param requestDeliveryReport demande un accusé de réception si `true`.
+     * @param attempt v1.28.3 (F23) — numéro de la tentative, `0` pour un premier envoi, incrémenté
+     *   par chaque relance explicite. Il est encodé dans les `PendingIntent` **et dans leur
+     *   `requestCode`** : sans lui, deux tentatives du même message partageaient un seul
+     *   `PendingIntent` (`filterEquals` ignore les extras, et `FLAG_UPDATE_CURRENT` réécrivait
+     *   ceux du premier), et leurs accusés étaient indiscernables.
+     * @return [Outcome.Success] si la remise à `SmsManager` a réussi, [Outcome.Failure] sinon.
+     */
+    fun send(
+        localMessageId: Long,
+        destination: String,
+        text: String,
+        subId: Int? = null,
+        requestDeliveryReport: Boolean = false,
+        attempt: Int = 0,
+    ): Outcome<Unit>
+
+    /**
+     * E2E (design §3.4) — sends ONE ciphertext fragment as its own
+     * single-part SMS. [fragmentIndex] (0-based) and [fragmentTotal]
+     * ride as the part index / part count in the tracking
+     * `PendingIntent`s, so each fragment of a message gets distinct
+     * sent/delivery intents (plain [send] would give every fragment
+     * part index 0 and collapse them onto one `PendingIntent`) and the
+     * delivery receiver can hold the DELIVERED promotion until ALL
+     * fragments report delivered.
+     *
+     * Default implementation delegates to [send]: test fakes keep
+     * compiling, and the real implementation
+     * ([com.relay.sms.data.sms.SmsSenderImpl]) overrides it with the
+     * fragment-indexed intents.
+     */
+    fun sendFragment(
+        localMessageId: Long,
+        destination: String,
+        text: String,
+        fragmentIndex: Int,
+        fragmentTotal: Int,
+        subId: Int? = null,
+        requestDeliveryReport: Boolean = false,
+        attempt: Int = 0,
+    ): Outcome<Unit> =
+        send(localMessageId, destination, text, subId, requestDeliveryReport, attempt)
+}

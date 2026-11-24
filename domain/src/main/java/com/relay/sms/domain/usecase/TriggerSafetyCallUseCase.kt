@@ -1,0 +1,679 @@
+package com.relay.sms.domain.usecase
+
+import com.relay.sms.core.result.Outcome
+import com.relay.sms.di.IoDispatcher
+import com.relay.sms.domain.model.MessageStatus
+import com.relay.sms.domain.model.PhoneAddress
+import com.relay.sms.domain.repository.OutgoingMessageMirror
+import com.relay.sms.domain.safety.SafetyMessageTexts
+import com.relay.sms.domain.safetycall.SafetyCallConfig
+import com.relay.sms.domain.safetycall.SafetyCallContact
+import com.relay.sms.domain.security.PanicStateProvider
+import com.relay.sms.domain.settings.AppSettingsSource
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import timber.log.Timber
+import javax.inject.Inject
+
+/**
+ * v1.9.0 — Évalue l'état du Safety call deadman et déclenche l'envoi des
+ * SMS d'urgence si le timer a expiré.
+ *
+ * Appelé depuis [com.relay.sms.system.scheduler.SafetyCallWorker] au tick périodique (60 min)
+ * et par le travail ponctuel qui porte chaque relance (15 min).
+ *
+ * **Garde panic-decoy (audit fix CRITICAL)** : si l'app est en session
+ * [com.relay.sms.security.AppLockManager.LockState.PanicDecoy], retourne [Result.PanicSuppressed]
+ * sans envoi. Sinon l'agresseur sous contrainte verrait partir les SMS
+ * d'urgence devant lui, révélant le réseau de soutien de la victime. Le
+ * worker du tick suivant retentera dès que la session decoy est quittée.
+ *
+ * **v1.27.2 — le désarmement préemptif de SEC-3 est RENVERSÉ.**
+ *
+ * L'ancien texte de ce bloc décrivait un `disableSafetyCall()` appelé AVANT la boucle d'envoi,
+ * pour qu'un plantage entre deux envois ne relance pas le déclenchement au tick suivant. Le prix
+ * n'avait pas été pesé : quand **tous** les envois échouaient — pas de réseau, mode avion, SIM
+ * absente — le deadman se désarmait quand même, définitivement et en silence. La protection
+ * s'éteignait exactement au moment où elle échouait.
+ *
+ * Le contrat est désormais :
+ *  1. le créneau est **réservé de façon atomique** avant l'envoi, ce qui couvre le doublon que
+ *     SEC-3 cherchait à éviter — y compris entre le tick périodique et une relance qui se
+ *     croiseraient ;
+ *  2. si **aucun** envoi n'aboutit, le créneau est **rendu** : le deadman reste armé et le tick
+ *     suivant retentera ;
+ *  3. le désarmement n'a lieu qu'à la **fin de la séquence** de [SafetyCallConfig.TOTAL_MESSAGES]
+ *     messages, ou sur une configuration invalide (aucun contact, message vide).
+ *
+ * Un plantage entre l'envoi et la libération du créneau coûte au pire **un message en double** —
+ * bien moins grave qu'une protection éteinte sans le dire.
+ *
+ * **Garde-fous** :
+ *  - Refuse si liste de contacts vide.
+ *  - Refuse si template = CUSTOM avec message vide.
+ *  - Skippe les contacts au numéro invalide (log warn redacté) mais les
+ *    autres reçoivent le SMS — un seul mauvais numéro ne bloque pas tout.
+ *
+ * **Logs (audit fix SEC-1)** : aucun `phoneNumber` n'est loggé en clair.
+ *
+ * **v1.10.0 — refacto C1** : ex-`SafetyCallTriggerService` (état non
+ * pertinent, l'état vit dans [SettingsRepository] déjà `@Singleton`).
+ * Migré vers le pattern UseCase dominant du projet avec `operator invoke()`.
+ */
+class TriggerSafetyCallUseCase @Inject constructor(
+    private val sendSms: SendSmsUseCase,
+    private val settings: AppSettingsSource,
+    private val panicState: PanicStateProvider,
+    // v1.28.3 (F05) — lecture seule du statut d'un envoi, pour attendre l'accuse du radio au
+    // lieu de tenir l'acceptation par `SmsManager` pour un envoi reussi.
+    private val mirror: OutgoingMessageMirror,
+    // v1.28.12 — les corps de SMS, dans la langue de l'application.
+    private val textes: SafetyMessageTexts,
+    @IoDispatcher private val io: CoroutineDispatcher,
+) {
+
+    suspend operator fun invoke(): Result = withContext(io) {
+        if (panicState.isPanicDecoyActive) {
+            Timber.i("TriggerSafetyCallUseCase: PanicDecoy active, suppressing trigger")
+            return@withContext Result.PanicSuppressed
+        }
+
+        var current = settings.flow.first().security.safetyCall
+        if (!current.enabled) {
+            Timber.d("TriggerSafetyCallUseCase: disabled, skipping")
+            return@withContext Result.Disabled
+        }
+
+        // v1.27.2 (relecture Gemini du 2026-08-05) - REPRISE D UN CRENEAU ABANDONNE.
+        //
+        // La reservation ci-dessous incremente `messagesSent` AVANT d envoyer. Si le processus
+        // meurt dans cet intervalle - memoire insuffisante, mise a jour du systeme, batterie
+        // critique - le tick suivant lit `messagesSent = 1` et croit le message initial parti.
+        // Les proches ne recevraient JAMAIS le message qui explique la situation : ils
+        // decouvriraient l affaire par un « Toujours aucun signe de ma part, 15 minutes plus
+        // tard ». Ce n est pas un doublon, c est une PERTE - et mon commentaire d origine
+        // affirmait le contraire.
+        //
+        // Le bail rend la reservation reversible. Passe `CLAIM_LEASE_MS` sans conclusion, le
+        // creneau est repris ici et l envoi sera retente plus bas dans la meme execution.
+        //
+        // Le repli va volontairement vers le DOUBLON : reprendre un creneau dont l envoi avait en
+        // realite abouti coute un message en double, sans commune mesure avec une alerte muette.
+        if (current.isClaimAbandoned()) {
+            current = reclaimAbandonedSlot(current.messagesSent)
+            if (!current.enabled) return@withContext Result.Disabled
+        }
+
+        // v1.27.2 - deux entrees possibles : le declenchement initial, ou une relance de la
+        // sequence deja ouverte. `isExpired` rend `false` des que `triggeredAt` est pose : les
+        // deux conditions sont donc exclusives, jamais concurrentes.
+        val isRelance = current.isTriggered
+        if (isRelance && !current.hasRelancePending) {
+            // 🔴 v1.27.2 (audit Codex du 2026-08-05, C-02) — un creneau RESERVE n est pas une
+            // sequence TERMINEE.
+            //
+            // `messagesSent` compte les creneaux reserves, pas les envois conclus. L etat
+            // `messagesSent = 4, claimedAt > 0` est exactement celui qui persiste entre la
+            // reservation du dernier message et sa conclusion. Sans cette garde, un second
+            // controle demarrant dans cette fenetre validait la sequence et desarmait : la
+            // derniere alerte n aurait JAMAIS ete retentee.
+            //
+            // La reprise des creneaux abandonnes est passee juste au-dessus : si l on arrive ici
+            // avec un bail pose, c est qu il est encore VALIDE, donc qu un envoi est en vol.
+            if (current.claimedAt != 0L) {
+                Timber.i("TriggerSafetyCallUseCase: dernier creneau en vol, on ne conclut pas")
+                return@withContext Result.AlreadySent
+            }
+            // Sequence terminee sans que le desarmement ait pu s ecrire - processus tue juste
+            // apres le dernier envoi. On finit le travail plutot que de laisser un etat bancal.
+            Timber.i("TriggerSafetyCallUseCase: relance sequence complete, disarming")
+            // v1.27.2 (audit Codex, P-02) — le rattrapage exige que la sequence soit TOUJOURS
+            // complete et sans bail au moment de l ecriture, pas seulement au moment de la lecture.
+            disableSafetyCall(current.generation) { cfg ->
+                cfg.isTriggered &&
+                    cfg.messagesSent >= SafetyCallConfig.TOTAL_MESSAGES &&
+                    cfg.claimedAt == 0L
+            }
+            return@withContext Result.SequenceComplete
+        }
+        if (!isRelance && !current.isExpired()) {
+            Timber.d(
+                "TriggerSafetyCallUseCase: armed but not expired (lastActivity=%d, timeout=%dh)",
+                current.lastActivityAt, current.timeoutMs / 3_600_000L,
+            )
+            return@withContext Result.NotExpired
+        }
+        if (isRelance && !current.isRelanceDue()) {
+            Timber.d("TriggerSafetyCallUseCase: relance %d not due yet", current.messagesSent)
+            return@withContext Result.NotExpired
+        }
+        if (current.contacts.isEmpty()) {
+            Timber.w("TriggerSafetyCallUseCase: expired but no contacts configured - disabling")
+            // v1.27.2 (audit Codex, P-02) — la liste doit etre ENCORE vide a l ecriture : quelqu un
+            // a pu ajouter un contact depuis les Reglages entre la lecture et ce desarmement.
+            disableSafetyCall(current.generation) { cfg -> cfg.contacts.isEmpty() }
+            return@withContext Result.NoContacts
+        }
+        val body = renderBody(current, isRelance)
+        if (body.isBlank()) {
+            Timber.w("TriggerSafetyCallUseCase: rendered body is blank - disabling")
+            // v1.27.2 (audit Codex, P-02) — le message doit etre ENCORE vide a l ecriture : le
+            // texte personnalise a pu etre corrige depuis les Reglages entre-temps.
+            disableSafetyCall(current.generation) { cfg -> renderBody(cfg, isRelance).isBlank() }
+            return@withContext Result.EmptyBody
+        }
+
+        // v1.27.2 - RESERVATION ATOMIQUE du creneau, AVANT l envoi.
+        //
+        // `settings.update` s execute sous le verrou d ecriture de DataStore : le test et
+        // l increment sont donc indivisibles. Sans cela, le tick periodique (60 min) et la
+        // relance ponctuelle (15 min) pourraient se croiser et envoyer deux fois le meme message.
+        //
+        // La reservation echoue si quelqu un a deja pris ce creneau : on ne fait alors rien.
+        val nowMs = System.currentTimeMillis()
+        // v1.27.2 (audit Codex du 2026-08-05, C-03 / C-04) — IDENTITE DU PROPRIETAIRE.
+        //
+        // Le bail seul disait qu UN envoi etait en cours, pas LEQUEL. Un worker bloque plus de
+        // `CLAIM_LEASE_MS` voyait son creneau repris - ce qui est voulu - puis, en revenant
+        // tardivement, concluait ou restituait la reservation du SECOND. Et une remise a zero
+        // faite pendant la boucle d envoi ne l arretait pas.
+        //
+        // On retient donc deux jetons : le numero de reservation qu on vient d ecrire, et la
+        // generation du cycle sur laquelle on a decide. Toute ecriture ulterieure les exige.
+        val myGeneration = current.generation
+        var myClaimId = 0L
+        var claimed = false
+        settings.update { s ->
+            val cfg = s.security.safetyCall
+            // `claimedAt != 0L` = un envoi est deja en vol et son bail court encore. On ne double
+            // pas, meme si le compteur coincide.
+            val leaseHeld = cfg.claimedAt != 0L && !cfg.isClaimAbandoned(nowMs)
+            // v1.27.2 (audit Codex du 2026-08-05, SC-03) — 🔴 UNE FAUSSE ALERTE APRÈS « JE VAIS
+            // BIEN ». La condition ne comparait que `enabled` et `messagesSent`. Or une remise a
+            // zero de l utilisateur - ouverture de l application, tap sur la notification, bouton
+            // dedie - deplace `lastActivityAt` SANS toucher au compteur. Un worker parti avec un
+            // instantane d avant la confirmation reservait donc le creneau et envoyait quand meme :
+            // les proches recevaient une urgence a la seconde ou la personne venait de confirmer
+            // aller bien. En comparant l horodatage d activite, l instantane perime est rejete.
+            val activityMoved = cfg.lastActivityAt != current.lastActivityAt
+            // Regroupe pour rester sous le seuil de complexite de detekt, et parce que les
+            // deux termes disent la meme chose : l instantane sur lequel ce worker a decide
+            // est perime.
+            // La generation est le jeton PROPRE : `lastActivityAt` peut coincider par hasard, une
+            // generation non. Les deux sont compares, le second est le garde-fou du premier.
+            val staleSnapshot = cfg.messagesSent != current.messagesSent ||
+                activityMoved ||
+                cfg.generation != myGeneration
+            if (!cfg.enabled || staleSnapshot || leaseHeld) {
+                s
+            } else {
+                claimed = true
+                myClaimId = cfg.claimId + 1
+                s.copy(
+                    security = s.security.copy(
+                        safetyCall = cfg.copy(
+                            triggeredAt = if (cfg.isTriggered) cfg.triggeredAt else nowMs,
+                            messagesSent = cfg.messagesSent + 1,
+                            claimedAt = nowMs,
+                            // ⚠️ v1.27.2 (audit Codex, P-01) — STRICTEMENT CROISSANT.
+                            // La premiere version remettait `claimId` a zero a chaque
+                            // conclusion, restitution et reprise : la reservation suivante
+                            // recalculait donc `0 + 1` et REUTILISAIT l identite du worker
+                            // precedent. Un ancien proprietaire encore vivant et son repreneur
+                            // portaient le meme couple `(claimId, generation)`, et
+                            // `stillOwnsClaim` ne pouvait plus les distinguer — le protocole
+                            // entier ne servait a rien. C est `claimedAt` qui dit s il y a un
+                            // bail actif, jamais `claimId`.
+                            claimId = myClaimId,
+                        ),
+                    ),
+                )
+            }
+        }
+        if (!claimed) {
+            Timber.i(
+                "TriggerSafetyCallUseCase: slot %d already claimed, skipping",
+                current.messagesSent,
+            )
+            return@withContext Result.AlreadySent
+        }
+
+        Timber.i(
+            "TriggerSafetyCallUseCase: SEND #%d - %d contact(s), relance=%s",
+            current.messagesSent + 1,
+            current.contacts.size,
+            isRelance,
+        )
+
+        val tally = sendToContacts(current.contacts, body, myClaimId, myGeneration)
+        // v1.28.3 (F05) — le compteur d'envois vient desormais du VERDICT DU RADIO, pas de
+        // l'acceptation par `SmsManager`. Cf. [confirmerAupresDuRadio] : sans ca, la sequence se
+        // deroulait entierement et se desarmait alors qu'aucun SMS n'avait atteint le reseau.
+        val confirmes = confirmerAupresDuRadio(tally.remisAuRadio)
+        val sent = confirmes
+        val failed = tally.failed + (tally.remisAuRadio.size - confirmes)
+        val superseded = tally.superseded
+
+        // v1.27.2 - ANNULATION DE LA RESERVATION si RIEN n est parti.
+        //
+        // C est le renversement assume du correctif SEC-3, qui desarmait AVANT la boucle d envoi
+        // pour qu un plantage entre deux envois ne relance pas le declenchement. Le prix n avait
+        // pas ete pese : sans reseau, en mode avion ou sans SIM, le deadman se desarmait quand
+        // meme - definitivement et en silence, exactement au moment ou il echouait.
+        //
+        // La reservation atomique ci-dessus couvre deja le doublon. Ici on REND le creneau pour
+        // que le tick suivant retente. Un plantage entre l envoi et cette ligne coute au pire UN
+        // message en double : bien moins grave qu une protection eteinte sans le dire.
+        // v1.27.2 (audit Codex, C-04) — le creneau nous a ete retire en cours de route : une
+        // remise a zero de l utilisateur, ou une reprise apres expiration du bail. On ne touche
+        // plus a rien — ni restitution, ni conclusion, ni desarmement : l etat appartient
+        // desormais a quelqu un d autre.
+        if (superseded) {
+            return@withContext Result.Superseded
+        }
+
+        if (sent == 0) {
+            Timber.w("TriggerSafetyCallUseCase: nothing sent - releasing slot for next tick")
+            settings.update { s ->
+                val cfg = s.security.safetyCall
+                // Restitution conditionnee a la PROPRIETE, pas au seul compteur : sans
+                // `claimId`, un worker revenu tardivement restituait la reservation d un autre,
+                // ramenant le compteur en arriere pendant un envoi reel.
+                if (cfg.claimId != myClaimId || cfg.generation != myGeneration) {
+                    s
+                } else {
+                    s.copy(
+                        security = s.security.copy(
+                            safetyCall = cfg.copy(
+                                triggeredAt = if (isRelance) cfg.triggeredAt else 0L,
+                                messagesSent = current.messagesSent,
+                                claimedAt = 0L,
+                            ),
+                        ),
+                    )
+                }
+            }
+            return@withContext Result.SendFailed(failed = failed)
+        }
+
+        // Envoi conclu : le bail est leve. Sans cette ligne, le creneau suivant serait bloque
+        // pendant deux minutes, et une relance due dans cet intervalle serait sautee.
+        //
+        // v1.27.2 (audit Codex, C-03) — la levee est CONDITIONNEE a la propriete. Sans elle, un
+        // worker revenu tardivement levait le bail d un envoi en cours et ouvrait la porte a un
+        // troisieme concurrent.
+        val messagesSentNow = current.messagesSent + 1
+        val remaining = SafetyCallConfig.TOTAL_MESSAGES - messagesSentNow
+        var concluded = false
+        settings.update { s ->
+            val cfg = s.security.safetyCall
+            if (cfg.claimId != myClaimId || cfg.generation != myGeneration) {
+                s
+            } else {
+                concluded = true
+                s.copy(
+                    security = s.security.copy(
+                        // Le desarmement de fin de sequence est ecrit DANS la meme transaction
+                        // que la levee du bail. Separes, un reset glisse entre les deux pouvait
+                        // desactiver le cycle tout neuf que l utilisateur venait d ouvrir.
+                        safetyCall = cfg.copy(
+                            claimedAt = 0L,
+                            enabled = if (remaining <= 0) false else cfg.enabled,
+                        ),
+                    ),
+                )
+            }
+        }
+        if (!concluded) {
+            Timber.i("TriggerSafetyCallUseCase: creneau perdu apres envoi, conclusion abandonnee")
+            return@withContext Result.Superseded
+        }
+        if (remaining <= 0) {
+            Timber.i(
+                "TriggerSafetyCallUseCase: sequence complete (%d messages), disarming",
+                messagesSentNow,
+            )
+        }
+        Result.Triggered(
+            sent = sent,
+            failed = failed,
+            nextRelanceInMs = if (remaining > 0) SafetyCallConfig.RELANCE_INTERVAL_MS else null,
+        )
+    }
+
+    /** Bilan d'une passe d'envoi. [superseded] = le creneau nous a ete retire en cours de route. */
+    /**
+     * @param remisAuRadio identifiants Room des messages que `SmsManager` a **acceptés**. Leur
+     *   sort est encore inconnu : il arrivera par le `PendingIntent` `SENT`. Ne jamais les
+     *   compter comme envoyés sans être passé par [confirmerAupresDuRadio].
+     */
+    private data class SendTally(
+        val remisAuRadio: List<Long>,
+        val failed: Int,
+        val superseded: Boolean,
+    )
+
+    /**
+     * Envoie [body] a chaque contact, en verifiant AVANT CHAQUE ENVOI que le creneau nous
+     * appartient toujours.
+     *
+     * v1.27.2 (audit Codex, C-04) — la verification est dans la boucle, pas avant elle. Comparer
+     * `lastActivityAt` fermait la fenetre « instantane -> reservation », pas
+     * « reservation -> envoi » : quelqu'un qui confirmait aller bien PENDANT la boucle ne
+     * l'arretait pas, et les SMS d'urgence continuaient de partir vers ses proches. Un SMS deja
+     * parti ne se rattrape pas — le cout est une ecriture DataStore par destinataire, sur un chemin
+     * qui en compte quatre au maximum, et elle sert doublement puisqu'elle RENOUVELLE LE BAIL
+     * (audit Codex du 2026-08-05, P-04 — voir [renewClaim]).
+     *
+     * Un contact invalide n'interrompt PAS les autres : un seul mauvais numero ne doit pas priver
+     * les trois autres proches de l'alerte.
+     */
+    private suspend fun sendToContacts(
+        contacts: List<SafetyCallContact>,
+        body: String,
+        claimId: Long,
+        generation: Long,
+    ): SendTally {
+        val remisAuRadio = mutableListOf<Long>()
+        var failed = 0
+        for ((index, contact) in contacts.withIndex()) {
+            if (!renewClaim(claimId, generation, System.currentTimeMillis())) {
+                Timber.i("TriggerSafetyCallUseCase: creneau perdu en cours d envoi, arret")
+                return SendTally(remisAuRadio, failed, superseded = true)
+            }
+            val target = contact.takeIf { it.isValid() }?.let { PhoneAddress.of(it.phoneNumber) }
+            if (target == null || target.normalized.isEmpty()) {
+                Timber.w("TriggerSafetyCallUseCase: skipping unusable contact #%d", index)
+                failed++
+                continue
+            }
+            when (val res = sendSms(recipients = listOf(target), body = body, appendSignature = false)) {
+                // v1.28.3 (F05) — on ne compte PLUS un envoi ici. Un `Outcome.Success` ne dit que
+                // ceci : `SmsManager` a accepte la demande sans lever. On retient les
+                // identifiants Room pour aller chercher le verdict du radio apres la boucle.
+                // v1.28.3 (F21) — `dispatched` et non plus la valeur entière : le rapport
+                // distingue désormais ce qui est parti de ce qui a été refusé, et seul le
+                // premier a un accusé à attendre.
+                is Outcome.Success -> remisAuRadio += res.value.dispatched
+                is Outcome.Failure -> {
+                    Timber.w("TriggerSafetyCallUseCase: send failed for contact #%d", index)
+                    failed++
+                }
+            }
+        }
+        return SendTally(remisAuRadio, failed, superseded = false)
+    }
+
+    /**
+     * v1.28.3 (F05) — attend le verdict du radio pour les messages remis a `SmsManager`, et rend
+     * le nombre de ceux qui sont REELLEMENT partis.
+     *
+     * # Pourquoi cette attente existe
+     *
+     * `SmsManager.sendMultipartTextMessage` ne rend rien : elle accepte la demande, et le sort du
+     * message arrive plus tard par le `PendingIntent` `SENT`, que `SmsSentReceiver` ecrit en base.
+     * Jusqu'ici l'appel de securite comptait un succes des l'acceptation. En mode avion, sans SIM
+     * ou hors couverture — c'est-a-dire exactement quand l'alerte echoue — aucune exception n'est
+     * levee : `RESULT_ERROR_NO_SERVICE` remonte de facon ASYNCHRONE. La sequence se deroulait donc
+     * entierement et, au dernier message, ecrivait `enabled = false` : **l'homme mort se
+     * desarmait sans qu'un seul SMS ait atteint le reseau.**
+     *
+     * # Ce qui est compte
+     *
+     * `SENT` et `DELIVERED` seulement. Un `FAILED` est acquis, on cesse d'attendre. Un `PENDING`
+     * encore la a l'echeance reste NON compte : le tick suivant retentera, et le compteur de
+     * sequence n'aura pas avance. C'est le meme arbitrage que la restitution de creneau quelques
+     * lignes plus haut — au pire UN message en double, ce qui est sans commune mesure avec une
+     * protection eteinte en silence.
+     *
+     * L'attente est bornee et courte au regard du budget d'un worker (10 min), et elle ne court
+     * qu'une fois, apres la boucle, pas par contact.
+     */
+    private suspend fun confirmerAupresDuRadio(ids: List<Long>): Int {
+        if (ids.isEmpty()) return 0
+        val enAttente = ids.toMutableSet()
+        var confirmes = 0
+        // `withTimeoutOrNull` et non une comparaison sur `System.currentTimeMillis()` : la borne
+        // doit suivre l'horloge des coroutines. Avec le temps mural, un test du cas « le radio ne
+        // repond jamais » durerait quarante-cinq secondes reelles, et personne n'ecrirait ce test.
+        withTimeoutOrNull(CONFIRMATION_TIMEOUT_MS) {
+            while (enAttente.isNotEmpty()) {
+                val iterateur = enAttente.iterator()
+                while (iterateur.hasNext()) {
+                    val id = iterateur.next()
+                    when (mirror.outgoingStatus(id)) {
+                        MessageStatus.SENT, MessageStatus.DELIVERED -> {
+                            confirmes++
+                            iterateur.remove()
+                        }
+                        // Verdict negatif acquis : inutile d'attendre davantage pour celui-ci.
+                        MessageStatus.FAILED -> iterateur.remove()
+                        // La ligne a disparu (purge, suppression manuelle) : rien a confirmer.
+                        null -> iterateur.remove()
+                        else -> Unit
+                    }
+                }
+                if (enAttente.isNotEmpty()) delay(CONFIRMATION_POLL_MS)
+            }
+        }
+        if (enAttente.isNotEmpty()) {
+            Timber.w(
+                "TriggerSafetyCallUseCase: %d message(s) sans verdict du radio apres %d ms — non comptes",
+                enAttente.size,
+                CONFIRMATION_TIMEOUT_MS,
+            )
+        }
+        return confirmes
+    }
+
+    /**
+     * v1.27.2 — reprend un creneau dont le bail a expire, et rend la configuration RELUE.
+     *
+     * Extrait de `invoke` pour la lisibilite autant que pour la complexite : la reprise est une
+     * operation a part entiere, avec sa propre garde de concurrence (`isClaimAbandoned` est
+     * re-teste DANS la transaction, car un autre worker a pu reprendre le creneau entre-temps).
+     */
+    private suspend fun reclaimAbandonedSlot(slot: Int): SafetyCallConfig {
+        Timber.w("TriggerSafetyCallUseCase: creneau %d abandonne, reprise", slot)
+        settings.update { s ->
+            val cfg = s.security.safetyCall
+            if (!cfg.isClaimAbandoned()) {
+                s
+            } else {
+                val rolledBack = (cfg.messagesSent - 1).coerceAtLeast(0)
+                s.copy(
+                    security = s.security.copy(
+                        safetyCall = cfg.copy(
+                            messagesSent = rolledBack,
+                            // Plus aucun message parti : la sequence n a jamais commence.
+                            triggeredAt = if (rolledBack == 0) 0L else cfg.triggeredAt,
+                            claimedAt = 0L,
+                        ),
+                    ),
+                )
+            }
+        }
+        return settings.flow.first().security.safetyCall
+    }
+
+    /**
+     * v1.27.2 (audit Codex, C-03 / C-04) — le créneau réservé nous appartient-il **toujours** ?
+     * Si oui, le bail est **renouvelé** dans la même transaction.
+     *
+     * Trois façons de le perdre : un autre worker a repris un bail qu'il croyait abandonné
+     * (`claimId` a changé, ou le bail a été levé sans que nous l'ayons fait), ou l'utilisateur a
+     * confirmé aller bien et ouvert une nouvelle génération de cycle. Dans tous les cas, ce worker
+     * n'a plus rien à envoyer ni rien à écrire.
+     *
+     * # Pourquoi renouveler (audit Codex du 2026-08-05, P-04)
+     *
+     * [SafetyCallConfig.CLAIM_LEASE_MS] valait deux minutes pour **toute la boucle d'envoi**. Le
+     * seuil répondait donc à la question « ce worker a-t-il commencé il y a plus de deux
+     * minutes ? », alors que la seule question utile est « ce worker **avance-t-il encore** ? ». Un
+     * propriétaire vivant mais lent — accès ContentProvider, appel OEM, verrou DataStore — voyait
+     * son créneau repris alors qu'il travaillait, avec à la clé une alerte en double.
+     *
+     * En renouvelant entre deux contacts, le bail cesse de mesurer l'ancienneté pour mesurer la
+     * **progression** : deux minutes sans le moindre contact traité, c'est un processus mort. Un
+     * envoi réellement bloqué ne renouvelle rien, puisque le renouvellement est *entre* les envois
+     * et jamais pendant.
+     *
+     * Le coût est d'au plus quatre écritures DataStore par alerte — le nombre maximum de contacts.
+     */
+    private suspend fun renewClaim(claimId: Long, generation: Long, nowMs: Long): Boolean {
+        var owned = false
+        settings.update { s ->
+            val cfg = s.security.safetyCall
+            val lost = cfg.claimId != claimId ||
+                cfg.generation != generation ||
+                // Bail levé sans que nous l'ayons fait : une reprise après expiration efface
+                // `claimedAt` sans toucher à `claimId`. Sans ce terme, la fenêtre entre la reprise
+                // et la réservation du repreneur nous aurait fait croire que le créneau est encore
+                // le nôtre.
+                cfg.claimedAt == 0L
+            if (lost) {
+                s
+            } else {
+                owned = true
+                s.copy(
+                    security = s.security.copy(safetyCall = cfg.copy(claimedAt = nowMs)),
+                )
+            }
+        }
+        return owned
+    }
+
+    /**
+     * Rend le corps du message pour [cfg].
+     *
+     * **Sans effet de bord et déterministe pour un [cfg] donné**, donc réutilisable dans une
+     * transaction DataStore pour revalider une décision prise sur un instantané plus ancien.
+     * v1.28.12 — le texte vient désormais des ressources (langue de l'application) au lieu
+     * d'être écrit en français dans le code ; il reste figé dans l'APK, donc la propriété qui
+     * compte ici — deux appels sur le même [cfg] rendent la même chose — est conservée.
+     */
+    private fun renderBody(cfg: SafetyCallConfig, isRelance: Boolean): String =
+        if (isRelance) {
+            textes.safetyCallRelance(cfg.messagesSent)
+        } else {
+            textes.safetyCallBody(cfg.template, cfg.timeoutMs, cfg.customMessage)
+        }.trim()
+
+    /**
+     * v1.27.2 (audit Codex du 2026-08-05, P-02) — désarme le deadman **seulement si l'état qui a
+     * motivé la décision est toujours celui qui est persisté**.
+     *
+     * # Le défaut que cette garde ferme
+     *
+     * La primitive écrivait `enabled = false` sans rien vérifier. Un worker parti sur un cycle
+     * déjà complet (`messagesSent = 4`) pouvait donc arriver ici **après** que l'utilisateur ait
+     * rouvert l'application ou confirmé aller bien : `withActivityReset()` avait entre-temps ouvert
+     * le cycle `G+1`, armé et non déclenché, et ce désarmement aveugle l'éteignait. L'interface
+     * confirmait « Activé », et plus rien ne protégeait personne.
+     *
+     * La conclusion nominale, elle, était déjà atomique : elle compare `(claimId, generation)` et
+     * désarme dans la même transaction que la levée du bail. Le trou n'était que sur les trois
+     * chemins de récupération — rattrapage de séquence complète, aucun contact, message vide.
+     *
+     * @param expectedGeneration génération du cycle sur laquelle la décision a été prise. Une
+     *   génération différente signifie qu'un nouveau cycle a été ouvert : ce worker n'a plus rien
+     *   à dire sur celui-là.
+     * @param stillJustified revalidation, évaluée **dans** la transaction, de la raison précise du
+     *   désarmement. La génération seule ne suffit pas : ajouter un contact ou corriger un message
+     *   personnalisé depuis les Réglages ne l'incrémente pas.
+     */
+    private suspend fun disableSafetyCall(
+        expectedGeneration: Long,
+        stillJustified: (SafetyCallConfig) -> Boolean,
+    ) {
+        var disabled = false
+        settings.update { s ->
+            val cfg = s.security.safetyCall
+            if (!cfg.enabled || cfg.generation != expectedGeneration || !stillJustified(cfg)) {
+                s
+            } else {
+                disabled = true
+                s.copy(security = s.security.copy(safetyCall = cfg.copy(enabled = false)))
+            }
+        }
+        if (!disabled) {
+            Timber.i("TriggerSafetyCallUseCase: desarmement abandonne, l etat a change entre-temps")
+        }
+    }
+
+    sealed interface Result {
+        /** SafetyCall désactivé dans Settings (no-op normal). */
+        data object Disabled : Result
+
+        /** SafetyCall armé mais pas encore expiré. */
+        data object NotExpired : Result
+
+        /** Expiré mais liste de contacts vide (config invalide auto-corrigée). */
+        data object NoContacts : Result
+
+        /** Expiré mais body rendu vide (template CUSTOM avec message vide). */
+        data object EmptyBody : Result
+
+        /**
+         * Session [com.relay.sms.security.AppLockManager.LockState.PanicDecoy] active — trigger
+         * supprimé pour ne pas révéler les contacts d'urgence à l'agresseur.
+         * Le worker tick suivant retentera.
+         */
+        data object PanicSuppressed : Result
+
+        /**
+         * Trigger effectué. [sent] = SMS envoyés, [failed] = contacts pour
+         * lesquels l'envoi a échoué (numéro invalide, default SMS app,
+         * blocklist, échec sender).
+         */
+        data class Triggered(
+            val sent: Int,
+            val failed: Int,
+            /** v1.27.2 - delai avant la prochaine relance, ou `null` si la sequence est finie. */
+            val nextRelanceInMs: Long? = null,
+        ) : Result
+
+        /** v1.27.2 - le creneau avait deja ete pris par un autre tick. Rien n a ete envoye. */
+        data object AlreadySent : Result
+
+        /**
+         * v1.27.2 (audit Codex, C-03 / C-04) — le creneau nous a ete RETIRE en cours de route :
+         * reprise par un autre worker apres expiration du bail, ou nouvelle generation de cycle
+         * ouverte par une confirmation « je vais bien ».
+         *
+         * Distinct de [AlreadySent], qui signifie « on n a jamais obtenu le creneau ». Ici on
+         * l avait, et on a pu envoyer une partie des messages avant de le perdre. L appelant ne
+         * doit RIEN conclure de cet etat : il appartient desormais a quelqu un d autre.
+         */
+        data object Superseded : Result
+
+        /** v1.27.2 - la sequence de relances est terminee ; le deadman vient d etre desarme. */
+        data object SequenceComplete : Result
+
+        /**
+         * v1.27.2 - AUCUN envoi n a abouti. Le creneau a ete rendu : le deadman reste arme et le
+         * tick suivant retentera. Ne JAMAIS desarmer sur ce chemin.
+         */
+        data class SendFailed(val failed: Int) : Result
+    }
+
+    private companion object {
+        /**
+         * v1.28.3 (F05) — combien de temps attendre le `PendingIntent` `SENT` avant de tenir un
+         * envoi pour non confirme.
+         *
+         * Un accus positif revient en quelques secondes. C'est l'ECHEC qui est lent :
+         * `RESULT_ERROR_NO_SERVICE` peut demander plusieurs dizaines de secondes, le temps que la
+         * pile radio renonce. Trop court, on ne compterait presque jamais un envoi reussi et la
+         * sequence tournerait en rond ; trop long, le worker s'immobilise. Quarante-cinq secondes
+         * couvrent le cas normal avec de la marge, pour un budget de worker de dix minutes.
+         */
+        const val CONFIRMATION_TIMEOUT_MS = 45_000L
+
+        /** Intervalle de sondage du statut. Une lecture par seconde sur au plus quelques lignes. */
+        const val CONFIRMATION_POLL_MS = 1_000L
+    }
+}
