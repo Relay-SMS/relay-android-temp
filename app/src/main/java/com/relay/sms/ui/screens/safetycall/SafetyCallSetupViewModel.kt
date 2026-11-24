@@ -1,0 +1,392 @@
+package com.relay.sms.ui.screens.safetycall
+
+import android.content.Context
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.relay.sms.data.local.datastore.SettingsRepository
+import com.relay.sms.domain.safetycall.SafetyCallConfig
+import com.relay.sms.domain.safetycall.SafetyCallContact
+import com.relay.sms.domain.safetycall.SafetyCallTemplate
+import com.relay.sms.domain.safetycall.SafetyCallTriggerRecord
+import com.relay.sms.system.scheduler.SafetyCallWorker
+import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+/**
+ * v1.9.0 — State holder pour [SafetyCallSetupScreen].
+ *
+ * **Working draft** : l'écran édite une copie locale (`draft`) de la config
+ * deadman avant validation. Le `Save` matérialise atomiquement la
+ * configuration dans DataStore et reschedule le worker. Tant que l'user
+ * n'a pas tapé `Save`, ses modifications restent en RAM et sont perdues
+ * en cas de back / kill — comportement attendu pour un formulaire de
+ * sécurité (éviter de sauver une config incomplète).
+ *
+ * **Validation au save** :
+ *  - `enabled = true` requiert ≥ 1 contact valide
+ *  - Template CUSTOM requiert `customMessage` non-vide
+ *  - Sinon, retourne un `Event.ValidationError(reason)` que l'écran
+ *    affiche via SnackBar.
+ *
+ * **Effet de bord du save** :
+ *  - Atomic write DataStore
+ *  - Si nouvellement enabled : reset `lastActivityAt = now()` pour démarrer
+ *    le timer à partir de maintenant (pas du dernier reset éventuel)
+ *  - Schedule du [SafetyCallWorker] (idempotent, KEEP policy)
+ */
+@HiltViewModel
+class SafetyCallSetupViewModel @Inject constructor(
+    private val settings: SettingsRepository,
+    @ApplicationContext private val context: Context,
+    /**
+     * v1.28.12 — pour dire, SUR L'ÉCRAN D'ARMEMENT, que rien ne partira sans le rôle
+     * d'application SMS par défaut. Cet écran l'ignorait : on pouvait armer un homme-mort,
+     * voir « activé » et un compte à rebours, et n'être protégé par rien.
+     */
+    val defaultAppManager: com.relay.sms.data.sms.DefaultSmsAppManager,
+) : ViewModel() {
+
+    /**
+     * Draft local édité par l'écran. Initialisé depuis DataStore au `init`
+     * via un `first()` ONE-SHOT (audit fix P1) — l'ancienne version collectait
+     * en continu et écrasait le draft à chaque émission DataStore concurrente,
+     * faisant perdre les modifications en cours si une autre source (ex:
+     * `onResume` qui écrit `lastActivityAt`) modifiait `settings` pendant
+     * que l'utilisateur éditait le formulaire.
+     */
+    private val _draft = MutableStateFlow(SafetyCallConfig())
+    val draft: StateFlow<SafetyCallConfig> = _draft.asStateFlow()
+
+    /**
+     * Snapshot du config persisté au moment où l'écran a été ouvert. Utilisé
+     * dans [save] pour décider si on doit reset `lastActivityAt` (passage
+     * disabled → enabled). Hydraté lazy via [snapshotInitial].
+     */
+    private var snapshotInitial: SafetyCallConfig = SafetyCallConfig()
+
+    /**
+     * v1.25.5 — vrai dès la première modification de l'utilisateur.
+     *
+     * L'hydratation depuis le DataStore est asynchrone : entre l'ouverture de l'écran et la
+     * réponse du disque, un ajout de contact rapide était **écrasé** par `_draft.value = initial`.
+     * Même motif que le Coffre en v1.25.4 — une initialisation tardive qui annule une décision
+     * déjà prise. On ne réhydrate donc plus par-dessus une saisie.
+     */
+    private var userEdited = false
+
+    /**
+     * v1.25.5 — vrai quand le brouillon diverge de ce qui est enregistré.
+     *
+     * Quitter l'écran jetait le brouillon **en silence** : le dialogue d'ajout de contact,
+     * dont le bouton s'intitulait « Enregistrer », donnait toute raison de croire que le contact
+     * était acquis. Il ne l'était pas — seul le bouton du bas écrit sur le disque. L'écran s'en
+     * sert désormais pour prévenir avant de sortir.
+     *
+     * # v1.27.3 — la comparaison porte sur les champs du FORMULAIRE, pas sur tout l'objet
+     *
+     * Depuis que [save] fusionne le brouillon dans la configuration LIVE, [snapshotInitial] porte
+     * l'état d'exécution réel (séquence, bail, génération, historique) alors que le brouillon garde
+     * celui d'à l'ouverture. Une égalité brute serait donc **fausse juste après un enregistrement**,
+     * et l'écran aurait réclamé de sauver ce qu'il venait de sauver.
+     *
+     * La bonne question n'est pas « ces deux objets sont-ils identiques ? » mais « appliquer les
+     * modifications du formulaire changerait-il quelque chose ? » — et c'est exactement ce que
+     * [SafetyCallConfig.withUserEdits] exprime.
+     */
+    val hasUnsavedChanges: Boolean
+        get() = snapshotInitial.withUserEdits(_draft.value) != snapshotInitial
+
+    private val _events = Channel<Event>(Channel.BUFFERED)
+    val events get() = _events.receiveAsFlow()
+
+    init {
+        // v1.9.0 audit fix P1 — hydrate one-shot depuis DataStore au lieu
+        // de `collect` permanent. Si l'user édite et qu'une autre coroutine
+        // écrit dans DataStore (ex: onResume reset), le draft local reste
+        // intact.
+        viewModelScope.launch {
+            val initial = settings.flow.first().security.safetyCall
+            snapshotInitial = initial
+            // v1.25.5 — ne jamais écraser une saisie plus rapide que le disque.
+            if (!userEdited) _draft.value = initial
+        }
+    }
+
+    /**
+     * v1.27.2 — état **RÉELLEMENT ENREGISTRÉ**, lu en continu depuis DataStore.
+     *
+     * Distinct de `draft.enabled`, qui n'est qu'une intention tant qu'on n'a pas enregistré.
+     * L'écran affiche celui-ci : un indicateur qui suivrait la position de l'interrupteur
+     * mentirait exactement comme lui.
+     */
+    val savedEnabled: StateFlow<Boolean> = settings.flow
+        .map { it.security.safetyCall.enabled }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000L), false)
+
+    /**
+     * v1.27.3 — **historique des déclenchements**, du plus récent au plus ancien.
+     *
+     * Lu depuis DataStore et non depuis le brouillon : ce n'est pas une saisie, c'est un fait
+     * passé, et le brouillon ne doit ni le modifier ni le perdre en cas d'abandon.
+     *
+     * 🔴 v1.27.3 (relecture Gemini du 2026-08-06, F-02) — on lit
+     * [SafetyCallConfig.historyWithCurrentCycle], **pas `history`**. Le désarmement de fin de
+     * séquence est écrit dans la transaction du dernier envoi, sans passer par `withActivityReset` :
+     * le cycle achevé n'est donc pas encore archivé. Et comme la remise à zéro d'ouverture
+     * d'application est conditionnée à `enabled` — faux après ce désarmement — elle ne l'archive pas
+     * davantage. Lire `history` seul aurait affiché « aucun déclenchement enregistré » à l'instant
+     * précis où quatre SMS venaient de partir, en contredisant la notification d'à côté.
+     *
+     * ⚠️ Aucune garde de mode leurre ici, **et c'est délibéré** : elle serait redondante et, pire,
+     * elle donnerait l'illusion que cet écran est atteignable sous contrainte. Il ne l'est pas — la
+     * route `SafetyCallSetup` est dépilée dès l'entrée en mode leurre (`AppRoot`), et la section qui
+     * y mène est masquée dans les Réglages. La garde porte sur l'**accès**, pas sur l'affichage,
+     * comme l'exige le motif de défaut dominant de ce dépôt.
+     */
+    val history: StateFlow<List<SafetyCallTriggerRecord>> = settings.flow
+        .map { it.security.safetyCall.historyWithCurrentCycle.asReversed() }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000L), emptyList())
+
+    /**
+     * v1.27.2 — l'interrupteur **désactive immédiatement**, et n'active qu'au moment
+     * d'enregistrer.
+     *
+     * L'asymétrie est volontaire, et elle penche du côté sûr :
+     *
+     *  - **Éteindre** ne demande aucune validation et l'intention ne souffre aucune ambiguïté.
+     *    Croire avoir coupé une surveillance qui tourne encore est inacceptable — c'est ce que
+     *    l'utilisateur a vécu, et l'avertissement de sortie arrivait trop tard, quand il pensait
+     *    déjà avoir agi.
+     *  - **Allumer** doit rester soumis à [save], qui vérifie qu'il existe au moins un contact.
+     *    Un Safety Call activé sans destinataire ne ferait rien, en silence — précisément la
+     *    famille de défauts que ce lot corrige.
+     *
+     * L'écriture met aussi [snapshotInitial] à jour, sans quoi l'écran réclamerait ensuite
+     * d'enregistrer une modification déjà persistée.
+     */
+    fun setEnabled(enabled: Boolean) {
+        userEdited = true
+        _draft.value = _draft.value.copy(enabled = enabled)
+        if (!enabled) {
+            viewModelScope.launch {
+                settings.update { s ->
+                    s.copy(
+                        security = s.security.copy(
+                            safetyCall = s.security.safetyCall.copy(enabled = false),
+                        ),
+                    )
+                }
+                snapshotInitial = snapshotInitial.copy(enabled = false)
+                _events.trySend(Event.DisabledImmediately)
+            }
+        }
+    }
+
+    fun setTimeoutMs(timeoutMs: Long) {
+        userEdited = true
+        val capped = timeoutMs.coerceIn(
+            SafetyCallConfig.TIMEOUT_MIN_MS,
+            SafetyCallConfig.TIMEOUT_MAX_MS,
+        )
+        _draft.value = _draft.value.copy(timeoutMs = capped)
+    }
+
+    fun setTemplate(template: SafetyCallTemplate) {
+        userEdited = true
+        _draft.value = _draft.value.copy(template = template)
+    }
+
+    fun setCustomMessage(message: String) {
+        userEdited = true
+        val capped = message.take(SafetyCallConfig.MAX_CUSTOM_MESSAGE_LENGTH)
+        _draft.value = _draft.value.copy(customMessage = capped)
+    }
+
+    /**
+     * Ajoute un contact au brouillon. **Rend `false` si rien n'a été ajouté.**
+     *
+     * v1.25.5 — le retour est le correctif : l'écran fermait le dialogue quel que soit le
+     * résultat, si bien qu'un numéro refusé disparaissait sans que l'utilisateur puisse le
+     * corriger — l'erreur passait dans un bandeau, derrière un dialogue déjà refermé.
+     */
+    fun addContact(name: String?, phoneNumber: String): Boolean {
+        val current = _draft.value
+        if (current.contacts.size >= SafetyCallConfig.MAX_CONTACTS) {
+            _events.trySend(Event.ValidationError(ValidationReason.MaxContactsReached))
+            return false
+        }
+        val candidate = SafetyCallContact(displayName = name, phoneNumber = phoneNumber.trim())
+        if (!candidate.isValid()) {
+            _events.trySend(Event.ValidationError(ValidationReason.InvalidPhone))
+            return false
+        }
+        userEdited = true
+        _draft.value = current.copy(contacts = current.contacts + candidate)
+        // v1.27.2 — l'ajout est confirmé. Les deux refus (numéro invalide, maximum atteint)
+        // émettaient déjà un message ; le succès, lui, refermait le dialogue en silence, sans
+        // rien dire de ce qui venait d'être enregistré.
+        _events.trySend(Event.ContactAdded)
+        return true
+    }
+
+    fun removeContact(index: Int) {
+        val current = _draft.value
+        if (index !in current.contacts.indices) return
+        userEdited = true
+        _draft.value = current.copy(
+            contacts = current.contacts.toMutableList().also { it.removeAt(index) },
+        )
+        // v1.27.2 — symétrique de l'ajout : chaque action sur le carnet se confirme.
+        _events.trySend(Event.ContactRemoved)
+    }
+
+    /**
+     * Sauvegarde la config draft dans DataStore après validation. Si la
+     * sauvegarde aboutit avec `enabled = true`, le worker est schedulé
+     * (idempotent) et le timer initialisé à `now()`.
+     *
+     * Émet [Event.Saved] sur succès, [Event.ValidationError] sinon.
+     */
+    fun save() {
+        viewModelScope.launch {
+            val current = _draft.value
+            // Validation au save.
+            if (current.enabled && current.contacts.isEmpty()) {
+                _events.trySend(Event.ValidationError(ValidationReason.NoContacts))
+                return@launch
+            }
+            // v1.26.1 (audit M5) — le carnet de contacts est PARTAGÉ avec le Mode urgence, qui
+            // lit `security.safetyCall.contacts`. La validation ci-dessus ne s'applique que si
+            // le Safety call lui-même est activé : un utilisateur qui le désarmait et retirait
+            // ses contacts au passage vidait donc le carnet, et le Mode urgence — resté armé —
+            // perdait TOUS ses destinataires. Il ne l'apprenait qu'au déclenchement, c'est-à-dire
+            // au moment précis où il en avait besoin.
+            if (current.contacts.isEmpty() &&
+                settings.state.value.security.emergency.enabled
+            ) {
+                _events.trySend(Event.ValidationError(ValidationReason.SharedWithEmergency))
+                return@launch
+            }
+            if (current.enabled &&
+                current.template == SafetyCallTemplate.CUSTOM &&
+                current.customMessage.isBlank()
+            ) {
+                _events.trySend(Event.ValidationError(ValidationReason.EmptyCustomMessage))
+                return@launch
+            }
+            // Si on active fraîchement (passage de disabled → enabled), reset
+            // le timer à maintenant. Si on était déjà enabled, on garde le
+            // lastActivityAt existant (pas de reset implicite via un simple
+            // change de template).
+            // 🔴 v1.27.3 — LE BROUILLON N'ÉCRASE PLUS L'ÉTAT D'EXÉCUTION.
+            //
+            // Cette écriture remplaçait `safetyCall` **en entier** par le brouillon, or celui-ci est
+            // hydraté une seule fois à l'ouverture de l'écran et ne porte donc que des valeurs
+            // périmées pour tout ce que l'utilisateur n'édite pas. Enregistrer pendant qu'une
+            // séquence courait :
+            //
+            //  - effaçait `triggeredAt`, `messagesSent` et `claimedAt` — l'alerte en cours
+            //    disparaissait des Réglages et de la notification, sans rien annuler côté worker ;
+            //  - **rembobinait `claimId` et `generation`**, c'est-à-dire exactement l'invariant que
+            //    P-01 et C-04 avaient établi : un worker encore en vol et son successeur pouvaient
+            //    dès lors porter la même identité, et un cycle clos redevenait « courant » ;
+            //  - et depuis v1.27.3, écraserait [SafetyCallConfig.history] avec une copie d'avant
+            //    l'archivage, perdant définitivement la trace d'un déclenchement.
+            //
+            // On fusionne donc les **cinq champs que l'écran édite** dans la configuration LIVE,
+            // relue sous le verrou d'écriture de DataStore. Tout le reste — horloges, séquence,
+            // bail, identité, génération, historique — appartient au moteur, pas au formulaire.
+            //
+            // La frontière elle-même vit dans le domaine ([SafetyCallConfig.withUserEdits]), pas
+            // ici : à cet endroit elle était intestable, et c'est précisément pour ça que le défaut
+            // a vécu si longtemps.
+            var persisted = current
+            settings.update { s ->
+                val live = s.security.safetyCall
+                val merged = live.withUserEdits(current)
+                // 🔴 v1.27.3 (relecture Codex du 2026-08-06, SC-1273-01) — LA TRANSITION SE DÉCIDE
+                // SUR L'ÉTAT LIVE, PAS SUR L'INSTANTANÉ D'OUVERTURE.
+                //
+                // La version précédente de ce correctif lisait `!snapshotInitial.enabled`, figé à
+                // l'ouverture de l'écran. Or le désarmement de fin de séquence tombe entre-temps :
+                //
+                //  1. l'écran est ouvert alors que le Safety call est armé ⇒ instantané `enabled = true` ;
+                //  2. la 4ᵉ alerte se conclut ⇒ l'état LIVE devient `enabled = false`, `triggeredAt > 0`,
+                //     `messagesSent = TOTAL_MESSAGES` ;
+                //  3. l'utilisateur enregistre une modification quelconque.
+                //
+                // `wasDisabled` valait alors `false`, la remise à zéro était sautée, et l'état
+                // persisté devenait `enabled = true` **avec la séquence terminale encore posée**.
+                // Dans cet état `isExpired` rend `false`, `hasRelancePending` est faux et
+                // `nextWakeUpAt` rend `null` : **aucune alarme n'est programmée**, alors que l'écran
+                // confirme l'activation. Croire à une protection qui n'existe pas est le pire état
+                // que cette fonction puisse produire — et ce correctif-ci l'avait introduit en
+                // fermant l'écrasement de `claimId`.
+                //
+                // Relue dans la transaction, `live.enabled` porte la vérité du moment de l'écriture.
+                val isLiveRearm = current.enabled && !live.enabled
+                // v1.10.0 SEC-11 — couple mono+wall au premier arming.
+                // v1.27.2 (audit Codex, SC-03) — même remise à zéro que partout ailleurs. Un
+                // armement part forcément d'un état vide : sans cela, un temps capitalisé ou une
+                // séquence de relances restée ouverte lors d'une activation précédente seraient
+                // rejoués, et le deadman partirait en avance — ou reprendrait ses relances.
+                // Appliquée à `merged`, donc à l'état LIVE : elle archive la séquence réellement
+                // en cours, et non celle que le brouillon croyait connaître.
+                persisted = if (isLiveRearm) merged.withActivityReset() else merged
+                s.copy(security = s.security.copy(safetyCall = persisted))
+            }
+            val toPersist = persisted
+            // v1.25.5 — le brouillon vient d'être écrit : il n'y a plus rien à perdre, donc plus
+            // de garde de sortie à déclencher.
+            snapshotInitial = toPersist
+            // Reschedule le worker — idempotent (KEEP policy). Même si enabled
+            // est false, on schedule (no-op ticks) pour qu'un futur enable
+            // n'ait pas besoin de cold-start pour démarrer.
+            SafetyCallWorker.schedulePeriodic(context)
+            _events.trySend(Event.Saved(enabled = toPersist.enabled))
+        }
+    }
+
+    sealed interface Event {
+        /**
+         * v1.27.2 — porte l'état enregistré pour que l'écran nomme ce qui vient de se passer
+         * (« Safety call activé » / « désactivé ») au lieu d'un « Contacts et réglages
+         * enregistrés » qui ne disait pas si la surveillance courait ou non.
+         */
+        data class Saved(val enabled: Boolean) : Event
+
+        /** v1.27.2 — confirme l'ajout, le dialogue se refermant sans rien dire jusqu'ici. */
+        data object ContactAdded : Event
+
+        /** v1.27.2 — jumeau de [ContactAdded] : le retrait était muet lui aussi. */
+        data object ContactRemoved : Event
+
+        /** v1.27.2 — l'interrupteur a éteint le Safety Call sur-le-champ, sans passer par Enregistrer. */
+        data object DisabledImmediately : Event
+        data class ValidationError(val reason: ValidationReason) : Event
+    }
+
+    enum class ValidationReason {
+        NoContacts,
+        InvalidPhone,
+        MaxContactsReached,
+        EmptyCustomMessage,
+
+        /**
+         * v1.26.1 (audit M5) — le carnet est partagé avec le Mode urgence, qui est encore armé :
+         * le vider le priverait de tous ses destinataires, en silence.
+         */
+        SharedWithEmergency,
+    }
+}

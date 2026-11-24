@@ -1,0 +1,114 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.system.receiver
+
+import android.content.BroadcastReceiver
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import dagger.hilt.android.AndroidEntryPoint
+import timber.log.Timber
+
+/**
+ * v1.12.0 — Receiver du raccourci d'urgence (notification persistante lock-screen).
+ *
+ * Actions restantes :
+ *
+ *  - **[ACTION_DIAL_112]** : ouvre le dialer pré-rempli sur 112 (numéro
+ *    d'urgence européen). Utilise `Intent.ACTION_DIAL` (pas CALL_PHONE qui
+ *    demanderait permission runtime + déclencherait l'appel sans confirmation).
+ *    Le numéro 112 est reconnu par l'OS comme numéro d'urgence et le dialer
+ *    s'ouvre même écran verrouillé sur la plupart des devices.
+ *  - **[ACTION_DIAL_POLICE]** : idem pour le 17, en opt-in.
+ *
+ * **v1.26.1 (audit B5) — `ACTION_TRIGGER_EMERGENCY` a été RETIRÉE.**
+ *
+ * Elle envoyait de VRAIS SMS d'urgence + la géolocalisation sur un SEUL broadcast, sans
+ * anti-rebond, sans temporisation et sans retour utilisateur. Son unique constructeur d'Intent
+ * n'avait plus aucun appelant depuis le retrait de la quick action en v1.14.2 : c'était un
+ * chemin armé sans consommateur, dont l'innocuité ne tenait qu'à `exported=false`. Une
+ * régression du manifeste — ou un copier-coller d'`intent-filter` — l'aurait rendue
+ * déclenchable par n'importe quelle application. Le déclenchement légitime passe par l'écran
+ * in-app, avec appui maintenu 3 secondes.
+ *
+ * **Sécurité** :
+ *  - `exported = false` dans le Manifest — uniquement le PendingIntent de
+ *    Relay peut déclencher ces actions, pas une autre app.
+ *  - Les numéros ne peuvent PAS être détournés : ils viennent d'un ensemble
+ *    FERMÉ connu à la compilation (`EmergencyNumbers`), jamais d'un extra
+ *    modifiable, et sont re-filtrés par la liste blanche d'`EmergencyCallHelper`.
+ */
+@AndroidEntryPoint
+class EmergencyShortcutReceiver : BroadcastReceiver() {
+
+    override fun onReceive(context: Context, intent: Intent) {
+        when (intent.action) {
+            // v1.26.1 (audit B5) — `ACTION_TRIGGER_EMERGENCY` retiree, cf. le KDoc de tete.
+            ACTION_DIAL_112 -> handleDial(context, EMERGENCY_NUMBER_EU)
+            // v1.28.12 — le numéro de police dépend du PAYS OÙ LE TÉLÉPHONE EST ENREGISTRÉ :
+            // 17 en France, 110 en Allemagne, 091 en Espagne. Il n'est toujours pas passé en
+            // extra — il est résolu ici, à partir d'un ensemble fermé connu à la compilation,
+            // puis re-filtré par la liste blanche d'`EmergencyCallHelper`. Cf. [EmergencyNumbers].
+            ACTION_DIAL_POLICE -> handleDial(
+                context,
+                com.relay.sms.system.emergency.EmergencyNumbers
+                    .raccourciForcesDeLOrdre(context).number,
+            )
+            else -> Timber.w("EmergencyShortcutReceiver: unknown action %s", intent.action)
+        }
+    }
+
+    private fun handleDial(context: Context, number: String) {
+        Timber.i("EmergencyShortcutReceiver: dial %s requested", number)
+        // v1.14.0 — délégué au helper centralisé `EmergencyCallHelper.openDialer`
+        // pour cohérence + whitelist stricte des numéros. Lock-screen action =
+        // TOUJOURS dialer (jamais auto-call) : hold-3s direct-call est réservé
+        // aux écrans in-app où la garde gestuelle est applicable. Sur lock-
+        // screen, le tap accidentel poche-pocket est trop probable.
+        com.relay.sms.system.emergency.EmergencyCallHelper.openDialer(context, number)
+    }
+
+    companion object {
+        /** Numéro européen unifié pour les urgences (24/24). Le seul qui ne dépend pas du pays. */
+        const val EMERGENCY_NUMBER_EU = "112"
+
+        const val ACTION_DIAL_112 = "com.relay.sms.SHORTCUT_DIAL_112"
+        const val ACTION_DIAL_POLICE = "com.relay.sms.SHORTCUT_DIAL_POLICE"
+
+        /**
+         * v1.14.1 — action portée par le `setContentIntent` de la notification
+         * persistante : tap sur le corps de la notif → ouvre la page Mode
+         * urgence in-app (full screen avec tous les boutons d'urgence visibles).
+         * Distinct des 3 quick actions qui restent ACTION_DIAL_* (lock-screen
+         * sécurité, l'OS gère le unlock si besoin).
+         */
+        const val ACTION_OPEN_EMERGENCY = "com.relay.sms.SHORTCUT_OPEN_EMERGENCY"
+
+        /** ID unique de la notif persistante (jamais collisionne avec celles SMS). */
+        const val NOTIF_ID_EMERGENCY_SHORTCUT = 0x53484f52 // 'SHOR'
+
+        fun intentDial112(context: Context): Intent =
+            Intent(context, EmergencyShortcutReceiver::class.java).apply {
+                action = ACTION_DIAL_112
+                component = ComponentName(context, EmergencyShortcutReceiver::class.java)
+                `package` = context.packageName
+            }
+
+        fun intentDialPolice(context: Context): Intent =
+            Intent(context, EmergencyShortcutReceiver::class.java).apply {
+                action = ACTION_DIAL_POLICE
+                component = ComponentName(context, EmergencyShortcutReceiver::class.java)
+                `package` = context.packageName
+            }
+    }
+}
+
+// v1.28.12 (audit B2) — `Context.cancelEmergencyShortcutNotification()` a été SUPPRIMÉE.
+// Aucun appelant, et une jumelle exacte de
+// [com.relay.sms.system.notifications.EmergencyShortcutNotifier.cancelShortcut], qui est
+// celle que l'application emprunte. Deux façons d'éteindre la même notification persistante,
+// dont une seule journalise et une seule est testée.

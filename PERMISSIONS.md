@@ -1,0 +1,50 @@
+# Permissions used by Relay
+
+Each permission is declared with a clear reason. Relay never escalates privileges, never holds
+permissions "just in case", and degrades gracefully if any of them is refused.
+
+| Permission                                   | Why we need it                                                                 |
+|----------------------------------------------|--------------------------------------------------------------------------------|
+| `SEND_SMS`                                   | Send text messages.                                                             |
+| `RECEIVE_SMS`                                | Receive text messages.                                                          |
+| `READ_SMS`                                   | Read the system inbox (mandatory for any default SMS app).                      |
+| `WRITE_SMS`                                  | Mark messages read, insert sent rows (mandatory).                               |
+| `RECEIVE_MMS` / `RECEIVE_WAP_PUSH`           | Receive MMS notifications (WAP push).                                           |
+| `READ_CONTACTS`                              | Show names instead of bare phone numbers in conversations.                      |
+| `WRITE_CONTACTS`                             | Linked devices only: a computer you linked can set a contact's photo (the camera badge on the desktop detail pane) — the phone writes the photo you picked to that contact. Requested only from the Linked devices screen, never at launch. Refused: the desktop keeps the photo locally and tells you the phone couldn't save it. |
+| `READ_PHONE_STATE` / `READ_PHONE_NUMBERS`    | Detect dual-SIM and let you choose which SIM to send from. `READ_PHONE_STATE` also lets a linked device see your call state (ringing / active / ended) while the server runs. |
+| `POST_NOTIFICATIONS` (API 33+)               | Show new-message notifications (no notifications without your consent).         |
+| `USE_BIOMETRIC`                              | Optional biometric unlock.                                                      |
+| `FOREGROUND_SERVICE` (+ `DATA_SYNC` type)    | Long-running migration and backup jobs.                                         |
+| `FOREGROUND_SERVICE_SPECIAL_USE`             | Two uses. (1) The optional "keep alive" setting (off by default): a permanent notification that stops aggressive ROMs from killing the app. (2) The linked-devices server (on by default, switchable in Settings → Linked devices): it listens on the local network so a linked computer can connect, which is why it needs to run in the background — under Android 15 a `dataSync` service would be capped at 6 hours a day, which cannot work for a server. |
+| `RECEIVE_BOOT_COMPLETED`                     | Reschedule pending scheduled messages after a reboot.                           |
+| `ACCESS_FINE_LOCATION` / `ACCESS_COARSE_LOCATION` | Emergency mode only, and only if you turn it on and grant the permission: **one** position, read when you trigger the alert, added to the emergency SMS as a map link. No background or continuous location. Refused: the SMS leaves without coordinates. See [PRIVACY.md](PRIVACY.md). |
+| `READ_CALL_LOG`                              | Linked devices only: the caller's number when the phone rings, shown on a linked device. Since Android 9 the platform passes an empty number to call-state listeners that lack this permission — without it a linked device still sees that the phone is ringing, just not who is calling. Relay never reads the call log itself (no query on the call history); the permission only unlocks the number in the live call-state callback. Requested only from the Linked devices screen, while the server is on, never at launch. |
+| `CALL_PHONE`                                 | Two uses. (1) Emergency mode: requested when you first tap an emergency call tile (the numbers of the country your phone is registered in, 112 always). Granted, the app places the call itself; refused, the tile opens the dialer pre-filled, which needs no permission. The lock-screen shortcut always opens the dialer. (2) Linked devices: a linked device can place a call from this phone — the number you pick on the desktop is dialed on the phone. Requested only from the Linked devices screen, while the server is on, never at launch. Refused: the desktop reports the dial as refused. |
+| `VIBRATE`                                    | Optional vibration on new messages.                                             |
+| `RECORD_AUDIO`                               | Record audio clips attached to outgoing MMS (mic only while the user is actively recording).|
+| `CAMERA`                                     | QR pairing only: the Linked devices screen scans the pairing code a computer shows, on-device, with CameraX + ZXing core (no Play Services). Requested at runtime, only when you open the scanner. No photo is taken or stored; the frames are decoded in memory and dropped. Refused: you cannot link a device by QR code, everything else still works. |
+| `HIDE_OVERLAY_WINDOWS` (API 31+)             | Hide other apps' overlays while you type a PIN or passphrase, so a malicious window cannot harvest your keystrokes. Grants **no** access to any data — it only asks that third-party overlays be hidden above **our own** windows. Protection level `normal`: granted at install, no prompt. |
+| `INTERNET`                                   | Three uses. (1) GIF search: the GIF tab sends the words you type to Klipy (`api.klipy.com`), shows GIF thumbnails from Klipy, and downloads the GIF you tap. (2) Link previews: a message containing a URL shows a preview card — Relay fetches that page once, on the device, and reads its Open Graph title and image for display only; the image is never sent as an attachment. (3) Linked devices: the phone runs a TLS server on the local network (port 47831, advertised via mDNS as `_relay._tcp.`) so a computer you linked can connect — no cloud, no Relay server, the traffic never leaves your Wi-Fi network. That is the only network use in the app — no analytics, no crash reporter, no update check. If it is blocked, everything else still works; GIF search just returns nothing, links show no preview, and no computer can link. |
+| `CHANGE_WIFI_MULTICAST_STATE`                | Linked devices only: lets the phone hold a Wi-Fi multicast lock while the server runs, so a linked computer can still find the phone when the screen is off — the Wi-Fi stack filters multicast packets (mDNS discovery) on a locked phone without it. Protection level `normal`: granted at install, no prompt. It grants access to no data; it only asks the Wi-Fi stack to deliver multicast packets. The lock is released when the server stops. |
+| `WAKE_LOCK`                                  | Linked devices only: lets the phone hold a partial wakelock while a sync run is actively streaming, so a brief screen-off doesn't freeze the sync. Protection level `normal`: granted at install, no prompt. It grants access to no data; it only keeps the CPU running with the screen off (it never turns the screen on). The lock is released when the sync run ends, errors, pauses, or disconnects. WorkManager also uses it briefly to finish background jobs. |
+| `ACCESS_NETWORK_STATE`                       | Linked devices only: lets Relay read the phone's own connection state — whether the active network is a VPN tunnel, and what its address is — so a linked computer can reach the phone through the tunnel when the VPN is up (see SYNC_PROTOCOL.md, "VPN / tunnel"). It opens no connection and sees no traffic content. Protection level `normal`: granted at install, no prompt. WorkManager also uses it for its own connectivity checks. |
+
+One more permission is declared by an AndroidX library, not by Relay's own manifest:
+`USE_FINGERPRINT` (the Biometric library, for Android 8). It is an install-time permission
+that gives access to no data. (`ACCESS_NETWORK_STATE` also arrives via WorkManager, but
+Relay declares it explicitly in its own manifest — see the table above.)
+
+## What we do **not** request
+
+- **No other network use.** `INTERNET` is held only for GIF search via Klipy, link previews and
+  the local-network server for linked devices (see the table above). Nothing else in the app opens
+  a network connection. MMS still work without it: Android's own MMS service, in its own process, talks to
+  your carrier's MMSC when Relay asks it to send or download one. A CI check
+  (`.github/scripts/permissions-manifeste.py`) fails the build if any permission outside the
+  reviewed list reaches the merged manifest.
+- No background location, no Bluetooth, no nearby devices, no usage stats. The camera is used only
+  for QR pairing (see the table above) — no photo is ever taken or stored.
+- No `QUERY_ALL_PACKAGES` (we use targeted `<queries>` blocks only).
+- No Play Services dependency.
+- No advertising identifier.

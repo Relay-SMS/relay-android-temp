@@ -1,0 +1,1109 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms
+
+import android.Manifest
+import android.content.ContentResolver
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.SystemClock
+import android.view.WindowManager
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.Surface
+import androidx.compose.runtime.getValue
+import androidx.compose.ui.Modifier
+import androidx.core.content.ContextCompat
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import androidx.fragment.app.FragmentActivity
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import com.relay.sms.data.local.datastore.SettingsRepository
+import com.relay.sms.domain.settings.AppSettings
+import com.relay.sms.domain.settings.DeviceMode
+import com.relay.sms.ownnumber.OwnNumberAutoFill
+import com.relay.sms.security.AppLockManager
+import com.relay.sms.system.notifications.IncomingMessageNotifier
+import com.relay.sms.system.notifications.PendingNavHolder
+import com.relay.sms.system.notifications.SafetyCallAckHolder
+import com.relay.sms.system.notifications.SafetyCallIntentToken
+import com.relay.sms.system.notifications.SafetyCallWarningNotifier
+import com.relay.sms.system.share.IncomingShareHolder
+import com.relay.sms.ui.AppRoot
+import com.relay.sms.ui.security.keepSelectedTextInApp
+import com.relay.sms.ui.theme.RelayTheme
+import dagger.hilt.android.AndroidEntryPoint
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
+import timber.log.Timber
+import javax.inject.Inject
+
+@AndroidEntryPoint
+/**
+ * Hosts the single Compose tree. Extends [FragmentActivity] (vs. the bare `ComponentActivity`
+ * used until v1.1.1) so the `androidx.biometric` `BiometricPrompt` can attach its internal
+ * `Fragment` — required to drive the biometric flow from [LockScreen]. `FragmentActivity` is a
+ * strict super-set of `ComponentActivity` for Compose purposes (it still extends
+ * `androidx.activity.ComponentActivity`), so this swap is invisible to the rest of the app.
+ */
+class MainActivity : FragmentActivity() {
+
+    @Inject lateinit var settings: SettingsRepository
+    @Inject lateinit var appLock: AppLockManager
+
+    /**
+     * v1.28.12 — le rôle d'application SMS par défaut, lu au moment de republier l'état du
+     * Safety call. Sans lui, un deadman armé sans ce rôle n'affichait rien du tout : à
+     * l'échéance le système refusait l'envoi, la réservation était rendue, et la porte
+     * d'affichage (`isTriggered`) restait fermée. Voir [SafetyCallNotice.EnvoiImpossible].
+     */
+    @Inject lateinit var defaultSmsAppChecker: com.relay.sms.domain.sender.DefaultSmsAppChecker
+    @Inject lateinit var incomingShare: IncomingShareHolder
+    @Inject lateinit var safetyCallIntentToken: SafetyCallIntentToken
+
+    /**
+     * v1.27.4 — porteur de la confirmation à afficher après un geste Safety call venu d'une
+     * notification. Sans lui, ces gestes réussissaient **en silence** ; le raisonnement complet est
+     * dans [com.relay.sms.system.notifications.SafetyCallAckHolder].
+     */
+    @Inject lateinit var safetyCallAck: SafetyCallAckHolder
+
+    /**
+     * v1.27.3 (relecture Codex du 2026-08-06, SC-1273-06) — republication de la notification du
+     * Safety call quand une écriture échoue **après** que son nonce a été consommé.
+     *
+     * `dagger.Lazy` volontairement : le notifieur n'a rien à construire au démarrage, et la garde
+     * d'architecture du dépôt refuse l'injection eager sur le fil principal.
+     */
+    @Inject
+    lateinit var safetyCallNotifierLazy:
+        dagger.Lazy<com.relay.sms.system.notifications.SafetyCallWarningNotifier>
+
+    /**
+     * v1.14.7 — safety net : déclenche un delta-sync à chaque retour foreground.
+     * Pattern single-flight + Mutex côté manager → re-tap rapides sont free.
+     * Couvre les cas où Samsung Freecess ou un OEM agressif a gelé le worker
+     * pendant que l'app était en background, ou où le ContentObserver système
+     * a manqué une émission.
+     */
+    // v1.24.0 SEC-CRIT — `Lazy` on purpose: this collaborator injects DAOs, so an eager
+    // resolution here would build `AppDatabase` (and run [LegacyZeroKeyRekey]) on the main
+    // thread while the activity is being created.
+    @Inject lateinit var telephonySyncManagerLazy: dagger.Lazy<com.relay.sms.data.sync.TelephonySyncManager>
+
+    /**
+     * Round 36 — the stale-PENDING watchdog, foreground trigger:
+     * flips outgoing PENDING rows older than 15 min to FAILED on
+     * every resume, so a lost send ack shows "failed" promptly
+     * instead of "Sending…" for hours (the 12-hour worker is the
+     * backstop). Round 38 adds the foreground tick (every 5
+     * minutes while open — see the `repeatOnLifecycle(RESUMED)`
+     * launch in `onCreate`). `Lazy` for the same reason as
+     * [telephonySyncManagerLazy]: resolving it builds
+     * `AppDatabase`. No client-mode gate — a linked device has
+     * optimistic PENDING rows too (see
+     * [com.relay.sms.system.scheduler.StalePendingWatchdog]).
+     */
+    @Inject
+    lateinit var stalePendingWatchdogLazy:
+        dagger.Lazy<com.relay.sms.system.scheduler.StalePendingWatchdog>
+
+    /**
+     * Group-send own-number fix — fills "My phone number" from the
+     * SIM when blank. Injected here as well as in MainApplication so
+     * the fill can be retried once READ_PHONE_NUMBERS is granted: the
+     * startup attempt runs before the permission dialog on a fresh
+     * install. `runOnce()` is idempotent (hub-only, no-op once the
+     * number is set), so the call sites need no extra guards.
+     */
+    @Inject lateinit var ownNumberAutoFill: OwnNumberAutoFill
+
+    /**
+     * v1.14.7 audit P1 — anti-spam `enqueueOneShot` WorkManager. Sans cooldown, un
+     * user qui switche entre apps rapidement enqueue un OneShot à chaque onResume.
+     * KEEP policy évite la dup d'exécution, mais chaque enqueue = 1 write WorkManager
+     * SQLite (interne) → peut déclencher Samsung Freecess throttling. `requestSync()`
+     * via Mutex absorbe déjà le hammering ; WorkManager est notre filet "process killed",
+     * un enqueue toutes les 30s suffit largement (le worker tourne 12h périodique).
+     */
+    @Volatile private var lastOneShotEnqueueElapsed: Long = 0L
+    private val oneShotEnqueueCooldownMs: Long = 30_000L
+
+    /**
+     * v1.8.0 (bug 4 fix) — holder partagé pour le `conversationId` cliqué via
+     * notification. Posé dans [handleSharedIntent] quand l'action vaut
+     * [IncomingMessageNotifier.ACTION_OPEN_CONVERSATION], consommé dans
+     * [com.relay.sms.ui.AppRoot] par un `LaunchedEffect` après que le
+     * `NavController` Compose est instancié et les guards (lock screen /
+     * panic-decoy / déjà sur ce thread) sont validés.
+     */
+    @Inject lateinit var pendingNav: PendingNavHolder
+
+    /** Gates the splash screen while the one-shot zero-key repair runs. */
+    @Inject lateinit var databaseRepairState: com.relay.sms.data.local.db.DatabaseRepairState
+
+    /**
+     * Audit K-3 / C-5 : le projet injecte son dispatcher IO partout plutôt que de coder
+     * `Dispatchers.IO` en dur — testabilité et politique centralisée.
+     */
+    @Inject
+    @com.relay.sms.di.IoDispatcher
+    lateinit var ioDispatcher: kotlinx.coroutines.CoroutineDispatcher
+
+    private val initialSettings = MutableStateFlow<AppSettings?>(null)
+
+    /**
+     * v1.3.10 — launcher pour demande EXPLICITE des permissions runtime critiques au
+     * cold-start. Contrat Android : quand une app devient `RoleManager.ROLE_SMS`
+     * holder, les permissions `READ_SMS`/`RECEIVE_SMS`/`RECEIVE_MMS`/`RECEIVE_WAP_PUSH`
+     * doivent être grantées automatiquement via `GRANTED_BY_ROLE`. **BUG OEM observé**
+     * sur Samsung Galaxy S9 Android 10 One UI : le grant automatique ne s'exécute pas,
+     * les permissions restent `restricted=true`, et l'utilisateur ne reçoit aucun SMS /
+     * MMS sans intervention manuelle (Paramètres → Apps → Relay → Autorisations).
+     * Pour rendre l'app robuste sans assumer ce contrat OEM, on demande nous-mêmes les
+     * permissions runtime manquantes au premier launch (et à chaque cold-start si user
+     * a refusé, jusqu'à grant explicite ou refus "Ne plus demander" du système).
+     */
+    private val permissionsLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { grantResults ->
+        val denied = grantResults.filter { !it.value }.keys
+        if (denied.isNotEmpty()) {
+            Timber.w(
+                "MainActivity: %d critical permissions still denied after user prompt: %s",
+                denied.size,
+                denied.joinToString(),
+            )
+            // Pas d'action forcée — l'utilisateur peut toujours les activer plus tard
+            // via Paramètres système. L'app reste fonctionnelle pour les paths qui ne
+            // dépendent pas des perms denied (ex: SMS texte si seul RECEIVE_MMS est
+            // denied).
+        }
+        // Own-number auto-fill — the startup attempt in MainApplication
+        // runs before this dialog on a fresh install, so a grant here
+        // is the first moment the SIM read can succeed. runOnce()
+        // no-ops when the number is already set or outside hub mode.
+        if (grantResults[Manifest.permission.READ_PHONE_NUMBERS] == true) {
+            lifecycleScope.launch(ioDispatcher) {
+                runCatching { ownNumberAutoFill.runOnce() }
+                    .onFailure { Timber.w(it, "permissions grant own-number auto-fill failed") }
+            }
+        }
+    }
+
+    /**
+     * v1.3.10 — liste des permissions runtime "dangerous" indispensables au fonctionnement
+     * de Relay en tant qu'app SMS par défaut. Calculée dynamiquement à chaque check
+     * pour inclure `POST_NOTIFICATIONS` uniquement sur Android 13+ (API 33+) où elle a
+     * été introduite.
+     *
+     * v1.28.13 (MR F-Droid !38458) — `RECORD_AUDIO` n'en fait plus partie. Le micro ne sert qu'aux
+     * messages vocaux, et le bouton micro du fil le demande déjà au moment où l'on appuie dessus
+     * (`ThreadScreen`, `rememberPermissionState`). Le réclamer au premier lancement d'une app SMS
+     * a été relevé par le testeur de F-Droid, à raison : rien ne le justifie à cet instant.
+     */
+    private val criticalSmsPermissions: Array<String>
+        get() = mutableListOf(
+            Manifest.permission.READ_SMS,
+            Manifest.permission.RECEIVE_SMS,
+            Manifest.permission.RECEIVE_MMS,
+            Manifest.permission.RECEIVE_WAP_PUSH,
+            Manifest.permission.SEND_SMS,
+            Manifest.permission.READ_PHONE_NUMBERS,
+            Manifest.permission.READ_PHONE_STATE,
+            Manifest.permission.READ_CONTACTS,
+        ).apply {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                add(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }.toTypedArray()
+
+    /**
+     * Demande les permissions runtime manquantes parmi [criticalSmsPermissions]. No-op
+     * si toutes déjà grantées (cas Pixel + Samsung One UI ≥ 11 où le grant automatique
+     * via ROLE_SMS fonctionne). Idempotent — Android dédoublonne les requests successifs.
+     *
+     * Client mode — a linked device has no SIM, so only
+     * `POST_NOTIFICATIONS` is requested: notifications still arrive
+     * from the hub, but the SMS permissions are meaningless there.
+     * (`READ_CONTACTS` is not requested either — contacts arrive
+     * from the hub, and the permission is asked with context when
+     * it is actually needed.)
+     */
+    private fun requestMissingCriticalPermissionsIfAny(mode: DeviceMode) {
+        val wanted: Array<String> = if (mode == DeviceMode.CLIENT) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                arrayOf(Manifest.permission.POST_NOTIFICATIONS)
+            } else {
+                emptyArray()
+            }
+        } else {
+            criticalSmsPermissions
+        }
+        val missing = wanted.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isNotEmpty()) {
+            Timber.i(
+                "MainActivity: requesting %d missing critical permissions at cold-start",
+                missing.size,
+            )
+            permissionsLauncher.launch(missing.toTypedArray())
+        }
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        // v1.24.0 SEC-CRIT — the splash also covers the one-shot database repair
+        // ([LegacyZeroKeyRekey]). On the single launch that rebuilds a legacy zero-key database
+        // that work takes seconds; showing an empty conversation list meanwhile would look like
+        // data loss. `settled` flips even when the repair fails, so this can never pin the splash.
+        installSplashScreen().setKeepOnScreenCondition {
+            initialSettings.value == null || !databaseRepairState.settled.value
+        }
+        // Hilt injects @Inject lateinit properties inside super.onCreate via the @AndroidEntryPoint
+        // bytecode transform. We must call super FIRST before touching `settings` or `appLock`.
+        super.onCreate(savedInstanceState)
+
+        // v1.3.3 bug #4 — partage entrant ACTION_SEND / ACTION_SEND_MULTIPLE depuis le
+        // chooser système (Galerie, navigateur, fichiers…). On parse l'intent et on stocke
+        // dans le holder ; AppRoot l'observe pour basculer en mode "pick to share".
+        handleSharedIntent(intent)
+
+        // Audit P-P0-5: the previous `runBlocking(IO) { settings.flow.first() }` blocked the main
+        // thread 50-200 ms on DataStore to know whether to apply FLAG_SECURE. We now apply it
+        // **inconditionally as a safe default** — privacy-preserving by construction — and only
+        // CLEAR the flag once the async settings read confirms the user has opted out. Net
+        // effect: the user is never exposed in Recents during cold-start, and the main thread
+        // is freed.
+        window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+
+        // Before the first field exists: the selection toolbar's "Translate" would hand the selected
+        // text of a message to another app. See `keepSelectedTextInApp`.
+        keepSelectedTextInApp()
+
+        enableEdgeToEdge()
+
+        // Resolve the initial AppSettings asynchronously. The splash screen stays visible until
+        // `initialSettings` flips to a non-null value (see `setKeepOnScreenCondition` above), so
+        // there is no visual flash to default theme / accent during the read.
+        lifecycleScope.launch {
+            // v1.28.3 (F31a) — `first()` sur un flux qui se TERMINE SANS EMETTRE leve une
+            // `NoSuchElementException`, et rien ne l'attrapait : le lancement se soldait par un
+            // crash. Le cas n'est pas theorique — `SettingsRepository` absorbe une lecture
+            // DataStore en echec (fichier corrompu, stockage chiffre pas encore disponible,
+            // quota) SANS reemettre, et le flux se termine alors vide.
+            //
+            // Le repli sur les valeurs par defaut est SUR ici, et il faut le dire parce que
+            // l'inverse serait grave : cette valeur ne sert qu'a amorcer le theme sous l'ecran
+            // de demarrage (`seed`, plus bas), qui applique DEJA `?: AppSettings()` pendant que
+            // la lecture est en vol. Elle ne decide d'aucun verrouillage — `AppLockManager` a sa
+            // propre resolution, qui part de `Locked`. Se rabattre sur les defauts de
+            // `AppSettings()` pour une decision de securite serait le defaut ferme en v1.27.11.
+            initialSettings.value = runCatching { settings.flow.first() }
+                .onFailure { timber.log.Timber.w(it, "Reglages illisibles au lancement — theme par defaut") }
+                .getOrNull()
+                ?: AppSettings()
+            // v1.3.10 — fail-safe contre le bug Samsung One UI Android 10
+            // où GRANTED_BY_ROLE ne grant pas les permissions runtime
+            // critiques malgré que Relay soit role holder. On demande
+            // explicitement les permissions manquantes au cold-start ;
+            // les ROMs où le grant automatique a fonctionné voient
+            // toutes les perms déjà à PERMISSION_GRANTED → no-op.
+            // Client mode — the request waits for this settings read so
+            // the mode is the stored one, not the default: a linked
+            // device is only asked for notifications.
+            requestMissingCriticalPermissionsIfAny(
+                initialSettings.value?.mode ?: DeviceMode.HUB,
+            )
+        }
+
+        // The actual lock-state resolution still happens lazily — receivers / services call
+        // `appLock.ensureResolved()` themselves; nothing here needs to block on it.
+        lifecycleScope.launch { appLock.ensureResolved() }
+
+        // Observe later toggles of FLAG_SECURE. distinctUntilChanged avoids the no-op addFlags /
+        // clearFlags churn on every settings emission (audit P8). Note this also handles the
+        // initial pass: when the first emission arrives with `flagSecure = false`, this clears
+        // the safe-default we applied above.
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                settings.flow
+                    .map { it.security.flagSecure }
+                    .distinctUntilChanged()
+                    .collect { applyFlagSecure(it) }
+            }
+        }
+
+        // Round 38 — the stale-PENDING watchdog's foreground
+        // tick: onResume flips stale rows when the app comes
+        // forward, but a message can go stale while the app is
+        // already open — without a tick it would sit on
+        // "Sending…" until the next resume or the 12-hour
+        // worker. repeatOnLifecycle(RESUMED) restarts the loop
+        // on every foreground session and cancels it on
+        // background, so the tick only runs while the app is
+        // open; the first tick lands 5 minutes in (onResume
+        // already ran the check at resume). No client-mode gate,
+        // same as the onResume trigger. Armed once here, not in
+        // onResume: repeatOnLifecycle restarts it itself.
+        lifecycleScope.launch(ioDispatcher) {
+            repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                stalePendingWatchdogLazy.get().tickForever()
+            }
+        }
+
+        // v1.27.2 — armé UNE fois ici, pas dans `onResume` : `repeatOnLifecycle` gère lui-même le
+        // redémarrage à chaque passage au premier plan. L'appeler depuis `onResume` empilerait un
+        // collecteur de plus à chaque retour dans l'application.
+        observeRealOpenForSafetyCallReset()
+
+        // v1.25.2 — Fallback Back au niveau Activity (enregistré AVANT setContent → priorité la plus
+        // basse : les BackHandler Compose et le callback interne du NavController passent d'abord). Il
+        // ne se déclenche donc QUE lorsque rien d'autre ne consomme le Retour, c.-à-d. sur la
+        // destination de départ (la liste des conversations, cf. startDestination = Conversations dans
+        // AppRoot). Là, au lieu de laisser l'Activity se `finish()` — ce qui retire la tâche et tue le
+        // process EN PLEINE TRANSITION, laissant une surface blanche gelée jusqu'à fermeture manuelle
+        // (bug remonté : Coffre → mot de passe → Retour rapides) — on envoie la tâche en arrière-plan
+        // comme le geste Accueil. Le process reste vivant, le Retour ne vide jamais le NavHost ni ne
+        // tue l'app à mi-transition. Toujours actif ⇒ insensible à la course de recomposition Compose.
+        onBackPressedDispatcher.addCallback(
+            this,
+            object : androidx.activity.OnBackPressedCallback(true) {
+                override fun handleOnBackPressed() {
+                    moveTaskToBack(true)
+                }
+            },
+        )
+
+        setContent {
+            // While the async settings read is in flight, `initialSettings.value` is null and
+            // the splash screen masks the Compose tree. We render the defaults under the splash
+            // so the first composition is ready the moment the splash clears.
+            val seed = initialSettings.collectAsStateWithLifecycle().value ?: AppSettings()
+            val current by settings.flow.collectAsStateWithLifecycle(initialValue = seed)
+            RelayTheme(appearance = current.appearance) {
+                Surface(modifier = Modifier.fillMaxSize()) {
+                    AppRoot()
+                    // v1.4.1 — the v1.3.10 [OemKeepAliveOnboarding] auto-popup was removed
+                    // here because it surprised users on Xiaomi / Redmi who tapped "Activer"
+                    // without realising it would create a permanent system notification
+                    // (a hard requirement for Android's foreground-service contract). The
+                    // "Mode résistant" toggle remains accessible via Réglages → Avancé for
+                    // power users who explicitly want the trade-off.
+                }
+            }
+        }
+    }
+
+    private fun applyFlagSecure(enabled: Boolean) {
+        if (enabled) window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+    }
+
+    /**
+     * v1.3.3 bug #4 — l'activité est `launchMode="singleTask"`, donc un partage
+     * entrant alors qu'une instance existe déjà arrive via [onNewIntent] et PAS
+     * [onCreate]. On câble les deux pour ne jamais rater un share.
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleSharedIntent(intent)
+    }
+
+    /**
+     * v1.9.0 — Safety call : reset du timer à chaque resume de l'app.
+     * Le contract du Safety call est "si tu n'ouvres pas Relay pendant
+     * X heures, j'envoie un SMS à tes proches" — donc chaque ouverture
+     * d'app est la preuve d'activité attendue. On délègue à un coroutine
+     * lifecycleScope pour ne pas bloquer le main thread (DataStore async).
+     *
+     * **Audit fix SEC-9** : reset uniquement si l'app est réellement
+     * déverrouillée par l'utilisateur ([AppLockManager.LockState.Unlocked]
+     * ou [AppLockManager.LockState.Disabled] = pas de lock configuré). Ne
+     * PAS reset si :
+     *  - [AppLockManager.LockState.Locked] : l'attaquant a juste ouvert
+     *    l'app sans connaître le PIN, ne doit pas pouvoir neutraliser le
+     *    deadman.
+     *  - [AppLockManager.LockState.PanicDecoy] : l'user est sous contrainte
+     *    et a saisi le PIN panic ; le deadman doit continuer à courir pour
+     *    que les contacts d'urgence soient alertés.
+     *
+     * Lecture conditionnelle : on ne fait l'update que si `enabled = true`.
+     * Sinon, c'est une écriture DataStore inutile à chaque resume (la
+     * majorité des users n'utilisera pas Safety call). Coût quand activé :
+     * 1 écriture DataStore par resume = ~5 ms, négligeable.
+     */
+    override fun onResume() {
+        super.onResume()
+        // v1.14.7 — safety net : re-déclenche un delta-sync à chaque retour
+        // foreground. Idempotent (single-flight Mutex). Couvre Samsung Freecess
+        // qui gèle le worker en background + le ContentObserver système qui peut
+        // manquer une émission après un sleep long. Pas de garde lockState ici
+        // car la sync écrit en Room derrière l'AppLockManager, indépendamment
+        // de l'écran de verrouillage UI.
+        // v1.24.0 — resolved off the main thread: `Lazy.get()` blocks until `AppDatabase` has been
+        // provisioned, which on the repair launch means waiting for [LegacyZeroKeyRekey].
+        // Belt-and-braces : double-track via WorkManager au cas où le manager
+        // serait dans un état inattendu (started flag bloqué, mutex deadlock).
+        // v1.14.7 audit P1 fix : throttle à 1 enqueue / 30s mono pour éviter de spammer
+        // WorkManager si l'user oscille entre apps rapidement. `requestSync()` ci-dessus
+        // gère déjà le path rapide via Mutex ; le worker est pour le path "process killé".
+        // The throttle decision stays on the main thread (as before); the
+        // enqueue itself moves into the coroutine so both tracks share the
+        // client-mode gate below.
+        val nowMono = android.os.SystemClock.elapsedRealtime()
+        val shouldEnqueueOneShot = nowMono - lastOneShotEnqueueElapsed >= oneShotEnqueueCooldownMs
+        if (shouldEnqueueOneShot) {
+            lastOneShotEnqueueElapsed = nowMono
+        }
+        lifecycleScope.launch(ioDispatcher) {
+            // Client mode — no telephony sync on a linked device: its
+            // messages arrive from the hub. The mode is read hydrated
+            // (the repository is warm by onResume, so this is a
+            // volatile read, not a wait).
+            if (settings.hydratedOrNull()?.mode == DeviceMode.CLIENT) return@launch
+            runCatching { telephonySyncManagerLazy.get().requestSync(reason = "MainActivity.onResume") }
+                .onFailure { Timber.w(it, "onResume sync trigger failed") }
+            // Own-number auto-fill — retry while blank: the startup
+            // attempt runs before READ_PHONE_NUMBERS is granted on a
+            // fresh install, so a grant made later (denied in the
+            // dialog, then granted in system Settings) would otherwise
+            // never fill the number until a cold start. runOnce() is a
+            // no-op once the number is set, so this costs nothing on
+            // later resumes.
+            runCatching { ownNumberAutoFill.runOnce() }
+                .onFailure { Timber.w(it, "onResume own-number auto-fill failed") }
+            if (shouldEnqueueOneShot) {
+                runCatching {
+                    com.relay.sms.system.scheduler.TelephonySyncWorker.enqueueOneShot(
+                        this@MainActivity,
+                    )
+                }.onFailure { Timber.w(it, "onResume enqueueOneShot failed") }
+            }
+        }
+        // Round 36 — stale-PENDING watchdog: a lost send ack
+        // leaves "Sending…" on screen until the 12-hour worker
+        // runs; the foreground timeout flips it to failed
+        // promptly. A SEPARATE launch from the sync block above:
+        // it has no client-mode gate (a linked device's own
+        // optimistic PENDING rows need it too, and the worker
+        // backstop does not run there). The query is idempotent,
+        // so rapid resumes cost one cheap UPDATE each.
+        lifecycleScope.launch(ioDispatcher) {
+            runCatching {
+                val flipped = stalePendingWatchdogLazy.get().runOnce()
+                if (flipped > 0) Timber.i("Watchdog: %d stale PENDING -> FAILED (foreground)", flipped)
+            }.onFailure { Timber.w(it, "onResume stale-PENDING watchdog failed") }
+        }
+    }
+
+    /**
+     * v1.27.2 (relecture Codex 2026-08-05, finding 1) — la remise à zéro **attend** que
+     * l'application soit réellement ouverte, au lieu d'échantillonner le verrou une seule fois.
+     *
+     * **Le défaut fermé ici, présent depuis v1.10.0.** Le code d'origine lisait
+     * `appLock.state.value` au début d'`onResume`. Or l'état initial d'[AppLockManager] est
+     * `Locked` — volontairement, il échoue fermé. Saisir le bon code ne recrée PAS l'activité : il
+     * ne fait que publier `Unlocked`, et [com.relay.sms.ui.AppRoot] dépile l'écran de
+     * verrouillage **dans la même activité** par un `popBackStack`. Aucun second `onResume` n'a
+     * donc lieu, et la remise à zéro, déjà abandonnée, ne se retentait jamais.
+     *
+     * Conséquence : pour quiconque protège l'application par un code — c'est-à-dire exactement le
+     * profil qui arme un deadman — ouvrir Relay ne remettait pas le minuteur à zéro. La preuve
+     * d'activité était fournie, ignorée, et l'alerte partait quand même vers les contacts
+     * d'urgence. Une seconde course existait sans verrou : l'état reste `Locked` jusqu'à ce que la
+     * résolution initiale publie `Disabled`.
+     *
+     * `repeatOnLifecycle(RESUMED)` redémarre ce bloc à chaque passage au premier plan et l'annule
+     * au premier plan perdu ; `first { … }` suspend jusqu'au premier état réellement ouvert. On
+     * obtient donc **une remise à zéro par session de premier plan**, qu'elle survienne
+     * immédiatement ou après la saisie du code.
+     *
+     * Les états refusés le restent, et pour la même raison qu'avant :
+     *  - `Locked` / `LockedOut` — quelqu'un a ouvert l'application sans connaître le code ; il ne
+     *    doit pas pouvoir neutraliser le deadman. On attend, sans jamais remettre à zéro.
+     *  - `PanicDecoy` — l'utilisateur est sous contrainte et a saisi le code leurre ; le minuteur
+     *    doit continuer à courir pour que les contacts soient bel et bien alertés.
+     */
+    private fun observeRealOpenForSafetyCallReset() {
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.RESUMED) {
+                // Pas de `runCatching` ici : il avalerait la `CancellationException` émise quand
+                // `repeatOnLifecycle` annule ce bloc au passage en arrière-plan. Une annulation
+                // n'est pas un échec, et la confondre avec un échec masque le cycle de vie.
+                try {
+                    // Suspend tant que l'application n'est pas réellement ouverte. `PanicDecoy`
+                    // n'est pas dans la liste : sous contrainte, on ne remet rien à zéro.
+                    // v1.28.4 (F06) — la règle « réellement ouvert » vit dans
+                    // [com.relay.sms.security.SafetyCallResetGate], testée ; les deux
+                    // chemins jumeaux l'attendent de la même façon.
+                    com.relay.sms.security.SafetyCallResetGate.attendreOuverture(appLock.state)
+                    // v1.27.2 — lecture HYDRATÉE obligatoire, cf. [SettingsRepository.hydratedOrNull].
+                    //
+                    // `state.value` rendait ici les réglages PAR DÉFAUT tant que DataStore n'avait
+                    // pas répondu, donc `enabled = false` — et la remise à zéro était sautée une
+                    // seconde fois, pour une seconde raison.
+                    //
+                    // `null` = réglages illisibles : on ne remet pas à zéro. Ne rien faire laisse
+                    // le minuteur courir et l'utilisateur rouvrira l'application ; remettre à zéro
+                    // à l'aveugle aurait désarmé une protection sur la foi d'une lecture ratée.
+                    val current = settings.hydratedOrNull()?.security?.safetyCall
+                    if (current != null && current.enabled) {
+                        settings.update { s ->
+                            s.copy(
+                                security = s.security.copy(
+                                    // v1.27.2 (audit Codex, SC-03) — `withActivityReset` ferme AUSSI
+                                    // la séquence de relances. Avant, ouvrir l'application après le
+                                    // départ de l'alerte laissait `triggeredAt` posé : les proches
+                                    // continuaient de recevoir une relance toutes les quinze
+                                    // minutes alors que la personne venait précisément de prouver
+                                    // qu'elle allait bien.
+                                    //
+                                    // Pas de `disarmIfTriggered` ici : ouvrir son téléphone ne vaut
+                                    // pas renoncer à sa protection. On referme la séquence et on
+                                    // repart pour un cycle. Le geste explicite « Je vais bien »,
+                                    // lui, désactive.
+                                    safetyCall = s.security.safetyCall.withActivityReset(),
+                                ),
+                            )
+                        }
+                        Timber.d("MainActivity: Safety call timer reset (app really open)")
+                    }
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (t: Throwable) {
+                    // Une écriture DataStore en échec ne doit pas faire tomber l'activité. Le
+                    // minuteur reste alors sur son ancienne valeur : c'est le repli sûr, il ne
+                    // désarme rien.
+                    Timber.w(t, "MainActivity: Safety call reset failed")
+                }
+            }
+        }
+    }
+
+    /**
+     * v1.3.3 bug #4 — parse [Intent.ACTION_SEND] / [Intent.ACTION_SEND_MULTIPLE] et
+     * pose le résultat dans [IncomingShareHolder]. L'UI (AppRoot) prend le relais pour
+     * naviguer vers le picker de conversation. No-op pour tout autre type d'intent.
+     *
+     * Sécurité :
+     *   - Lecture d'URIs uniquement (jamais d'exec, jamais d'écriture en aveugle).
+     *   - v1.26.1 (audit M9) — les URI entrantes sont FILTRÉES avant d'être retenues :
+     *     `content://` uniquement, et jamais notre propre autorité. Voir [isSafeSharedUri].
+     *   - ⚠️ Le `type` (MIME) est purement indicatif, et le reste. Ce KDoc affirmait que la
+     *     dispatch finale « revalide l'extension / le contenu » et « inspecte le header image » :
+     *     VÉRIFIÉ, C'EST FAUX — `SendMediaMmsUseCase` n'applique qu'un plafond de taille et fait
+     *     confiance au type MIME fourni. La correction est notée ici parce qu'un commentaire
+     *     faussement rassurant est pire que pas de commentaire : il détourne le prochain
+     *     auditeur d'un contrôle qui n'existe pas.
+     */
+    private fun handleSharedIntent(intent: Intent?) {
+        if (intent == null) return
+        when (intent.action) {
+            Intent.ACTION_SEND -> {
+                val uri = intent.extraStream()
+                val text = intent.getStringExtra(Intent.EXTRA_TEXT)
+                if (uri != null || !text.isNullOrBlank()) {
+                    incomingShare.set(
+                        IncomingShareHolder.Pending(
+                            uris = listOfNotNull(uri),
+                            mimeType = intent.type,
+                            text = text,
+                        ),
+                    )
+                }
+            }
+            Intent.ACTION_SEND_MULTIPLE -> {
+                val uris = intent.extraStreamList()
+                if (uris.isNotEmpty()) {
+                    incomingShare.set(
+                        IncomingShareHolder.Pending(
+                            uris = uris,
+                            mimeType = intent.type,
+                            text = intent.getStringExtra(Intent.EXTRA_TEXT),
+                        ),
+                    )
+                }
+            }
+            SafetyCallWarningNotifier.ACTION_SAFETY_CALL_RESET -> {
+                // v1.9.0 — tap sur la notification "Confirme que tu vas bien" :
+                // reset immédiat du timer + dismiss de la notif. On délègue à
+                // un usecase coroutine via lifecycleScope pour ne pas bloquer
+                // onNewIntent / onCreate.
+                //
+                // **Audit fix SEC-10** : valide le nonce mono-usage avant
+                // de reset. MainActivity est `exported="true"` (rôle SMS)
+                // donc une app tierce pourrait forger ACTION_SAFETY_CALL_RESET ;
+                // sans le bon token (re-genéré à chaque pose de notif et
+                // connu uniquement du process Relay), l'intent est ignoré.
+                val token = intent.getLongExtra(
+                    SafetyCallWarningNotifier.EXTRA_RESET_TOKEN, 0L,
+                )
+                if (!safetyCallIntentToken.consume(token)) {
+                    Timber.w("MainActivity: rejecting SAFETY_CALL_RESET — invalid/missing token")
+                    incomingShare.clear()
+                    return
+                }
+                lancerGesteDeNotification {
+                    // 🔴 v1.28.3 (F06) — L'AUTHENTIFICATION D'ABORD, L'ÉCRITURE ENSUITE.
+                    //
+                    // Le nonce prouve que l'intention vient bien de NOTRE notification ; il ne
+                    // prouve pas QUI tient le téléphone. Or ce chemin ne remet pas seulement un
+                    // minuteur à zéro : `disarmIfTriggered = true` **désarme l'homme mort**. Il
+                    // s'exécutait pourtant sans jamais consulter `appLock`.
+                    //
+                    // L'asymétrie était nette et c'est elle qui trahit le défaut : le chemin
+                    // VOISIN, `observeRealOpenForSafetyCallReset`, qui ne fait que remettre le
+                    // minuteur à zéro — donc bien moins grave — attend depuis la v1.27.2 un état
+                    // réellement ouvert, et son KDoc explique pourquoi `PanicDecoy` n'est pas
+                    // dans la liste. Le chemin le plus dangereux des deux n'avait pas ce garde.
+                    //
+                    // Concrètement : téléphone déverrouillé mais application verrouillée, ou
+                    // session leurre, un seul tap sur « Confirme que tu vas bien » suffisait à
+                    // éteindre la protection. Sous contrainte, c'est exactement le geste qu'un
+                    // agresseur ferait.
+                    //
+                    // L'attente est bornée par le cycle de vie de l'activité : si l'utilisateur
+                    // n'ouvre jamais réellement l'application, rien n'est écrit et le deadman
+                    // continue de courir — le bon sens de l'échec.
+                    // v1.28.4 (F06) — la règle « réellement ouvert » vit dans
+                    // [com.relay.sms.security.SafetyCallResetGate], testée.
+                    // v1.28.5 (sixième note d'Andrew, point 5) — ce chemin DÉSARME : un geste
+                    // reçu en session leurre ou pendant un blocage est JETÉ, pas retenu jusqu'au
+                    // prochain vrai déverrouillage. Le jumeau de remise à zéro, qui ne désarme
+                    // rien, continue d'attendre. Le nonce est déjà consommé : on republie la
+                    // notification pour qu'un geste ultérieur, légitime, reste possible.
+                    if (!com.relay.sms.security.SafetyCallResetGate.attendreOuvertureOuJeter(appLock.state)) {
+                        Timber.w("MainActivity: SAFETY_CALL_RESET discarded — locked out or decoy session")
+                        republishSafetyCallNotice()
+                        incomingShare.clear()
+                        return@lancerGesteDeNotification
+                    }
+                    // v1.27.4 — l'état AVANT l'écriture décide de la phrase à confirmer, et il doit
+                    // être relevé dans la transaction : le lire après, c'est le lire déjà remis à
+                    // zéro par `withActivityReset`. Même relevé que celui du bouton des Réglages,
+                    // qui capture `wasTriggered` avant sa propre mutation.
+                    var wasTriggered = false
+                    runCatching {
+                        settings.update { s ->
+                            wasTriggered = s.security.safetyCall.isTriggered
+                            s.copy(
+                                security = s.security.copy(
+                                    // v1.27.2 (audit Codex, SC-03) — le tap sur la notification EST
+                                    // le geste « Je vais bien » : il doit se comporter exactement
+                                    // comme le bouton des Réglages, désactivation comprise si
+                                    // l'alerte est déjà partie. Deux boutons portant la même
+                                    // promesse et agissant différemment, c'est le jumeau
+                                    // asymétrique — le motif de défaut le plus fréquent ici.
+                                    safetyCall = s.security.safetyCall
+                                        .withActivityReset(disarmIfTriggered = true),
+                                ),
+                            )
+                        }
+                        // v1.27.4 — LA CONFIRMATION, et elle est POSÉE APRÈS L'ÉCRITURE.
+                        //
+                        // Elle est dans le bloc de succès, jamais avant : une confirmation émise
+                        // avant l'écriture affirmerait un fait non acquis, exactement le défaut
+                        // P-06 corrigé en v1.27.2 sur cette même fonction — la notification
+                        // annonçait « alerte envoyée » à un instant où rien n'était parti.
+                        safetyCallAck.set(
+                            if (wasTriggered) {
+                                SafetyCallAckHolder.Ack.DISARMED
+                            } else {
+                                SafetyCallAckHolder.Ack.TIMER_RESET
+                            },
+                        )
+                        Timber.i("MainActivity: deadman timer reset via warning notif tap")
+                    }.onFailure { t ->
+                        // v1.27.4 — une annulation n'est PAS un échec.
+                        //
+                        // `runCatching` capture `CancellationException` comme n'importe quoi
+                        // d'autre. Si l'activité disparaît pendant l'écriture, la brancher sur le
+                        // chemin d'échec lancerait une republication sur un scope déjà mort — donc
+                        // sans effet — tout en faisant croire, en journal, à un échec d'écriture.
+                        // La règle vaut dans tout le dépôt : ne jamais avaler une annulation
+                        // autour d'un appel suspend.
+                        if (t is kotlinx.coroutines.CancellationException) throw t
+                        // v1.27.3 (relecture Codex du 2026-08-06, SC-1273-06) — JUMEAU DU CHEMIN DE
+                        // RÉARMEMENT, et défaut préexistant.
+                        //
+                        // Le nonce est consommé AVANT l'écriture. Si celle-ci échoue, l'état ne
+                        // change pas, aucune émission ne déclenche de réconciliation, et la
+                        // notification — non balayable, `setOngoing(true)` — reste affichée avec un
+                        // jeton mort. Chaque tap suivant est alors rejeté **avant même** de retenter
+                        // l'écriture : l'unique moyen d'arrêter une alerte devient définitivement
+                        // inerte, en silence.
+                        Timber.w(t, "MainActivity: reset write failed — republishing notice")
+                        republishSafetyCallNotice()
+                    }
+                }
+                incomingShare.clear()
+            }
+            SafetyCallWarningNotifier.ACTION_SAFETY_CALL_REARM -> {
+                // v1.27.3 — bouton « Réactiver » de la notification de fin de séquence.
+                //
+                // # Pourquoi ce chemin existe
+                //
+                // Le désarmement de fin de séquence est écrit dans la même transaction que la
+                // conclusion du dernier envoi : quand cette notification s'affiche, le Safety call
+                // est **déjà coupé**, et aucune alarme n'est même programmée. Le seul geste que la
+                // notification proposait jusqu'ici — taper son corps — désarme aussi. Elle n'offrait
+                // donc aucun moyen de se remettre sous protection, et son texte ne disait même pas
+                // que la protection était tombée.
+                //
+                // ⚠️ Contrairement au reset, le réarmement est **sans risque depuis le volet** : il
+                // ne peut que remettre la protection en marche. C'est la raison pour laquelle il est
+                // acceptable en action de notification, là où un bouton « Désactiver » aurait offert
+                // à qui tient le téléphone un coupe-circuit du deadman sans le code de l'application.
+                val token = intent.getLongExtra(
+                    SafetyCallWarningNotifier.EXTRA_RESET_TOKEN, 0L,
+                )
+                if (!safetyCallIntentToken.consume(token)) {
+                    Timber.w("MainActivity: rejecting SAFETY_CALL_REARM — invalid/missing token")
+                    incomingShare.clear()
+                    return
+                }
+                lancerGesteDeNotification {
+                    // v1.28.5 (lecture ciblée, Q3) — LE MÊME GARDE QUE SON JUMEAU. Réarmer ne
+                    // peut que remettre la protection en marche, et c'est vrai ; mais c'est une
+                    // écriture persistée des réglages de sécurité faite sans preuve de
+                    // déverrouillage, sur un chemin dont le jumeau exige cette preuve. Deux
+                    // chemins jumeaux avec deux gardes, c'est le motif de défaut le plus fréquent
+                    // ici : on l'applique par symétrie, et le geste en leurre ou blocage est jeté.
+                    if (!com.relay.sms.security.SafetyCallResetGate.attendreOuvertureOuJeter(appLock.state)) {
+                        Timber.w("MainActivity: SAFETY_CALL_REARM discarded — locked out or decoy session")
+                        republishSafetyCallNotice()
+                        incomingShare.clear()
+                        return@lancerGesteDeNotification
+                    }
+                    var rearmed = false
+                    runCatching {
+                        settings.update { s ->
+                            val cfg = s.security.safetyCall
+                            // 🔴 v1.27.3 (relecture Codex du 2026-08-06, SC-1273-02) — SANS CONTACT,
+                            // ON NE TOUCHE À RIEN.
+                            //
+                            // La version précédente refermait le cycle **puis** écrivait
+                            // `enabled = false` : la notification disparaissait donc exactement comme
+                            // en cas de succès, alors que la protection restait coupée, sans le
+                            // moindre retour. Un échec silencieux, et du mauvais côté.
+                            //
+                            // `SafetyCallNotice` ne propose plus l'action dans ce cas ; cette garde
+                            // reste en défense en profondeur, pour un intent resté en cache. Elle
+                            // **préserve** l'état : la notification demeure, et le tap de son corps
+                            // mène à l'application où l'on peut ajouter un contact.
+                            if (cfg.contacts.isEmpty()) return@update s
+                            rearmed = true
+                            s.copy(
+                                security = s.security.copy(
+                                    // `withActivityReset` sans `disarmIfTriggered` : il archive la
+                                    // séquence dans [SafetyCallConfig.history], referme le cycle et
+                                    // repart d'un minuteur neuf, en préservant `enabled`.
+                                    //
+                                    // ⚠️ `enabled = true` explicitement : l'état terminal a
+                                    // `enabled = false`, et `withActivityReset` le préserve tel quel
+                                    // sans `disarmIfTriggered`. Sans cette ligne, « Réactiver »
+                                    // effacerait le cycle sans rien réarmer.
+                                    safetyCall = cfg.withActivityReset().copy(enabled = true),
+                                ),
+                            )
+                        }
+                        if (rearmed) {
+                            // v1.27.4 — LA FACE JUMELLE, confirmée elle aussi.
+                            //
+                            // Ne confirmer que l'acquittement aurait rouvert le motif que ce lot
+                            // ferme : deux actions de la même notification, l'une qui parle et
+                            // l'autre muette. « Réactiver » est même le geste dont la confirmation
+                            // compte le plus — il remet une protection en marche, et rien à l'écran
+                            // ne le montre puisque l'application s'ouvre sur la liste des SMS.
+                            //
+                            // ⚠️ Dans la branche `else`, on ne confirme RIEN : le réarmement a été
+                            // refusé faute de contact, l'état est préservé, et afficher une
+                            // confirmation serait le pire retour possible — annoncer une protection
+                            // qui n'existe pas.
+                            safetyCallAck.set(SafetyCallAckHolder.Ack.REARMED)
+                            Timber.i("MainActivity: safety call re-armed via notification action")
+                        } else {
+                            Timber.w("MainActivity: rearm refused — no contact configured")
+                        }
+                    }.onFailure { t ->
+                        // v1.27.4 — jumeau du chemin de reset : une annulation n'est pas un échec.
+                        if (t is kotlinx.coroutines.CancellationException) throw t
+                        // v1.27.3 (relecture Codex, SC-1273-06) — le nonce a déjà été consommé et
+                        // l'écriture a échoué : sans republication, la notification reste affichée
+                        // avec deux surfaces portant un jeton mort, et plus rien n'y répond jamais.
+                        Timber.w(t, "MainActivity: rearm write failed — republishing notice")
+                        republishSafetyCallNotice()
+                    }
+                }
+                incomingShare.clear()
+            }
+            com.relay.sms.system.receiver.EmergencyShortcutReceiver.ACTION_OPEN_EMERGENCY -> {
+                // v1.14.1 — l'utilisateur a tapé le corps de la notification
+                // persistante du raccourci urgence (PendingIntent setContentIntent
+                // posé par EmergencyShortcutNotifier). On marque pending nav
+                // openEmergency=true ; AppRoot consommera dans un LaunchedEffect
+                // après hydratation du NavController + guards (lock actif → pas
+                // de pop, panic-decoy → pas de pop).
+                incomingShare.clear()
+                pendingNav.set(
+                    PendingNavHolder.Pending(
+                        openEmergency = true,
+                        // v1.26.1 (audit SEC-A1) — meme authentification que la branche
+                        // d'ouverture de conversation : la brancher d'un cote seulement
+                        // aurait laisse la jumelle grande ouverte.
+                        navToken = intent.getLongExtra(
+                            com.relay.sms.system.notifications.NotificationIntentToken.EXTRA_NAV_TOKEN,
+                            0L,
+                        ),
+                    ),
+                )
+            }
+            IncomingMessageNotifier.ACTION_OPEN_CONVERSATION -> {
+                // v1.8.0 (bug 4 fix) — l'utilisateur a tapé une notif de message
+                // entrant. On extrait le `conversationId` mis en extra par
+                // [IncomingMessageNotifier] et on le dépose dans [pendingNav].
+                // [AppRoot] consommera ce holder dans un `LaunchedEffect` après
+                // que le `NavController` Compose est instancié, avec les guards
+                // habituels (lock actif, panic-decoy, déjà sur ce thread).
+                //
+                // **Important** : on `clear()` aussi le `incomingShare` ici —
+                // un tap notif est une intention de navigation pure, pas un
+                // partage. Si un share traînait dans le holder depuis une
+                // session précédente, on ne veut surtout pas qu'il s'attache
+                // à la conversation qu'on vient d'ouvrir.
+                incomingShare.clear()
+                val conversationId =
+                    intent.getLongExtra(IncomingMessageNotifier.EXTRA_CONVERSATION_ID, -1L)
+                if (conversationId > 0L) {
+                    pendingNav.set(
+                        PendingNavHolder.Pending(
+                            conversationId = conversationId,
+                            // v1.26.1 (audit H2) — le secret voyage jusqu'a AppRoot, qui seul
+                            // peut le verifier (lecture suspendue).
+                            navToken = intent.getLongExtra(
+                                com.relay.sms.system.notifications.NotificationIntentToken.EXTRA_NAV_TOKEN,
+                                0L,
+                            ),
+                        ),
+                    )
+                } else {
+                    Timber.w(
+                        "MainActivity: OPEN_CONVERSATION intent missing valid conversationId (got %d)",
+                        conversationId,
+                    )
+                }
+            }
+            Intent.ACTION_SENDTO, Intent.ACTION_VIEW -> {
+                // v1.14.8 bug fix — Avant : l'app Téléphone tapait "Message" sur un contact
+                // → ACTION_SENDTO + URI `smsto:+33xxx` → Relay ouvrait sur la liste des
+                // conversations sans pré-sélection (intent qui retombait dans `else`, juste
+                // un wipe d'incomingShare). Maintenant : on parse le scheme + le numéro,
+                // on stage le body éventuel, et on pose un pendingNav.sendToAddress qu'AppRoot
+                // résout via [ConversationRepository.findOrCreate] → navigation directe sur
+                // le ThreadScreen (conv existante OU nouvelle).
+                val data = intent.data
+                val scheme = data?.scheme?.lowercase()
+                if (scheme == "sms" || scheme == "smsto" || scheme == "mms" || scheme == "mmsto") {
+                    // schemeSpecificPart contient le(s) numéro(s) URL-encodés.
+                    // Multi-recipient possible (séparés par `,` ou `;` selon caller) —
+                    // pour cette v1.14.8, on prend le 1er ; le multi-recipient nécessite
+                    // de passer par ComposeScreen pour confirmer le groupe (v1.15 backlog).
+                    // v1.27.2 (audit externe Gemini 2026-08-04) — la partie `?query` est retirée
+                    // AVANT tout traitement. `sms:0612345678?body=Bonjour` est une forme
+                    // standard (RFC 5724), émise par les navigateurs et les QR codes : son
+                    // `schemeSpecificPart` vaut `0612345678?body=Bonjour` en entier, et rien
+                    // ici ne l'écartait. Le découpage sur `,`/`;` ne l'enlève pas, et la
+                    // validation d'en dessous la laisse passer (longueur correcte, au moins un
+                    // chiffre) — la conversation était donc créée sur une adresse corrompue.
+                    // Retrait structurel, avant décodage : un numéro ne contient jamais de `?`.
+                    val raw = data?.schemeSpecificPart
+                        ?.substringBefore('?')
+                        ?.let { Uri.decode(it) }
+                        .orEmpty()
+                    // v1.26.1 (audit B6) — le destinataire est désormais VALIDÉ.
+                    //
+                    // Toute chaîne non vide était acceptée et ÉCRIVAIT une ligne en base : une
+                    // application tierce pouvait, en boucle, créer autant de conversations
+                    // qu'elle voulait dans la liste, avec un libellé entièrement sous son
+                    // contrôle (un nom de banque, par exemple) et un corps pré-rempli — une
+                    // amorce d'hameçonnage crédible. Le KDoc de `PendingNavHolder` affirmait
+                    // pourtant « valide phone number côté caller (MainActivity) » : cette
+                    // validation n'existait pas.
+                    //
+                    // On s'aligne sur les bornes déjà appliquées par `HeadlessSmsSendService`,
+                    // l'autre entrée IPC qui fait la même chose : longueur plafonnée, et au
+                    // moins un chiffre — ce qui laisse passer les formats internationaux et les
+                    // codes courts, mais écarte le texte arbitraire.
+                    val firstRecipient = raw.split(",", ";")
+                        .map { it.trim() }
+                        .firstOrNull { it.isNotEmpty() }
+                        ?.takeIf { it.length <= SENDTO_ADDRESS_MAX_CHARS && it.any(Char::isDigit) }
+                    val body = intent.getStringExtra("sms_body")?.takeIf { it.isNotBlank() }
+                        ?: intent.getStringExtra(Intent.EXTRA_TEXT)?.takeIf { it.isNotBlank() }
+                    incomingShare.clear()
+                    if (!firstRecipient.isNullOrBlank()) {
+                        if (body != null) {
+                            incomingShare.set(
+                                IncomingShareHolder.Pending(
+                                    uris = emptyList(),
+                                    mimeType = null,
+                                    text = body,
+                                ),
+                            )
+                        }
+                        pendingNav.set(
+                            PendingNavHolder.Pending(sendToAddress = firstRecipient),
+                        )
+                    }
+                } else {
+                    // Scheme non-SMS (ex. http://) → comportement antérieur (wipe share).
+                    incomingShare.clear()
+                }
+            }
+            else -> {
+                // v1.3.3 G2 audit fix — l'app a été relancée via un intent NON-SEND
+                // (icône launcher, deep-link inconnu). Si un partage attend depuis
+                // une session précédente, on l'efface : l'intention de l'utilisateur
+                // a changé, pas question d'attacher une PJ oubliée à la conversation
+                // qu'il vient d'ouvrir.
+                incomingShare.clear()
+            }
+        }
+    }
+
+    /**
+     * v1.27.3 (relecture Codex du 2026-08-06, SC-1273-06) — republie la notification du Safety call
+     * avec un **nonce neuf**, après l'échec d'une écriture dont le nonce a déjà été consommé.
+     *
+     * # Le défaut que ça ferme
+     *
+     * `SafetyCallIntentToken.consume` est mono-usage et s'exécute **avant** la mutation. Si DataStore
+     * échoue, l'état persisté ne bouge pas, donc aucune émission ne déclenche la réconciliation qui
+     * régénérerait le jeton. La notification, non balayable, reste alors affichée avec un corps et une
+     * action portant tous deux un jeton mort — et chaque geste suivant est rejeté **avant même** de
+     * retenter l'écriture. Sur la seule commande capable d'arrêter une alerte, l'inertie définitive
+     * est inacceptable.
+     *
+     * Republier appelle `showSequence`, qui rotationne un jeton neuf : les deux surfaces redeviennent
+     * vivantes, et un second geste de l'utilisateur retentera réellement l'écriture.
+     *
+     * ⚠️ On relit l'état **persisté** plutôt que de reconstruire une décision à la main : si
+     * l'écriture avait en fait abouti, ou si le mode leurre s'est engagé entre-temps,
+     * [SafetyCallNotice.decide] rendra la bonne réponse — y compris `None`, qui retire tout.
+     */
+    /**
+     * v1.28.5 (relecture externe de la seconde vague) — **un geste venu d'une notification est
+     * BORNÉ au premier plan.** `lifecycleScope.launch` seul survit à l'arrière-plan : notification
+     * tapée, application laissée verrouillée, l'attente de [com.relay.sms.security.SafetyCallResetGate]
+     * restait suspendue et le geste s'exécutait des heures plus tard, au premier déverrouillage
+     * venu pour une autre raison — désarmant ou réarmant l'homme mort à retardement. Quand
+     * l'activité s'arrête, le geste encore en attente est annulé et la notification republiée,
+     * pour que le bouton reste disponible. Les deux chemins jumeaux (RESET, REARM) passent ici.
+     */
+    private fun lancerGesteDeNotification(bloc: suspend () -> Unit) {
+        val travail = lifecycleScope.launch { bloc() }
+        val observateur = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP && travail.isActive) {
+                Timber.i("MainActivity: notification gesture dropped — activity stopped while waiting")
+                travail.cancel()
+                republishSafetyCallNotice()
+            }
+        }
+        lifecycle.addObserver(observateur)
+        travail.invokeOnCompletion { runOnUiThread { lifecycle.removeObserver(observateur) } }
+    }
+
+    private fun republishSafetyCallNotice() {
+        lifecycleScope.launch {
+            runCatching {
+                val cfg = settings.hydratedOrNull()?.security?.safetyCall ?: return@runCatching
+                val notice = com.relay.sms.domain.safetycall.SafetyCallNotice.decide(
+                    cfg = cfg,
+                    isDecoy = appLock.state.value is AppLockManager.LockState.PanicDecoy,
+                    nowMs = System.currentTimeMillis(),
+                    nowMonoMs = android.os.SystemClock.elapsedRealtime(),
+                    peutEnvoyer = defaultSmsAppChecker.isDefault(),
+                )
+                safetyCallNotifierLazy.get().reconcile(notice)
+            }.onFailure { t ->
+                Timber.w(t, "MainActivity: safety call notice republication failed")
+            }
+        }
+    }
+
+    /** v1.3.3 — récupère `EXTRA_STREAM` avec API moderne (Android 13+) + legacy fallback. */
+    @Suppress("DEPRECATION")
+    private fun Intent.extraStream(): Uri? =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+        } else {
+            getParcelableExtra(Intent.EXTRA_STREAM)
+        }?.takeIf { it.isSafeSharedUri() }
+
+    /**
+     * v1.26.1 (audit M9) — filtre les URI de partage entrantes.
+     *
+     * `EXTRA_STREAM` vient d'une application tierce et était accepté TEL QUEL : ni vérification
+     * du schéma, ni vérification de l'autorité. En aval, `copyAttachmentToCache` fait
+     * `contentResolver.openInputStream(uri)` — et comme l'appelant et le fournisseur partagent
+     * notre UID, une URI `content://com.relay.sms.fileprovider/...` ou un `file:///data/...`
+     * désignant NOS PROPRES fichiers privés (pièce jointe MMS, PDF d'export d'une conversation)
+     * était résolue sans le moindre contrôle de permission. L'utilisateur pouvait alors, sans le
+     * savoir, réexpédier à un tiers un fichier interne — un député confus classique.
+     *
+     * Le KDoc de `handleSharedIntent` affirmait que le pipeline aval « inspecte le header
+     * image » : vérifié, c'est FAUX — `SendMediaMmsUseCase` ne fait qu'un plafond de taille et
+     * fait confiance au type MIME fourni. Le commentaire a été corrigé.
+     *
+     * Règle : uniquement `content://`, et jamais notre propre autorité.
+     */
+    private fun Uri.isSafeSharedUri(): Boolean {
+        if (scheme != ContentResolver.SCHEME_CONTENT) {
+            Timber.w("handleSharedIntent: rejected non-content URI scheme=%s", scheme)
+            return false
+        }
+        val auth = authority.orEmpty()
+        if (auth == packageName || auth.startsWith("$packageName.")) {
+            Timber.w("handleSharedIntent: rejected self-owned authority %s", auth)
+            return false
+        }
+        return true
+    }
+
+    /** v1.3.3 — récupère la liste d'URIs pour ACTION_SEND_MULTIPLE. */
+    @Suppress("DEPRECATION")
+    private fun Intent.extraStreamList(): List<Uri> =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            getParcelableArrayListExtra(Intent.EXTRA_STREAM, Uri::class.java).orEmpty()
+        } else {
+            getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM).orEmpty()
+        }
+            // v1.26.1 (audit M9) — même filtre que le partage simple, cf. [isSafeSharedUri].
+            .filter { it.isSafeSharedUri() }
+
+    private companion object {
+        /**
+         * v1.26.1 (audit B6) — longueur maximale d'un destinataire reçu via `sms:`/`smsto:`.
+         * Alignée sur `HeadlessSmsSendService.MAX_NUMBER_LEN`, l'autre entrée IPC qui accepte un
+         * numéro d'une source non fiable : deux portes d'entrée équivalentes, une seule règle.
+         */
+        const val SENDTO_ADDRESS_MAX_CHARS = 32
+    }
+}

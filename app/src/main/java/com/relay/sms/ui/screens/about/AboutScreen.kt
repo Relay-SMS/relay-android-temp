@@ -1,0 +1,560 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.ui.screens.about
+
+import android.content.Intent
+import android.net.Uri
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.ArrowBack
+import androidx.compose.material.icons.automirrored.outlined.Reply
+import androidx.compose.material.icons.outlined.Backup
+import androidx.compose.material.icons.outlined.BugReport
+import androidx.compose.material.icons.outlined.ChatBubbleOutline
+import androidx.compose.material.icons.outlined.Code
+import androidx.compose.material.icons.outlined.DarkMode
+import androidx.compose.material.icons.outlined.Description
+import androidx.compose.material.icons.outlined.Email
+import androidx.compose.material.icons.outlined.Fingerprint
+import androidx.compose.material.icons.outlined.Gavel
+import androidx.compose.material.icons.outlined.GraphicEq
+import androidx.compose.material.icons.outlined.Language
+import androidx.compose.material.icons.outlined.Mic
+import androidx.compose.material.icons.outlined.PrivacyTip
+import androidx.compose.material.icons.outlined.QuestionAnswer
+import androidx.compose.material.icons.outlined.Search
+import androidx.compose.material.icons.outlined.Security
+import androidx.compose.material.icons.outlined.Shield
+import androidx.compose.material.icons.outlined.Translate
+import androidx.compose.material.icons.outlined.Warning
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.painter.Painter
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import com.relay.sms.BuildConfig
+import com.relay.sms.BuildMarker
+import com.relay.sms.R
+import com.relay.sms.ui.components.RelaySectionLabel
+import com.relay.sms.ui.components.RelaySettingRow
+import com.relay.sms.ui.components.RelaySettingsGroup
+import com.relay.sms.ui.components.RelayTextButton
+import com.relay.sms.ui.theme.BrandBlue
+import com.relay.sms.ui.theme.RelayText
+
+/**
+ * About screen in the Seca grouped-list format (M3 Expressive): section labels plus
+ * [RelaySettingsGroup] rows with round icon badges, same as Settings and Help. No copy
+ * changes — only the presentation moved onto the shared kit.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun AboutScreen(
+    onBack: () -> Unit,
+    isPanicDecoy: Boolean,
+    // Feedback round 8 — the License link opens the License screen (the
+    // copyright notice), instead of the Apache license in the browser.
+    onOpenLicense: () -> Unit,
+) {
+    val context = LocalContext.current
+    var tapCount by remember { mutableStateOf(0) }
+
+    Scaffold(
+        containerColor = MaterialTheme.colorScheme.surface,
+        topBar = {
+            TopAppBar(
+                title = { Text(stringResource(R.string.about_title)) },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(
+                            Icons.AutoMirrored.Outlined.ArrowBack,
+                            contentDescription = stringResource(R.string.action_back),
+                        )
+                    }
+                },
+            )
+        },
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .verticalScroll(rememberScrollState())
+                // Feedback round 9 — only a top gap here: the section
+                // labels already carry 24dp above each group, and the
+                // trailing spacer below is the 32dp bottom breathing room,
+                // same as Help. The old vertical 24dp doubled the
+                // bottom gap (spacer + column padding).
+                .padding(top = 24.dp),
+        ) {
+            HeaderBlock(
+                onCheckUpdate = {
+                    safeStartActivity(
+                        context,
+                        Intent(Intent.ACTION_VIEW, Uri.parse(RELEASES_URL)),
+                    )
+                },
+                onVersionTap = { tapCount++ },
+                tapCount = tapCount,
+            )
+
+            RelaySectionLabel(text = stringResource(R.string.about_section_privacy))
+            RelaySettingsGroup {
+                item {
+                    RelaySettingRow(
+                        icon = Icons.Outlined.Shield,
+                        title = stringResource(R.string.about_privacy_headline),
+                    )
+                }
+            }
+            // Feedback round 5 — the four privacy badges ("No ads",
+            // "No tracker", "No data collected", "Zero sharing") lived
+            // here; they are removed, and the last two move down to the
+            // "Zero ads, zero trackers" feature below.
+
+            RelaySectionLabel(text = stringResource(R.string.about_section_features))
+            // Round 40 — hoisted above the group: the group content lambda is
+            // plain (not @Composable), so features() cannot be called inside it.
+            val featureList = features(isPanicDecoy)
+            RelaySettingsGroup {
+                featureList.forEach { f ->
+                    item {
+                        RelaySettingRow(icon = f.icon, iconPainter = f.iconPainter, title = f.label, subtitle = f.desc)
+                    }
+                }
+            }
+
+            // Feedback round 5 — the Author section lived here (name + role
+            // in its own row); it duplicated the upstream credit already in
+            // the footer below, so it was removed. The footer credit is the
+            // one that matters.
+
+            // Feedback round 5 — Quick Help moved out of About onto its own
+            // Help screen, reached from Settings (see HelpScreen); this
+            // section is gone from here.
+            RelaySectionLabel(text = stringResource(R.string.about_security_title))
+            RelaySettingsGroup {
+                item {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.Top,
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.Warning,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(18.dp),
+                        )
+                        Text(
+                            text = stringResource(R.string.about_security_body),
+                            style = RelayText.Preview,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+
+            RelaySectionLabel(text = stringResource(R.string.about_permissions_title))
+            // Round 40 — hoisted above the group: the group content lambda is
+            // plain (not @Composable), so permissions() cannot be called inside it.
+            val permissionList = permissions(isPanicDecoy)
+            RelaySettingsGroup {
+                permissionList.forEach { p ->
+                    item {
+                        RelaySettingRow(icon = null, title = p.name, subtitle = p.why)
+                    }
+                }
+            }
+
+            // v1.28.13 — la politique et les conditions existent dans les cinq langues de
+            // l'application : le lien ouvre celle de la langue AFFICHÉE, l'anglais à défaut.
+            // Masqués en session leurre (revue de sécurité de la 1.28.13) : ces deux documents
+            // décrivent le mode urgence et le Safety call, que le reste de cet écran tait en leurre
+            // (fonctions, aide, permissions). Un agresseur ne peut pas savoir qu'ils manquent.
+            val langue = LocalConfiguration.current.locales[0].language
+            RelaySectionLabel(text = stringResource(R.string.about_section_links))
+            RelaySettingsGroup {
+                item(onClick = { safeStartActivity(context, Intent(Intent.ACTION_VIEW, Uri.parse(REPO_URL))) }) {
+                    RelaySettingRow(
+                        icon = Icons.Outlined.Code,
+                        title = stringResource(R.string.about_source_code),
+                        chevron = true,
+                    )
+                }
+                item(onClick = {
+                    // Fork: issues go to the Relay repo, not to the upstream author's inbox.
+                    safeStartActivity(
+                        context,
+                        Intent(
+                            Intent.ACTION_VIEW,
+                            Uri.parse("https://github.com/relay-sms/relay-android/issues/new")
+                        )
+                    )
+                }) {
+                    RelaySettingRow(
+                        icon = Icons.Outlined.BugReport,
+                        title = stringResource(R.string.about_report_issue),
+                        chevron = true,
+                    )
+                }
+                item(onClick = { safeStartActivity(context, Intent(Intent.ACTION_VIEW, Uri.parse(WEBSITE_URL))) }) {
+                    RelaySettingRow(
+                        icon = Icons.Outlined.Language,
+                        title = stringResource(R.string.about_website),
+                        subtitle = WEBSITE_URL,
+                        chevron = true,
+                    )
+                }
+                // Round 36 — contact support by email: opens the
+                // email app with the Relay support address. An
+                // email address reveals nothing, so the row stays
+                // visible in a panic-decoy session.
+                item(onClick = {
+                    safeStartActivity(
+                        context,
+                        Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:$SUPPORT_EMAIL")),
+                    )
+                }) {
+                    RelaySettingRow(
+                        icon = Icons.Outlined.Email,
+                        title = stringResource(R.string.about_contact_support),
+                        subtitle = SUPPORT_EMAIL,
+                        chevron = true,
+                    )
+                }
+                // Feedback round 8 — the License link opens the License
+                // screen (Relay's copyright notice + the upstream
+                // attribution) instead of the Apache license in the browser,
+                // and it carries no subtext now.
+                item(onClick = onOpenLicense) {
+                    RelaySettingRow(
+                        icon = Icons.Outlined.Gavel,
+                        title = stringResource(R.string.about_license),
+                        chevron = true,
+                    )
+                }
+                if (!isPanicDecoy) {
+                    item(onClick = { ouvrirTexteJuridique(context, "PRIVACY", langue) }) {
+                        RelaySettingRow(
+                            icon = Icons.Outlined.PrivacyTip,
+                            title = stringResource(R.string.about_privacy),
+                            chevron = true,
+                        )
+                    }
+                    item(onClick = { ouvrirTexteJuridique(context, "TERMS", langue) }) {
+                        RelaySettingRow(
+                            icon = Icons.Outlined.Description,
+                            title = stringResource(R.string.about_terms),
+                            chevron = true,
+                        )
+                    }
+                }
+            }
+
+            // Feedback round 9 — the bottom credits line is gone too: the
+            // full attribution (including the upstream credit) lives in the
+            // License screen, reached from the License link above. The
+            // spacer is the bottom breathing room, same as Help.
+            Spacer(Modifier.size(32.dp))
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Header
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Composable
+private fun HeaderBlock(
+    onCheckUpdate: () -> Unit,
+    onVersionTap: () -> Unit,
+    tapCount: Int,
+) {
+    val cs = MaterialTheme.colorScheme
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        // Feedback round 5 — Relay interim logo: the white chat bubble
+        // (adaptive-icon foreground vector, tail bottom-right) on a
+        // brand-blue rounded tile, the same treatment as the splash. The
+        // old upstream PNG was removed.
+        // Round 11 — the bubble is sized up: the adaptive-icon foreground
+        // carries the 108dp safe-zone padding, so the bubble itself is only
+        // ~48x44 of the 108 viewport and read as tiny inside the tile.
+        // The 11dp inset is dropped and the image is scaled 1.8x around its
+        // centre (the bubble is centred on the viewport), so the bubble
+        // fills the tile; the tile's rounded clip keeps the overflow inside.
+        Box(
+            modifier = Modifier
+                .size(80.dp)
+                .clip(RoundedCornerShape(20.dp))
+                .background(BrandBlue),
+            contentAlignment = Alignment.Center,
+        ) {
+            Image(
+                painter = painterResource(id = R.drawable.ic_launcher_foreground),
+                contentDescription = null,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .scale(1.8f),
+            )
+        }
+        Spacer(Modifier.size(14.dp))
+        Text(
+            text = stringResource(R.string.app_name),
+            style = RelayText.LargeTitle,
+        )
+        Spacer(Modifier.size(4.dp))
+        Box(
+            modifier = Modifier
+                .clip(RoundedCornerShape(20.dp))
+                .background(cs.primaryContainer)
+                .clickable { onVersionTap() }
+                .padding(horizontal = 10.dp, vertical = 3.dp),
+        ) {
+            Text(
+                text = "v${BuildConfig.VERSION_NAME}",
+                // Phase 8 — le texte vit sur `primaryContainer` : `primary` donnait 1.40:1
+                // sur `#004788` en sombre (5.56:1 en clair). `onPrimaryContainer` donne
+                // 7.23:1 en sombre et 14.41:1 en clair.
+                color = cs.onPrimaryContainer,
+                style = RelayText.Timestamp.copy(fontWeight = FontWeight.SemiBold),
+            )
+        }
+        // Build marker — the same line as the Encryption screen, so
+        // the build is verifiable from About too.
+        Spacer(Modifier.size(6.dp))
+        Text(
+            text = BuildMarker.current(),
+            style = RelayText.Timestamp,
+            color = cs.onSurfaceVariant,
+        )
+        if (tapCount >= 7) {
+            Spacer(Modifier.size(6.dp))
+            Text(
+                text = stringResource(R.string.about_easter_egg),
+                style = RelayText.Timestamp,
+                color = cs.onSurfaceVariant,
+            )
+        }
+        Spacer(Modifier.size(8.dp))
+        Text(
+            text = stringResource(R.string.about_tagline_short),
+            style = RelayText.Timestamp,
+            color = cs.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+        )
+        Spacer(Modifier.size(14.dp))
+        RelayTextButton(
+            text = stringResource(R.string.about_check_updates),
+            onClick = onCheckUpdate,
+        )
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Audit U4: never crash if no Activity is registered for the intent. */
+private fun safeStartActivity(context: android.content.Context, intent: android.content.Intent) {
+    runCatching { context.startActivity(intent) }
+        .onFailure { timber.log.Timber.w(it, "safeStartActivity: no handler for %s", intent.action) }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Static data
+// ─────────────────────────────────────────────────────────────────────────────
+
+// v1.27.10 (revue externe GitLab !38458) — le depot s'appelle `relay-android`, pas `relay_android` :
+// ces deux liens rendaient 404 depuis toujours. Ce n'est pas une affaire de casse (GitHub
+// l'ignore) mais de separateur, tiret contre soulignement. Seul RELEASES_URL etait juste, ce
+// qui a masque le defaut : une des trois surfaces marchait.
+private const val REPO_URL = "https://github.com/relay-sms/relay-android"
+private const val RELEASES_URL = "https://github.com/relay-sms/relay-android/releases/latest"
+
+// Round 36 — Relay has its own website now.
+private const val WEBSITE_URL = "https://getrelaysms.com"
+private const val LEGAL_BASE_URL = "https://github.com/relay-sms/relay-android/blob/main/"
+
+/** Round 36 — the support email, shown on the About screen. */
+private const val SUPPORT_EMAIL = "support@getrelaysms.com"
+
+/** Langues dans lesquelles PRIVACY et TERMS ont une traduction ; l'anglais est `PRIVACY.md`. */
+private val LANGUES_DES_TEXTES_JURIDIQUES = setOf("fr", "de", "it", "es")
+
+/**
+ * v1.28.13 — `PRIVACY.md` / `TERMS.md` en anglais, `PRIVACY.fr.md`… pour les autres langues de
+ * l'application. Les versions anglaise et française font foi ; les autres sont des traductions.
+ */
+internal fun urlTexteJuridique(document: String, langue: String): String {
+    val suffixe = if (langue in LANGUES_DES_TEXTES_JURIDIQUES) ".$langue" else ""
+    return "$LEGAL_BASE_URL$document$suffixe.md"
+}
+
+private fun ouvrirTexteJuridique(context: android.content.Context, document: String, langue: String) {
+    safeStartActivity(context, Intent(Intent.ACTION_VIEW, Uri.parse(urlTexteJuridique(document, langue))))
+}
+
+/**
+ * @param sensitive v1.26.1 (audit C4) — la fonctionnalité ne doit PAS être nommée en session
+ *   leurre. Marquer plutôt que filtrer à la main : une fonctionnalité de sécurité ajoutée
+ *   plus tard hérite du bon comportement en posant un seul drapeau, au lieu d'être oubliée
+ *   dans une liste d'exclusion tenue ailleurs.
+ */
+private data class Feature(
+    // Round 22 — the icon is either a Material [ImageVector] or a drawable
+    // [Painter] (Kristin's own icons, shared with the desktop app); the
+    // painter wins when both are given. The painter stays last so the
+    // existing positional entries keep working.
+    val icon: ImageVector? = null,
+    val label: String,
+    // Feedback round 5 — `null` = title-only row (the "No data
+    // collected" / "Zero sharing" rows below have no description).
+    val desc: String? = null,
+    val sensitive: Boolean = false,
+    val iconPainter: Painter? = null,
+)
+
+/**
+ * v1.26.1 (audit C4) — en session leurre, on retire les fonctionnalités marquées `sensitive`.
+ *
+ * Cet écran était le dernier à décrire en clair ce que tout le reste du mode leurre s'emploie
+ * à nier. Le texte du code panique dit mot pour mot « Second code qui ouvre l'app en mode
+ * leurre — coffre invisible et inaccessible » : un agresseur qui ouvrait À propos apprenait
+ * donc à la fois qu'un coffre existe et qu'un second code le lui cache. Le leurre désignait
+ * ce qu'il cachait.
+ *
+ * On filtre les entrées plutôt que de masquer l'écran entier : une application SMS ordinaire
+ * a un écran « À propos », et le faire disparaître serait en soi une anomalie visible.
+ */
+@androidx.compose.runtime.Composable
+private fun features(isPanicDecoy: Boolean): List<Feature> = listOf(
+    Feature(Icons.Outlined.ChatBubbleOutline, stringResource(R.string.about_feat_sms_label), stringResource(R.string.about_feat_sms_desc)),
+    Feature(Icons.Outlined.Mic, stringResource(R.string.about_feat_voice_label), stringResource(R.string.about_feat_voice_desc)),
+    Feature(
+        Icons.Outlined.Security,
+        stringResource(R.string.about_feat_vault_label),
+        stringResource(R.string.about_feat_vault_desc),
+        sensitive = true,
+    ),
+    Feature(
+        Icons.Outlined.Shield,
+        stringResource(R.string.about_feat_panic_label),
+        stringResource(R.string.about_feat_panic_desc),
+        sensitive = true,
+    ),
+    Feature(
+        Icons.Outlined.Warning,
+        stringResource(R.string.about_feat_emergency_label),
+        stringResource(R.string.about_feat_emergency_desc),
+        sensitive = true,
+    ),
+    Feature(Icons.Outlined.Fingerprint, stringResource(R.string.about_feat_biometric_label), stringResource(R.string.about_feat_biometric_desc)),
+    Feature(Icons.AutoMirrored.Outlined.Reply, stringResource(R.string.about_feat_reply_label), stringResource(R.string.about_feat_reply_desc)),
+    Feature(Icons.Outlined.Translate, stringResource(R.string.about_feat_translate_label), stringResource(R.string.about_feat_translate_desc)),
+    Feature(
+        iconPainter = painterResource(R.drawable.ic_block),
+        label = stringResource(R.string.about_feat_block_label),
+        desc = stringResource(R.string.about_feat_block_desc),
+    ),
+    Feature(Icons.Outlined.Search, stringResource(R.string.about_feat_search_label), stringResource(R.string.about_feat_search_desc)),
+    Feature(
+        iconPainter = painterResource(R.drawable.ic_export_pdf),
+        label = stringResource(R.string.about_feat_pdf_label),
+        desc = stringResource(R.string.about_feat_pdf_desc),
+    ),
+    Feature(Icons.Outlined.Backup, stringResource(R.string.about_feat_backup_label), stringResource(R.string.about_feat_backup_desc)),
+    Feature(Icons.Outlined.DarkMode, stringResource(R.string.about_feat_themes_label), stringResource(R.string.about_feat_themes_desc)),
+    Feature(Icons.Outlined.GraphicEq, stringResource(R.string.about_feat_ui_label), stringResource(R.string.about_feat_ui_desc)),
+    Feature(Icons.Outlined.QuestionAnswer, stringResource(R.string.about_feat_noads_label), stringResource(R.string.about_feat_noads_desc)),
+    // Feedback round 5 — the two privacy claims moved here from the badges
+    // at the top of this screen: title-only rows under "Zero ads, zero
+    // trackers", same style as the other features.
+    Feature(Icons.Outlined.Security, stringResource(R.string.about_badge_no_collection)),
+    Feature(Icons.Outlined.PrivacyTip, stringResource(R.string.about_badge_no_sharing)),
+    // Round 21 — the no-tracking rule, stated plainly next to the other
+    // privacy badges: no Google services anywhere in the app.
+    Feature(Icons.Outlined.Shield, stringResource(R.string.about_badge_no_google)),
+).filterNot { isPanicDecoy && it.sensitive }
+
+/**
+ * @property sensitive v1.28.13 — la ligne nomme le mode urgence : masquée en session leurre, comme
+ *   les fonctions et l'aide du même écran (cf. [features], [HelpScreen]).
+ */
+private data class Permission(val name: String, val why: String, val sensitive: Boolean = false)
+
+/**
+ * v1.25.3 (audit H20) — les justificatifs de permissions étaient des littéraux **anglais** dans
+ * le corps de l'écran : un utilisateur francophone lisait « Required for any SMS app. » au milieu
+ * d'une page en français. Même patron de factory `@Composable` que [features] et [HelpScreen].
+ *
+ * Les noms de permissions restent des littéraux : ce sont les identifiants Android exacts, et les
+ * traduire les rendrait invérifiables face à l'écran système des autorisations.
+ */
+@androidx.compose.runtime.Composable
+private fun permissions(isPanicDecoy: Boolean): List<Permission> = listOf(
+    Permission("SEND_SMS / RECEIVE_SMS / READ_SMS / WRITE_SMS", stringResource(R.string.about_perm_sms)),
+    Permission("RECEIVE_MMS / RECEIVE_WAP_PUSH", stringResource(R.string.about_perm_mms)),
+    Permission("READ_CONTACTS", stringResource(R.string.about_perm_contacts)),
+    Permission("READ_PHONE_STATE / READ_PHONE_NUMBERS", stringResource(R.string.about_perm_phone_state)),
+    Permission("POST_NOTIFICATIONS", stringResource(R.string.about_perm_notifications)),
+    Permission("USE_BIOMETRIC", stringResource(R.string.about_perm_biometric)),
+    // v1.3.5 G3 + audit F1 — SCHEDULE_EXACT_ALARM retiré du manifest (envoi planifié via
+    // WorkManager.enqueueUniqueWork, pas AlarmManager.setExact*).
+    // Round 13 — INTERNET est de retour dans le manifeste, pour la recherche de GIF
+    // uniquement : le MMS passe toujours par le service MMS d'Android.
+    Permission("INTERNET", stringResource(R.string.about_perm_internet)),
+    Permission("RECORD_AUDIO", stringResource(R.string.about_perm_record_audio)),
+    // v1.28.13 — les deux permissions « dangereuses » du mode urgence manquaient à cette liste,
+    // intitulée « Permissions utilisées » : précisément les plus sensibles. Masquées en leurre.
+    Permission(
+        "ACCESS_FINE_LOCATION / ACCESS_COARSE_LOCATION",
+        stringResource(R.string.about_perm_location),
+        sensitive = true,
+    ),
+    Permission("CALL_PHONE", stringResource(R.string.about_perm_call_phone), sensitive = true),
+    Permission("FOREGROUND_SERVICE", stringResource(R.string.about_perm_foreground_service)),
+).filterNot { isPanicDecoy && it.sensitive }

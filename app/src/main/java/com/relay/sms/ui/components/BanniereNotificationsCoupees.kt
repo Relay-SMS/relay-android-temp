@@ -1,0 +1,127 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.ui.components
+
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.relay.sms.R
+import com.relay.sms.system.notifications.canauxVisibles
+import com.relay.sms.system.settings.ouvrirLesNotificationsDeLApplication
+
+/**
+ * v1.28.13 (balayage des permissions refusées, MR F-Droid !38458) — **une protection qui passe par
+ * une notification doit dire quand les notifications sont coupées.**
+ *
+ * Sans `POST_NOTIFICATIONS` (ou avec les notifications coupées pour l'application), les notifiers
+ * sortent sans rien poster, et c'est voulu : `notify()` ne lève pas. Mais rien ne le disait :
+ *  - le Safety call perdait son avertissement avant envoi, sa notification d'arrêt, et le signal
+ *    « armé mais rien ne partira » posé en v1.28.12 ;
+ *  - le raccourci d'urgence de l'écran verrouillé restait affiché « activé » dans les Réglages sans
+ *    exister nulle part ;
+ *  - les SMS arrivaient sans notification, et l'avertissement des Réglages prévu pour ce cas
+ *    (v1.8.0) n'avait jamais été branché.
+ *
+ * Même patron que [BanniereRoleSmsManquant] : l'état est relu à chaque retour au premier plan, pour
+ * que la bannière disparaisse quand on revient de la page Android où l'on vient de les rallumer.
+ *
+ * @param message ce que la coupure empêche, à cet endroit précis.
+ * @param canaux les canaux sur lesquels la fonction poste RÉELLEMENT (cf. `CanauxVisibles.kt`),
+ *   qu'Android permet de couper un à un sans toucher à l'interrupteur global. Une liste et non une
+ *   fonction : elle se compare, donc l'état est relu quand elle change — le style des notifications
+ *   peut changer pendant que l'écran est ouvert (audit pré-release 1.28.13, L2).
+ */
+@Composable
+fun BanniereNotificationsCoupees(
+    message: String,
+    canaux: List<String>,
+    modifier: Modifier = Modifier,
+) {
+    val contexte = LocalContext.current
+    val cycleDeVie = LocalLifecycleOwner.current.lifecycle
+    var actives by remember(canaux) { mutableStateOf(canauxVisibles(contexte, canaux)) }
+    DisposableEffect(cycleDeVie, canaux) {
+        val observateur = LifecycleEventObserver { _, evenement ->
+            if (evenement == Lifecycle.Event.ON_RESUME) actives = canauxVisibles(contexte, canaux)
+        }
+        cycleDeVie.addObserver(observateur)
+        onDispose { cycleDeVie.removeObserver(observateur) }
+    }
+
+    if (actives) return
+
+    Card(
+        modifier = modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.errorContainer,
+            contentColor = MaterialTheme.colorScheme.onErrorContainer,
+        ),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(
+                text = stringResource(R.string.notifications_off_title),
+                style = MaterialTheme.typography.titleSmall,
+            )
+            Text(text = message, style = MaterialTheme.typography.bodyMedium)
+            Spacer(Modifier.size(8.dp))
+            // Feedback round 7 — pill shape, non-bold label, like the other
+            // large buttons app-wide.
+            // Feedback round 10 — in dark mode the button takes the same
+            // light `#E5EAFD` background with dark-navy text as the
+            // set-as-default button: the default darker button reads as
+            // muddy against the red banner. Light mode is left as it
+            // was (brand primary). The dark/light split comes from the
+            // surface luminance, like the bubble colours.
+            val cs = MaterialTheme.colorScheme
+            val surface = cs.surface
+            val surfaceLuma = 0.2126f * surface.red + 0.7152f * surface.green +
+                0.0722f * surface.blue
+            val isDark = surfaceLuma < 0.5f
+            Button(
+                onClick = { ouvrirLesNotificationsDeLApplication(contexte) },
+                shape = RoundedCornerShape(50),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (isDark) Color(0xFFE5EAFD) else cs.primary,
+                    contentColor = if (isDark) Color(0xFF001A40) else cs.onPrimary,
+                ),
+            ) {
+                Text(
+                    stringResource(R.string.notifications_off_fix),
+                    fontWeight = FontWeight.Normal,
+                )
+            }
+        }
+    }
+}

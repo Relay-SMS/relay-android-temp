@@ -1,0 +1,319 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.data.repository
+
+import android.content.Context
+import androidx.room.Room
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
+import com.google.common.truth.Truth.assertThat
+import com.relay.sms.data.local.datastore.SettingsRepository
+import com.relay.sms.data.local.db.AppDatabase
+import com.relay.sms.data.local.db.entity.ConversationEntity
+import com.relay.sms.data.mms.ContenuMmsRecu
+import com.relay.sms.data.mms.EcrivainDePiecesSurDisque
+import com.relay.sms.data.mms.IntegrationMmsRecu
+import com.relay.sms.data.mms.IntegrationMmsRecu.Resultat
+import com.relay.sms.data.mms.PartieMms
+import com.relay.sms.data.mms.PdusEnAttente
+import com.relay.sms.data.sms.PhoneIdentity
+import com.relay.sms.data.sms.PhoneNumberWireFormatter
+import com.relay.sms.data.sms.SystemThreadResolver
+import com.relay.sms.domain.model.Contact
+import com.relay.sms.domain.model.PhoneAddress
+import com.relay.sms.domain.repository.ContactPhotoWriteResult
+import com.relay.sms.domain.repository.ContactRepository
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.runBlocking
+import org.junit.After
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+import java.io.File
+
+/**
+ * v1.28.9 (F17) — **l'écriture d'un MMS reçu est idempotente**, sur un vrai Room et de vrais fichiers.
+ *
+ * La reprise rejoue un PDU gardé : elle doit reconnaître le message déjà écrit (sinon doublon), compléter
+ * celui dont une pièce manquait (sinon média perdu), ne rien changer quand la complétion échoue encore, et
+ * ne rien écrire pour un message supprimé pendant qu'elle travaillait (sinon résurrection). Les pièces sont
+ * écrites par l'écrivain réel ; seul son refus est simulé, sur un type choisi.
+ *
+ * Les tests où rien ne doit être écrit ont leur contrôle positif : [unMmsNeufEstEcritAvecSaCle].
+ */
+@RunWith(AndroidJUnit4::class)
+class IntegrationMmsRecuTest {
+
+    private lateinit var db: AppDatabase
+    private lateinit var mirror: ConversationMirror
+    private val portee = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /** Chaque fichier écrit par un test, pour le ménage — et pour vérifier ce qui a été effacé. */
+    private val ecrits = mutableListOf<File>()
+
+    private val context: Context
+        get() = InstrumentationRegistry.getInstrumentation().targetContext
+
+    private val cle = PdusEnAttente.cle("TX-1", "http://mmsc.example/1", 1)!!
+
+    private object SansContacts : ContactRepository {
+        override suspend fun lookupByPhone(rawPhone: String): Contact? = null
+        override suspend fun listAll(): List<Contact> = emptyList()
+        override suspend fun listAllDetailed(): List<Contact> = emptyList()
+        override suspend fun openPhotoStream(address: String): java.io.InputStream? = null
+        override suspend fun setContactPhoto(address: String, photoBytes: ByteArray): ContactPhotoWriteResult =
+            ContactPhotoWriteResult.NotFound
+    }
+
+    @Before
+    fun setUp() {
+        db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        mirror = ConversationMirror(
+            db,
+            db.conversationDao(),
+            db.messageDao(),
+            db.scheduledMessageDao(),
+            db.attachmentDao(),
+            SansContacts,
+            PhoneIdentity(PhoneNumberWireFormatter(context, SettingsRepository(context, portee))),
+            AnnulateurDeNotificationsEspion(),
+            Dispatchers.IO,
+        )
+    }
+
+    @After
+    fun tearDown() {
+        db.close()
+        ecrits.forEach { it.delete() }
+    }
+
+    @Test
+    fun unMmsNeufEstEcritAvecSaCle(): Unit = runBlocking {
+        val resultat = integration().integrer(contenu(), subId = 1, membres = null, cle = cle) { true }
+
+        assertThat(resultat).isInstanceOf(Resultat.Ecrit::class.java)
+        val id = (resultat as Resultat.Ecrit).messageId
+        assertThat(db.messageDao().findById(id)?.mmsTransactionKey).isEqualTo(cle)
+        val pieces = db.attachmentDao().findForMessage(id)
+        assertThat(pieces.map { it.mimeType }).containsExactly("image/jpeg", "image/png").inOrder()
+        assertThat(pieces.all { File(it.localUri).exists() }).isTrue()
+    }
+
+    @Test
+    fun unSecondExemplaireEstReconnuSansRienEcrire(): Unit = runBlocking {
+        val premier = integration().integrer(contenu(), 1, null, cle = cle) { true } as Resultat.Ecrit
+        val ecritsAvant = ecrits.size
+
+        val second = integration().integrer(contenu(), 1, null, cle = cle) { true }
+
+        assertThat(second).isEqualTo(Resultat.DejaComplet(premier.messageId))
+        assertThat(ecrits.size).isEqualTo(ecritsAvant)
+        assertThat(nombreDeMessages()).isEqualTo(1)
+    }
+
+    @Test
+    fun unePieceNonEcriteEstCompleteeALaReprise(): Unit = runBlocking {
+        val incomplet = integration(ecrivainReel("image/png")).integrer(contenu(), 1, null, cle = cle) { true }
+        assertThat(incomplet).isInstanceOf(Resultat.EcritIncomplet::class.java)
+        val id = (incomplet as Resultat.EcritIncomplet).messageId
+        val avant = db.attachmentDao().findForMessage(id).map { it.localUri }
+        assertThat(avant).hasSize(1)
+        assertThat(db.messageDao().findById(id)?.attachmentsCount).isEqualTo(1)
+
+        val repris = integration().integrer(contenu(), 1, null, cle = cle) { true }
+
+        assertThat(repris).isEqualTo(Resultat.Complete(id))
+        val apres = db.attachmentDao().findForMessage(id)
+        assertThat(apres.map { it.mimeType }).containsExactly("image/jpeg", "image/png").inOrder()
+        assertThat(apres.all { File(it.localUri).exists() }).isTrue()
+        assertThat(db.messageDao().findById(id)?.attachmentsCount).isEqualTo(2)
+        // L'ancienne pièce, remplacée et plus citée par rien, est partie : pas d'orphelin.
+        assertThat(File(avant.single()).exists()).isFalse()
+        assertThat(nombreDeMessages()).isEqualTo(1)
+    }
+
+    @Test
+    fun uneCompletionQuiEchoueEncoreNeChangeRienEtEffaceCeQuElleAEcrit(): Unit = runBlocking {
+        val premier = integration(ecrivainReel("image/png")).integrer(contenu(), 1, null, cle = cle) { true }
+        val id = (premier as Resultat.EcritIncomplet).messageId
+        val avant = db.attachmentDao().findForMessage(id).map { it.localUri }
+        val ecritsAvant = ecrits.size
+
+        val repris = integration(ecrivainReel("image/png")).integrer(contenu(), 1, null, cle = cle) { true }
+
+        assertThat(repris).isEqualTo(Resultat.ToujoursIncomplet(id))
+        assertThat(db.attachmentDao().findForMessage(id).map { it.localUri }).isEqualTo(avant)
+        assertThat(File(avant.single()).exists()).isTrue()
+        // Le JPEG réécrit pour la complétion n'est cité par rien : il ne reste pas.
+        val reecrits = ecrits.drop(ecritsAvant)
+        assertThat(reecrits).hasSize(1)
+        assertThat(reecrits.single().exists()).isFalse()
+    }
+
+    @Test
+    fun unMessageSupprimePendantLaCompletionNeReprendPasDePieces(): Unit = runBlocking {
+        val premier = integration(ecrivainReel("image/png")).integrer(contenu(), 1, null, cle = cle) { true }
+        val id = (premier as Resultat.EcritIncomplet).messageId
+        val ecritsAvant = ecrits.size
+        var supprime = false
+        val suppressionPendantLEcriture = ecrivainReel(
+            avant = {
+                if (!supprime) {
+                    supprime = true
+                    runBlocking {
+                        db.attachmentDao().deleteForMessage(id)
+                        db.messageDao().delete(id)
+                    }
+                }
+            },
+        )
+
+        val repris = integration(suppressionPendantLEcriture).integrer(contenu(), 1, null, cle = cle) { true }
+
+        assertThat(supprime).isTrue()
+        assertThat(repris).isEqualTo(Resultat.Disparu)
+        assertThat(db.messageDao().findById(id)).isNull()
+        assertThat(db.attachmentDao().findForMessage(id)).isEmpty()
+        val reecrits = ecrits.drop(ecritsAvant)
+        assertThat(reecrits).hasSize(2)
+        assertThat(reecrits.none { it.exists() }).isTrue()
+    }
+
+    /**
+     * La porte : un PDU effacé avec son message pendant l'écriture des pièces n'inscrit rien — sans elle, la
+     * reprise qui l'avait lu juste avant écrivait de nouveau le message supprimé.
+     */
+    @Test
+    fun unPduEffacePendantLEcritureNInscritRienEtNeLaisseAucunFichier(): Unit = runBlocking {
+        val resultat = integration().integrer(contenu(), 1, null, cle = cle) { false }
+
+        assertThat(resultat).isEqualTo(Resultat.Disparu)
+        assertThat(db.messageDao().findIdByTransactionKey(cle)).isNull()
+        assertThat(nombreDeMessages()).isEqualTo(0)
+        assertThat(ecrits).hasSize(2)
+        assertThat(ecrits.none { it.exists() }).isTrue()
+    }
+
+    /** Limite écrite : sans clé, rien ne reconnaît le second exemplaire. */
+    @Test
+    fun sansCleDeuxExemplairesFontDeuxMessages(): Unit = runBlocking {
+        val premier = integration().integrer(contenu(), 1, null, cle = null) { true }
+        val second = integration().integrer(contenu(), 1, null, cle = null) { true }
+
+        assertThat(premier).isInstanceOf(Resultat.Ecrit::class.java)
+        assertThat(second).isInstanceOf(Resultat.Ecrit::class.java)
+        assertThat(nombreDeMessages()).isEqualTo(2)
+    }
+
+    /**
+     * Round 13 — un MMS de groupe dont le fil système est connu retrouve la conversation
+     * de ce fil, même quand ses adresses ne correspondent à rien en base. La conversation
+     * pré-ensemencée porte des numéros volontairement différents des membres du PDU
+     * (ni CSV exact, ni rapprochement par clé) : seul le fil système peut la retrouver.
+     * C'est le cas qui cassait avant — un groupe jamais vu, ou un `To` dépouillé par
+     * l'opérateur, tombait en conversation individuelle.
+     */
+    @Test
+    fun unMmsDeGroupeAvecFilSystemeRetrouveLaConversationDuFil(): Unit = runBlocking {
+        val groupeId = db.conversationDao().insert(
+            ConversationEntity(
+                threadId = FIL,
+                addressesCsv = "0600000001;0600000002;0600000003",
+                displayName = null,
+                lastMessageAt = 0L,
+                lastMessagePreview = null,
+            ),
+        )
+        val membres = listOf(PhoneAddress.of(ALICE), PhoneAddress.of(BOB), PhoneAddress.of(CAROL))
+
+        val resultat = integration(resolveur = ResolveurFixe(FIL, context)).integrer(
+            contenu(), subId = 1, membres = membres, cle = null,
+        ) { true }
+
+        assertThat(resultat).isInstanceOf(Resultat.Ecrit::class.java)
+        val id = (resultat as Resultat.Ecrit).messageId
+        assertThat(db.messageDao().findById(id)?.conversationId).isEqualTo(groupeId)
+    }
+
+    /**
+     * Round 13 — un groupe nouveau pour Relay stocke son fil système à la création :
+     * le message suivant du même fil le retrouvera par `findByThreadId`, même si sa
+     * liste de participants est incomplète.
+     */
+    @Test
+    fun unNouveauGroupeStockeSonFilSysteme(): Unit = runBlocking {
+        val membres = listOf(PhoneAddress.of(ALICE), PhoneAddress.of(BOB), PhoneAddress.of(CAROL))
+
+        val resultat = integration(resolveur = ResolveurFixe(FIL_NOUVEAU, context)).integrer(
+            contenu(), subId = 1, membres = membres, cle = null,
+        ) { true }
+
+        assertThat(resultat).isInstanceOf(Resultat.Ecrit::class.java)
+        val id = (resultat as Resultat.Ecrit).messageId
+        val convId = db.messageDao().findById(id)?.conversationId
+        assertThat(convId).isNotNull()
+        assertThat(db.conversationDao().findByThreadId(FIL_NOUVEAU)?.id).isEqualTo(convId)
+    }
+
+    // ───── Outillage ─────
+
+    /** L'écrivain réel, qui refuse les types de [refuses] et note chaque fichier écrit. */
+    private fun ecrivainReel(vararg refuses: String, avant: () -> Unit = {}) =
+        IntegrationMmsRecu.EcrivainDePieces { partie ->
+            avant()
+            if (partie.mime in refuses) {
+                null
+            } else {
+                EcrivainDePiecesSurDisque(context).ecrire(partie)?.also { ecrits += it.file }
+            }
+        }
+
+    private fun integration(
+        ecrivain: IntegrationMmsRecu.EcrivainDePieces = ecrivainReel(),
+        resolveur: SystemThreadResolver? = null,
+    ) = IntegrationMmsRecu(
+        mirror,
+        db.attachmentDao(),
+        db.messageDao(),
+        FichiersDePiecesJointes(db.attachmentDao(), db.scheduledMessageDao(), context),
+        ecrivain,
+        resolveur,
+    )
+
+    /** Round 13 — un résolveur qui rend toujours le même fil système, pour les tests. */
+    private class ResolveurFixe(private val fil: Long, context: Context) : SystemThreadResolver(context) {
+        override fun resolve(recipients: Collection<String>): Long = fil
+    }
+
+    private fun contenu() = ContenuMmsRecu(
+        expediteur = ALICE,
+        date = 1_726_000_000_000L,
+        sujet = null,
+        legende = "photos",
+        parties = listOf(PartieMms(byteArrayOf(1, 2, 3), "image/jpeg"), PartieMms(byteArrayOf(4, 5), "image/png")),
+        destinataires = emptyList(),
+        copies = emptyList(),
+    )
+
+    private fun nombreDeMessages(): Int = db.query("SELECT COUNT(*) FROM messages", null).use { curseur ->
+        curseur.moveToFirst()
+        curseur.getInt(0)
+    }
+
+    private companion object {
+        const val ALICE = "+33612345678"
+        const val BOB = "+33612345679"
+        const val CAROL = "+33612345680"
+        /** Fils système factices pour les tests du round 13 — jamais `0L` (inconnu). */
+        const val FIL = 9001L
+        const val FIL_NOUVEAU = 9002L
+    }
+}

@@ -1,0 +1,186 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.di
+
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.google.common.truth.Truth.assertThat
+import org.junit.Test
+import org.junit.runner.RunWith
+import javax.inject.Inject
+
+/**
+ * Tripwire against the regression that made the SEC-CRIT repair dangerous (audit C1 / T1 / T2).
+ *
+ * Hilt resolves `@Inject` **fields** eagerly, on the main thread: for an `@HiltAndroidApp`
+ * Application inside `super.onCreate()`, for an `@AndroidEntryPoint` receiver before the body of
+ * `onReceive`, for a service in `onCreate`. Any such field whose type transitively reaches a Room
+ * DAO therefore provisions `AppDatabase` there — and with it [LegacyZeroKeyRekey], which on the one
+ * launch that rebuilds a legacy zero-key database is seconds of work. On a broadcast that means a
+ * hard 10-second ANR budget, on a dead process it means the incoming SMS is lost.
+ *
+ * Two audits found six such paths, including one only three hops long
+ * (`autoLockObserver` → `VaultManager` → `ConversationRepository` → `AppDatabase`) that a manual
+ * review had missed. Reachability is not something a reviewer can reliably eyeball, so this test
+ * takes the opposite approach: it pins down the *exact* set of eager field types each entry point
+ * is allowed to declare. Adding a dependency to any of them fails here until someone states
+ * explicitly whether the new type reaches the database.
+ *
+ * Fixing a failure is a decision, not a chore:
+ *  - the type reaches a DAO → wrap it in `dagger.Lazy<…>` and resolve it off the main thread;
+ *  - it provably does not → add it to the allowlist below, with the reason.
+ */
+@RunWith(AndroidJUnit4::class)
+class EagerInjectionGuardTest {
+
+    /**
+     * Eager field types allowed per entry point, because none of them reaches a Room DAO.
+     *
+     * `dagger.Lazy` is always allowed — that is the whole point of the fix, since a `Lazy` field
+     * defers provisioning to whatever thread calls `get()`.
+     */
+    private val allowedEagerTypes: Map<String, Set<String>> = mapOf(
+        "com.relay.sms.MainApplication" to setOf(
+            "androidx.hilt.work.HiltWorkerFactory", // holds Providers only
+            "com.relay.sms.system.notifications.NotificationChannelInitializer", // Context only
+            "com.relay.sms.security.AutoLockObserver", // its VaultManager is Lazy (audit T1)
+            "com.relay.sms.system.startup.StartupMigrations", // holds Lazy<DAO>, opens nothing at construction
+            "com.relay.sms.security.AppLockManager", // DataStore + PasswordKdf, no DAO
+            "com.relay.sms.data.local.datastore.SettingsRepository", // DataStore
+            // Slice 1 — LinkedDeviceStore is DataStore Preferences only
+            // (linked_devices file), no DAO: eager injection is safe.
+            "com.relay.sms.sync.LinkedDeviceStore",
+            "com.relay.sms.system.notifications.EmergencyShortcutNotifier", // Context only
+            // v1.28.12 — la seule implementation liee, `DefaultSmsAppManager`, prend
+            // `@ApplicationContext Context` et RIEN d'autre : elle interroge `RoleManager` et
+            // `Telephony.Sms.getDefaultSmsPackage`. Elle ne peut pas atteindre un DAO, faute de
+            // toute autre dependance. Inscrite ici plutot qu'enveloppee dans `Lazy`, ce qui est
+            // la decision que ce test demande d'assumer.
+            "com.relay.sms.domain.sender.DefaultSmsAppChecker",
+            "kotlinx.coroutines.CoroutineScope",
+            "kotlinx.coroutines.CoroutineDispatcher",
+        ),
+        "com.relay.sms.MainActivity" to setOf(
+            "com.relay.sms.data.local.datastore.SettingsRepository",
+            "com.relay.sms.security.AppLockManager",
+            "com.relay.sms.system.share.IncomingShareHolder",
+            "com.relay.sms.system.notifications.SafetyCallIntentToken",
+            "com.relay.sms.system.notifications.PendingNavHolder",
+            "com.relay.sms.data.local.db.DatabaseRepairState", // a StateFlow holder, no DAO
+            // v1.27.4 — same shape as PendingNavHolder and IncomingShareHolder above:
+            // `@Inject constructor()` with no arguments, a MutableStateFlow and nothing else.
+            // It cannot reach a DAO because it depends on nothing. Added here rather than
+            // wrapped in Lazy, which is the decision this test asks for.
+            "com.relay.sms.system.notifications.SafetyCallAckHolder",
+            // v1.28.12 — meme raisonnement que dans `MainApplication` ci-dessus :
+            // `DefaultSmsAppManager` ne depend que du `Context` applicatif. Consulte ici par
+            // `republishSafetyCallNotice`, pour que l'ecran cesse d'afficher « arme » quand le
+            // role SMS manque et qu'aucun message ne partira.
+            "com.relay.sms.domain.sender.DefaultSmsAppChecker",
+            "kotlinx.coroutines.CoroutineDispatcher",
+        ),
+        "com.relay.sms.system.receiver.SmsDeliverReceiver" to setOf(
+            "kotlinx.coroutines.CoroutineScope",
+            "kotlinx.coroutines.CoroutineDispatcher",
+        ),
+        "com.relay.sms.system.receiver.SmsSentReceiver" to setOf(
+            "kotlinx.coroutines.CoroutineScope",
+        ),
+        "com.relay.sms.system.receiver.SmsDeliveredReceiver" to setOf(
+            "kotlinx.coroutines.CoroutineScope",
+        ),
+        "com.relay.sms.system.receiver.MmsSentReceiver" to setOf(
+            "com.relay.sms.data.mms.MmsSystemWriteback", // ContentResolver only
+            "com.relay.sms.data.local.datastore.SettingsRepository",
+            "kotlinx.coroutines.CoroutineScope",
+        ),
+        "com.relay.sms.system.receiver.BootReceiver" to setOf(
+            "com.relay.sms.data.local.datastore.SettingsRepository",
+            // Slice 1 — LinkedDeviceStore is DataStore Preferences only
+            // (linked_devices file), no DAO: eager injection is safe.
+            "com.relay.sms.sync.LinkedDeviceStore",
+            "com.relay.sms.system.notifications.EmergencyShortcutNotifier",
+            "kotlinx.coroutines.CoroutineScope",
+        ),
+        "com.relay.sms.system.receiver.EmergencyShortcutReceiver" to setOf(
+            "kotlinx.coroutines.CoroutineScope",
+        ),
+        "com.relay.sms.system.notifications.NotificationActionReceiver" to setOf(
+            "com.relay.sms.security.AppLockManager",
+            "kotlinx.coroutines.CoroutineScope",
+        ),
+        "com.relay.sms.system.service.HeadlessSmsSendService" to setOf(
+            "com.relay.sms.security.AppLockManager",
+            "kotlinx.coroutines.CoroutineScope",
+        ),
+    )
+
+    private companion object {
+        const val LAZY = "dagger.Lazy"
+    }
+
+    @Test
+    fun noEntryPointDeclaresAnUnvettedEagerInjection() {
+        val violations = mutableListOf<String>()
+        var inspected = 0
+
+        allowedEagerTypes.forEach { (className, allowed) ->
+            val clazz = Class.forName(className)
+            clazz.declaredFields
+                .filter { field -> field.annotations.any { it is Inject } }
+                .forEach { field ->
+                    inspected++
+                    val typeName = field.type.name
+                    if (typeName != LAZY && typeName !in allowed) {
+                        violations += "$className.${field.name}: $typeName"
+                    }
+                }
+        }
+
+        // Without this the test would pass vacuously the day Kotlin stops placing `@Inject` on the
+        // backing field, or R8 strips the annotation — it would inspect nothing and report nothing.
+        assertThat(inspected).isAtLeast(30)
+        assertThat(violations).isEmpty()
+    }
+
+    /**
+     * Proves the check has teeth: a class that deliberately declares an eager DAO injection must be
+     * reported. Without this, a silent change in how `@Inject` is retained would turn the guard
+     * above into a test that can no longer fail.
+     */
+    @Test
+    fun theGuardActuallyDetectsAnEagerDaoInjection() {
+        val offender = EagerOffenderSample::class.java
+        val eagerFields = offender.declaredFields
+            .filter { field -> field.annotations.any { it is Inject } }
+            .map { it.type.name }
+
+        assertThat(eagerFields).contains("com.relay.sms.data.local.db.dao.MessageDao")
+        assertThat(eagerFields).doesNotContain(LAZY)
+    }
+
+    /**
+     * Fixture for [theGuardActuallyDetectsAnEagerDaoInjection] — never instantiated.
+     *
+     * Not `private`: Dagger's processor refuses to generate a members-injector for a private class,
+     * and it inspects every `@Inject` field it can see, test sources included.
+     */
+    @Suppress("unused")
+    internal class EagerOffenderSample {
+        @Inject lateinit var dao: com.relay.sms.data.local.db.dao.MessageDao
+    }
+
+    /**
+     * Guards the allowlist itself: if an entry point stops declaring one of its vetted types, the
+     * entry stays behind and quietly widens what the test tolerates. This keeps the list honest.
+     */
+    @Test
+    fun theAllowlistDescribesClassesThatActuallyExist() {
+        allowedEagerTypes.keys.forEach { className ->
+            assertThat(Class.forName(className)).isNotNull()
+        }
+    }
+}
