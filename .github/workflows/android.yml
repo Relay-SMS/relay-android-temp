@@ -37,6 +37,14 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Files pushed via the GitHub API lose their executable bit, so restore
+      # it before any script runs (the i18n step below invokes a .sh directly).
+      - name: Restore script permissions
+        run: chmod +x .github/scripts/*.sh
+
+      - name: Inject Klipy API key
+        run: echo "klipyApiKey=${{ secrets.KLIPY_API_KEY }}" >> local.properties   
+
       # v1.28.12 - PARITE DES TRADUCTIONS, avant toute compilation : le controle coute une
       # seconde la ou un echec de build en coute dix minutes. Une langue qui perd des cles ne
       # devient pas incomplete au grand jour, elle le devient EN SILENCE : l'ecran retombe en
@@ -81,9 +89,15 @@ jobs:
       - name: Lint
         run: ./gradlew lintDebug --no-daemon
 
-      # Round 13 — INTERNET is back in the manifest, for GIF search via Klipy only (see PERMISSIONS.md). The merged RELEASE manifest decides; the check reads the XML, holds a reviewed list, and first proves it can fail (fabricated faulty manifests). It also refuses any unreviewed ProtectedPermissions lint exception in the source manifests.
-      - name: Permissions (reviewed list, no unreviewed permission)
-
+      # v1.28.13 — Relay ne détient INTERNET que pour deux usages revus : la recherche de GIF
+      # (Klipy) et les aperçus de liens ; le MMS passe par le service MMS d'Android. La promesse
+      # est publique
+      # (PERMISSIONS.md, PRIVACY.md) ; c'est le manifeste fusionné RELEASE qui en décide, une
+      # dépendance pouvant y ajouter une permission. Le contrôle lit le XML, tient une liste revue,
+      # et prouve d'abord qu'il sait échouer (manifestes fautifs fabriqués).
+      # Après la 1.28.13, il refuse aussi toute exception non revue au lint ProtectedPermissions
+      # dans les manifestes source : elle cachait une permission système jamais accordée.
+      - name: Permissions (reviewed permissions only)
         run: |
           python3 .github/scripts/permissions-manifeste.py --controle-negatif
           ./gradlew :app:processReleaseMainManifest --no-daemon
@@ -108,6 +122,17 @@ jobs:
           name: relay-debug-apks
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: warn
+
+      - name: Assemble release
+        run: ./gradlew assembleRelease --no-daemon
+        
+      - name: Upload release APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: relay-release-apks
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: warn
+           
 
   instrumented:
     name: Instrumented tests (emulator)
@@ -171,7 +196,7 @@ jobs:
           # propre : l'echec possible est le retour a l'etat anterieur, pas une CI cassee.
           script: |
             ./gradlew :app:installDebug --no-daemon
-            adb shell cmd role add-role-holder android.app.role.SMS com.filestech.sms.debug
+            adb shell cmd role add-role-holder android.app.role.SMS com.relay.sms.debug
             adb shell dumpsys role | grep -A2 "android.app.role.SMS"
             ./gradlew :app:connectedDebugAndroidTest --no-daemon
 
