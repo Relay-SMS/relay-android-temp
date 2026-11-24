@@ -1,0 +1,898 @@
+package com.relay.sms.domain.usecase
+
+import com.google.common.truth.Truth.assertThat
+import com.relay.sms.domain.model.MessageStatus
+import com.relay.sms.domain.safetycall.SafetyCallConfig
+import com.relay.sms.domain.safetycall.SafetyCallContact
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import org.junit.jupiter.api.Test
+
+/**
+ * v1.27.2 — **séquence de relances du Safety call**, décidée par Patrice le 2026-08-05 : le
+ * déclenchement ne désarme plus le deadman sur-le-champ, trois relances suivent à quinze minutes
+ * d'intervalle, et « Je vais bien » clôt la séquence.
+ *
+ * # Ce que ces tests protègent
+ *
+ * Deux propriétés, et elles tirent en sens opposés — c'est pour cela qu'il faut les tenir
+ * ensemble :
+ *
+ *  1. **Rien ne doit partir en double.** Le tick périodique (60 min) et la relance ponctuelle
+ *     (15 min) peuvent se croiser. Le créneau est donc réservé de façon atomique avant l'envoi.
+ *  2. **Rien ne doit s'éteindre en silence.** Si aucun envoi n'aboutit — pas de réseau, mode
+ *     avion, SIM absente — le créneau est **rendu** et le deadman reste armé. C'est le
+ *     renversement du correctif SEC-3, qui désarmait avant même d'essayer : la protection
+ *     s'éteignait exactement au moment où elle échouait.
+ *
+ * Faux écrits à la main : `:domain` n'a ni mockk ni Robolectric.
+ */
+class TriggerSafetyCallRelanceTest {
+
+    // ──────────────────────────── Les tests ────────────────────────────
+
+    @Test
+    fun `le declenchement n arme plus le desarmement immediat`() {
+        val settings = expiredSettings()
+        val sender = CountingSender(succeed = true)
+
+        val result = runBlocking { useCase(settings, sender).invoke() }
+
+        assertThat(result).isInstanceOf(TriggerSafetyCallUseCase.Result.Triggered::class.java)
+        assertThat(sender.calls).isEqualTo(1)
+        // Le deadman RESTE arme : c'est toute la difference avec v1 (`enabled = false` d'emblee).
+        assertThat(settings.safetyCall.enabled).isTrue()
+        assertThat(settings.safetyCall.isTriggered).isTrue()
+        assertThat(settings.safetyCall.messagesSent).isEqualTo(1)
+        assertThat(settings.safetyCall.hasRelancePending).isTrue()
+        // Et une relance est annoncee a l'appelant, qui la programmera.
+        val triggered = result as TriggerSafetyCallUseCase.Result.Triggered
+        assertThat(triggered.nextRelanceInMs).isEqualTo(SafetyCallConfig.RELANCE_INTERVAL_MS)
+    }
+
+    /**
+     * **Le défaut que ce lot ferme.** Sans réseau, l'ancienne version désarmait quand même : elle
+     * appelait `disableSafetyCall()` AVANT la boucle d'envoi. La protection s'éteignait
+     * définitivement et en silence, au moment précis où elle échouait.
+     */
+    @Test
+    fun `si aucun envoi n aboutit le creneau est rendu et le deadman reste arme`() {
+        val settings = expiredSettings()
+        val sender = CountingSender(succeed = false)
+
+        val uc = useCase(settings, sender)
+        val result = runBlocking { uc.invoke() }
+
+        assertThat(result).isInstanceOf(TriggerSafetyCallUseCase.Result.SendFailed::class.java)
+        assertThat(sender.calls).isEqualTo(1)
+        // Rien ne doit avoir bouge : ni le desarmement, ni le compteur, ni l'horodatage.
+        assertThat(settings.safetyCall.enabled).isTrue()
+        assertThat(settings.safetyCall.isTriggered).isFalse()
+        assertThat(settings.safetyCall.messagesSent).isEqualTo(0)
+        // Donc le tick suivant retentera exactement le meme declenchement.
+        assertThat(settings.safetyCall.isExpired()).isTrue()
+
+        sender.succeed = true
+        val retry = runBlocking { uc.invoke() }
+        assertThat(retry).isInstanceOf(TriggerSafetyCallUseCase.Result.Triggered::class.java)
+        assertThat(sender.calls).isEqualTo(2)
+        assertThat(settings.safetyCall.messagesSent).isEqualTo(1)
+        assertThat(settings.safetyCall.claimedAt).isEqualTo(0L)
+    }
+
+    // ──────────────────── F05 : remis au radio n'est pas parti ────────────────────
+
+    /**
+     * v1.28.3 (F05) — **le défaut que ce test ferme**, signalé par la relecture externe sur la MR
+     * F-Droid !38458.
+     *
+     * Le test juste au-dessus couvre l'échec SYNCHRONE : `SmsManager` lève, `sender.succeed` est
+     * faux, le créneau est rendu. Ce que personne ne couvrait, c'est le cas bien plus fréquent où
+     * `SmsManager` **accepte** la demande sans rien promettre. `sendMultipartTextMessage` ne rend
+     * rien : le sort du message arrive plus tard par le `PendingIntent` `SENT`. En mode avion,
+     * sans SIM ou hors couverture, `RESULT_ERROR_NO_SERVICE` remonte de façon ASYNCHRONE — aucune
+     * exception n'est levée, et l'ancienne version comptait donc un succès.
+     *
+     * La conséquence était la pire possible pour un homme mort : la séquence se déroulait
+     * entièrement et, au dernier message, écrivait `enabled = false`. **La protection se
+     * désarmait sans qu'un seul SMS ait atteint le réseau.**
+     *
+     * Ici le sender réussit — la demande part bien vers `SmsManager`, `calls` le prouve — mais le
+     * radio ne rend jamais son verdict : le statut reste `PENDING`. Rien ne doit avancer.
+     */
+    @Test
+    fun `un envoi accepte par SmsManager mais jamais confirme par le radio ne desarme pas`() =
+        kotlinx.coroutines.test.runTest {
+            val settings = expiredSettings()
+            val sender = CountingSender(succeed = true)
+            val mirror = NoopMirror(statutRendu = MessageStatus.PENDING)
+
+            val result = useCase(
+                settings,
+                sender,
+                mirror,
+                kotlinx.coroutines.test.StandardTestDispatcher(testScheduler),
+            ).invoke()
+
+            // La demande a bien ete remise a `SmsManager` — ce n'est pas un echec synchrone.
+            assertThat(sender.calls).isEqualTo(1)
+            // Mais elle n'est pas confirmee, donc elle ne compte pas.
+            assertThat(result).isInstanceOf(TriggerSafetyCallUseCase.Result.SendFailed::class.java)
+            assertThat(settings.safetyCall.enabled).isTrue()
+            assertThat(settings.safetyCall.isTriggered).isFalse()
+            assertThat(settings.safetyCall.messagesSent).isEqualTo(0)
+            // Le creneau est rendu : le tick suivant retentera.
+            assertThat(settings.safetyCall.claimedAt).isEqualTo(0L)
+            assertThat(settings.safetyCall.isExpired()).isTrue()
+        }
+
+    /**
+     * v1.28.3 (F05) — le pendant du précédent : quand le radio répond, et répond NON. Même
+     * conclusion, par un chemin différent — ici le verdict est acquis, on ne l'attend pas.
+     */
+    @Test
+    fun `un envoi refuse par le radio apres acceptation ne desarme pas`() =
+        kotlinx.coroutines.test.runTest {
+            val settings = expiredSettings()
+            val sender = CountingSender(succeed = true)
+            val mirror = NoopMirror(statutRendu = MessageStatus.FAILED)
+
+            val result = useCase(
+                settings,
+                sender,
+                mirror,
+                kotlinx.coroutines.test.StandardTestDispatcher(testScheduler),
+            ).invoke()
+
+            assertThat(sender.calls).isEqualTo(1)
+            assertThat(result).isInstanceOf(TriggerSafetyCallUseCase.Result.SendFailed::class.java)
+            assertThat(settings.safetyCall.enabled).isTrue()
+            assertThat(settings.safetyCall.messagesSent).isEqualTo(0)
+        }
+
+    /**
+     * Contrôle positif des deux tests ci-dessus : avec un radio qui confirme, la séquence avance
+     * comme avant. Sans lui, un correctif qui refuserait TOUS les envois passerait pour bon.
+     */
+    @Test
+    fun `un envoi confirme par le radio fait avancer la sequence`() =
+        kotlinx.coroutines.test.runTest {
+            val settings = expiredSettings()
+            val sender = CountingSender(succeed = true)
+            val mirror = NoopMirror(statutRendu = MessageStatus.SENT)
+
+            val result = useCase(
+                settings,
+                sender,
+                mirror,
+                kotlinx.coroutines.test.StandardTestDispatcher(testScheduler),
+            ).invoke()
+
+            assertThat(result).isInstanceOf(TriggerSafetyCallUseCase.Result.Triggered::class.java)
+            assertThat(settings.safetyCall.messagesSent).isEqualTo(1)
+            assertThat(settings.safetyCall.isTriggered).isTrue()
+        }
+
+    @Test
+    fun `deux ticks qui se croisent n envoient qu un seul message`() {
+        val store = expiredSettings()
+        val settings = ClaimBarrierSettings(store)
+        val sender = CountingSender(succeed = true)
+        val uc = useCase(settings, sender)
+
+        runBlocking {
+            val first = async(Dispatchers.Default) { uc.invoke() }
+            val second = async(Dispatchers.Default) { uc.invoke() }
+            val results = withTimeout(5_000L) { listOf(first.await(), second.await()) }
+
+            assertThat(results.count { it is TriggerSafetyCallUseCase.Result.Triggered }).isEqualTo(1)
+            assertThat(results.count { it is TriggerSafetyCallUseCase.Result.AlreadySent }).isEqualTo(1)
+        }
+
+        assertThat(sender.calls).isEqualTo(1)
+        assertThat(store.safetyCall.messagesSent).isEqualTo(1)
+        assertThat(store.safetyCall.claimedAt).isEqualTo(0L)
+    }
+
+    @Test
+    fun `une annulation apres reservation avant envoi laisse un bail recuperable`() {
+        val store = expiredSettings()
+        val settings = CancelAfterClaimSettings(store)
+        val sender = CountingSender(succeed = true)
+        val uc = useCase(settings, sender)
+
+        runBlocking {
+            val running = async(Dispatchers.Default) { uc.invoke() }
+            withTimeout(5_000L) { settings.afterClaim.await() }
+
+            // Point exact de l'entrelacement : le compteur et le bail sont persistés, mais le
+            // premier appel à SmsSender n'a pas encore eu lieu.
+            assertThat(store.safetyCall.messagesSent).isEqualTo(1)
+            assertThat(store.safetyCall.claimedAt).isGreaterThan(0L)
+            assertThat(sender.calls).isEqualTo(0)
+
+            running.cancelAndJoin()
+            assertThat(running.isCancelled).isTrue()
+
+            // Simule le prochain réveil après expiration du bail : le même créneau doit repartir.
+            store.update { s ->
+                s.copy(
+                    security = s.security.copy(
+                        safetyCall = s.security.safetyCall.copy(
+                            claimedAt = System.currentTimeMillis() -
+                                SafetyCallConfig.CLAIM_LEASE_MS - 1_000L,
+                        ),
+                    ),
+                )
+            }
+            val retry = uc.invoke()
+            assertThat(retry).isInstanceOf(TriggerSafetyCallUseCase.Result.Triggered::class.java)
+        }
+
+        assertThat(sender.calls).isEqualTo(1)
+        assertThat(store.safetyCall.messagesSent).isEqualTo(1)
+        assertThat(store.safetyCall.claimedAt).isEqualTo(0L)
+    }
+
+    @Test
+    fun `la sequence complete envoie quatre messages puis desarme`() {
+        val settings = expiredSettings()
+        val sender = CountingSender(succeed = true)
+        val uc = useCase(settings, sender)
+
+        runBlocking {
+            uc.invoke() // message initial
+            repeat(SafetyCallConfig.RELANCE_COUNT) {
+                rewindTriggeredAt(settings)
+                uc.invoke()
+            }
+        }
+
+        assertThat(sender.calls).isEqualTo(SafetyCallConfig.TOTAL_MESSAGES)
+        // Les relances ne repetent PAS le message initial : chacune a son propre texte.
+        assertThat(sender.bodies.toSet()).hasSize(SafetyCallConfig.TOTAL_MESSAGES)
+        // La derniere se distingue de toutes les autres — c'est ce que ce test peut voir d'ici.
+        // v1.28.12 : elle verifiait le mot francais « Dernière alerte », ce qui liait la SEQUENCE
+        // a une langue. Que la derniere s'ANNONCE comme la derniere se verifie desormais sur les
+        // vraies ressources et dans les trois langues, par
+        // `com.relay.sms.system.safety.SafetyMessageTextsTest`.
+        assertThat(sender.bodies.last()).isNotEqualTo(sender.bodies.first())
+        assertThat(sender.bodies.dropLast(1)).doesNotContain(sender.bodies.last())
+        // Sequence close : le deadman est desarme, sans relance en attente.
+        assertThat(settings.safetyCall.enabled).isFalse()
+        assertThat(settings.safetyCall.hasRelancePending).isFalse()
+    }
+
+    /**
+     * **Le jumeau asymétrique** du test d'échec ci-dessus — et le motif qui a produit onze des
+     * dix-sept correctifs du 2026-08-04, donc celui qu'il faut tenir des deux côtés.
+     *
+     * Sur un échec, le chemin **initial** remet `triggeredAt` à `0L` : rien n'est parti, la
+     * séquence n'a pas commencé. Le chemin **relance**, lui, doit le **conserver** : le premier
+     * message est déjà chez les contacts. L'effacer ferait repartir la séquence à zéro, et les
+     * proches recevraient à nouveau le message d'origine — puis les relances — en boucle.
+     */
+    @Test
+    fun `une relance qui echoue rend le creneau sans effacer le declenchement`() {
+        val settings = expiredSettings()
+        val sender = CountingSender(succeed = true)
+        val uc = useCase(settings, sender)
+
+        val result = runBlocking {
+            uc.invoke() // message initial : parti, sequence ouverte
+            rewindTriggeredAt(settings)
+            sender.succeed = false // reseau perdu entre le message initial et la relance
+            uc.invoke()
+        }
+
+        assertThat(result).isInstanceOf(TriggerSafetyCallUseCase.Result.SendFailed::class.java)
+        // Non-vacuite : la relance a bien ete TENTEE, elle n'a pas ete court-circuitee.
+        assertThat(sender.calls).isEqualTo(2)
+        // Le creneau est rendu : la relance 1 sera retentee au tick suivant.
+        assertThat(settings.safetyCall.messagesSent).isEqualTo(1)
+        assertThat(settings.safetyCall.enabled).isTrue()
+        // LE POINT : le declenchement n'est PAS efface, sinon la sequence repartirait a zero.
+        assertThat(settings.safetyCall.isTriggered).isTrue()
+    }
+
+    /**
+     * Le processus a pu être tué juste après le dernier envoi, avant que le désarmement ne
+     * s'écrive. On finit le travail plutôt que de laisser un deadman armé qui, `triggeredAt` étant
+     * posé et la séquence close, ne partirait plus jamais.
+     */
+    @Test
+    fun `une sequence deja complete se referme sans renvoyer de message`() {
+        val settings = expiredSettings()
+        val sender = CountingSender(succeed = true)
+
+        val result = runBlocking {
+            settings.update { s ->
+                s.copy(
+                    security = s.security.copy(
+                        safetyCall = s.security.safetyCall.copy(
+                            triggeredAt = System.currentTimeMillis() -
+                                SafetyCallConfig.TOTAL_MESSAGES * SafetyCallConfig.RELANCE_INTERVAL_MS,
+                            messagesSent = SafetyCallConfig.TOTAL_MESSAGES,
+                        ),
+                    ),
+                )
+            }
+            useCase(settings, sender).invoke()
+        }
+
+        assertThat(result).isEqualTo(TriggerSafetyCallUseCase.Result.SequenceComplete)
+        assertThat(sender.calls).isEqualTo(0)
+        assertThat(settings.safetyCall.enabled).isFalse()
+    }
+
+    /**
+     * 🔴 **Le défaut trouvé par la relecture Gemini du 2026-08-05.**
+     *
+     * Le créneau est réservé — `messagesSent` incrémenté — **avant** l'envoi, pour qu'un tick
+     * périodique et une relance ponctuelle qui se croiseraient n'envoient pas deux fois. Si le
+     * processus meurt dans cet intervalle (mémoire insuffisante, mise à jour du système, batterie
+     * critique), le tick suivant lisait `messagesSent = 1` et croyait le message initial parti.
+     *
+     * Les proches ne recevaient **jamais** le message qui explique la situation : ils
+     * découvraient l'affaire par une relance. Ce n'était pas « au pire un doublon » — comme
+     * l'affirmait mon commentaire — mais une **perte**.
+     *
+     * Le bail rend la réservation réversible : passé `CLAIM_LEASE_MS`, le créneau est repris et
+     * l'envoi retenté dans la même exécution.
+     */
+    @Test
+    fun `un creneau reserve mais jamais conclu est repris et le message initial part`() {
+        val settings = expiredSettings()
+        val sender = CountingSender(succeed = true)
+        val abandonne = System.currentTimeMillis() - SafetyCallConfig.CLAIM_LEASE_MS - 1_000L
+
+        val result = runBlocking {
+            // L'état exact que laisse un processus tué entre la réservation et l'envoi.
+            settings.update { s ->
+                s.copy(
+                    security = s.security.copy(
+                        safetyCall = s.security.safetyCall.copy(
+                            triggeredAt = abandonne,
+                            messagesSent = 1,
+                            claimedAt = abandonne,
+                        ),
+                    ),
+                )
+            }
+            useCase(settings, sender).invoke()
+        }
+
+        assertThat(result).isInstanceOf(TriggerSafetyCallUseCase.Result.Triggered::class.java)
+        assertThat(sender.calls).isEqualTo(1)
+        // LE POINT : c'est le message INITIAL qui part, pas une relance. Sans la reprise, les
+        // contacts auraient recu « toujours aucune activite, 15 minutes plus tard » en premier.
+        assertThat(sender.bodies.single()).doesNotContain("15 minutes")
+        assertThat(settings.safetyCall.messagesSent).isEqualTo(1)
+        // Le bail est leve : sinon le creneau suivant serait bloque deux minutes et la relance
+        // due dans cet intervalle serait sautee.
+        assertThat(settings.safetyCall.claimedAt).isEqualTo(0L)
+    }
+
+    /**
+     * Le versant opposé du bail : tant qu'il court, **rien d'autre ne part**. C'est la ceinture qui
+     * double la comparaison de compteur, pour le cas où deux exécutions liraient le même
+     * instantané.
+     */
+    @Test
+    fun `un bail encore valide empeche un second envoi`() {
+        val settings = expiredSettings()
+        val sender = CountingSender(succeed = true)
+
+        val result = runBlocking {
+            settings.update { s ->
+                s.copy(
+                    security = s.security.copy(
+                        safetyCall = s.security.safetyCall.copy(
+                            // Relance 1 due depuis longtemps...
+                            triggeredAt = System.currentTimeMillis() -
+                                SafetyCallConfig.RELANCE_INTERVAL_MS - 1_000L,
+                            messagesSent = 1,
+                            // ...mais un envoi est en vol, bail pose a l instant.
+                            claimedAt = System.currentTimeMillis(),
+                        ),
+                    ),
+                )
+            }
+            useCase(settings, sender).invoke()
+        }
+
+        assertThat(result).isEqualTo(TriggerSafetyCallUseCase.Result.AlreadySent)
+        assertThat(sender.calls).isEqualTo(0)
+        assertThat(settings.safetyCall.messagesSent).isEqualTo(1)
+    }
+
+    /**
+     * 🔴 **Le défaut SC-03 de l'audit Codex du 2026-08-05 : une fausse urgence juste après
+     * « Je vais bien ».**
+     *
+     * La réservation ne comparait que `enabled` et `messagesSent`. Or une remise à zéro de
+     * l'utilisateur — ouverture de l'application, tap sur la notification, bouton dédié — déplace
+     * `lastActivityAt` **sans toucher au compteur**. Un worker parti avec un instantané d'avant la
+     * confirmation réservait donc le créneau et envoyait quand même : les proches recevaient une
+     * urgence à la seconde où la personne venait de confirmer aller bien.
+     *
+     * On simule l'entrelacement exact : le use-case lit un instantané expiré, puis le stockage
+     * bouge sous lui avant qu'il ne réserve.
+     */
+    @Test
+    fun `une remise a zero entre l instantane et la reservation annule l envoi`() {
+        val store = expiredSettings()
+        val interleaved = BeforeReservationSettings(store)
+        val sender = CountingSender(succeed = true)
+        val uc = useCase(interleaved, sender)
+
+        val result = runBlocking {
+            val worker = async(Dispatchers.Default) { uc.invoke() }
+            // Le worker a lu son instantané expiré et attend juste avant sa transaction.
+            withTimeout(5_000L) { interleaved.reservationReached.await() }
+            store.update { s ->
+                s.copy(
+                    security = s.security.copy(
+                        safetyCall = s.security.safetyCall.withActivityReset(),
+                    ),
+                )
+            }
+            interleaved.continueReservation.complete(Unit)
+            withTimeout(5_000L) { worker.await() }
+        }
+
+        assertThat(result).isEqualTo(TriggerSafetyCallUseCase.Result.AlreadySent)
+        // LE POINT : aucune fausse urgence n'est partie.
+        assertThat(sender.calls).isEqualTo(0)
+        assertThat(store.safetyCall.messagesSent).isEqualTo(0)
+        assertThat(store.safetyCall.isTriggered).isFalse()
+    }
+
+    /**
+     * 🔴 **La garde de non-régression de C-01** — le défaut que l'audit Codex a trouvé dans un
+     * correctif vieux de vingt minutes.
+     *
+     * L'observateur de `MainApplication` annule le travail de relance dès qu'il juge la séquence
+     * terminée. Il se fiait à `!hasRelancePending`. Or `messagesSent` compte les créneaux
+     * **réservés** : à la réservation du 4ᵉ et dernier message, le compteur atteint
+     * `TOTAL_MESSAGES` **avant le premier SMS**, et `hasRelancePending` devient faux
+     * instantanément. L'observateur annulait donc le worker **pendant qu'il envoyait la dernière
+     * alerte**.
+     *
+     * Ce test observe l'état persisté à l'instant précis de chaque envoi — c'est exactement ce
+     * que l'observateur aurait vu — et exige qu'il ne soit JAMAIS terminal.
+     */
+    @Test
+    fun `pendant chaque envoi, la sequence n est jamais vue comme terminee`() {
+        val settings = expiredSettings()
+        val vusPendantEnvoi = mutableListOf<SafetyCallConfig>()
+        val sender = ObservingSender(settings) { vusPendantEnvoi += it }
+        val uc = useCase(settings, sender)
+
+        runBlocking {
+            uc.invoke() // message initial
+            repeat(SafetyCallConfig.RELANCE_COUNT) {
+                rewindTriggeredAt(settings)
+                uc.invoke()
+            }
+        }
+
+        // Les quatre messages sont bien partis, dernier compris.
+        assertThat(sender.calls).isEqualTo(SafetyCallConfig.TOTAL_MESSAGES)
+        assertThat(vusPendantEnvoi).hasSize(SafetyCallConfig.TOTAL_MESSAGES)
+        // LE POINT : a aucun moment l'observateur n'aurait annule le travail en cours.
+        vusPendantEnvoi.forEachIndexed { index, cfg ->
+            assertThat(cfg.claimedAt).isGreaterThan(0L)
+            assertThat(cfg.isSequenceTerminal).isFalse()
+            // Non-vacuite : au dernier envoi, `hasRelancePending` est bien FAUX. C'est
+            // precisement l'etat sur lequel l'ancienne version se trompait.
+            if (index == SafetyCallConfig.TOTAL_MESSAGES - 1) {
+                assertThat(cfg.hasRelancePending).isFalse()
+            }
+        }
+        // Et une fois tout conclu, l'etat DEVIENT terminal : sinon le test ci-dessus serait vide
+        // de sens, un predicat toujours faux le satisferait aussi.
+        assertThat(settings.safetyCall.isSequenceTerminal).isTrue()
+    }
+
+    /**
+     * 🔴 **C-02** — un créneau réservé n'est pas une séquence terminée.
+     *
+     * État exact laissé entre la réservation du dernier message et sa conclusion :
+     * `messagesSent = TOTAL_MESSAGES`, bail encore valide. Un second contrôle démarrant dans cette
+     * fenêtre validait la séquence et **désarmait** : la dernière alerte n'aurait jamais été
+     * retentée.
+     */
+    @Test
+    fun `un dernier creneau en vol n est pas conclu par un second controle`() {
+        val settings = expiredSettings()
+        val sender = CountingSender(succeed = true)
+
+        val result = runBlocking {
+            settings.update { s ->
+                s.copy(
+                    security = s.security.copy(
+                        safetyCall = s.security.safetyCall.copy(
+                            triggeredAt = System.currentTimeMillis() -
+                                SafetyCallConfig.TOTAL_MESSAGES * SafetyCallConfig.RELANCE_INTERVAL_MS,
+                            messagesSent = SafetyCallConfig.TOTAL_MESSAGES,
+                            // Bail pose a l instant : l envoi du dernier message est EN VOL.
+                            claimedAt = System.currentTimeMillis(),
+                            claimId = 7L,
+                        ),
+                    ),
+                )
+            }
+            useCase(settings, sender).invoke()
+        }
+
+        assertThat(result).isEqualTo(TriggerSafetyCallUseCase.Result.AlreadySent)
+        assertThat(sender.calls).isEqualTo(0)
+        // LE POINT : le deadman n'est PAS desarme, le creneau reste au proprietaire en vol.
+        assertThat(settings.safetyCall.enabled).isTrue()
+        assertThat(settings.safetyCall.claimedAt).isGreaterThan(0L)
+    }
+
+    /**
+     * 🔴 **C-03** — le bail a désormais un propriétaire.
+     *
+     * Un worker bloqué au-delà du bail voit son créneau repris, ce qui est voulu. Mais en revenant
+     * tardivement il ne doit **rien** conclure : sans jeton de propriété, il restituait la
+     * réservation du second — compteur ramené en arrière pendant un envoi réel — ou levait son
+     * bail, ouvrant la porte à un troisième concurrent.
+     */
+    @Test
+    fun `un worker revenu tard ne conclut pas le creneau d un autre`() {
+        val settings = expiredSettings()
+        // W1 est SUSPENDU dans sa boucle d'envoi, apres avoir persiste sa reservation. C'est le
+        // seul etat ou le defaut existe : un bail pose, et son proprietaire encore vivant.
+        val bloquant = BlockingFirstSender()
+        val libre = CountingSender(succeed = true)
+
+        runBlocking {
+            val w1 = async(Dispatchers.Default) { useCase(settings, bloquant).invoke() }
+            try {
+                withTimeout(5_000L) { bloquant.reachedSend.await() }
+                val claimW1 = settings.safetyCall.claimId
+                assertThat(claimW1).isGreaterThan(0L)
+
+                // Le bail de W1 expire : W2 est en droit de reprendre le creneau.
+                settings.update { s ->
+                    s.copy(
+                        security = s.security.copy(
+                            safetyCall = s.security.safetyCall.copy(
+                                claimedAt = System.currentTimeMillis() -
+                                    SafetyCallConfig.CLAIM_LEASE_MS - 1_000L,
+                            ),
+                        ),
+                    )
+                }
+                val w2 = useCase(settings, libre).invoke()
+                assertThat(w2).isInstanceOf(TriggerSafetyCallUseCase.Result.Triggered::class.java)
+                val apresW2 = settings.safetyCall
+                assertThat(apresW2.claimId).isNotEqualTo(claimW1)
+
+                // W1 revient enfin et tente de conclure SON creneau, qui ne lui appartient plus.
+                bloquant.release.complete(Unit)
+                val retardataire = withTimeout(5_000L) { w1.await() }
+
+                assertThat(retardataire).isEqualTo(TriggerSafetyCallUseCase.Result.Superseded)
+                // LE POINT : W1 n'a RIEN touche. Sans jeton de propriete, il levait le bail de W2 et
+                // ramenait son compteur en arriere pendant un envoi reel.
+                assertThat(settings.safetyCall.claimId).isEqualTo(apresW2.claimId)
+                assertThat(settings.safetyCall.claimedAt).isEqualTo(apresW2.claimedAt)
+                assertThat(settings.safetyCall.messagesSent).isEqualTo(apresW2.messagesSent)
+                assertThat(settings.safetyCall.enabled).isEqualTo(apresW2.enabled)
+            } finally {
+                // Voir [BlockingFirstSender.release] : sans ce bloc, une assertion qui echoue fait
+                // PENDRE le test au lieu de le faire tomber.
+                bloquant.release.complete(Unit)
+                withTimeout(5_000L) { runCatching { w1.await() } }
+            }
+        }
+    }
+
+    /**
+     * 🔴 **C-04** — une confirmation « je vais bien » arrête l'envoi **en vol**.
+     *
+     * Comparer `lastActivityAt` fermait la fenêtre « instantané → réservation », pas
+     * « réservation → envoi ». Quelqu'un qui confirmait aller bien pendant la boucle ne l'arrêtait
+     * pas : les SMS d'urgence continuaient de partir vers ses proches.
+     */
+    @Test
+    fun `une confirmation pendant la boucle d envoi arrete les envois suivants`() {
+        val quatreContacts = List(4) { SafetyCallContact(phoneNumber = "+3361111111$it") }
+        val settings = expiredSettings()
+        runBlocking {
+            settings.update { s ->
+                s.copy(
+                    security = s.security.copy(
+                        safetyCall = s.security.safetyCall.copy(contacts = quatreContacts),
+                    ),
+                )
+            }
+        }
+        // Au PREMIER envoi, l'utilisateur confirme aller bien : nouvelle generation de cycle.
+        val sender = ObservingSender(settings) {
+            runBlocking {
+                if (settings.safetyCall.generation == 0L) {
+                    settings.update { s ->
+                        s.copy(
+                            security = s.security.copy(
+                                safetyCall = s.security.safetyCall.withActivityReset(),
+                            ),
+                        )
+                    }
+                }
+            }
+        }
+
+        val result = runBlocking { useCase(settings, sender).invoke() }
+
+        assertThat(result).isEqualTo(TriggerSafetyCallUseCase.Result.Superseded)
+        // UN seul SMS est parti — celui deja en vol quand la confirmation est arrivee. Les trois
+        // autres contacts n'ont RIEN recu.
+        assertThat(sender.calls).isEqualTo(1)
+        // Et le cycle tout neuf ouvert par la confirmation n'a ete ni desarme, ni pollue.
+        assertThat(settings.safetyCall.enabled).isTrue()
+        assertThat(settings.safetyCall.isTriggered).isFalse()
+        assertThat(settings.safetyCall.messagesSent).isEqualTo(0)
+        assertThat(settings.safetyCall.claimedAt).isEqualTo(0L)
+    }
+
+    /**
+     * 🔴 **P-01 (audit Codex du 2026-08-05) — DEUX WORKERS EN VOL EN MÊME TEMPS.**
+     *
+     * Le test `un worker revenu tard ne conclut pas le creneau d un autre` ci-dessus est **vacant**
+     * sur ce point, et Codex l'a démontré : il laisse W2 terminer et effacer son bail avant de
+     * libérer W1. Il passait donc précisément parce que `claimId` valait alors `0`, différent du
+     * `1` de W1 — pas grâce au protocole de propriété.
+     *
+     * L'entrelacement réel est celui-ci : `reclaimAbandonedSlot()` remettait `claimId = 0`, si bien
+     * que la réservation du repreneur recalculait `0 + 1` et **réutilisait l'identité du worker
+     * précédent**. `stillOwnsClaim(1, G)` rendait `true` pour les deux, et W1 pouvait conclure,
+     * restituer ou désarmer le créneau de W2 pendant que celui-ci envoyait encore.
+     *
+     * Ici W1 **et** W2 sont bloqués dans leur envoi en même temps. C'est le seul état où le défaut
+     * existe.
+     */
+    @Test
+    fun `deux workers en vol simultanement ne portent jamais la meme identite`() {
+        val settings = expiredSettings()
+        val envoiW1 = BlockingFirstSender()
+        val envoiW2 = BlockingFirstSender()
+
+        runBlocking {
+            val w1 = async(Dispatchers.Default) { useCase(settings, envoiW1).invoke() }
+            var w2: kotlinx.coroutines.Deferred<TriggerSafetyCallUseCase.Result>? = null
+            try {
+                withTimeout(5_000L) { envoiW1.reachedSend.await() }
+                val claimW1 = settings.safetyCall.claimId
+                assertThat(claimW1).isGreaterThan(0L)
+
+                // Le bail de W1 expire alors qu'il est TOUJOURS en vol — c'est tout le scenario.
+                settings.update { s ->
+                    s.copy(
+                        security = s.security.copy(
+                            safetyCall = s.security.safetyCall.copy(
+                                claimedAt = System.currentTimeMillis() -
+                                    SafetyCallConfig.CLAIM_LEASE_MS - 1_000L,
+                            ),
+                        ),
+                    )
+                }
+
+                // W2 reprend le creneau abandonne et part a son tour ; il reste bloque en envoi.
+                w2 = async(Dispatchers.Default) { useCase(settings, envoiW2).invoke() }
+                withTimeout(5_000L) { envoiW2.reachedSend.await() }
+                val enVolW2 = settings.safetyCall
+                assertThat(enVolW2.claimedAt).isGreaterThan(0L)
+
+                // LE POINT : les deux proprietaires vivants portent des identites DISTINCTES.
+                assertThat(enVolW2.claimId).isNotEqualTo(claimW1)
+                assertThat(enVolW2.claimId).isGreaterThan(claimW1)
+
+                // Donc W1, en revenant, ne peut RIEN conclure du creneau de W2.
+                envoiW1.release.complete(Unit)
+                val retardataire = withTimeout(5_000L) { w1.await() }
+                assertThat(retardataire).isEqualTo(TriggerSafetyCallUseCase.Result.Superseded)
+                assertThat(settings.safetyCall.claimId).isEqualTo(enVolW2.claimId)
+                assertThat(settings.safetyCall.claimedAt).isEqualTo(enVolW2.claimedAt)
+                assertThat(settings.safetyCall.messagesSent).isEqualTo(1)
+                assertThat(settings.safetyCall.enabled).isTrue()
+
+                // Et W2, lui, conclut normalement son creneau.
+                envoiW2.release.complete(Unit)
+                val abouti = withTimeout(5_000L) { w2.await() }
+                assertThat(abouti)
+                    .isInstanceOf(TriggerSafetyCallUseCase.Result.Triggered::class.java)
+            } finally {
+                // ⚠️ Sans ce bloc, une assertion qui echoue laisse les deux workers suspendus dans
+                // un `runBlocking` imbrique que l'annulation ne traverse pas : le test ne tombe
+                // pas, il PEND. Voir [BlockingFirstSender.release].
+                envoiW1.release.complete(Unit)
+                envoiW2.release.complete(Unit)
+                withTimeout(5_000L) {
+                    runCatching { w1.await() }
+                    w2?.let { runCatching { it.await() } }
+                }
+            }
+        }
+
+        // Un seul creneau consomme au total, bail leve, deadman toujours arme pour les relances.
+        assertThat(envoiW1.calls).isEqualTo(1)
+        assertThat(envoiW2.calls).isEqualTo(1)
+        assertThat(settings.safetyCall.messagesSent).isEqualTo(1)
+        assertThat(settings.safetyCall.claimedAt).isEqualTo(0L)
+        assertThat(settings.safetyCall.hasRelancePending).isTrue()
+    }
+
+    /**
+     * 🔴 **P-02 (audit Codex du 2026-08-05) — un désarmement de rattrapage ne doit pas éteindre un
+     * cycle qu'il ne connaît pas.**
+     *
+     * Un worker lit un cycle déjà complet (`messagesSent = 4`, aucun bail). Avant qu'il n'écrive
+     * son désarmement, l'utilisateur rouvre l'application ou confirme aller bien :
+     * `withActivityReset()` ouvre le cycle suivant, armé et non déclenché. L'ancienne primitive
+     * écrivait `enabled = false` **sans rien comparer** — l'interface affichait « Activé » et plus
+     * rien ne protégeait personne.
+     */
+    @Test
+    fun `un desarmement de rattrapage n eteint pas le cycle tout neuf`() {
+        val store = expiredSettings()
+        runBlocking {
+            store.update { s ->
+                s.copy(
+                    security = s.security.copy(
+                        safetyCall = s.security.safetyCall.copy(
+                            triggeredAt = System.currentTimeMillis() -
+                                SafetyCallConfig.TOTAL_MESSAGES * SafetyCallConfig.RELANCE_INTERVAL_MS,
+                            messagesSent = SafetyCallConfig.TOTAL_MESSAGES,
+                        ),
+                    ),
+                )
+            }
+        }
+        val interleaved = BeforeReservationSettings(store)
+        val sender = CountingSender(succeed = true)
+        val uc = useCase(interleaved, sender)
+
+        val result = runBlocking {
+            val worker = async(Dispatchers.Default) { uc.invoke() }
+            // Le worker a decide « sequence complete » et attend juste avant son ecriture.
+            withTimeout(5_000L) { interleaved.reservationReached.await() }
+            store.update { s ->
+                s.copy(
+                    security = s.security.copy(
+                        safetyCall = s.security.safetyCall.withActivityReset(),
+                    ),
+                )
+            }
+            interleaved.continueReservation.complete(Unit)
+            withTimeout(5_000L) { worker.await() }
+        }
+
+        assertThat(result).isEqualTo(TriggerSafetyCallUseCase.Result.SequenceComplete)
+        assertThat(sender.calls).isEqualTo(0)
+        // LE POINT : le cycle ouvert entre-temps est INTACT.
+        assertThat(store.safetyCall.enabled).isTrue()
+        assertThat(store.safetyCall.isTriggered).isFalse()
+        assertThat(store.safetyCall.messagesSent).isEqualTo(0)
+    }
+
+    /**
+     * **P-02, second volet** : la génération ne suffit pas.
+     *
+     * Ajouter un contact depuis les Réglages ne l'incrémente pas. La raison précise du
+     * désarmement — « aucun contact configuré » — doit donc être revalidée **dans** la
+     * transaction, sinon on éteint une protection que l'utilisateur vient tout juste de réparer.
+     */
+    @Test
+    fun `un contact ajoute avant l ecriture annule le desarmement pour liste vide`() {
+        val store = expiredSettings()
+        runBlocking {
+            store.update { s ->
+                s.copy(
+                    security = s.security.copy(
+                        safetyCall = s.security.safetyCall.copy(contacts = emptyList()),
+                    ),
+                )
+            }
+        }
+        val interleaved = BeforeReservationSettings(store)
+        val sender = CountingSender(succeed = true)
+        val uc = useCase(interleaved, sender)
+
+        val result = runBlocking {
+            val worker = async(Dispatchers.Default) { uc.invoke() }
+            withTimeout(5_000L) { interleaved.reservationReached.await() }
+            store.update { s ->
+                s.copy(
+                    security = s.security.copy(
+                        safetyCall = s.security.safetyCall.copy(
+                            contacts = listOf(SafetyCallContact(phoneNumber = CONTACT)),
+                        ),
+                    ),
+                )
+            }
+            interleaved.continueReservation.complete(Unit)
+            withTimeout(5_000L) { worker.await() }
+        }
+
+        assertThat(result).isEqualTo(TriggerSafetyCallUseCase.Result.NoContacts)
+        // LE POINT : la protection reparee reste armee. Le tick suivant enverra pour de bon.
+        assertThat(store.safetyCall.enabled).isTrue()
+        assertThat(store.safetyCall.contacts).hasSize(1)
+    }
+
+    /**
+     * **P-04 (audit Codex du 2026-08-05) — le bail mesure la PROGRESSION, pas l'ancienneté.**
+     *
+     * Deux minutes couvraient toute la boucle d'envoi : un propriétaire vivant mais lent — verrou
+     * DataStore, accès fournisseur, appel OEM — voyait son créneau repris alors qu'il travaillait,
+     * avec une alerte en double à la clé. Le bail est désormais renouvelé entre deux contacts.
+     */
+    @Test
+    fun `le bail est renouvele entre deux contacts`() {
+        val settings = expiredSettings()
+        val quatreContacts = List(4) { SafetyCallContact(phoneNumber = "+3361111111$it") }
+        runBlocking {
+            settings.update { s ->
+                s.copy(
+                    security = s.security.copy(
+                        safetyCall = s.security.safetyCall.copy(contacts = quatreContacts),
+                    ),
+                )
+            }
+        }
+        val bauxVusPendantEnvoi = mutableListOf<Long>()
+        // Apres CHAQUE envoi on vieillit le bail de plus de `CLAIM_LEASE_MS`. Sans renouvellement
+        // entre deux contacts, les envois suivants verraient donc un bail perime — et un worker
+        // concurrent serait en droit de reprendre le creneau en plein envoi.
+        val sender = ObservingSender(settings) { cfg ->
+            bauxVusPendantEnvoi += cfg.claimedAt
+            runBlocking {
+                settings.update { s ->
+                    val courant = s.security.safetyCall
+                    s.copy(
+                        security = s.security.copy(
+                            safetyCall = courant.copy(
+                                claimedAt = courant.claimedAt -
+                                    SafetyCallConfig.CLAIM_LEASE_MS - 1_000L,
+                            ),
+                        ),
+                    )
+                }
+            }
+        }
+
+        val debut = System.currentTimeMillis()
+        runBlocking { useCase(settings, sender).invoke() }
+
+        assertThat(sender.calls).isEqualTo(4)
+        assertThat(bauxVusPendantEnvoi).hasSize(4)
+        // LE POINT : chaque envoi a vu un bail FRAIS, alors qu'on l'avait perime juste avant.
+        bauxVusPendantEnvoi.forEach { assertThat(it).isAtLeast(debut) }
+        assertThat(settings.safetyCall.claimedAt).isEqualTo(0L)
+        assertThat(settings.safetyCall.messagesSent).isEqualTo(1)
+    }
+
+    @Test
+    fun `une relance non due n envoie rien`() {
+        val settings = expiredSettings()
+        val sender = CountingSender(succeed = true)
+        val uc = useCase(settings, sender)
+
+        runBlocking {
+            uc.invoke() // message initial, `triggeredAt` = maintenant
+            val second = uc.invoke() // 15 min ne sont pas ecoulees
+            assertThat(second).isEqualTo(TriggerSafetyCallUseCase.Result.NotExpired)
+        }
+
+        assertThat(sender.calls).isEqualTo(1)
+    }
+}

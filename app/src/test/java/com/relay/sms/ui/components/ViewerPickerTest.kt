@@ -1,0 +1,97 @@
+/*
+ * Copyright 2026 Relay Messaging. All rights reserved.
+ *
+ * This file is proprietary to Relay Messaging and is not licensed under the
+ * Apache License 2.0. See LICENSE-RELAY for the terms.
+ */
+
+package com.relay.sms.ui.components
+
+import com.google.common.truth.Truth.assertThat
+import com.relay.sms.data.local.datastore.ViewerKind
+import org.junit.jupiter.api.Test
+
+/**
+ * Round 33 — the viewer-picker decision: when an open goes
+ * straight to an app and when it raises the picker. The
+ * remember/fallback behaviour lives here (the store itself is
+ * covered by `ViewerChoiceStoreTest`).
+ */
+class ViewerPickerTest {
+
+    private val gallery = ViewerApp("com.example.gallery", "Gallery", null)
+    private val photos = ViewerApp("com.example.photos", "Photos", null)
+
+    @Test
+    fun `no handlers means no handler`() {
+        assertThat(resolveViewerOpen(null, emptyList()))
+            .isEqualTo(ViewerOpenDecision.NoHandler)
+    }
+
+    @Test
+    fun `one handler opens directly without a picker`() {
+        assertThat(resolveViewerOpen(null, listOf(gallery)))
+            .isEqualTo(ViewerOpenDecision.Open("com.example.gallery"))
+    }
+
+    @Test
+    fun `a remembered handler opens directly`() {
+        assertThat(resolveViewerOpen("com.example.gallery", listOf(gallery, photos)))
+            .isEqualTo(ViewerOpenDecision.Open("com.example.gallery"))
+    }
+
+    @Test
+    fun `no remembered handler shows the picker`() {
+        assertThat(resolveViewerOpen(null, listOf(gallery, photos)))
+            .isEqualTo(ViewerOpenDecision.Pick(listOf(gallery, photos)))
+    }
+
+    @Test
+    fun `a remembered app that is gone shows the picker again`() {
+        // The remembered package was uninstalled: it is not among
+        // the handlers, so the picker shows instead of a dead open.
+        assertThat(resolveViewerOpen("com.example.gone", listOf(gallery, photos)))
+            .isEqualTo(ViewerOpenDecision.Pick(listOf(gallery, photos)))
+    }
+
+    @Test
+    fun `an empty query means no handler even with a remembered viewer`() {
+        // The remembered app cannot rescue a blind query — the
+        // opener fails open to the plain intent instead.
+        assertThat(resolveViewerOpen("com.example.gallery", emptyList()))
+            .isEqualTo(ViewerOpenDecision.NoHandler)
+    }
+
+    @Test
+    fun `one handler opens directly even when a different app is remembered`() {
+        assertThat(resolveViewerOpen("com.example.gone", listOf(gallery)))
+            .isEqualTo(ViewerOpenDecision.Open("com.example.gallery"))
+    }
+
+    @Test
+    fun `viewer kind follows the MIME type`() {
+        assertThat(ViewerKind.fromMimeType("image/png")).isEqualTo(ViewerKind.IMAGE)
+        assertThat(ViewerKind.fromMimeType("image/gif")).isEqualTo(ViewerKind.IMAGE)
+        assertThat(ViewerKind.fromMimeType("video/mp4")).isEqualTo(ViewerKind.VIDEO)
+        assertThat(ViewerKind.fromMimeType("audio/mpeg")).isEqualTo(ViewerKind.AUDIO)
+        assertThat(ViewerKind.fromMimeType("application/pdf")).isNull()
+        assertThat(ViewerKind.fromMimeType("text/vcard")).isNull()
+    }
+
+    @Test
+    fun `just once opens the chosen app without remembering`() {
+        // Round 36 — the Just-once tap used to drop the pick and
+        // open the plain intent, which raised the system chooser
+        // a second time instead of opening the app the user just
+        // picked. The outcome carries the chosen package (an
+        // explicit intent) and no remember flag.
+        assertThat(viewerPickOutcome(true, gallery))
+            .isEqualTo(ViewerPickOutcome("com.example.gallery", remember = false))
+    }
+
+    @Test
+    fun `always opens the chosen app and remembers it`() {
+        assertThat(viewerPickOutcome(false, photos))
+            .isEqualTo(ViewerPickOutcome("com.example.photos", remember = true))
+    }
+}
