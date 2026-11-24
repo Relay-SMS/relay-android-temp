@@ -1,0 +1,716 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.data.sms
+
+import android.content.ContentResolver
+import android.content.ContentValues
+import android.content.Context
+import android.net.Uri
+import android.provider.Telephony
+import com.relay.sms.data.local.db.entity.MessageEntity
+import com.relay.sms.domain.model.MessageDirection
+import com.relay.sms.domain.model.MessageStatus
+import com.relay.sms.domain.model.MessageType
+import com.relay.sms.domain.sender.SentSmsRecorder
+import dagger.hilt.android.qualifiers.ApplicationContext
+import timber.log.Timber
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Read-side wrapper around `content://sms` and `content://mms-sms/conversations`.
+ *
+ * NOTE: this class deliberately exposes minimal projections — we mirror system SMS into our
+ * own SQLCipher DB so most of the app reads from Room, not from the system provider.
+ */
+@Singleton
+class TelephonyReader @Inject constructor(
+    @ApplicationContext private val context: Context,
+) : SentSmsRecorder {
+    private val resolver: ContentResolver get() = context.contentResolver
+
+    /** All SMS rows (inbox + sent + drafts + outbox + failed). Use [readSmsBatched] for big imports. */
+    fun readAllSms(): List<MessageEntity> {
+        val out = ArrayList<MessageEntity>(256)
+        resolver.query(Telephony.Sms.CONTENT_URI, SMS_PROJECTION, null, null, "${Telephony.Sms.DATE} ASC")?.use { c ->
+            while (c.moveToNext()) {
+                val e = c.toSms() ?: continue
+                out += e
+            }
+        }
+        return out
+    }
+
+    /**
+     * Streams SMS rows whose [Telephony.Sms._ID] is strictly greater than [sinceId]. Used by the
+     * [com.relay.sms.data.sync.TelephonySyncManager] for delta syncs: the cursor advances
+     * monotonically so each call only sees rows the provider has accepted since the last sync.
+     *
+     * Rows are emitted in `_ID ASC` order in chunks of [pageSize] via the suspend [onPage]
+     * lambda — important for the very first run (fresh install) where the user may have tens
+     * of thousands of historical SMS: we never hold the full result set in RAM.
+     *
+     * Returns the highest `_ID` actually seen, which becomes the new cursor. When no rows match
+     * the predicate (steady state), returns [sinceId] unchanged — the caller persists nothing.
+     */
+    suspend fun readSmsSince(
+        sinceId: Long,
+        pageSize: Int = 500,
+        onPage: suspend (List<DeltaRow>) -> Unit,
+    ): Long {
+        var maxSeen = sinceId
+        val chunk = ArrayList<DeltaRow>(pageSize)
+        resolver.query(
+            Telephony.Sms.CONTENT_URI,
+            SMS_PROJECTION,
+            "${Telephony.Sms._ID} > ?",
+            arrayOf(sinceId.toString()),
+            "${Telephony.Sms._ID} ASC",
+        )?.use { c ->
+            val idIdx = c.getColumnIndexOrThrow(Telephony.Sms._ID)
+            while (c.moveToNext()) {
+                val id = c.getLong(idIdx)
+                val entity = c.toSms() ?: continue
+                if (id > maxSeen) maxSeen = id
+                chunk += DeltaRow(id, entity)
+                if (chunk.size >= pageSize) {
+                    onPage(chunk.toList())
+                    chunk.clear()
+                }
+            }
+        }
+        if (chunk.isNotEmpty()) onPage(chunk.toList())
+        return maxSeen
+    }
+
+    /**
+     * Cheap fingerprint of the SMS provider: total row count + highest `_ID`. Used by
+     * [TelephonySyncManager] to **skip** the expensive [readAllSmsIds] full scan when nothing
+     * has changed since the last reconciliation — the typical case on every observer burst.
+     *
+     * The aggregate query touches only the SQLite metadata; we do not pull any row body. On a
+     * device with 50 000 messages the call is ~1 ms vs the 100-300 ms cost of materialising
+     * the full id set.
+     */
+    fun snapshotSmsFingerprint(): SmsFingerprint {
+        var count = 0
+        var maxId = 0L
+        resolver.query(
+            Telephony.Sms.CONTENT_URI,
+            arrayOf("COUNT(${Telephony.Sms._ID}) AS c", "MAX(${Telephony.Sms._ID}) AS m"),
+            null,
+            null,
+            null,
+        )?.use { c ->
+            if (c.moveToFirst()) {
+                count = c.getInt(0)
+                maxId = if (c.isNull(1)) 0L else c.getLong(1)
+            }
+        }
+        return SmsFingerprint(count = count, maxId = maxId)
+    }
+
+    /** Output of [snapshotSmsFingerprint]. `count == 0` means the provider is empty. */
+    data class SmsFingerprint(val count: Int, val maxId: Long)
+
+    /**
+     * Returns every `_ID` currently in `content://sms`. Used by [TelephonySyncManager] for the
+     * deletion-reconciliation pass: any [MessageEntity.telephonyUri] in our Room DB whose `_ID`
+     * is missing from this set has been deleted from the system (by us, by another SMS app, or
+     * via the OS "Erase data" path) and we drop the local row to converge.
+     *
+     * Uses a minimal projection (`_ID` only) so it stays cheap even on devices with 50 k messages.
+     * Callers should still gate behind [snapshotSmsFingerprint] when possible — even a minimal
+     * projection allocates 50 k `Long` boxes plus a `HashSet` of the same size.
+     *
+     * ⚠️ **v1.27.2 (audit Codex du 2026-08-05, P-09) — `null` ≠ tableau vide.**
+     *
+     * La signature rendait `LongArray` et repliait sur un tableau vide quand le `ContentResolver`
+     * rendait un curseur `null` — fournisseur indisponible, permission retirée en cours de route.
+     * L'appelant ne pouvait donc PAS distinguer « le système n'a plus aucun SMS » d'« on n'a rien
+     * pu lire », alors que le premier autorise une suppression et le second l'interdit
+     * absolument. C'est le motif du **repli qui échoue du mauvais côté**, sur le seul chemin de
+     * l'application qui efface des messages.
+     *
+     * Désormais : `null` = lecture impossible, tableau vide = fournisseur réellement vide. Une
+     * exception (`SecurityException`…) continue de remonter à l'appelant, qui ne supprime alors
+     * rien non plus.
+     */
+    /**
+     * v1.27.2 (audit Codex du 2026-08-05, C-03 / C-04) — **preuve individuelle** qu'un SMS a bien
+     * disparu du fournisseur.
+     *
+     * `true` = la ligne existe encore · `false` = elle a réellement été supprimée · `null` = on n'a
+     * pas pu savoir (fournisseur indisponible, permission retirée).
+     *
+     * # Pourquoi une requête par identifiant
+     *
+     * La réconciliation déduisait la suppression d'une **absence dans une lecture globale** :
+     * « tout ce qui manque à la liste est supprimé ». Une lecture partielle mais non vide franchit
+     * cette logique, et jusqu'à la moitié du miroir pouvait être effacée alors que les messages
+     * existaient toujours. Relire deux fois n'y changeait rien : deux requêtes identiques contre le
+     * même fournisseur peuvent reproduire la même troncature — ce ne sont pas deux observations
+     * indépendantes.
+     *
+     * Interroger l'URI canonique de la ligne pose une question **fermée**, dont la réponse ne
+     * dépend d'aucune pagination : « celle-ci existe-t-elle ? ». C'est la seule preuve qui vaille
+     * avant un effacement irréversible.
+     */
+    fun smsExists(id: Long): Boolean? = runCatching {
+        val uri = Uri.withAppendedPath(Telephony.Sms.CONTENT_URI, id.toString())
+        val cursor = resolver.query(uri, arrayOf(Telephony.Sms._ID), null, null, null)
+            ?: return@runCatching null
+        cursor.use { it.moveToFirst() }
+    }.getOrNull()
+
+    fun readAllSmsIds(): LongArray? {
+        val cursor = resolver.query(
+            Telephony.Sms.CONTENT_URI,
+            arrayOf(Telephony.Sms._ID),
+            null,
+            null,
+            null,
+        ) ?: return null
+        val ids = ArrayList<Long>(1024)
+        cursor.use { c ->
+            val idx = c.getColumnIndexOrThrow(Telephony.Sms._ID)
+            while (c.moveToNext()) ids += c.getLong(idx)
+        }
+        return ids.toLongArray()
+    }
+
+    /** Pair of resolved system `_ID` and the mapped [MessageEntity]. */
+    data class DeltaRow(val telephonyId: Long, val entity: MessageEntity)
+
+    /**
+     * Audit Q2: the [onPage] callback is `suspend` so the importer can call other suspending APIs
+     * (like the Room `ConversationMirror`) without resorting to `runBlocking`. The receiver
+     * function itself is `suspend` so callers chain naturally inside a coroutine.
+     *
+     * NOTE: the SMS ContentProvider **does not honour `LIMIT`/`OFFSET` in `sortOrder`** — the
+     * legacy "ASC LIMIT N OFFSET M" trick worked on AOSP <11 but Samsung One UI / Pixel 12+
+     * silently ignores it and returns the full result every iteration, causing an infinite
+     * import loop. We now open the cursor once, iterate it, and flush chunks of [pageSize].
+     */
+    suspend fun readSmsBatched(pageSize: Int = 1000, onPage: suspend (List<MessageEntity>) -> Unit) {
+        val chunk = ArrayList<MessageEntity>(pageSize)
+        resolver.query(
+            Telephony.Sms.CONTENT_URI,
+            SMS_PROJECTION,
+            null,
+            null,
+            "${Telephony.Sms.DATE} ASC",
+        )?.use { c ->
+            while (c.moveToNext()) {
+                val row = c.toSms() ?: continue
+                chunk += row
+                if (chunk.size >= pageSize) {
+                    onPage(chunk.toList())
+                    chunk.clear()
+                }
+            }
+        }
+        if (chunk.isNotEmpty()) onPage(chunk.toList())
+    }
+
+    /** Insert a sent SMS into the system provider (mandatory for default SMS apps). */
+    override fun insertSentSms(
+        address: String,
+        body: String,
+        date: Long,
+        threadId: Long?,
+        subId: Int?,
+    ): String? {
+        val cv = ContentValues().apply {
+            put(Telephony.Sms.ADDRESS, address)
+            put(Telephony.Sms.BODY, body)
+            put(Telephony.Sms.DATE, date)
+            put(Telephony.Sms.DATE_SENT, date)
+            put(Telephony.Sms.READ, 1)
+            put(Telephony.Sms.SEEN, 1)
+            put(Telephony.Sms.TYPE, Telephony.Sms.MESSAGE_TYPE_SENT)
+            threadId?.let { put(Telephony.Sms.THREAD_ID, it) }
+            subId?.let { put(Telephony.Sms.SUBSCRIPTION_ID, it) }
+        }
+        // v1.27.11 — on enregistre la forme CANONIQUE, pas celle que rend le fournisseur.
+        // Voir [canonicalTelephonyUri] : selon la version d'Android, `insert` rend ici
+        // `content://sms/sent/<id>` ou `content://sms/<id>`, et la premiere est a la fois
+        // refusee en suppression et invisible pour la deduplication de l'import.
+        return resolver.insert(Telephony.Sms.Sent.CONTENT_URI, cv)
+            ?.toString()
+            ?.let(::canonicalTelephonyUri)
+    }
+
+    /** Insert an incoming SMS into the system inbox. Required from SmsDeliverReceiver. */
+    fun insertInboxSms(
+        address: String,
+        body: String,
+        date: Long,
+        subId: Int? = null,
+    ): Uri? {
+        val cv = ContentValues().apply {
+            put(Telephony.Sms.ADDRESS, address)
+            put(Telephony.Sms.BODY, body)
+            put(Telephony.Sms.DATE, date)
+            put(Telephony.Sms.DATE_SENT, date)
+            put(Telephony.Sms.READ, 0)
+            put(Telephony.Sms.SEEN, 0)
+            put(Telephony.Sms.TYPE, Telephony.Sms.MESSAGE_TYPE_INBOX)
+            subId?.let { put(Telephony.Sms.SUBSCRIPTION_ID, it) }
+        }
+        // v1.27.11 — meme normalisation que pour l'envoi, et pour les memes deux raisons.
+        return resolver.insert(Telephony.Sms.Inbox.CONTENT_URI, cv)
+            ?.let { Uri.parse(canonicalTelephonyUri(it.toString())) }
+    }
+
+    fun markMessageRead(uri: Uri) {
+        val cv = ContentValues().apply {
+            put(Telephony.Sms.READ, 1)
+            put(Telephony.Sms.SEEN, 1)
+        }
+        resolver.update(uri, cv, null, null)
+    }
+
+    /**
+     * v1.8.0 (post-audit fix badges après désinstallation) — propage massivement
+     * `READ=1` + `SEEN=1` côté système Android pour TOUS les SMS et MMS incoming
+     * non lus. Sans cette propagation, un user qui désinstalle/réinstalle
+     * Relay récupère ses messages avec `READ=0` côté `content://sms` (jamais
+     * mis à jour par Relay à la lecture) → l'import les voit comme non-lus
+     * → les badges réapparaissent.
+     *
+     * Le markRead côté Room ne propage volontairement PAS toujours côté système
+     * pour éviter des écritures inutiles, mais l'action utilisateur "Tout
+     * marquer comme lu" DOIT propager — c'est exactement le sens de l'action.
+     *
+     * Wrapped en runCatching pour ne pas crasher si le content provider est
+     * indisponible (ROM custom, panic mode, etc.). Retourne le nombre total
+     * de rows touchées (sms + mms).
+     */
+    /**
+     * v1.8.0 (post-audit fix badges) — propage `READ=1` + `SEEN=1` côté système
+     * pour TOUS les messages incoming non lus appartenant au `threadId` système.
+     * Appelé en complément de `markConversationRead` côté Room quand l'user
+     * ouvre une conversation dans Relay, pour aligner Android sur l'état lu.
+     *
+     * Sans cette propagation, désinstaller + réinstaller Relay ramène les
+     * badges sur la conversation car le système SMS Provider conserve toujours
+     * `READ=0` (jamais notifié de la lecture côté Relay).
+     */
+    fun markConversationReadInSystem(systemThreadId: Long): Int {
+        val cv = ContentValues().apply {
+            put(Telephony.Sms.READ, 1)
+            put(Telephony.Sms.SEEN, 1)
+        }
+        val smsUpdated = runCatching {
+            resolver.update(
+                Telephony.Sms.CONTENT_URI,
+                cv,
+                "${Telephony.Sms.THREAD_ID} = ? AND ${Telephony.Sms.READ} = 0 " +
+                    "AND ${Telephony.Sms.TYPE} = ${Telephony.Sms.MESSAGE_TYPE_INBOX}",
+                arrayOf(systemThreadId.toString()),
+            )
+        }.getOrDefault(0)
+        val cvMms = ContentValues().apply {
+            put("read", 1)
+            put("seen", 1)
+        }
+        val mmsUpdated = runCatching {
+            resolver.update(
+                Uri.parse("content://mms"),
+                cvMms,
+                "thread_id = ? AND read = 0 AND msg_box = $MMS_MSG_BOX_INBOX",
+                arrayOf(systemThreadId.toString()),
+            )
+        }.getOrDefault(0)
+        return smsUpdated + mmsUpdated
+    }
+
+    fun markAllIncomingReadInSystem(): Int {
+        val cv = ContentValues().apply {
+            put(Telephony.Sms.READ, 1)
+            put(Telephony.Sms.SEEN, 1)
+        }
+        val smsUpdated = runCatching {
+            resolver.update(
+                Telephony.Sms.CONTENT_URI,
+                cv,
+                "${Telephony.Sms.READ} = 0 AND ${Telephony.Sms.TYPE} = ${Telephony.Sms.MESSAGE_TYPE_INBOX}",
+                null,
+            )
+        }.getOrDefault(0)
+        // MMS utilise les mêmes noms de colonnes "read" / "seen" mais pas via
+        // Telephony.Sms (qui est SMS-only). On utilise les URIs MMS standard.
+        val cvMms = ContentValues().apply {
+            put("read", 1)
+            put("seen", 1)
+        }
+        val mmsUpdated = runCatching {
+            resolver.update(
+                Uri.parse("content://mms"),
+                cvMms,
+                "read = 0 AND msg_box = $MMS_MSG_BOX_INBOX",
+                null,
+            )
+        }.getOrDefault(0)
+        return smsUpdated + mmsUpdated
+    }
+
+    private fun android.database.Cursor.toSms(): MessageEntity? {
+        val id = getLong(getColumnIndexOrThrow(Telephony.Sms._ID))
+        val addr = getString(getColumnIndexOrThrow(Telephony.Sms.ADDRESS)) ?: return null
+        val body = getString(getColumnIndexOrThrow(Telephony.Sms.BODY)) ?: ""
+        val date = getLong(getColumnIndexOrThrow(Telephony.Sms.DATE))
+        val dateSent = getLong(getColumnIndexOrThrow(Telephony.Sms.DATE_SENT))
+        val read = getInt(getColumnIndexOrThrow(Telephony.Sms.READ)) == 1
+        val type = getInt(getColumnIndexOrThrow(Telephony.Sms.TYPE))
+        val threadId = getLong(getColumnIndexOrThrow(Telephony.Sms.THREAD_ID))
+        val subIdIndex = getColumnIndex(Telephony.Sms.SUBSCRIPTION_ID)
+        val subId = if (subIdIndex >= 0 && !isNull(subIdIndex)) getInt(subIdIndex) else null
+
+        // v1.28.1 — regle partagee avec le verificateur d'identite, cf. [smsTypeToDirection].
+        val direction = smsTypeToDirection(type)
+        val status = when (type) {
+            Telephony.Sms.MESSAGE_TYPE_SENT -> MessageStatus.SENT
+            Telephony.Sms.MESSAGE_TYPE_FAILED -> MessageStatus.FAILED
+            Telephony.Sms.MESSAGE_TYPE_OUTBOX,
+            Telephony.Sms.MESSAGE_TYPE_QUEUED -> MessageStatus.PENDING
+            else -> MessageStatus.RECEIVED
+        }
+
+        return MessageEntity(
+            conversationId = threadId,
+            telephonyUri = "content://sms/$id",
+            address = addr,
+            body = body,
+            type = MessageType.SMS,
+            direction = direction,
+            date = if (date > 0) date else System.currentTimeMillis(),
+            dateSent = if (dateSent > 0) dateSent else null,
+            read = read,
+            starred = false,
+            status = status,
+            errorCode = null,
+            subId = subId,
+            scheduledAt = null,
+            attachmentsCount = 0,
+        )
+    }
+
+    // ──────────────────── MMS import ────────────────────────────────────────────────────────
+    //
+    // Why we need this: Android stores **MMS** rows (voice notes, images, group messages…) under
+    // `content://mms` — completely separate from `content://sms`. Re-installing the app wipes
+    // our local SQLCipher mirror; without this method, every MMS the user ever sent/received
+    // disappears from the UI after re-install (the system rows survive but we never read them).
+    //
+    // Date encoding caveat: `content://mms.date` is in **SECONDS** (not ms like SMS), per AOSP.
+    // We multiply by 1000 for consistency with the rest of the pipeline.
+
+    /** One MMS row, ready to be mirrored into Room. */
+    // v1.16.0 — Type sécurisé (était Int). Le mapper [readPendingMms] convertit
+    // depuis les codes AOSP via `MessageDirection.fromRaw` / `MessageStatus.fromRaw`.
+    data class MmsImportRow(
+        val telephonyId: Long,
+        val threadId: Long,
+        val dateMs: Long,
+        val read: Boolean,
+        val direction: MessageDirection,
+        val status: MessageStatus,
+        val address: String,
+        val subId: Int?,
+        val textBody: String,
+        val attachments: List<MmsPartImport>,
+    )
+
+    /** One attachment part of an MMS — referenced by its `content://mms/part/{id}` URI. */
+    data class MmsPartImport(
+        val partId: Long,
+        val contentType: String,
+        val filename: String?,
+    )
+
+    /**
+     * Paged MMS reader — invokes [onPage] for every chunk of up to [pageSize] resolved rows.
+     * The cursor over `content://mms` stays open for the whole walk; addresses + parts are
+     * resolved row-by-row (N+1 queries are inherent to the AOSP MMS schema), but we no longer
+     * hold the entire result list + bytes-bearing part list in RAM before yielding the first
+     * row to the importer. v1.2.4 audit P3.
+     *
+     * Marked `suspend` so [onPage] can call into Room (which is suspend-only). Caller must
+     * already be in a coroutine context (typically `Dispatchers.IO` via `withContext`).
+     */
+    /**
+     * v1.27.2 (audit Codex du 2026-08-05, C-05) — rend `true` seulement si **toutes** les lectures
+     * necessaires ont abouti.
+     *
+     * # Le defaut que ce retour ferme
+     *
+     * Un `resolver.query(...)` qui rend `null` — fournisseur indisponible, permission retiree —
+     * faisait sortir `?.use {}` sans rien executer, et la fonction revenait NORMALEMENT. L'appelant
+     * en concluait « import termine » et posait le marqueur de completion : l'historique MMS
+     * restait ampute **de facon permanente**, puisque les passes suivantes sautent alors l'import.
+     *
+     * Le retour ne prouvait que le retour de la fonction, jamais le succes des lectures. C'est le
+     * meme motif que `readAllSmsIds()` rendant un tableau vide sur echec — le jumeau qui n'avait
+     * pas ete corrige.
+     */
+    suspend fun readMmsBatched(pageSize: Int, onPage: suspend (List<MmsImportRow>) -> Unit): Boolean {
+        if (pageSize <= 0) return false
+        var complete = true
+        // v1.2.7 audit P5 — 2 passes par page : on collecte d'abord les métadonnées + adresse
+        // de tous les MMS du chunk, puis on fait UN seul query `content://mms/part` filtré par
+        // `mid IN (…)` et on dispatche les parts en mémoire. Gain mesuré : 200 queries Telephony
+        // → 3 queries par chunk de 200 MMS (~5 s économisées sur premier import 500 MMS S9).
+        val pending = ArrayList<PendingMms>(pageSize)
+        val mainCursor = resolver.query(
+            Uri.parse("content://mms"),
+            arrayOf("_id", "thread_id", "date", "read", "msg_box", "sub_id"),
+            null,
+            null,
+            "date DESC",
+        ) ?: return false
+        mainCursor.use { c ->
+            while (c.moveToNext()) {
+                val mmsId = c.getLong(0)
+                val threadId = c.getLong(1)
+                val dateSec = c.getLong(2)
+                val read = c.getInt(3) == 1
+                val msgBox = c.getInt(4)
+                val subId = if (!c.isNull(5)) c.getInt(5) else null
+
+                val direction = mmsBoxToDirection(msgBox)
+                val status = when (msgBox) {
+                    MMS_MSG_BOX_INBOX -> MessageStatus.RECEIVED
+                    MMS_MSG_BOX_SENT -> MessageStatus.SENT
+                    MMS_MSG_BOX_FAILED -> MessageStatus.FAILED
+                    MMS_MSG_BOX_OUTBOX, MMS_MSG_BOX_DRAFT -> MessageStatus.PENDING
+                    else -> MessageStatus.RECEIVED
+                }
+
+                // Adresse FROM/TO reste N+1 (URI `addr` non-batchable de façon fiable côté AOSP).
+                val resolvedAddress = readMmsAddress(resolver, mmsId, direction)
+                if (resolvedAddress == null) {
+                    // v1.27.2 (audit Codex, C-05) — la requete d'adresse a ECHOUE. Ce n'est pas
+                    // « un MMS sans adresse exploitable », c'est « on n'a pas pu lire ». La passe
+                    // ne peut donc pas etre declaree complete.
+                    complete = false
+                    continue
+                }
+                if (resolvedAddress.isBlank()) {
+                    // v1.8.0 (bug 1 fix) — Timber log quand un MMS est skippé pour
+                    // adresse vide. Permet de diagnostiquer les régressions OEM
+                    // (Samsung One UI, Xiaomi MIUI, Huawei HMS) où le provider
+                    // utilise des types d'adresse non-standards (autres que les
+                    // 137/151/129 AOSP). Sans ce log, le MMS disparaît
+                    // silencieusement et l'user n'a aucun moyen de comprendre
+                    // pourquoi un message reçu n'apparaît pas dans Relay.
+                    Timber.w(
+                        "TelephonyReader: MMS %d skipped (empty address after FROM=137/151/129 fallback, direction=%d, threadId=%d)",
+                        mmsId, direction, threadId,
+                    )
+                    continue
+                }
+                val address = resolvedAddress
+
+                pending += PendingMms(
+                    telephonyId = mmsId,
+                    threadId = threadId,
+                    dateMs = dateSec * 1000L,
+                    read = read,
+                    direction = direction,
+                    status = status,
+                    address = address,
+                    subId = subId,
+                )
+                if (pending.size >= pageSize) {
+                    if (!flushPending(pending, onPage)) complete = false
+                    pending.clear()
+                }
+            }
+        }
+        if (pending.isNotEmpty()) {
+            if (!flushPending(pending, onPage)) complete = false
+        }
+        return complete
+    }
+
+    /**
+     * Résout les parts du chunk via UN seul `content://mms/part WHERE mid IN (…)` puis assemble
+     * les `MmsImportRow`. Drop les rows pure-text-empty pour cohérence avec l'ancien flow.
+     */
+    /**
+     * v1.27.2 (audit Codex, C-05) — enveloppe qui distingue « page ecrite » de « parts illisibles ».
+     * Rend `false` quand la lecture des parts a echoue : la page est quand meme remise a
+     * l'appelant, mais la passe ne pourra pas etre declaree complete.
+     */
+    private suspend fun flushPending(
+        pending: List<PendingMms>,
+        onPage: suspend (List<MmsImportRow>) -> Unit,
+    ): Boolean {
+        val partsByMid = readMmsPartsBatched(pending.map { it.telephonyId })
+        onPage(flushPendingWithBatchedParts(pending, partsByMid ?: emptyMap()))
+        return partsByMid != null
+    }
+
+    private fun flushPendingWithBatchedParts(
+        pending: List<PendingMms>,
+        partsByMid: Map<Long, Pair<String, List<MmsPartImport>>>,
+    ): List<MmsImportRow> {
+        if (pending.isEmpty()) return emptyList()
+        val out = ArrayList<MmsImportRow>(pending.size)
+        for (p in pending) {
+            val (textBody, attachments) = partsByMid[p.telephonyId] ?: ("" to emptyList())
+            if (textBody.isBlank() && attachments.isEmpty()) continue
+            out += MmsImportRow(
+                telephonyId = p.telephonyId,
+                threadId = p.threadId,
+                dateMs = p.dateMs,
+                read = p.read,
+                direction = p.direction,
+                status = p.status,
+                address = p.address,
+                subId = p.subId,
+                textBody = textBody,
+                attachments = attachments,
+            )
+        }
+        return out
+    }
+
+    /**
+     * Batch resolver query : `content://mms/part WHERE mid IN (?,?,?,…)`. SQLite cap à 999
+     * placeholders ; on chunk les ids à 500 pour rester sous la limite avec marge. Retourne
+     * un map `mid → (textBody, attachments)`.
+     */
+    /** v1.27.2 (audit Codex, C-05) — `null` = au moins une requete de parts a echoue. */
+    private fun readMmsPartsBatched(mids: List<Long>): Map<Long, Pair<String, List<MmsPartImport>>>? {
+        if (mids.isEmpty()) return emptyMap()
+        var ok = true
+        val acc = HashMap<Long, Pair<StringBuilder, ArrayList<MmsPartImport>>>(mids.size)
+        for (m in mids) acc[m] = StringBuilder() to ArrayList(2)
+
+        mids.chunked(500).forEach { chunk ->
+            val placeholders = chunk.joinToString(",") { "?" }
+            val args = Array(chunk.size) { chunk[it].toString() }
+            resolver.query(
+                Uri.parse("content://mms/part"),
+                arrayOf("_id", "mid", "ct", "name", "text"),
+                "mid IN ($placeholders)",
+                args,
+                null,
+            ).also { if (it == null) ok = false }?.use { c ->
+                while (c.moveToNext()) {
+                    val partId = c.getLong(0)
+                    val mid = c.getLong(1)
+                    val ct = c.getString(2) ?: continue
+                    val slot = acc[mid] ?: continue
+                    when {
+                        ct.equals("application/smil", ignoreCase = true) -> Unit
+                        estTexteEnLigne(ct) -> {
+                            val t = c.getString(4) ?: ""
+                            if (t.isNotBlank()) {
+                                if (slot.first.isNotEmpty()) slot.first.append('\n')
+                                slot.first.append(t)
+                            }
+                        }
+                        else -> slot.second += MmsPartImport(
+                            partId = partId,
+                            contentType = ct,
+                            filename = c.getString(3),
+                        )
+                    }
+                }
+            }
+        }
+        // ⚠️ v1.27.2 — `ok` DOIT sortir d'ici. La première version le posait sans jamais le rendre :
+        // la fonction retournait toujours une carte, `flushPending` rendait donc toujours `true`,
+        // et un échec de lecture des parts ne pouvait plus invalider la complétion de l'import.
+        // C'est-à-dire exactement le défaut C-05 que ce code est censé fermer, réintroduit dans
+        // son propre correctif.
+        return if (ok) acc.mapValues { (_, v) -> v.first.toString() to v.second } else null
+    }
+
+    /** Métadonnées MMS captées en pass 1 avant la résolution batchée des parts en pass 2.
+     *  v1.16.0 — direction/status typés enum (était Int). */
+    private data class PendingMms(
+        val telephonyId: Long,
+        val threadId: Long,
+        val dateMs: Long,
+        val read: Boolean,
+        val direction: MessageDirection,
+        val status: MessageStatus,
+        val address: String,
+        val subId: Int?,
+    )
+
+    /**
+     * Reads every part of an MMS message and splits them into a plain-text body (joined text/
+     * parts, SMIL filtered) and a list of binary attachments (audio / image / video / other).
+     */
+    private fun readMmsParts(mmsId: Long): Pair<String, List<MmsPartImport>> {
+        val text = StringBuilder()
+        val atts = ArrayList<MmsPartImport>(4)
+        resolver.query(
+            Uri.parse("content://mms/part"),
+            arrayOf("_id", "ct", "name", "text"),
+            "mid = ?",
+            arrayOf(mmsId.toString()),
+            null,
+        )?.use { c ->
+            while (c.moveToNext()) {
+                val partId = c.getLong(0)
+                val ct = c.getString(1) ?: continue
+                when {
+                    ct.equals("application/smil", ignoreCase = true) -> Unit
+                    estTexteEnLigne(ct) -> {
+                        val t = c.getString(3) ?: ""
+                        if (t.isNotBlank()) {
+                            if (text.isNotEmpty()) text.append('\n')
+                            text.append(t)
+                        }
+                    }
+                    else -> atts += MmsPartImport(
+                        partId = partId,
+                        contentType = ct,
+                        filename = c.getString(2),
+                    )
+                }
+            }
+        }
+        return text.toString() to atts
+    }
+
+    companion object {
+        /**
+         * v1.28.9 (audit de cohérence du 2026-09-14, C2) — la partie est-elle du texte que le fournisseur
+         * range dans sa colonne `text` ? `PduPersister` n'y met que `text/plain` et `text/html` ; tout autre
+         * type, `text/x-vcard` compris, vit dans un fichier et se lit par `content://mms/part/<id>`.
+         *
+         * Le test était `startsWith("text/")` : une carte de visite passait pour du texte, sa colonne `text`
+         * était vide, et un MMS qui ne portait qu'elle était sauté à l'import — le jumeau de F16
+         * (`LecteurRetrieveConf.partiesMedia`), jamais porté sur ce chemin.
+         */
+        internal fun estTexteEnLigne(contentType: String): Boolean {
+            val base = contentType.substringBefore(';').trim()
+            return base.equals("text/plain", ignoreCase = true) || base.equals("text/html", ignoreCase = true)
+        }
+
+        private val SMS_PROJECTION = arrayOf(
+            Telephony.Sms._ID,
+            Telephony.Sms.THREAD_ID,
+            Telephony.Sms.ADDRESS,
+            Telephony.Sms.BODY,
+            Telephony.Sms.DATE,
+            Telephony.Sms.DATE_SENT,
+            Telephony.Sms.READ,
+            Telephony.Sms.TYPE,
+            Telephony.Sms.STATUS,
+            Telephony.Sms.SUBSCRIPTION_ID,
+        )
+    }
+}

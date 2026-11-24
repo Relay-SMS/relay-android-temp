@@ -1,0 +1,1254 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.data.repository
+
+import android.net.Uri
+import androidx.room.withTransaction
+import com.relay.sms.core.ext.blockKey
+import com.relay.sms.core.ext.stripInvisibleChars
+import com.relay.sms.core.ext.stripMmsAddressSuffix
+import com.relay.sms.core.result.AppError
+import com.relay.sms.core.result.Outcome
+import com.relay.sms.data.local.db.AppDatabase
+import com.relay.sms.data.local.db.dao.AttachmentDao
+import com.relay.sms.data.local.db.dao.ConversationDao
+import com.relay.sms.data.local.db.dao.MessageDao
+import com.relay.sms.data.local.db.entity.ConversationEntity
+import com.relay.sms.data.local.db.entity.MessageEntity
+import com.relay.sms.data.local.db.mapper.toDomain
+import com.relay.sms.di.IoDispatcher
+import com.relay.sms.domain.clientmode.ClientAction
+import com.relay.sms.domain.clientmode.ClientActionGateway
+import com.relay.sms.domain.clientmode.NoOpClientActionGateway
+import com.relay.sms.domain.model.Attachment
+import com.relay.sms.domain.model.Conversation
+import com.relay.sms.domain.model.Message
+import com.relay.sms.domain.model.MessageSearchHit
+import com.relay.sms.domain.model.MessageState
+import com.relay.sms.domain.model.MessageWindow
+import com.relay.sms.domain.model.MessageWindowSpec
+import com.relay.sms.domain.model.PhoneAddress
+import com.relay.sms.domain.model.PhoneAddress.Companion.toCsv
+import com.relay.sms.domain.notification.ConversationNotificationCanceller
+import com.relay.sms.domain.purge.purgeCutoffMs
+import com.relay.sms.domain.repository.BlockedNumberRepository
+import com.relay.sms.domain.repository.ConversationRepository
+import com.relay.sms.domain.repository.SetReactionResult
+import com.relay.sms.domain.repository.VaultPurgeResult
+import com.relay.sms.security.AppLockManager
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.withContext
+import timber.log.Timber
+import javax.inject.Inject
+import javax.inject.Singleton
+
+@Singleton
+class ConversationRepositoryImpl @Inject constructor(
+    private val database: AppDatabase,
+    private val conversationDao: ConversationDao,
+    private val messageDao: MessageDao,
+    private val attachmentDao: AttachmentDao,
+    private val appLock: AppLockManager,
+    // v1.26.1 (audit H1) — le second facteur du Coffre gardait l'ÉCRAN, pas la DONNÉE :
+    // `isVaultUnlockedInSession` n'avait qu'UN SEUL lecteur dans tout le dépôt, l'écran Coffre.
+    // La couche données ne le consultait jamais, si bien qu'un fil du Coffre atteint autrement
+    // (« Nouveau message » vers le contact, lien `smsto:`, Intent forgé) s'affichait en entier
+    // sans que le PIN coffre soit demandé. On dépend de [VaultSessionState] et non de
+    // [VaultManager] : ce dernier dépend de ce repository, l'injecter fermerait le cycle Hilt.
+    private val vaultSession: com.relay.sms.security.VaultSessionState,
+    private val blockedRepo: BlockedNumberRepository,
+    private val notifier: ConversationNotificationCanceller,
+    // v1.12.0 — résolution du displayName à la création d'une conv via
+    // ComposeScreen. Sans ça, `findOrCreate` créait toujours
+    // `displayName = null`, ce qui faisait afficher le numéro brut dans le
+    // TopAppBar ThreadScreen au lieu du nom du contact pourtant choisi.
+    private val contactRepo: com.relay.sms.domain.repository.ContactRepository,
+    // v1.8.0 (post-audit fix badges après désinstallation) — propage `READ=1`
+    // côté système quand l'user ouvre une conversation. Sans ça, désinstaller
+    // + réinstaller Relay ramène les badges (le système avait toujours
+    // `READ=0`, jamais aligné par Relay).
+    private val telephonyReader: com.relay.sms.data.sms.TelephonyReader,
+    // v1.27.2 (audit Codex, C-07) — voir [com.relay.sms.data.sms.PhoneIdentity].
+    private val phoneIdentity: com.relay.sms.data.sms.PhoneIdentity,
+    // v1.28.1 — le chemin destructeur a quitte cette classe pour devenir testable, cf.
+    // [ConversationEraser] et [com.relay.sms.data.sms.SystemCopyEraser].
+    private val eraser: ConversationEraser,
+    @IoDispatcher private val io: CoroutineDispatcher,
+    /**
+     * Client mode C3 — the write-back gateway. Default NoOp keeps the
+     * hub tests compiling untouched; Hilt always provides the real one.
+     */
+    private val clientActions: ClientActionGateway = NoOpClientActionGateway,
+) : ConversationRepository {
+
+    /**
+     * Main list stream. Marks — et ne masque plus — les conversations dont **toutes** les adresses
+     * sont bloquées, via [Conversation.blocked].
+     *
+     * v1.25.3 — auparavant ces conversations étaient filtrées hors de la liste. Combiné à la
+     * suppression que déclenchait l'action « Bloquer », l'utilisateur n'avait aucun moyen de
+     * distinguer « masqué » de « effacé », et aucun retour lui confirmant que le blocage avait
+     * pris. Elles restent désormais visibles, regroupées et signalées par l'écran de liste.
+     *
+     * v1.25.4 — le marquage reproduit **exactement** le test que fait `BlockedNumberRepository.
+     * isBlocked` : appartenance de `raw.blockKey()` à l'ensemble des clés enregistrées. C'est la
+     * même comparaison, sur la même clé, donc le badge « Bloqué » ne peut plus affirmer ce que le
+     * filtre de réception ne tient pas. La v1.25.3 comparait ici des suffixes de 8 chiffres pendant
+     * que le filtre exigeait une égalité stricte, d'où des conversations annoncées bloquées qui
+     * continuaient de recevoir.
+     *
+     * Deux précautions qui ne se voient pas :
+     * - on part de [com.relay.sms.domain.model.PhoneAddress.raw], **jamais** de `normalized` :
+     *   ce dernier a déjà perdu les lettres (« SFR 123 » y devient « 123 »), et
+     *   [com.relay.sms.core.ext.blockKey] a précisément besoin de les voir pour ne pas confondre
+     *   l'opérateur avec le code court homonyme ;
+     * - les clés enregistrées sont prises telles quelles, sans re-normalisation. Une entrée héritée
+     *   d'une version antérieure ne correspondra donc à rien tant que
+     *   `BlockedNumbersImporter.rekeyLegacyEntries()` ne l'a pas convertie — une conversation non
+     *   marquée, jamais un badge mensonger. L'erreur penche du bon côté.
+     *
+     * Un groupe mêlant un participant bloqué et un autorisé n'est **pas** marqué : le filtre de
+     * réception dans `SmsDeliverReceiver` écarte déjà les messages du seul participant bloqué.
+     */
+    override fun observeAll(includeArchived: Boolean): Flow<List<Conversation>> =
+        combine(
+            conversationDao.observe(includeArchived),
+            blockedRepo.observe(),
+            decryptFailedLatestIds(),
+        ) { rows, blocked, decryptFailedIds ->
+            // v1.27.2 (audit Codex du 2026-08-05, C-08) — MEME comparaison que le filtre de
+            // reception, region comprise. La v1.25.3 avait deja diverge ici, avec des
+            // conversations annoncees bloquees qui continuaient de recevoir ; retomber sur la cle
+            // de neuf chiffres aurait recree l'ecart, dans l'autre sens cette fois.
+            val isBlockedAddress = phoneIdentity.snapshot()
+                .blockedMatcher(blocked.map { it.rawNumber })
+            rows.map { row ->
+                val conv = row.toDomain()
+                val allBlocked = conv.addresses.isNotEmpty() &&
+                    conv.addresses.all { addr -> isBlockedAddress(addr.raw) }
+                // E2E — the latest message is an undecryptable
+                // placeholder: the row renders "This message couldn't
+                // be decrypted." instead of a blank preview.
+                val decryptFailed = conv.id in decryptFailedIds
+                if (allBlocked || decryptFailed) {
+                    conv.copy(blocked = allBlocked, lastMessageDecryptFailed = decryptFailed)
+                } else {
+                    conv
+                }
+            }
+        }.flowOn(io)
+
+    /**
+     * E2E — the conversations whose latest visible message is an
+     * undecryptable placeholder, as a set, re-emitted only when the set
+     * itself changes. The DAO flow re-runs on ANY messages-table write
+     * (a status update, a read mark), so without the
+     * `distinctUntilChanged` every such write would re-emit the whole
+     * conversation list.
+     */
+    private fun decryptFailedLatestIds(): Flow<Set<Long>> =
+        messageDao.observeDecryptFailedLatestConversationIds()
+            .distinctUntilChanged()
+            .map { it.toSet() }
+
+    /**
+     * Vault listing — **gated against [AppLockManager.LockState.PanicDecoy]**.
+     *
+     * The panic-decoy session intentionally exposes the regular conversations list (so an
+     * attacker reading over the user's shoulder sees a plausible, working app), but must never
+     * leak the encrypted vault. Without this gate, simply tapping the vault icon would surface
+     * every protected conversation in clear — the whole point of the panic code is to keep
+     * that content out of reach until the real PIN is entered.
+     *
+     * `combine` re-evaluates whenever the lock state changes, so the moment the user transitions
+     * out of decoy back to a real unlock (next session), the list re-populates without manual
+     * refresh.
+     */
+    /**
+     * v1.27.2 (audit externe Gemini 2026-08-04) — le second facteur du Coffre garde AUSSI sa
+     * propre liste.
+     *
+     * Le correctif H1 (v1.26.1) avait branché [vaultSession] sur [observeOne],
+     * [observeMessages] et [observeMessageWindow] — mais pas ici, sur le flux qui rend le
+     * contenu du Coffre lui-même. C'était le dernier chemin de lecture du Coffre gardé
+     * uniquement contre la session leurre, alors que ses trois frères exigent en plus le second
+     * facteur. Aucune fuite atteignable aujourd'hui (l'unique consommateur, `VaultScreen`, masque
+     * son contenu tant que l'authentification n'a pas abouti) — mais c'est exactement la forme
+     * que H1 décrit : la garde sur l'ÉCRAN et non sur la DONNÉE. Le prochain consommateur de ce
+     * flux hériterait de la protection au lieu de devoir y penser.
+     */
+    override fun observeVault(): Flow<List<Conversation>> =
+        combine(
+            appLock.state,
+            conversationDao.observeVault(),
+            vaultSession.unlocked,
+            decryptFailedLatestIds(),
+        ) { lockState, list, vaultOpen, decryptFailedIds ->
+            if (lockState is AppLockManager.LockState.PanicDecoy || !vaultOpen) {
+                emptyList()
+            } else {
+                // E2E — same decrypt-failed preview flag as the main
+                // list (see [observeAll]).
+                list.map { row ->
+                    val conv = row.toDomain()
+                    if (conv.id in decryptFailedIds) {
+                        conv.copy(lastMessageDecryptFailed = true)
+                    } else {
+                        conv
+                    }
+                }
+            }
+        }.flowOn(io)
+
+    /**
+     * Single conversation row stream. **Hidden when the conversation is in the vault and the
+     * session is a panic decoy** — same rationale as [observeVault]: deep-linking to a vault
+     * thread (saved nav state, share-target shortcut, future widget) must not bypass the gate.
+     */
+    override fun observeOne(id: Long): Flow<Conversation?> =
+        combine(
+            appLock.state,
+            conversationDao.observeById(id),
+            vaultSession.unlocked,
+        ) { lockState, entity, vaultOpen ->
+            when {
+                entity == null -> null
+                // v1.26.1 (audit H1) — condition étendue : le contenu du Coffre reste masqué
+                // tant que son second facteur n'a pas été franchi DANS CETTE SESSION, pas
+                // seulement en session leurre. `vaultSession.unlocked` est un StateFlow pour
+                // que le fil se révèle bien au moment où l'utilisateur ouvre son Coffre.
+                entity.inVault && (lockState is AppLockManager.LockState.PanicDecoy || !vaultOpen) -> null
+                else -> entity.toDomain()
+            }
+        }.flowOn(io)
+
+    /**
+     * v1.26.1 (audit H1, suite de revue) — « ce fil est masqué parce que le Coffre s'est
+     * refermé », par opposition à « cette conversation n'existe pas ».
+     *
+     * Sans cette distinction, le masquage introduit ci-dessus produisait une RÉGRESSION vécue :
+     * `lockVaultOnLeave` vaut `true` par défaut et [AutoLockObserver] referme le Coffre
+     * IMMÉDIATEMENT à chaque passage en arrière-plan — bascule d'application, écran éteint,
+     * sélecteur de photos, appel entrant. L'utilisateur revenait donc sur un fil du Coffre
+     * entièrement VIDE, dont le bouton « Envoyer » ne faisait plus rien : tous les chemins
+     * d'envoi retournent en silence sur `conversation == null`. Rien ne le lui disait.
+     *
+     * L'écran s'en sert pour ressortir du fil au lieu de laisser un écran mort.
+     *
+     * ⚠️ Rend `false` en session leurre : là, le fil doit rester indiscernable d'une
+     * conversation inexistante — surtout pas déclencher une navigation qui trahirait qu'il y a
+     * quelque chose à cacher.
+     */
+    override fun observeVaultHidden(id: Long): Flow<Boolean> =
+        combine(
+            conversationDao.observeById(id),
+            appLock.state,
+            vaultSession.unlocked,
+        ) { entity, lockState, vaultOpen ->
+            entity != null &&
+                entity.inVault &&
+                lockState !is AppLockManager.LockState.PanicDecoy &&
+                !vaultOpen
+        }.distinctUntilChanged().flowOn(io)
+
+    /**
+     * Messages stream for a given conversation. **Empty list when the host conversation is in
+     * the vault and the session is a panic decoy.**
+     *
+     * Audit P-P0-1: attachments are now bulk-fetched once per emission via
+     * [AttachmentDao.findForConversation] and grouped in memory, replacing the old N+1
+     * pattern that ran one Room query per audio row. The grouping is done lazily — text-only
+     * threads pay zero attachment cost because the bulk SELECT against `attachments` returns
+     * an empty list (covered by the `message_id` index).
+     */
+    override fun observeMessages(conversationId: Long): Flow<List<Message>> {
+        // v1.6.1 (audit PERF-05) — `appLock.state` isolé du combine principal afin que
+        // chaque déverrouillage biométrique / timeout lock NE déclenche PAS la
+        // reconstruction complète des messages + fetch attachments.
+        //
+        // v1.14.9 (audit PERF-M6) — `conv.inVault` extrait via `distinctUntilChanged` AVANT
+        // le combine messages. Avant : chaque write `draft` côté composer → `observeById`
+        // ré-émettait → `combine` réévaluait → `attachmentDao.findForConversation` SQLCipher
+        // re-tourné à chaque caractère tapé. Désormais : on n'observe que la slice utile
+        // (inVault) ; le combine ne ré-évalue que si inVault OU messages changent réellement.
+        val inVaultFlow = conversationDao.observeById(conversationId)
+            .map { it?.inVault == true }
+            .distinctUntilChanged()
+        val baseFlow = combine(
+            inVaultFlow,
+            messageDao.observeForConversation(conversationId),
+        ) { inVault, rows ->
+            // Single bulk fetch — only hit Room if at least one row claims an attachment.
+            // Avoids the SELECT round-trip on text-only conversations entirely.
+            val needAttachments = rows.any { it.attachmentsCount > 0 }
+            val attachmentsByMessage: Map<Long, List<Attachment>> =
+                if (needAttachments) {
+                    attachmentDao.findForConversation(conversationId)
+                        .groupBy { it.messageId }
+                        .mapValues { (_, list) -> list.map { it.toDomain() } }
+                } else emptyMap()
+            val messages = rows.map { entity ->
+                entity.toDomain(attachmentsByMessage[entity.id].orEmpty())
+            }
+            inVault to messages
+        }.flowOn(io)
+        // v1.26.1 (audit H1) — voir [observeOne] : le masquage ne dépend plus seulement du
+        // mode leurre, mais aussi du second facteur du Coffre pour la session en cours.
+        return combine(
+            baseFlow,
+            appLock.state,
+            vaultSession.unlocked,
+        ) { (inVault, messages), lockState, vaultOpen ->
+            if (inVault && (lockState is AppLockManager.LockState.PanicDecoy || !vaultOpen)) {
+                emptyList()
+            } else {
+                messages
+            }
+        }
+    }
+
+    /** Issue #59 — même masquage que [observeMessages] : un fil caché ne montre pas non plus ses photos. */
+    override fun observeMedia(conversationId: Long): Flow<List<Attachment>> =
+        combine(
+            conversationDao.observeById(conversationId).map { it?.inVault == true }.distinctUntilChanged(),
+            attachmentDao.observeMediaForConversation(conversationId),
+            appLock.state,
+            vaultSession.unlocked,
+        ) { inVault, rows, lockState, vaultOpen ->
+            if (inVault && (lockState is AppLockManager.LockState.PanicDecoy || !vaultOpen)) {
+                emptyList()
+            } else {
+                // Round 36 — the media query also carries the
+                // message's system MMS id, for the gallery's
+                // fallback probe when the cache file is gone; it
+                // is applied here, on top of the shared mapper
+                // (see `AttachmentWithMessage.toDomain`).
+                rows.map { it.toDomain().copy(mmsSystemId = it.mmsSystemId) }
+            }
+        }.flowOn(io)
+
+    /** Details panel — Files tab: same vault masking as [observeMedia]. */
+    override fun observeFiles(conversationId: Long): Flow<List<Attachment>> =
+        combine(
+            conversationDao.observeById(conversationId).map { it?.inVault == true }.distinctUntilChanged(),
+            attachmentDao.observeFilesForConversation(conversationId),
+            appLock.state,
+            vaultSession.unlocked,
+        ) { inVault, rows, lockState, vaultOpen ->
+            if (inVault && (lockState is AppLockManager.LockState.PanicDecoy || !vaultOpen)) {
+                emptyList()
+            } else {
+                rows.map { it.toDomain() }
+            }
+        }.flowOn(io)
+
+    /**
+     * Bounded counterpart of [observeMessages] — see [MessageDao.observeWindowForConversation] for
+     * why the thread UI must not read the whole history on every emission.
+     *
+     * Deliberately mirrors [observeMessages] rather than replacing it: the `inVault` isolation
+     * (audit PERF-M6), the conditional attachment bulk-fetch (audit P-P0-1) and the `PanicDecoy`
+     * guard are all load-bearing and stay identical. Only the source query is bounded, and the
+     * window widens through [limit] via `flatMapLatest`.
+     */
+    override fun observeMessagesWindow(
+        conversationId: Long,
+        window: Flow<MessageWindowSpec>,
+    ): Flow<MessageWindow> {
+        val inVaultFlow = conversationDao.observeById(conversationId)
+            .map { it?.inVault == true }
+            .distinctUntilChanged()
+        // Feedback round 5 — the window is a spec now, not just a size: a search
+        // jump swaps the tail for a window ending at the target message. The
+        // anchored query asks for one row more than the window holds; the extra
+        // row is the proof that older messages exist past the anchor (see
+        // [MessageDao.observeWindowEndingAt]) — a stats-based check would lie
+        // near the thread start, where the window is smaller than the thread
+        // while no older message exists past the anchor.
+        val rowsFlow = window
+            .distinctUntilChanged()
+            .flatMapLatest { spec ->
+                when (spec) {
+                    is MessageWindowSpec.Tail ->
+                        messageDao.observeWindowForConversation(conversationId, spec.limit)
+                            .map { rows -> WindowRows(rows, hasMoreOlder = null) }
+                    is MessageWindowSpec.EndingAt ->
+                        messageDao.observeWindowEndingAt(
+                            conversationId,
+                            spec.anchorDate,
+                            spec.anchorId,
+                            spec.limit + 1,
+                        ).map { rows ->
+                            val hasMoreOlder = rows.size > spec.limit
+                            val trimmed = if (hasMoreOlder) rows.drop(1) else rows
+                            WindowRows(trimmed, hasMoreOlder)
+                        }
+                }
+            }
+        // Les statistiques sont volontairement HORS de ce combine : `messages` et l'agrégat sont
+        // tous deux invalidés par la table `messages`, donc les réunir ici ferait tourner le
+        // bulk-fetch des pièces jointes et le mapping des 200 lignes DEUX fois par message reçu —
+        // annulant la moitié du gain visé. Ici on ne garde que le travail lourd.
+        val mapped = combine(inVaultFlow, rowsFlow) { inVault, (rows, hasMoreOlder) ->
+            val needAttachments = rows.any { it.attachmentsCount > 0 }
+            // Feedback round 6 — attachments are fetched for the WINDOW only,
+            // not the whole conversation: `findForConversation` re-ran a
+            // SQLCipher query over the entire history on every emission (new
+            // message, delivery report, read change), and its cost grew with
+            // the thread. Ids are chunked: a window grown by repeated "load
+            // older" pages can exceed SQLite's bound-variable cap.
+            val attachmentsByMessage: Map<Long, List<Attachment>> =
+                if (needAttachments) {
+                    rows.map { it.id }
+                        .chunked(ATTACHMENT_FETCH_BATCH_SIZE)
+                        .flatMap { batch -> attachmentDao.findForMessages(batch) }
+                        .groupBy { it.messageId }
+                        .mapValues { (_, list) -> list.map { it.toDomain() } }
+                } else emptyMap()
+            val messages = rows.map { entity ->
+                entity.toDomain(attachmentsByMessage[entity.id].orEmpty())
+            }
+            Triple(inVault, messages, hasMoreOlder)
+        }.flowOn(io)
+
+        // Assemblage seulement : une ré-émission des stats ne coûte plus qu'une data class.
+        return combine(
+            mapped,
+            messageDao.observeStatsForConversation(conversationId).distinctUntilChanged(),
+            appLock.state,
+            vaultSession.unlocked,
+        ) { (inVault, messages, hasMoreOlder), stats, lockState, vaultOpen ->
+            // v1.26.1 (audit H1) — même condition que [observeOne] et [observeMessages].
+            if (inVault && (lockState is AppLockManager.LockState.PanicDecoy || !vaultOpen)) {
+                MessageWindow()
+            } else {
+                MessageWindow(
+                    messages = messages,
+                    totalCount = stats.total,
+                    hasMore = hasMoreOlder ?: (messages.size < stats.total),
+                    firstMessageAt = stats.firstAt,
+                    lastMessageAt = stats.lastAt,
+                )
+            }
+        }
+    }
+
+    /**
+     * Feedback round 5 — full-history thread search. Same vault gate as
+     * [observeMessagesWindow]: a hidden conversation yields no ids. The LIKE
+     * pattern is built here (a SQL concern, not the caller's): the query wrapped
+     * in `%…%` after escaping its wildcards.
+     */
+    override fun observeSearchInConversation(
+        conversationId: Long,
+        query: String,
+    ): Flow<List<Long>> {
+        if (query.isBlank()) return flowOf(emptyList())
+        val inVaultFlow = conversationDao.observeById(conversationId)
+            .map { it?.inVault == true }
+            .distinctUntilChanged()
+        val pattern = "%${escapeLikePattern(query)}%"
+        return combine(
+            inVaultFlow,
+            messageDao.observeSearchIdsInConversation(conversationId, pattern),
+            appLock.state,
+            vaultSession.unlocked,
+        ) { inVault, ids, lockState, vaultOpen ->
+            if (inVault && (lockState is AppLockManager.LockState.PanicDecoy || !vaultOpen)) {
+                emptyList()
+            } else {
+                ids
+            }
+        }.flowOn(io)
+    }
+
+    override fun observeUnreadConversationCount(): Flow<Int> =
+        conversationDao.observeUnreadConversationCount().flowOn(io)
+
+    /** Nom de contact d'une adresse, assaini (Bidi/invisibles) ; `null` si inconnu ou illisible. */
+    private suspend fun nomDuContact(adresse: PhoneAddress): String? =
+        runCatching { contactRepo.lookupByPhone(adresse.raw)?.displayName }
+            .getOrNull()
+            ?.stripInvisibleChars()
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+
+    /**
+     * v1.28.3 (audit global, X-08) — titre d'un groupe : les noms de ses membres, un numéro brut
+     * pour chaque inconnu ; `null` si aucun n'est un contact, l'écran retombe alors sur les numéros.
+     * Même règle que `ConversationMirror.nomDeGroupe`, pour les groupes créés à la réception.
+     */
+    private suspend fun nomDeGroupe(addresses: List<PhoneAddress>): String? =
+        com.relay.sms.domain.model.GroupTitle.of(addresses.map { a -> a.raw to nomDuContact(a) })
+
+    /**
+     * Audit A10: wraps the read-modify-write in a single Room transaction so two concurrent
+     * `findOrCreate` calls for the same canonical CSV cannot create two separate rows.
+     */
+    override suspend fun findOrCreate(addresses: List<PhoneAddress>): Outcome<Conversation> = withContext(io) {
+        if (addresses.isEmpty()) return@withContext Outcome.Failure(AppError.Validation("empty addresses"))
+        // Client mode C3 — a linked device never creates a conversation
+        // locally: the hub owns the thread. Local first (no round-trip
+        // for a thread that already exists), `create_conversation`
+        // only for a genuinely new one — and unnamed here: the compose
+        // flow, which carries the group name, calls the gateway
+        // directly.
+        if (clientActions.isClientMode()) return@withContext findOrCreateClient(addresses)
+        val csv = canonicalCsv(addresses)
+        // v1.12.0 — resolve le displayName AVANT la transaction Room pour le
+        // cas single-recipient (parcours classique ComposeScreen).
+        //
+        // v1.28.3 (audit global, X-08 — mesuré sur le S9) — et pour un GROUPE aussi, désormais :
+        // la version précédente gardait `null` en affirmant que « le rendu UI joint les noms
+        // côté présentation ». Il joignait les NUMÉROS (`addresses.joinToString { it.raw }`),
+        // et un groupe s'affichait comme une suite de chiffres. Le titre est la liste des noms
+        // des membres, numéro brut pour un inconnu — cf. [nomDeGroupe].
+        //
+        // Lookup hors-transaction pour ne pas tenir le verrou Room pendant
+        // l'appel `ContentResolver` (qui peut bloquer ~5-30 ms si la base
+        // contacts est froide). En cas d'échec (READ_CONTACTS révoqué,
+        // contact inexistant), `displayName` reste null et l'UI tombera
+        // gracieusement sur `addresses.joinToString { it.raw }` — comportement
+        // pré-v1.12.0 préservé.
+        //
+        // v1.12.0 audit B2 — sanitization Bidi/invisible via
+        // `stripInvisibleChars()` (helper existant) : neutralise les
+        // caractères RLO/LRO/ZWJ/BOM qui pourraient être présents dans un
+        // nom de contact vCard importé. Sans ça, un nom avec U+202E pourrait
+        // inverser le rendu du TopAppBar ThreadScreen.
+        val resolvedDisplayName: String? = if (addresses.size == 1) {
+            nomDuContact(addresses[0])
+        } else {
+            nomDeGroupe(addresses)
+        }
+
+        val id = database.withTransaction {
+            val existing = conversationDao.findByAddressesCsv(csv)
+            if (existing != null) {
+                // v1.12.0 audit B1 — back-fill displayName si la conv existe
+                // déjà mais avec displayName null/blanc ET qu'on vient d'en
+                // résoudre un. Sans ça, les conv créées avant v1.12.0 (où le
+                // resolve n'était pas fait) gardent leur numéro brut même
+                // après ré-ouverture via ComposeScreen.
+                if (existing.displayName.isNullOrBlank() && !resolvedDisplayName.isNullOrBlank()) {
+                    conversationDao.setDisplayName(existing.id, resolvedDisplayName)
+                }
+                existing.id
+            } else {
+                // Fix doublon "Nouvelle conversation" — AVANT de créer une nouvelle
+                // conversation, on rejoue le fallback par clé numérique déjà éprouvé côté
+                // [ConversationMirror.ensureConversation]. Sans lui, composer un message
+                // vers un contact dont le numéro est stocké au format national
+                // (`06 12 34 56 78`) alors qu'une conversation existe déjà au format
+                // international (`+33612345678`, tel que reçu du système) ne matchait PAS
+                // l'égalité stricte du CSV (`findByAddressesCsv` compare la forme brute) →
+                // une 2ᵉ conversation était créée pour le même correspondant.
+                // Restreint aux 1-to-1, mêmes garde-fous que le mirror : deux participants
+                // partiels d'un groupe ne doivent jamais être rapprochés par suffixe.
+                val suffixMatch = if (addresses.size == 1) {
+                    matchOneToOneByBlockKey(
+                        conversationDao.snapshotOneToOneConversations(),
+                        addresses.first(),
+                        phoneIdentity.snapshot()::matches,
+                    )
+                } else {
+                    // v1.28.4 — le jumeau pour les groupes, cf. [matchGroupByIdentity].
+                    matchGroupByIdentity(
+                        conversationDao.snapshotGroupConversations(),
+                        addresses,
+                        phoneIdentity.snapshot()::matches,
+                    )
+                }
+
+                if (suffixMatch != null) {
+                    if (suffixMatch.displayName.isNullOrBlank() && !resolvedDisplayName.isNullOrBlank()) {
+                        conversationDao.setDisplayName(suffixMatch.id, resolvedDisplayName)
+                    }
+                    suffixMatch.id
+                } else {
+                    // v1.28.3 (F01) — `threadId = null` et non plus `0L`. C'est le chemin
+                    // reproduit sur émulateur par la relecture externe : deux conversations
+                    // créées depuis le composeur, la seconde effaçait la première et son
+                    // brouillon. Ici la perte était DÉFINITIVE, rien n'existant côté système.
+                    conversationDao.insert(
+                        ConversationEntity(
+                            threadId = null,
+                            addressesCsv = csv,
+                            displayName = resolvedDisplayName,
+                            lastMessageAt = System.currentTimeMillis(),
+                            lastMessagePreview = null,
+                            unreadCount = 0,
+                        ),
+                    )
+                }
+            }
+        }
+        Outcome.Success(requireNotNull(conversationDao.findById(id)?.toDomain()))
+    }
+
+    /**
+     * Client mode C3 — find-or-create on a linked device: a local
+     * conversation is opened without a round-trip (the inline-reply
+     * path depends on this not creating anything); only a genuinely
+     * new conversation sends `create_conversation`.
+     */
+    private suspend fun findOrCreateClient(addresses: List<PhoneAddress>): Outcome<Conversation> {
+        findLocalByAddresses(addresses)?.let { return Outcome.Success(it.toDomain()) }
+        return when (val created = clientActions.createConversation(addresses.map { it.raw }, null)) {
+            is Outcome.Success -> {
+                val row = conversationDao.findById(created.value)
+                    ?: return Outcome.Failure(AppError.NotFound("conversation"))
+                Outcome.Success(row.toDomain())
+            }
+            is Outcome.Failure -> created
+        }
+    }
+
+    /**
+     * Client mode C3 — the local-first match for [findOrCreateClient]:
+     * the same three matchers the hub path replays inside its
+     * transaction (canonical CSV, 1:1 suffix, group identity), without
+     * the display-name back-fill (a synced row's display name is the
+     * hub's to own).
+     */
+    private suspend fun findLocalByAddresses(addresses: List<PhoneAddress>): ConversationEntity? {
+        val csv = canonicalCsv(addresses)
+        conversationDao.findByAddressesCsv(csv)?.let { return it }
+        return if (addresses.size == 1) {
+            matchOneToOneByBlockKey(
+                conversationDao.snapshotOneToOneConversations(),
+                addresses.first(),
+                phoneIdentity.snapshot()::matches,
+            )
+        } else {
+            matchGroupByIdentity(
+                conversationDao.snapshotGroupConversations(),
+                addresses,
+                phoneIdentity.snapshot()::matches,
+            )
+        }
+    }
+
+    /** Canonical CSV: addresses sorted by normalized value so reordering does not duplicate threads. */
+    private fun canonicalCsv(addresses: List<PhoneAddress>): String =
+        addresses.sortedBy { it.normalized }.toCsv()
+
+    companion object {
+        /**
+         * Feedback round 6 — batch size for window-scoped attachment fetches
+         * (see [findForMessages]). SQLite caps the bound variables per
+         * statement (999 on older builds); a window grown by repeated "load
+         * older" pages can hold more ids than that, so the caller chunks.
+         * 500 stays safely under the cap with room for the rest of the query.
+         */
+        private const val ATTACHMENT_FETCH_BATCH_SIZE: Int = 500
+        /**
+         * Rapprochement d'une conversation 1-to-1 par la clé numérique canonique [blockKey]
+         * (9 chiffres significatifs). Extrait ici en fonction pure (aucune dépendance Room)
+         * pour être testable en JVM et appelé depuis [findOrCreate] : quand l'égalité stricte
+         * du CSV échoue (`06 12 34 56 78` composé vs `+33612345678` stocké), ce fallback
+         * réunit les deux formes du même numéro et évite un doublon de conversation.
+         *
+         * v1.27.2 (audit externe 2026-08-04 #1) — `phoneSuffix8()` amputait le chiffre qui
+         * sépare un `06…` d'un `07…` : `0612345678` et `0712345678` — deux personnes
+         * différentes — partageaient leur clé de 8 chiffres. Composer vers la seconde ouvrait
+         * la conversation de la première, et le message rédigé partait au mauvais
+         * destinataire. Le jumeau réception avait été corrigé en v1.26.1 (audit H13, cf.
+         * [ConversationMirror.ensureConversation]) ; ce côté composition ne l'avait pas été.
+         * Même clé, même seuil, même garde numérique que le mirror désormais.
+         *
+         * Le seuil [CONV_MATCH_MIN_DIGITS] (partagé avec le mirror) écarte les codes courts
+         * (services, 3xxx), trop peu discriminants pour un rapprochement par suffixe. La
+         * garde tout-chiffres écarte les libellés alphanumériques, que `blockKey()` rend en
+         * minuscules AVEC leurs lettres. L'appelant restreint déjà aux 1-to-1 ; on ne
+         * rapproche jamais deux groupes par suffixe.
+         */
+        /**
+         * v1.28.4 — **un groupe se reconnaît à ses membres, pas à l'écriture de leurs numéros.**
+         *
+         * Mesuré sur le S24 : le groupe créé depuis le composeur (`0617…;0698…`) et le même
+         * groupe reconstitué depuis un PDU reçu (`+33617…;+33698…`) faisaient deux conversations.
+         * Règle stricte, sans le risque du suffixe partiel que le miroir redoutait : MÊME nombre
+         * de membres, et chaque membre rapproché par la règle d'identité (E.164 quand possible),
+         * dans les deux sens. Un sous-ensemble n'est pas un groupe.
+         */
+        internal fun matchGroupByIdentity(
+            groups: List<ConversationEntity>,
+            target: List<PhoneAddress>,
+            matches: (String, String) -> Boolean,
+        ): ConversationEntity? {
+            if (target.size < 2) return null
+            return groups.firstOrNull { existing ->
+                val membres = PhoneAddress.list(existing.addressesCsv)
+                membres.size == target.size &&
+                    target.all { t -> membres.any { m -> matches(m.raw, t.raw) } } &&
+                    membres.all { m -> target.any { t -> matches(m.raw, t.raw) } }
+            }
+        }
+
+        /**
+         * v1.28.10 — le jumeau « moins un » de [matchGroupByIdentity] : la cible porte
+         * l'utilisateur lui-même (« Mon numéro » non renseigné), donc le groupe cherché a
+         * exactement un membre de moins que la cible, et chacun de ses membres se retrouve dans
+         * la cible. L'adresse en trop dans la cible, c'est nous. Même nombre de membres moins un
+         * et inclusion dans un seul sens suffisent : avec un membre d'écart, l'inclusion implique
+         * l'égalité à un membre près. Deux groupes ne différant que d'un membre restent ambigus
+         * (le premier trouvé gagne) — un cas rare, et la conversation individuelle, l'ancien
+         * repli, était strictement pire.
+         */
+        internal fun matchGroupByIdentityMinusOne(
+            groups: List<ConversationEntity>,
+            target: List<PhoneAddress>,
+            matches: (String, String) -> Boolean,
+        ): ConversationEntity? {
+            if (target.size < 3) return null
+            return groups.firstOrNull { existing ->
+                val membres = PhoneAddress.list(existing.addressesCsv)
+                membres.size == target.size - 1 &&
+                    membres.all { m -> target.any { t -> matches(m.raw, t.raw) } }
+            }
+        }
+
+        internal fun matchOneToOneByBlockKey(
+            oneToOne: List<ConversationEntity>,
+            target: PhoneAddress,
+            // v1.27.2 (audit Codex, C-07) — le comparateur est INJECTE : la regle a besoin de la
+            // region de la SIM, que cette fonction pure ne peut pas resoudre elle-meme.
+            matches: (String, String) -> Boolean,
+        ): ConversationEntity? {
+            val targetKey = target.raw.stripMmsAddressSuffix().blockKey()
+            if (targetKey.length < CONV_MATCH_MIN_DIGITS ||
+                !targetKey.all { it.isDigit() }
+            ) {
+                return null
+            }
+            // v1.27.2 (audit Codex du 2026-08-05, P-11) — le seau `blockKey` ne suffit pas :
+            // `+33 6 12 34 56 78` et `+1 561 234 5678` rendent la même clé de neuf chiffres, et le
+            // repli ouvrait alors la conversation du premier pour un message destiné au second.
+            // [phoneAddressesMatch] ajoute la désambiguïsation par indicatif pays.
+            return oneToOne.firstOrNull { conv ->
+                val convRaw = PhoneAddress.list(conv.addressesCsv).firstOrNull()?.raw
+                convRaw != null && matches(convRaw, target.raw)
+            }
+        }
+    }
+
+    override suspend fun setPinned(id: Long, pinned: Boolean) {
+        withContext(io) {
+            // Client mode C3 — optimistic local change, then the `set_pin`
+            // frame; the sender reverts on `ok:false` (the hub is
+            // authoritative). No revert is run here: the sender owns it.
+            if (clientActions.isClientMode()) {
+                val previous = conversationDao.findById(id)?.pinned
+                conversationDao.setPinned(id, pinned)
+                clientActions.sendAction(ClientAction.SetPin(id, pinned)) {
+                    if (previous != null) conversationDao.setPinned(id, previous)
+                }
+            } else {
+                conversationDao.setPinned(id, pinned)
+            }
+        }
+    }
+    override suspend fun setArchived(id: Long, archived: Boolean) {
+        withContext(io) {
+            // Client mode C3 — same optimistic + `set_archived` frame pattern as [setPinned].
+            if (clientActions.isClientMode()) {
+                val previous = conversationDao.findById(id)?.archived
+                conversationDao.setArchived(id, archived)
+                clientActions.sendAction(ClientAction.SetArchived(id, archived)) {
+                    if (previous != null) conversationDao.setArchived(id, previous)
+                }
+            } else {
+                conversationDao.setArchived(id, archived)
+            }
+        }
+    }
+    override suspend fun setMuted(id: Long, muted: Boolean) {
+        withContext(io) {
+            // Client mode C3 — same optimistic + `set_muted` frame pattern as [setPinned].
+            if (clientActions.isClientMode()) {
+                val previous = conversationDao.findById(id)?.muted
+                conversationDao.setMuted(id, muted)
+                clientActions.sendAction(ClientAction.SetMuted(id, muted)) {
+                    if (previous != null) conversationDao.setMuted(id, previous)
+                }
+            } else {
+                conversationDao.setMuted(id, muted)
+            }
+        }
+    }
+    override suspend fun setPinnedMessage(id: Long, messageId: Long?, pinnedAt: Long?) {
+        withContext(io) {
+            // Client mode C3 — optimistic local pin, then the
+            // `set_pinned_message` frame (unpin sends a null message id);
+            // the sender reverts on `ok:false`.
+            if (clientActions.isClientMode()) {
+                val row = conversationDao.findById(id)
+                val previousId = row?.pinnedMessageId
+                val previousAt = row?.pinnedMessageAt
+                conversationDao.setPinnedMessage(id, messageId, pinnedAt)
+                clientActions.sendAction(ClientAction.SetPinnedMessage(id, messageId)) {
+                    conversationDao.setPinnedMessage(id, previousId, previousAt)
+                }
+            } else {
+                conversationDao.setPinnedMessage(id, messageId, pinnedAt)
+            }
+        }
+    }
+
+    override suspend fun findById(id: Long): Conversation? = withContext(io) {
+        conversationDao.findById(id)?.toDomain()
+    }
+
+    // v1.14.8 R8 — Bulk move atomique : wrap dans `database.withTransaction` pour qu'un
+    // process-kill au milieu de la boucle laisse la base intacte (rollback) plutôt qu'un
+    // état partiel non-récupérable. Retourne le count effectivement modifié.
+    override suspend fun bulkMoveToVault(ids: List<Long>, inVault: Boolean): Int = withContext(io) {
+        if (ids.isEmpty()) return@withContext 0
+        database.withTransaction {
+            var n = 0
+            for (id in ids) {
+                conversationDao.setInVault(id, inVault)
+                n++
+            }
+            n
+        }
+    }
+    override suspend fun setDraft(id: Long, draft: String?) = withContext(io) { conversationDao.setDraft(id, draft) }
+    override suspend fun setCustomName(id: Long, name: String?) = withContext(io) {
+        conversationDao.setCustomName(id, name)
+    }
+
+    /**
+     * Round 44 — self-heal for a stale cached display name (see
+     * [ConversationRepository.clearStaleDisplayName]). The gates,
+     * in order: client mode never clears (the name came from the
+     * hub; the local synced-contacts cache is not authoritative
+     * for "no contact"); then the lookup must definitively miss —
+     * permission granted, provider answered, no contact. A denied
+     * permission also reads as "no contact", so it must never
+     * clear: [lookupDefinitivelyMisses] owns that distinction.
+     */
+    override suspend fun clearStaleDisplayName(conversationId: Long, address: String): Unit =
+        withContext(io) {
+            if (clientActions.isClientMode()) return@withContext
+            if (lookupDefinitivelyMisses(address)) {
+                conversationDao.setDisplayName(conversationId, null)
+            }
+        }
+
+    /**
+     * Round 44 — true only when a lookup the provider could
+     * actually answer came back empty. A denied permission
+     * returns false (a miss the provider never got to answer is
+     * not evidence), and a `SecurityException` between the check
+     * and the lookup — revoked mid-flight — is the same "cannot
+     * verify", never a clear.
+     */
+    private suspend fun lookupDefinitivelyMisses(address: String): Boolean {
+        if (!contactRepo.hasContactsPermission()) return false
+        return try {
+            contactRepo.lookupByPhone(address) == null
+        } catch (e: SecurityException) {
+            // The log carries the exception TYPE only, never its
+            // message: a provider error message can embed contact
+            // data, and contact data never reaches the log.
+            Timber.d("ConversationRepositoryImpl: stale-name lookup denied (%s)", e.javaClass.simpleName)
+            false
+        }
+    }
+
+    override suspend fun setAppearance(id: Long, bubbleColorArgb: Int?, avatarUri: String?) =
+        withContext(io) {
+            // v1.11.0 audit S5 — whitelist `content://` pour avatar_uri.
+            // PickVisualMedia ne retourne que ce scheme par contrat Android,
+            // mais on défend en profondeur : un bug futur ou un test qui
+            // passerait `file://` ou `http://` serait neutralisé ici (Coil
+            // chargerait sinon depuis fichier local ou réseau → fuite ou
+            // path traversal). null reste valide (= reset).
+            val safeAvatarUri = avatarUri?.takeIf { uri ->
+                val scheme = android.net.Uri.parse(uri).scheme?.lowercase()
+                scheme == "content"
+            }
+            conversationDao.setAppearance(id, bubbleColorArgb, safeAvatarUri)
+        }
+    override suspend fun markRead(id: Long) = withContext(io) {
+        // Client mode C3 — never touch `content://sms` here: this
+        // device is not the messaging device. The unread ids are
+        // captured BEFORE the mark, so a refused frame restores the
+        // exact unread set (the hub is authoritative, but a refused
+        // mark must not silently clear the badge). Local notifications
+        // are still cancelled: they are this device's own.
+        if (clientActions.isClientMode()) {
+            val unreadIds = messageDao.findUnreadIds(id)
+            database.withTransaction {
+                messageDao.markConversationRead(id)
+                conversationDao.clearUnread(id)
+            }
+            clientActions.sendAction(ClientAction.MarkRead(id)) {
+                database.withTransaction {
+                    for (messageId in unreadIds) messageDao.setRead(messageId, false)
+                    conversationDao.recomputeUnreadCount(id)
+                }
+            }
+            notifier.cancelAllForConversation(id)
+            return@withContext
+        }
+        // v1.26.1 (audit B3) — les deux écritures Room sont ATOMIQUES. Une mort du processus
+        // entre elles laissait `unread_count > 0` alors que tous les messages étaient marqués
+        // lus : badge fantôme. C'était rattrapé au démarrage suivant par
+        // `recomputeAllUnreadCounts`, d'où la sévérité basse — mais le rattrapage n'est pas une
+        // raison de laisser deux écritures liées se désynchroniser.
+        database.withTransaction {
+            messageDao.markConversationRead(id)
+            conversationDao.clearUnread(id)
+        }
+        // v1.8.0 (post-audit fix badges après désinstallation) — propage
+        // `READ=1` côté `content://sms` + `content://mms` pour les messages
+        // incoming de cette conversation. Récupère le `threadId` système
+        // depuis Room (ConversationEntity.threadId stocke le mapping AOSP).
+        // Wrapped en runCatching pour ne pas bloquer le markRead Room si le
+        // content provider est indisponible (panic mode, ROM custom).
+        runCatching {
+            val systemThreadId = conversationDao.findThreadIdById(id)
+            if (systemThreadId != null && systemThreadId > 0L) {
+                telephonyReader.markConversationReadInSystem(systemThreadId)
+            }
+        }
+        // v1.3.3 bug #6 — efface aussi les notifications encore affichées dans la
+        // barre système pour cette conversation. Sans ça, ouvrir une thread depuis l'app
+        // (et non depuis la notif elle-même) laissait les notifs s'accumuler dans le
+        // shade. `cancelAllForConversation` itère sur les notifs actives filtrées par
+        // groupe `com.relay.sms.conv.<id>`.
+        notifier.cancelAllForConversation(id)
+    }
+
+    override suspend fun markUnread(id: Long) = withContext(io) {
+        // Long-press "Mark unread" (desktop parity). Unread is
+        // DERIVED — `unread_count` is recomputed from incoming
+        // `read = 0` rows — so the durable mark flips the latest
+        // incoming message back to unread and recomputes: the
+        // badge shows 1 and survives the cold-start recompute.
+        // A conversation with no incoming message
+        // (outgoing-only) has nothing to flip, so the count is
+        // set directly — that mark lasts only until the next
+        // recompute, the honest limit of a count with no message
+        // behind it.
+        //
+        // Same write in both modes: in client mode this is LOCAL
+        // ONLY — no mark-unread frame exists (protocol gap), so
+        // the hub never learns of it and a `conversation_updated`
+        // or re-sync may reset it. Deliberate, not an oversight.
+        //
+        // Room-only, never the system store: unlike mark-read
+        // (which propagates READ=1 so a badge can't resurrect
+        // after a reinstall), an unread mark is Relay-local state
+        // like a pin or a reaction — lost on reinstall, invisible
+        // to other SMS apps. And no notification is (re-)posted:
+        // the mark is silent by design.
+        database.withTransaction {
+            val latest = messageDao.findLatestIncomingId(id)
+            if (latest != null) {
+                messageDao.setRead(latest, false)
+                conversationDao.recomputeUnreadCount(id)
+            } else {
+                conversationDao.setUnreadCount(id, 1)
+            }
+        }
+    }
+
+    // v1.14.8 H4 — Implémentation centralisée de "tout marquer comme lu". Encapsule la séquence
+    // Room (markAllIncomingAsRead + recomputeAllUnreadCounts) + propagation content://sms+mms
+    // pour que le badge ne ré-apparaisse pas après désinstall/reinstall. Avant : la VM
+    // orchestrait elle-même en injectant 2 DAOs + le TelephonyReader (layer violation).
+    override suspend fun markAllRead() = withContext(io) {
+        // Client mode C3 — no system propagation (this device owns no
+        // `content://sms` rows) and no revert: the hub always answers
+        // `ok:true` for `mark_all_read`, and the next sync re-aligns
+        // the counts anyway. An offline frame leaves the local mark
+        // in place until that sync.
+        if (clientActions.isClientMode()) {
+            runCatching {
+                database.withTransaction {
+                    messageDao.markAllIncomingAsRead()
+                    conversationDao.recomputeAllUnreadCounts()
+                }
+            }.onFailure { Timber.w(it, "markAllRead: local mark failed") }
+            clientActions.sendAction(ClientAction.MarkAllRead)
+            return@withContext
+        }
+        // v1.26.1 (audit B3) — les deux écritures ROOM sont atomiques ; l'écriture SYSTÈME reste
+        // en dehors, et c'est délibéré : elle passe par un ContentProvider tiers, donc ni
+        // transactionnable avec Room ni fiable (indisponible en mode panique, ROM custom). La
+        // faire échouer ne doit pas annuler le marquage local, qui est ce que l'utilisateur voit.
+        runCatching {
+            database.withTransaction {
+                messageDao.markAllIncomingAsRead()
+                conversationDao.recomputeAllUnreadCounts()
+            }
+        }.onFailure { Timber.w(it, "markAllRead: local mark failed") }
+        runCatching { telephonyReader.markAllIncomingReadInSystem() }
+            .onFailure { Timber.w(it, "markAllRead: system propagation failed") }
+        Unit
+    }
+
+    override suspend fun delete(id: Long): com.relay.sms.domain.repository.ConversationDeleteResult =
+        withContext(io) {
+            // Suppression ordinaire : la ligne locale part meme si la copie systeme resiste — voir
+            // [ConversationEraser.erase] pour la raison, et pour ce qui differe cote coffre.
+            // v1.28.9 (septième note d'Andrew, point 5) — sauf pour une conversation du COFFRE,
+            // conservée sur tout échec : voir [ConversationEraser.supprimer].
+            eraser.supprimer(id)
+        }
+
+    override suspend fun deleteAllInVault(
+        force: Boolean,
+        apresPurge: suspend (VaultPurgeResult) -> Unit,
+    ): VaultPurgeResult = withContext(io) {
+        eraser.purgeVault(force, apresPurge)
+    }
+
+    /** v1.26.1 (audit F2) — voir [ConversationRepository.setMessageStarred]. */
+    override suspend fun setMessageStarred(messageId: Long, starred: Boolean) = withContext(io) {
+        messageDao.setStarred(messageId, starred)
+    }
+
+    override suspend fun deleteMessage(messageId: Long) = withContext(io) {
+        // v1.28.5 (audit de coherence C1) — meme chemin que [delete] : l'effaceur emporte la
+        // copie systeme ET les fichiers de pieces jointes, que la cascade Room laissait en clair.
+        eraser.eraseMessage(messageId)
+        // Feedback round 5 — si le message effacé était celui épinglé du fil,
+        // l'épingle part avec lui (la bannière ne doit pas survivre à son message).
+        conversationDao.clearPinnedMessageIfMessage(messageId)
+    }
+
+    override suspend fun setReaction(messageId: Long, emoji: String?): SetReactionResult =
+        withContext(io) {
+            // v1.3.0 audit Q1 — passe par le repo (cohérence pattern domain/data) plutôt
+            // que de laisser le ViewModel toucher directement au DAO. Audit F4 — court-
+            // circuit no-op si la valeur est déjà la même : évite le churn FTS4
+            // (DELETE+INSERT trigger pour `body` et `address` à chaque tap, alors que ces
+            // colonnes ne changent pas) et évite un round-trip Flow inutile. `findById` est
+            // suspend + indexé sur PRIMARY KEY, négligeable.
+            //
+            // v1.3.1 — retourne un [SetReactionResult] explicite pour que le ViewModel puisse
+            // décider d'envoyer un SMS au correspondant (cas [First] uniquement) sans avoir à
+            // re-lire la DB. La transition est calculée AVANT l'update afin que l'ordre
+            // d'exécution soit déterministe et qu'un retry suite à exception ne fasse pas
+            // double-envoi côté caller.
+            //
+            // Client mode C3 — the optimistic badge goes out with a
+            // `set_reaction` frame instead of a Tapback SMS. Offline
+            // (or an unresolvable id) returns [SetReactionResult.Noop]:
+            // the sender already reverted the badge, so the ViewModel
+            // must NOT dispatch a reaction SMS for a reaction that is
+            // no longer set.
+            val current = messageDao.findById(messageId) ?: return@withContext SetReactionResult.Noop
+            val previous = current.reactionEmoji
+            if (previous == emoji) return@withContext SetReactionResult.Noop
+            messageDao.setReaction(messageId, emoji)
+            if (clientActions.isClientMode()) {
+                val sent = clientActions.sendAction(
+                    ClientAction.SetReaction(current.conversationId, messageId, emoji),
+                ) { messageDao.setReaction(messageId, previous) }
+                return@withContext if (sent) {
+                    reactionTransition(previous, emoji, messageId)
+                } else {
+                    SetReactionResult.Noop
+                }
+            }
+            reactionTransition(previous, emoji, messageId)
+        }
+
+    /**
+     * The [SetReactionResult] for a badge change from [previous] to
+     * [emoji] — shared by the hub path and the client-mode write-back
+     * branch, so the two can never disagree about what a tap means.
+     */
+    private fun reactionTransition(previous: String?, emoji: String?, messageId: Long): SetReactionResult =
+        when {
+            previous == null && emoji != null -> SetReactionResult.First(messageId, emoji)
+            previous != null && emoji == null -> SetReactionResult.Removed
+            previous != null && emoji != null -> SetReactionResult.Changed(previous, emoji)
+            else -> SetReactionResult.Noop // unreachable (couvert par le check d'égalité)
+        }
+
+    override suspend fun countMessagesToPurge(olderThanDays: Int): Int = withContext(io) {
+        if (olderThanDays <= 0) return@withContext 0
+        val cutoff = purgeCutoffMs(olderThanDays)
+        messageDao.countOlderThan(cutoff)
+    }
+
+    override suspend fun purgeHistoryNow(olderThanDays: Int): Int = withContext(io) {
+        if (olderThanDays <= 0) return@withContext 0
+        // v1.28.1 — la recette vit desormais en UN seul endroit, partage avec le cycle mensuel de
+        // `TelephonySyncWorker` qui la reecrivait a l'identique. Elle propage aussi au fournisseur
+        // du systeme, ce qu'elle ne faisait pas : voir [ConversationEraser.purgeHistory].
+        eraser.purgeHistory(purgeCutoffMs(olderThanDays))
+    }
+
+    // v1.6.1 (audit QUAL-01) — `purgeCutoffMs` et `SAFETY_NET_DAYS` centralisés dans
+    // [com.relay.sms.domain.purge.PurgePolicy]. Tous les call sites passent par là.
+
+    override fun observeMessageSearch(query: String, archivedOnly: Boolean): Flow<List<MessageSearchHit>> {
+        val requete = requeteRecherchable(query) ?: return flowOf(emptyList())
+        return messageDao.observeSearch(requete, archivedOnly)
+            .map { rows ->
+                if (rows.isEmpty()) return@map emptyList()
+                val conversations = conversationDao
+                    .findOutsideVaultByIds(rows.map { it.conversationId }.distinct())
+                    .map { it.toDomain() }
+                // Défense en profondeur, testée : cf. [apparierResultats].
+                apparierResultats(rows, conversations)
+            }
+            .flowOn(io)
+    }
+
+    override suspend fun findMessageById(id: Long): Message? = withContext(io) {
+        // v1.3.1 — lookup PRIMARY KEY, pas de jointure attachments (le caller actuel —
+        // SendReactionUseCase — n'en a pas besoin). Si un futur caller le demande, ajouter
+        // un overload `findMessageByIdWithAttachments`. Volontairement minimal pour rester
+        // O(1) sur la lecture la plus chaude (chaque tap réaction).
+        //
+        // v1.11.0 audit SEC-V1 — garde `inVault` : ce point d'entrée ne doit pas exposer un
+        // message dont la conversation parente est dans le coffre. Sans elle, un appelant
+        // futur (lien profond, intent, réaction sur un id résolu par une autre voie) pourrait
+        // lire le corps d'un message du coffre.
+        //
+        // ⚠️ v1.28.12 — elle masquait le coffre **INCONDITIONNELLEMENT**, y compris session
+        // ouverte, et c'était le seul des cinq accès à le faire. La règle est écrite partout
+        // ailleurs comme « masqué en leurre OU hors session » : [observeOne] ci-dessus,
+        // `observeMessages`, `ScheduledMessageRepositoryImpl`, `CorrespondentVisibilityPolicy`.
+        //
+        // Ce qu'elle coûtait, dans un coffre OUVERT, second facteur franchi :
+        //  - toute citation d'un message hors de la fenêtre chargée affichait « message
+        //    supprimé » sur un message qui existe — exactement le défaut que le correctif
+        //    v1.24.0 avait écrit pour empêcher, mais seulement hors coffre ;
+        //  - une réaction posait son badge local et **n'envoyait aucun SMS**, en silence.
+        //
+        // Le défaut avait déjà été constaté sur cet accesseur (X-09, v1.28.3) et corrigé sur
+        // UN SEUL de ses quatre appelants. Relevé par un audit de motifs le 2026-09-17 : c'est
+        // le motif dominant de ce dépôt, sur le même accesseur, une seconde fois.
+        //
+        // Aligner RENFORCE la garde en mode leurre — elle y devient explicite au lieu d'être
+        // couverte par hasard — et lève le masquage là où l'utilisateur a franchi son second
+        // facteur.
+        val entity = messageDao.findById(id) ?: return@withContext null
+        val parent = conversationDao.findById(entity.conversationId)
+        val coffreMasque = parent?.inVault == true && (
+            appLock.state.value is AppLockManager.LockState.PanicDecoy ||
+                !vaultSession.unlocked.value
+            )
+        if (coffreMasque) return@withContext null
+        entity.toDomain()
+    }
+
+    // Re-dispatch (retry) — lookup PRIMARY KEY SANS garde `inVault` : le renvoi ré-émet vers le
+    // destinataire d'origine sans jamais exposer le corps à l'UI, donc masquer un message de
+    // conversation coffre casserait le retry sans bénéfice de confidentialité. Cf. la garde
+    // délibérée de [findMessageById] pour les chemins visibles par l'utilisateur.
+    override suspend fun findMessageForResend(id: Long): Message? = withContext(io) {
+        messageDao.findById(id)?.toDomain()
+    }
+
+    // Slice 3 — lookup par clé d'idempotence, AVEC la garde `inVault` inconditionnelle des
+    // lectures de synchronisation : une conversation déplacée au coffre après l'envoi ne doit
+    // plus répondre à sa clé (le chemin d'envoi refuse le coffre avant d'arriver ici, donc un
+    // `null` ici ne peut pas provoquer de double envoi — il provoque un refus).
+    override suspend fun findMessageByClientMessageId(key: String): Message? = withContext(io) {
+        val entity = messageDao.findByClientMessageId(key) ?: return@withContext null
+        if (isVaultConversation(entity.conversationId)) return@withContext null
+        entity.toDomain()
+    }
+
+    // Slice 4 — thin DAO wrapper; the glue owns the membership +
+    // vault guard (message → conversation), so this stays a plain
+    // lookup.
+    override suspend fun findAttachmentById(id: Long): Attachment? = withContext(io) {
+        attachmentDao.findById(id)?.toDomain()
+    }
+
+    // Slice 2 — sync reads. All of them refuse vault conversations
+    // UNCONDITIONALLY: vault content never leaves the phone, even in
+    // an unlocked session (unlike the UI paths, which unmask once the
+    // second factor is passed). The `hidden = 0` filter lives in the
+    // DAO queries themselves.
+    override suspend fun messagesBefore(conversationId: Long, beforeId: Long, limit: Int): List<Message> =
+        withContext(io) {
+            if (isVaultConversation(conversationId)) return@withContext emptyList()
+            attachTo(messageDao.findBefore(conversationId, beforeId, limit))
+        }
+
+    override suspend fun messagesAfter(conversationId: Long, afterId: Long): List<Message> =
+        withContext(io) {
+            if (isVaultConversation(conversationId)) return@withContext emptyList()
+            attachTo(messageDao.findAfter(conversationId, afterId))
+        }
+
+    override suspend fun totalMessageCount(): Long = withContext(io) {
+        messageDao.countByConversation().sumOf { it.messageCount }.toLong()
+    }
+
+    override suspend fun messageCountsByConversation(): Map<Long, Int> = withContext(io) {
+        messageDao.countByConversation().associate { it.conversationId to it.messageCount }
+    }
+
+    override suspend fun maxMessageId(): Long = withContext(io) {
+        messageDao.maxId() ?: 0L
+    }
+
+    override fun observeMessageStates(ids: List<Long>): Flow<List<MessageState>> {
+        if (ids.isEmpty()) return flowOf(emptyList())
+        return messageDao.observeStates(ids)
+            .map { rows -> rows.map { it.toDomain() } }
+            .flowOn(io)
+    }
+
+    private suspend fun isVaultConversation(conversationId: Long): Boolean =
+        conversationDao.findById(conversationId)?.inVault == true
+
+    /**
+     * Slice 2 — joins attachments onto a page of message rows, the
+     * same bulk pattern as [observeMessages] but scoped to the page's
+     * ids ([AttachmentDao.findForMessages]) instead of the whole
+     * conversation. Pages are capped at 200 rows, well under SQLite's
+     * bound-variable cap for a single `IN` list.
+     */
+    private suspend fun attachTo(rows: List<MessageEntity>): List<Message> {
+        if (rows.isEmpty()) return emptyList()
+        val needAttachments = rows.any { it.attachmentsCount > 0 }
+        val byMessage: Map<Long, List<Attachment>> =
+            if (needAttachments) {
+                attachmentDao.findForMessages(rows.map { it.id })
+                    .groupBy { it.messageId }
+                    .mapValues { (_, list) -> list.map { it.toDomain() } }
+            } else {
+                emptyMap()
+            }
+        return rows.map { it.toDomain(byMessage[it.id].orEmpty()) }
+    }
+
+    // v1.6.1 (audit QUAL-01) — SAFETY_NET_DAYS centralisé dans
+    // [com.relay.sms.domain.purge.PurgePolicy]. Plus de companion local nécessaire.
+}
+
+/**
+ * Feedback round 5 — one emission of the window query: the loaded rows plus,
+ * for an anchored window, whether older messages exist past the anchor
+ * (`null` for the tail window, which answers that from the stats instead).
+ */
+private data class WindowRows(
+    val rows: List<MessageEntity>,
+    val hasMoreOlder: Boolean?,
+)

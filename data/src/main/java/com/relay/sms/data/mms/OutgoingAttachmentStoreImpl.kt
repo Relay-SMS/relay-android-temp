@@ -1,0 +1,128 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.data.mms
+
+import android.content.Context
+import com.relay.sms.core.mms.MmsConstants
+import com.relay.sms.domain.mms.OutgoingAttachmentStore
+import dagger.hilt.android.qualifiers.ApplicationContext
+import timber.log.Timber
+import java.io.File
+import java.util.UUID
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Promotes an outgoing MMS attachment from its **volatile** staging cache into the app's
+ * **durable** attachment store just before the message is committed to Room + dispatched.
+ *
+ * **Why** : the UI stages user-picked media in `cacheDir/media_outgoing/` and recorded voice
+ * clips in `cacheDir/voice_mms/`. Those cache directories are intentionally prunable, swept by
+ * [com.relay.sms.system.scheduler.TelephonySyncWorker.pruneStaleOutboundCaches] (24 h) and by
+ * [com.relay.sms.security.purgerBrouillonsSortants] when the app goes to background.
+ *
+ * ⚠️ v1.28.12 (audit B1) — ce commentaire affirmait que ces dossiers ne tiennent que des
+ * *abandoned drafts* et qu'ils sont « wiped wholesale » à chaque cycle de verrouillage. C'était faux,
+ * et c'est cette phrase même qui a servi à justifier la purge en bloc côté `AutoLockObserver` : un
+ * brouillon VIVANT y vit aussi, tant que l'utilisateur n'a pas envoyé. La purge en bloc est
+ * désormais réservée au verrou réellement mordu ; sinon elle procède par âge.
+ *
+ * Once a message is **sent**, its `AttachmentEntity.localUri` keeps pointing at that same cache path,
+ * so the file it references gets deleted out from under the row — the bubble then renders an
+ * empty tile when the thread is reopened later (bug pré-existant depuis v1.2.3).
+ *
+ * Moving the file into `filesDir/mms_attachments/` — the exact same durable root the **inbound**
+ * path already uses (cf. [com.relay.sms.system.receiver.MmsDownloadedReceiver] `persistAttachment`,
+ * v1.14.7) — makes outgoing attachments survive identically to incoming ones: exempt from the
+ * cache pruners / lock purge, declared in `file_provider_paths.xml` for share/open, whitelisted by
+ * [MmsSystemWriteback] and [com.relay.sms.ui.components.MediaAttachmentBubble], and wiped only
+ * by [com.relay.sms.security.PanicService].
+ *
+ * Fail-open by design: if the move cannot complete (IO error, rename + copy both fail), we return
+ * the **original** staged file so the send still proceeds. The worst case then degrades to today's
+ * pre-existing behaviour for that one file — never worse.
+ */
+@Singleton
+class OutgoingAttachmentStoreImpl @Inject constructor(
+    @ApplicationContext private val context: Context,
+) : OutgoingAttachmentStore {
+
+    /**
+     * Moves [staged] into `filesDir/mms_attachments/` and returns the durable [File]. Idempotent
+     * for files already inside the durable root (returned unchanged). Returns [staged] untouched on
+     * any failure so the caller can still dispatch the MMS.
+     */
+    override fun promoteToDurable(staged: File): File {
+        val dir = File(context.filesDir, ATTACHMENTS_DIR)
+        // Already durable (e.g. re-entrancy) — nothing to do.
+        val canonicalDir = runCatching { dir.canonicalPath }.getOrNull()
+        val canonicalStaged = runCatching { staged.canonicalPath }.getOrNull()
+        if (canonicalDir != null && canonicalStaged != null &&
+            canonicalStaged.startsWith(canonicalDir + File.separator)
+        ) {
+            return staged
+        }
+        return try {
+            if (!dir.exists()) dir.mkdirs()
+            val ext = staged.extension.ifBlank { "bin" }
+            val target = File(dir, durableAttachmentFileName(staged.name, ext))
+            // Same partition (both under /data/data/<pkg>/), so rename normally succeeds; fall back
+            // to copy + delete for the rare cross-volume / locked-file case.
+            if (staged.renameTo(target)) {
+                target
+            } else {
+                staged.copyTo(target, overwrite = false)
+                runCatching { staged.delete() }
+                target
+            }
+        } catch (t: Throwable) {
+            Timber.w(t, "OutgoingAttachmentStore: promote failed for %s, keeping staged path", staged.name)
+            staged
+        }
+    }
+
+    internal companion object {
+        /**
+         * Durable attachment root (filesDir), shared with the inbound writer [EcrivainDePiecesSurDisque]
+         * (v1.28.9 — it replaces `MmsDownloadedReceiver.ATTACHMENTS_DIR`, gone with F17). MUST stay in sync
+         * with the `<files-path name="attachments" .../>` entry in `res/xml/file_provider_paths.xml`, and the
+         * wipe list in `PanicService.nukeEverything`.
+         */
+        const val ATTACHMENTS_DIR: String = "mms_attachments"
+    }
+}
+
+/**
+ * Round 33 follow-up — the durable filename for a promoted outgoing
+ * attachment. Same shape as before (`out-<timestamp>-<uuid>.<ext>`), with
+ * one addition: a staged name carrying the sticker marker keeps it —
+ * `sticker-out-<timestamp>-<uuid>.<ext>`.
+ *
+ * The promotion used to rename EVERYTHING to `out-…`, which stripped the
+ * marker a second time: even with the staged copy named `sticker-…`, the
+ * mirror would still have stored `out-…` and the Photos tab's filename
+ * arm would never fire. The marker must survive both renames — staging
+ * (`outgoingCacheFileName`) and promotion (here) — for the stored row to
+ * say "sticker". Desktop-sent stickers benefit too: their staged name is
+ * already `sticker-<position>.png`, so they now get the filename arm as
+ * well as the 512×512 dimensions arm that caught them until now.
+ *
+ * Extracted from [OutgoingAttachmentStoreImpl.promoteToDurable] to be
+ * testable without a `Context`, like `selecteurOutboxPossedee`.
+ */
+internal fun durableAttachmentFileName(stagedName: String, extension: String): String {
+    val ext = extension.ifBlank { "bin" }
+    val unique = "out-${System.currentTimeMillis()}-${UUID.randomUUID().toString().take(8)}"
+    val stickerPrefix = if (
+        stagedName.startsWith(MmsConstants.STICKER_FILENAME_PREFIX, ignoreCase = true)
+    ) {
+        MmsConstants.STICKER_FILENAME_PREFIX
+    } else {
+        ""
+    }
+    return "$stickerPrefix$unique.$ext"
+}

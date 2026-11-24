@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Controle des permissions du manifeste FUSIONNE release - il ECHOUE, il n'avertit pas.
+
+Ce que ce controle protege
+--------------------------
+Round 13 (2026-11-11) - INTERNET est de retour dans le manifeste, pour la
+recherche de GIF via Klipy et, depuis le round 17, les apercus de liens
+(voir PERMISSIONS.md, `data/.../klipy/KlipyClient.kt` et
+`data/.../linkpreview/LinkPreviewFetcher.kt`). Historique : en v1.28.13
+(MR F-Droid !38458,
+relecture de mezinster), INTERNET avait ete retiree - elle etait declaree
+« pour le transport MMS », alors que l'application n'ouvre aucune connexion :
+le service MMS d'Android, dans son propre processus, parle au MMSC de
+l'operateur. Ce qui ne change pas : le MMS ne passe toujours pas par cette
+permission, et aucune autre utilisation reseau n'est autorisee. La liste
+revue ci-dessous reste le garde-fou : une permission qui arrive par une
+dependance doit etre un acte delibere - l'ajouter a AUTORISEES ET a
+PERMISSIONS.md, ou retirer la dependance. Une promesse qu'aucune build ne
+verifie n'est qu'une intention - modele : tools/check-manifest-permissions.py
+d'Agenda Tech.
+
+Deux pieges que ce script evite
+-------------------------------
+1. Le manifeste SOURCE ne prouve rien : une dependance peut ajouter une permission a la fusion
+   (androidx.work apporte ACCESS_NETWORK_STATE, WAKE_LOCK, RECEIVE_BOOT_COMPLETED). Seul le manifeste
+   fusionne de la variante RELEASE dit ce que porte l'APK publie.
+2. `<uses-permission>` peut s'ecrire sur plusieurs lignes : un grep ligne a ligne ne le voit pas.
+   On lit le XML.
+
+Liste revue, pas seulement liste noire : une permission qui arrive par une dependance doit etre un
+acte delibere - l'ajouter a AUTORISEES ET a PERMISSIONS.md, ou retirer la dependance.
+
+Les exceptions au lint ProtectedPermissions, dans les manifestes SOURCE
+-----------------------------------------------------------------------
+Relecture de mezinster sur la 1.28.13 : le manifeste demandait BROADCAST_WAP_PUSH, une permission
+`signature` qu'aucune application installee par l'utilisateur n'obtient. Mesure sur le S9 le
+2026-10-04 : demandee, jamais accordee (`dumpsys package`). Le lint le signalait depuis la v1.2.0 ;
+un `tools:ignore="ProtectedPermissions"` le faisait taire, et PERMISSIONS.md la justifiait par un
+« appariement requis » qui n'existe pas - c'est l'attribut `android:permission` du RECEPTEUR qui
+compte, et il reste. Une exception a ce lint doit donc etre revue, comme une permission : elle figure
+dans PROTEGEES_REVUES avec sa mesure, ou la build echoue. Le manifeste fusionne ne porte plus les
+attributs `tools:`, d'ou la lecture des manifestes source.
+
+Usage
+-----
+    python3 .github/scripts/permissions-manifeste.py [manifeste]
+    python3 .github/scripts/permissions-manifeste.py --controle-negatif
+
+Code 0 si le manifeste correspond exactement a la liste revue et si chaque exception au lint
+ProtectedPermissions est revue, 1 sinon. Le contrôle negatif fabrique des manifestes fautifs et
+exige que chacun soit REFUSE : un controle qui ne peut pas echouer ne protege rien.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import os
+import shutil
+import sys
+import tempfile
+import xml.etree.ElementTree as ET
+
+NS_ANDROID = "http://schemas.android.com/apk/res/android"
+
+MANIFESTE_PAR_DEFAUT = os.path.join(
+    "app", "build", "intermediates", "merged_manifest", "release",
+    "processReleaseMainManifest", "AndroidManifest.xml",
+)
+
+# Ne doit JAMAIS atteindre l'APK, quoi que dise la liste revue. Vide depuis le
+# round 13 : INTERNET, seule permission reseau, est desormais revue et figure
+# dans AUTORISEES (recherche de GIF, apercus de liens et serveur local des
+# appareils lies). L'ensemble reste : c'est le crochet ou inscrire une future
+# permission a bannir absolument.
+INTERDITES = set()
+
+# Tout ce que l'APK revu porte. Chaque entree est documentee dans PERMISSIONS.md.
+AUTORISEES = {
+    # Declarees dans app/src/main/AndroidManifest.xml.
+    "android.permission.SEND_SMS",
+    "android.permission.RECEIVE_SMS",
+    "android.permission.READ_SMS",
+    "android.permission.WRITE_SMS",
+    "android.permission.RECEIVE_MMS",
+    "android.permission.RECEIVE_WAP_PUSH",
+    "android.permission.READ_CONTACTS",
+    # Round 3, item 9 — WRITE_CONTACTS, pour qu'un ordinateur lie
+    # puisse definir la photo d'un contact (la pastille camera du
+    # panneau de detail du bureau) : le telephone ecrit la photo
+    # choisie dans la ligne PHOTO du contact. Demandee a l'execution
+    # depuis l'ecran Appareils lies, jamais au lancement.
+    # Documentee dans PERMISSIONS.md.
+    "android.permission.WRITE_CONTACTS",
+    "android.permission.READ_PHONE_STATE",
+    "android.permission.READ_PHONE_NUMBERS",
+    # Live calls — READ_CALL_LOG, pour le numero de l'appelant
+    # quand le telephone sonne (affiche sur un appareil lie) :
+    # depuis Android 9, la plateforme passe un numero vide aux
+    # ecouteurs d'etat d'appel qui ne l'ont pas. Relay ne lit
+    # JAMAIS le journal d'appels lui-meme (aucune requete sur
+    # CallLog.Calls) ; la permission ne fait que deverrouiller le
+    # numero dans le rappel d'etat d'appel en direct. Demandee a
+    # l'execution depuis l'ecran Appareils lies, serveur allume
+    # uniquement, jamais au lancement. Documentee dans
+    # PERMISSIONS.md.
+    "android.permission.READ_CALL_LOG",
+    "android.permission.POST_NOTIFICATIONS",
+    "android.permission.VIBRATE",
+    "android.permission.USE_BIOMETRIC",
+    "android.permission.RECORD_AUDIO",
+    "android.permission.ACCESS_FINE_LOCATION",
+    "android.permission.ACCESS_COARSE_LOCATION",
+    "android.permission.CALL_PHONE",
+    "android.permission.HIDE_OVERLAY_WINDOWS",
+    "android.permission.FOREGROUND_SERVICE",
+    "android.permission.FOREGROUND_SERVICE_DATA_SYNC",
+    "android.permission.FOREGROUND_SERVICE_SPECIAL_USE",
+    "android.permission.RECEIVE_BOOT_COMPLETED",
+    # Slice 1 — CAMERA, pour le scan du code QR d'appariement uniquement
+    # (CameraX + ZXing core, en local, aucune photo prise ni stockee).
+    # Documentee dans PERMISSIONS.md ; demandee a l'execution, au moment
+    # ou l'utilisateur ouvre le scanner.
+    "android.permission.CAMERA",
+    # Round 13 + 17, Slice 1 — INTERNET, pour la recherche de GIF via
+    # Klipy, les apercus de liens et le serveur local des appareils lies
+    # (LAN uniquement, aucun cloud). Documentee dans PERMISSIONS.md ;
+    # aucune autre utilisation reseau n'est autorisee.
+    "android.permission.INTERNET",
+    # Sync server — CHANGE_WIFI_MULTICAST_STATE, pour le verrou
+    # multicast tenu tant que le serveur tourne (MulticastLockGuard) :
+    # sans lui, un ordinateur lie ne trouve plus le telephone
+    # verrouille (la pile Wi-Fi filtre le multicast ecran eteint).
+    # Niveau `normal`, accordee a l'installation. Documentee dans
+    # PERMISSIONS.md.
+    "android.permission.CHANGE_WIFI_MULTICAST_STATE",
+    # Transitives : androidx.biometric (Android 8) et androidx.work.
+    "android.permission.USE_FINGERPRINT",
+    "android.permission.WAKE_LOCK",
+    # androidx.work : LIT l'etat de la connexion, n'en ouvre aucune.
+    "android.permission.ACCESS_NETWORK_STATE",
+    # Signature, generee par androidx.core pour ses recepteurs non exportes.
+    "com.relay.sms.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION",
+    # Meme permission generee par androidx.core, sous l'identifiant du build
+    # release de test (applicationIdSuffix ".relay", round 6 A/B) : le nom de
+    # la permission derive de l'applicationId.
+    "com.relay.sms.relay.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION",
+}
+
+NS_TOOLS = "http://schemas.android.com/tools"
+
+# Les seules permissions dont le manifeste SOURCE peut faire taire le lint ProtectedPermissions.
+# Chaque entree porte sa mesure : une exception sans preuve est la faute meme que ce controle vise.
+PROTEGEES_REVUES = {
+    # Niveau `normal`, accordee a l'installation (S9 Android 10, 2026-10-04 : `pm list permissions -f`
+    # et `dumpsys package`). Le lint la classe encore parmi les permissions reservees au systeme.
+    "android.permission.WRITE_SMS",
+}
+
+EN_CI = os.environ.get("GITHUB_ACTIONS") == "true"
+
+
+def erreur(lignes: list[str]) -> None:
+    prefixe = "::error::" if EN_CI else "ERREUR: "
+    for ligne in lignes:
+        print(f"{prefixe}{ligne}")
+
+
+def permissions_declarees(chemin: str) -> set[str]:
+    racine = ET.parse(chemin).getroot()
+    noms = set()
+    for balise in ("uses-permission", "uses-permission-sdk-23"):
+        for element in racine.iter(balise):
+            nom = element.get(f"{{{NS_ANDROID}}}name")
+            if nom:
+                noms.add(nom)
+    return noms
+
+
+def verifier(chemin: str, bavard: bool = True) -> int:
+    if not os.path.isfile(chemin):
+        erreur([
+            f"manifeste fusionne introuvable : {chemin}",
+            "lancer d'abord : ./gradlew :app:processReleaseMainManifest",
+        ])
+        return 1
+    try:
+        trouvees = permissions_declarees(chemin)
+    except ET.ParseError as e:
+        erreur([f"manifeste fusionne illisible ({chemin}) : {e}"])
+        return 1
+    if not trouvees:
+        # Un resultat vide est un controle casse, jamais un certificat de proprete.
+        erreur([f"aucune permission lue dans {chemin} : c'est un echec du controle, pas une absence."])
+        return 1
+
+    if bavard:
+        print(f"Permissions du manifeste fusionne ({len(trouvees)}) :")
+        for nom in sorted(trouvees):
+            print(f"  {nom}")
+
+    problemes: list[str] = []
+    interdites = sorted(trouvees & INTERDITES)
+    if interdites:
+        problemes.append("Permission RESEAU presente dans le manifeste fusionne release :")
+        problemes += [f"  {nom}" for nom in interdites]
+        problemes.append(
+            "Cette permission ne doit jamais atteindre l'APK (voir PERMISSIONS.md). "
+            "Retirer la dependance qui l'apporte, ou la retirer par tools:node=\"remove\" en le justifiant."
+        )
+    inattendues = sorted(trouvees - AUTORISEES - INTERDITES)
+    if inattendues:
+        problemes.append("Permission(s) hors de la liste revue :")
+        problemes += [f"  {nom}" for nom in inattendues]
+        problemes.append("L'ajouter a AUTORISEES ET a PERMISSIONS.md, ou retirer la dependance.")
+    absentes = sorted(AUTORISEES - trouvees)
+    if absentes and bavard:
+        print("\nNote - attendue(s) mais absente(s) ; retirer de AUTORISEES et de PERMISSIONS.md si voulu :")
+        for nom in absentes:
+            print(f"  {nom}")
+
+    if problemes:
+        if bavard:
+            print()
+        erreur(problemes)
+        return 1
+    if bavard:
+        print("\nOK : aucune permission hors de la liste revue (INTERNET y figure, recherche de GIF, apercus de liens et serveur local des appareils lies).")
+    return 0
+
+
+IGNORES_AU_PARCOURS = {".git", ".gradle", "build", "node_modules"}
+
+
+def fichiers_du_depot(retenir) -> list[str]:
+    """Tous les fichiers du depot que `retenir(chemin)` accepte, a toute profondeur.
+
+    A toute profondeur : un module imbrique (`feature/x/src/main/`) doit etre lu comme les
+    autres - un motif a un seul niveau l'aurait laisse hors du controle, sans un mot.
+    """
+    trouves = []
+    for dossier, sous_dossiers, noms in os.walk("."):
+        sous_dossiers[:] = [d for d in sous_dossiers if d not in IGNORES_AU_PARCOURS]
+        trouves += [os.path.join(dossier, nom) for nom in noms if retenir(os.path.join(dossier, nom))]
+    return sorted(trouves)
+
+
+def manifestes_source() -> list[str]:
+    """Les manifestes de chaque module et de chaque jeu de sources (main, debug...)."""
+    return fichiers_du_depot(lambda c: os.path.basename(c) == "AndroidManifest.xml"
+                             and f"{os.sep}src{os.sep}" in c)
+
+
+def configurations_lint() -> list[str]:
+    """Les autres endroits ou un lint se fait taire : lint.xml, baselines, scripts Gradle."""
+    return fichiers_du_depot(lambda c: os.path.basename(c) in ("lint.xml", "lint-baseline.xml")
+                             or c.endswith((".gradle.kts", ".gradle")))
+
+
+def verifier_exceptions_lint(chemins: list[str], configurations: list[str] = (),
+                             bavard: bool = True) -> int:
+    """Chaque `tools:ignore` qui couvre ProtectedPermissions doit viser une permission revue.
+
+    `all` fait taire tous les lints, ProtectedPermissions compris : il compte. Pose sur un autre
+    element qu'un <uses-permission> (la racine <manifest>, par exemple), il couvrirait tout ce
+    qui est dessous : refuse aussi. Hors du manifeste - `lint.xml`, une baseline regeneree,
+    `lint { disable += ... }` - l'exception ne vise aucune permission en particulier : refusee
+    toujours.
+    """
+    if not chemins:
+        erreur(["aucun manifeste source trouve (*/src/*/AndroidManifest.xml) : c'est un echec du "
+                "controle, pas une absence. Lancer le script depuis la racine du depot."])
+        return 1
+    problemes: list[str] = []
+    for chemin in configurations:
+        with open(chemin, encoding="utf-8", errors="replace") as f:
+            if "ProtectedPermissions" in f.read():
+                problemes.append(f"{chemin} : fait taire le lint ProtectedPermissions hors du manifeste")
+    for chemin in chemins:
+        try:
+            racine = ET.parse(chemin).getroot()
+        except ET.ParseError as e:
+            problemes.append(f"manifeste source illisible ({chemin}) : {e}")
+            continue
+        for element in racine.iter():
+            ignores = {v.strip() for v in element.get(f"{{{NS_TOOLS}}}ignore", "").split(",")}
+            if not ignores & {"ProtectedPermissions", "all"}:
+                continue
+            nom = element.get(f"{{{NS_ANDROID}}}name", "")
+            if element.tag == "uses-permission" and nom in PROTEGEES_REVUES:
+                continue
+            problemes.append(f"{chemin} : <{element.tag} {nom}> fait taire le lint ProtectedPermissions")
+    if problemes:
+        problemes.append(
+            "Une permission reservee au systeme n'est jamais accordee a une application installee par "
+            "l'utilisateur : la retirer. Si la mesure sur appareil prouve le contraire, l'ajouter a "
+            "PROTEGEES_REVUES avec cette mesure.")
+        erreur(problemes)
+        return 1
+    if bavard:
+        print(f"OK : aucune exception non revue au lint ProtectedPermissions "
+              f"({len(chemins)} manifestes source, {len(configurations)} configurations lint).")
+    return 0
+
+
+def controle_negatif() -> int:
+    """Chaque manifeste fautif doit etre REFUSE ; le manifeste conforme doit passer."""
+
+    def manifeste(permissions: list[str]) -> str:
+        lignes = [f'<manifest xmlns:android="{NS_ANDROID}" package="com.relay.sms">']
+        for nom in permissions:
+            # Une permission sur PLUSIEURS lignes : la forme qu'un grep ne voit pas.
+            lignes.append(f'  <uses-permission\n      android:name="{nom}" />')
+        lignes.append("</manifest>")
+        fd, chemin = tempfile.mkstemp(suffix=".xml")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(lignes))
+        return chemin
+
+    conforme = sorted(AUTORISEES)
+    # Le cas « conforme » contient INTERNET (revue depuis le round 13) : son
+    # succes prouve qu'INTERNET est acceptee. Ce qui doit toujours etre REFUSE,
+    # c'est une permission reseau NON revue.
+    # (nom, permissions, code attendu, ce que le refus doit nommer)
+    cas = [
+        ("conforme", conforme, 0, ()),
+        ("permission reseau non revue (CHANGE_NETWORK_STATE)",
+         conforme + ["android.permission.CHANGE_NETWORK_STATE"], 1,
+         ("hors de la liste revue", "android.permission.CHANGE_NETWORK_STATE")),
+        # Live calls — the unknown-permission example used to be
+        # READ_CALL_LOG; it is reviewed now, so the case uses
+        # BODY_SENSORS instead (a permission Relay will never
+        # need).
+        ("permission inconnue", conforme + ["android.permission.BODY_SENSORS"], 1,
+         ("hors de la liste revue", "android.permission.BODY_SENSORS")),
+        ("manifeste vide", [], 1, ("aucune permission lue",)),
+    ]
+    echecs = 0
+    for nom, permissions, attendu, causes in cas:
+        chemin = manifeste(permissions)
+        # La sortie des cas fautifs est CAPTUREE, comme pour les cas lint plus bas. Imprimes, leurs
+        # `::error::` devenaient des annotations rouges sur un run VERT : le 2026-10-15, sept
+        # « errors » affichees par GitHub ont ete prises pour un echec de la CI. Capturer permet
+        # aussi d'exiger la bonne cause : un refus pour une autre raison n'est pas un refus.
+        sortie = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(sortie):
+                obtenu = verifier(chemin, bavard=False)
+        finally:
+            os.unlink(chemin)
+        ok = obtenu == attendu and all(c in sortie.getvalue() for c in causes)
+        echecs += 0 if ok else 1
+        print(f"  {'OK   ' if ok else 'RATE '} {nom} : attendu {attendu}, obtenu {obtenu}")
+        if obtenu == attendu and not ok:
+            print(f"        rougit, mais sans nommer {' + '.join(causes)} :\n        {sortie.getvalue().strip()}")
+
+    def source(corps: str) -> str:
+        fd, chemin = tempfile.mkstemp(suffix=".xml")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(f'<manifest xmlns:android="{NS_ANDROID}" xmlns:tools="{NS_TOOLS}"{corps}</manifest>')
+        return chemin
+
+    def exception(nom: str, valeur: str = "ProtectedPermissions") -> str:
+        return f'  <uses-permission\n      android:name="{nom}"\n      tools:ignore="{valeur}" />\n'
+
+    def lint_xml(contenu: str) -> str:
+        fd, chemin = tempfile.mkstemp(suffix="-lint.xml")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(contenu)
+        return chemin
+
+    revue = ">\n" + exception("android.permission.WRITE_SMS")
+    lint_sain = '<lint>\n  <issue id="NewerVersionAvailable" severity="ignore" />\n</lint>\n'
+    # (nom, corps du manifeste source ou None pour « aucun manifeste », lint.xml, code, cause)
+    cas_lint = [
+        ("exception revue (WRITE_SMS)", revue, lint_sain, 0, ""),
+        ("exception sur BROADCAST_WAP_PUSH (le defaut de la 1.28.13)",
+         ">\n" + exception("android.permission.BROADCAST_WAP_PUSH"), lint_sain, 1, "BROADCAST_WAP_PUSH"),
+        ("tools:ignore=\"all\"", ">\n" + exception("android.permission.READ_CONTACTS", "all"),
+         lint_sain, 1, "READ_CONTACTS"),
+        ("exception parmi d'autres lints",
+         ">\n" + exception("android.permission.CALL_PHONE", "MissingVersion, ProtectedPermissions"),
+         lint_sain, 1, "CALL_PHONE"),
+        ("exception posee sur la racine <manifest>",
+         ' tools:ignore="ProtectedPermissions">\n' + exception("android.permission.WRITE_SMS", "Autre"),
+         lint_sain, 1, "<manifest"),
+        ("exception dans lint.xml", revue,
+         '<lint>\n  <issue id="ProtectedPermissions" severity="ignore" />\n</lint>\n',
+         1, "hors du manifeste"),
+        ("aucun manifeste source", None, lint_sain, 1, "aucun manifeste source"),
+    ]
+    for nom, corps, config, attendu, cause in cas_lint:
+        chemins = [] if corps is None else [source(corps)]
+        configurations = [lint_xml(config)]
+        sortie = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(sortie):
+                obtenu = verifier_exceptions_lint(chemins, configurations, bavard=False)
+        finally:
+            for chemin in chemins + configurations:
+                os.unlink(chemin)
+        ok = obtenu == attendu and cause in sortie.getvalue()
+        echecs += 0 if ok else 1
+        print(f"  {'OK   ' if ok else 'RATE '} lint : {nom} : attendu {attendu}, obtenu {obtenu}")
+        if obtenu == attendu and not ok:
+            print(f"        rougit, mais sans nommer « {cause} » :\n        {sortie.getvalue().strip()}")
+
+    # La decouverte elle-meme : un module IMBRIQUE doit etre lu, une sortie de build jamais.
+    attendus = {os.path.join(".", "feature", "x", "src", "main", "AndroidManifest.xml"),
+                os.path.join(".", "app", "src", "debug", "AndroidManifest.xml")}
+    ecartes = {os.path.join(".", "app", "build", "intermediates", "src", "AndroidManifest.xml"),
+               os.path.join(".", "app", "AndroidManifest.xml")}
+    arbre = tempfile.mkdtemp(prefix="permissions-")
+    ici = os.getcwd()
+    try:
+        for relatif in attendus | ecartes:
+            os.makedirs(os.path.join(arbre, os.path.dirname(relatif)), exist_ok=True)
+            open(os.path.join(arbre, relatif), "w").close()
+        os.chdir(arbre)
+        trouves = set(manifestes_source())
+    finally:
+        os.chdir(ici)
+        shutil.rmtree(arbre, ignore_errors=True)
+    ok = trouves == attendus
+    echecs += 0 if ok else 1
+    print(f"  {'OK   ' if ok else 'RATE '} decouverte : module imbrique lu, build/ ecarte "
+          f"(trouves : {sorted(trouves)})")
+
+    if echecs:
+        erreur([f"le controle des permissions ne refuse pas ce qu'il doit refuser ({echecs} cas)"])
+        return 1
+    print("Controle negatif : chaque manifeste fautif est refuse, et pour la bonne raison ; le conforme passe.")
+    return 0
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--controle-negatif":
+        sys.exit(controle_negatif())
+    fusionne = verifier(sys.argv[1] if len(sys.argv) > 1 else MANIFESTE_PAR_DEFAUT)
+    print()
+    sources = verifier_exceptions_lint(manifestes_source(), configurations_lint())
+    sys.exit(1 if fusionne or sources else 0)

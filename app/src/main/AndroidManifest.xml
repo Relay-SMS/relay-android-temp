@@ -1,0 +1,584 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- SMS / MMS core permissions -->
+    <uses-permission android:name="android.permission.SEND_SMS" />
+    <uses-permission android:name="android.permission.RECEIVE_SMS" />
+    <uses-permission android:name="android.permission.READ_SMS" />
+    <uses-permission android:name="android.permission.WRITE_SMS"
+        tools:ignore="ProtectedPermissions" />
+    <uses-permission android:name="android.permission.RECEIVE_MMS" />
+    <uses-permission android:name="android.permission.RECEIVE_WAP_PUSH" />
+
+    <!-- Contacts -->
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <!-- Round 3, item 9 — a linked computer can set a contact's
+         photo (the camera badge on the desktop detail pane): the
+         phone writes the picked photo to the contact's PHOTO row.
+         Requested at runtime from the Linked devices screen, only
+         when the user opens it — never at launch, never from the
+         background service (which cannot show a dialog). Refused:
+         the desktop keeps the photo locally and tells the user the
+         phone couldn't save it. Documented in PERMISSIONS.md and
+         allowed by .github/scripts/permissions-manifeste.py. -->
+    <uses-permission android:name="android.permission.WRITE_CONTACTS" />
+
+    <!-- Phone state (dual SIM) -->
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+    <uses-permission android:name="android.permission.READ_PHONE_NUMBERS" />
+    <!-- Live calls — the incoming number of a ringing call, shown
+         on a linked device: since Android 9 the platform passes an
+         empty number to call-state listeners that lack this
+         permission (Android 9 behavior changes, "Restrict access
+         to phone numbers"). Relay never reads the call log itself
+         — no query on CallLog.Calls anywhere; the permission only
+         unlocks the number in the live call-state callback. The
+         state (ringing / active / ended) still works without it,
+         just with no number. Requested at runtime from the Linked
+         devices screen, only when the server is on — never at
+         launch. Documented in PERMISSIONS.md and allowed by
+         .github/scripts/permissions-manifeste.py. -->
+    <uses-permission android:name="android.permission.READ_CALL_LOG" />
+
+    <!-- Notifications -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <!-- v1.2.7 audit S8 : USE_FULL_SCREEN_INTENT retiré (privilégiée Android 14+,
+         auto-révoquée par Play Console hors cas calling/alarms, et aucune utilisation
+         côté code — vérifié par grep, aucun setFullScreenIntent appelé). -->
+
+
+    <!-- Biometric -->
+    <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+
+    <!-- Voice MMS (audio recording attached to outgoing MMS) -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <!-- Slice 1 — QR pairing only: the Linked devices screen scans the
+         pairing code a computer shows, on-device, with CameraX + ZXing
+         core (no Play Services). Requested at runtime, at the moment
+         the user opens the scanner — never earlier. No photo is taken
+         or stored; the frames are decoded in memory and dropped.
+         Documented in PERMISSIONS.md and allowed by
+         .github/scripts/permissions-manifeste.py. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+
+    <!-- v1.10.0 — Mode urgence : géoloc pour SMS d'urgence (single-fix uniquement,
+         pas de tracking continu). ACCESS_COARSE_LOCATION en filet pour devices/OEM
+         où FINE est durci. Permission opt-in : si refusée par l'user, le SMS d'urgence
+         est envoyé sans coordonnées (graceful degradation). Aucune utilisation
+         background. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <!-- v1.14.0 — Mode urgence : appel direct 112 / 17 sur hold-3s opt-in.
+         Permission demandée RUNTIME uniquement quand l'user active explicitement
+         `emergencyCallBehavior = HOLD_3S_DIRECT_CALL` dans Réglages. Default
+         `DIALER_ONLY` (ACTION_DIAL composeur pré-rempli, zéro permission).
+         Si refusée → fallback automatique vers DIALER_ONLY + warning. Aucun
+         appel automatique : hold-3s est anti-pocket-dial. Numéros 112 et 17
+         hardcodés dans `EmergencyCallHelper.placeEmergencyCall(number)`,
+         pas de paramètre user-modifiable. -->
+    <uses-permission android:name="android.permission.CALL_PHONE" />
+
+    <!-- v1.3.5 G3 audit fix — SCHEDULE_EXACT_ALARM + USE_EXACT_ALARM retirées :
+         l'envoi planifié passe exclusivement par WorkManager.enqueueUniqueWork (cf.
+         ScheduledMessageScheduler) qui n'a PAS besoin de ces permissions. Elles
+         étaient des permissions orphelines générant un Play Console warning + une
+         révocation potentielle Android 14+. Aucun usage de AlarmManager.setExact*
+         vérifié par grep avant retrait. -->
+
+    <!-- Round 13 + 17 — INTERNET is back, for TWO purposes: GIF search via
+         Klipy (see data/.../klipy/KlipyClient.kt) and link previews (see
+         data/.../linkpreview/LinkPreviewFetcher.kt). The picker sends the typed
+         search words to api.klipy.com and downloads the chosen GIF; Coil fetches
+         the GIF thumbnails from Klipy the same way. A message containing a URL
+         shows a preview card: Relay fetches that page once, on the device, and
+         reads its Open Graph title and image for display only — the image is
+         never sent as an attachment. Slice 1 adds a THIRD purpose, local only:
+         the LAN server (see sync/SyncServer.kt) listens on the local network
+         so a linked computer can connect — no cloud, no Relay server, the
+         traffic never leaves the Wi-Fi network. Nothing else in the app opens
+         a network connection: no analytics, no crash reporter, no update check.
+         MMS still work exactly as before — Android's own MMS service, in its own
+         process, talks to the carrier's MMSC (SmsManager.sendMultimediaMessage /
+         downloadMultimediaMessage), so MMS never needed this permission and still
+         don't use it. If the permission is blocked, the app still works fully —
+         GIF search just returns nothing, links show no preview, and no computer
+         can link.
+         History: INTERNET was removed in v1.28.13 (it had been declared "for MMS
+         transport", which was never true); it returns here deliberately, reviewed
+         in PERMISSIONS.md and allowed by .github/scripts/permissions-manifeste.py.
+         ACCESS_NETWORK_STATE is declared explicitly below (it also arrives
+         via androidx.work): it READS the connection state, it opens no
+         connection. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Linked devices — `ACCESS_NETWORK_STATE`, for the tunnel
+         address (VpnAddressProvider reads the active network's
+         transport and addresses, and SyncService registers a VPN
+         network callback so the tunnel advertisement tracks the
+         tunnel): a linked computer dials the tunnel address to
+         reach the phone when a VPN is up (SYNC_PROTOCOL.md,
+         "VPN / tunnel"). Protection level `normal`: granted at
+         install, no prompt, no data access — it only reads the
+         device's own connection state; it opens no connection and
+         sees no traffic content. Declared explicitly here rather
+         than relied on transitively via androidx.work (which also
+         uses it for its own connectivity checks): a transitive
+         permission is not a dependency to build on. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- Linked devices — `CHANGE_WIFI_MULTICAST_STATE`, for the
+         multicast lock SyncService holds while the server runs
+         (MulticastLockGuard): the Wi-Fi stack filters multicast
+         packets when the screen is off, and mDNS discovery is
+         multicast in both directions, so without the lock a linked
+         computer cannot find a locked phone. Protection level
+         `normal`: granted at install, no prompt, no data access —
+         it only lets the app ask the Wi-Fi stack to deliver
+         multicast packets addressed to the local network. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+
+    <!-- WAKE_LOCK (normal, granted at install, no prompt): held only while a sync run is actively streaming. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!-- v1.27.1 (N3) — requise par `Window.setHideOverlayWindows()`, qui masque les
+         superpositions des autres applications pendant la saisie d'un secret
+         (cf. ProtectSecretInput / THREAT-MODEL.md N3).
+
+         Niveau de protection `normal` : accordée à l'installation, sans invite ni
+         écran de réglage. Elle n'accorde AUCUN accès à des données : elle autorise
+         seulement l'app à demander que les overlays TIERS soient masqués au-dessus
+         de SES propres fenêtres.
+
+         ⚠️ Sans cette déclaration, l'appel lève `SecurityException` et fait TOMBER
+         l'application — constaté sur Galaxy S24 FE / Android 14 le 2026-08-03, sur
+         l'écran de définition du PIN ET sur l'écran de verrouillage. L'appel est
+         désormais aussi protégé côté code : une garde de sécurité ne doit jamais
+         pouvoir crasher l'app qu'elle protège. -->
+    <uses-permission android:name="android.permission.HIDE_OVERLAY_WINDOWS" />
+
+    <!-- Foreground service for long migration/backup tasks -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- dataSync : consomme par le SystemForegroundService de WorkManager (sauvegarde, migration),
+         travaux bornes qui se terminent d'eux-memes. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- v1.27.10 (revue externe GitLab !38458) — specialUse pour KeepAliveService : voir sa
+         declaration plus bas pour la raison, qui n'est pas cosmetique. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+
+    <!-- Boot completed for scheduled messages -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- Telephony features (not strictly required - app works on tablets without SIM for reading backups) -->
+    <uses-feature
+        android:name="android.hardware.telephony"
+        android:required="false" />
+
+    <!-- Slice 1 — the camera is only used for QR pairing; the app works
+         fully on devices without one. -->
+    <uses-feature
+        android:name="android.hardware.camera"
+        android:required="false" />
+
+    <!-- Queries (Android 11+ package visibility) -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.SENDTO" />
+            <data android:scheme="smsto" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SEND" />
+            <data android:mimeType="text/plain" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="tel" />
+        </intent>
+        <!-- Viewer picker: `queryIntentActivities` for ACTION_VIEW
+             + a media MIME type needs a matching entry here on
+             Android 11+, or the query comes back empty and a tap
+             on an image or video does nothing. A VIEW query adds
+             nothing to any text-selection toolbar, so the
+             ACTION_PROCESS_TEXT problem below does not apply. -->
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:mimeType="image/*" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:mimeType="video/*" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:mimeType="audio/*" />
+        </intent>
+        <!-- Plus de <queries> pour ACTION_PROCESS_TEXT. Déclarée en v1.7.1 pour que
+             `resolveActivity` sache d'avance si un traducteur était installé, elle rendait
+             VISIBLE toute application qui déclare une action de texte — n'importe laquelle peut
+             le faire, sous n'importe quel nom — et Compose (foundation 1.12, ProcessText_android)
+             ajoute chacune de ces applications à la barre de sélection de tout champ et de tout
+             SelectionContainer, messages du coffre compris : un toucher lui remettait le texte
+             sélectionné. Le bouton « Traduire » d'un message n'en a pas besoin : il ouvre le
+             sélecteur du système, qui voit toutes les applications. Même choix que Notes Tech
+             (audit du 2026-09-26). -->
+        <!-- Création de contact (ComposeScreen / liste conversations). `startActivity` n'est
+             pas bloqué par la visibilité de packages, mais on déclare l'intent par robustesse
+             et cohérence avec les autres délégations ci-dessus — indépendant du nom de package
+             OEM de l'app Contacts (Samsung `com.samsung.android.app.contacts`, etc.). -->
+        <intent>
+            <action android:name="android.intent.action.INSERT" />
+            <data android:mimeType="vnd.android.cursor.dir/contact" />
+        </intent>
+        <package android:name="com.android.contacts" />
+    </queries>
+
+    <!-- `enableOnBackInvokedCallback` réactivé (predictive back) après le bump
+         navigation-compose 2.8.4 → 2.9.8.
+         Historique : la 2.8.4 crashait (IndexOutOfBoundsException dans
+         NavHostKt$NavHost$28$1 : `backStack.get(-1)` sur un geste retour), bug
+         réveillé par la MAJ One UI / Android 16 (2026-06-05). Le workaround v1.18.2
+         était de désactiver le callback. La 2.9.8 corrige ce gestionnaire en amont,
+         donc on restaure l'animation predictive back native.
+         OBLIGATOIRE avant release : re-tester le geste retour sur One UI récent
+         (S24/S9) pour confirmer l'absence de régression du crash. -->
+    <application
+        android:name=".MainApplication"
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:localeConfig="@xml/locales_config"
+        android:supportsRtl="true"
+        android:enableOnBackInvokedCallback="true"
+        android:largeHeap="false"
+        android:hardwareAccelerated="true"
+        android:theme="@style/Theme.Relay.Splash"
+        tools:targetApi="34">
+
+        <!-- Single Activity host -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|uiMode|locale|layoutDirection|keyboard|keyboardHidden|navigation|fontScale"
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@style/Theme.Relay.Splash">
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+
+            <!-- Default SMS app — Tab "Texto" entry points -->
+            <intent-filter>
+                <action android:name="android.intent.action.SENDTO" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="sms" />
+                <data android:scheme="smsto" />
+                <data android:scheme="mms" />
+                <data android:scheme="mmsto" />
+            </intent-filter>
+
+            <!-- View entry -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="sms" />
+                <data android:scheme="smsto" />
+                <data android:scheme="mms" />
+                <data android:scheme="mmsto" />
+            </intent-filter>
+
+            <!-- v1.3.3 bug #4 — apparaît dans le chooser système "Partager" depuis la
+                 Galerie, le navigateur, les apps de fichiers, etc. Le user peut envoyer
+                 une image / vidéo / fichier directement vers une conversation Relay.
+                 MainActivity intercepte l'intent ACTION_SEND (extra EXTRA_STREAM) /
+                 ACTION_SEND_MULTIPLE et ouvre le picker de conversation. -->
+            <!-- v1.3.3 Z6 audit fix — restreindre aux types réellement supportés par
+                 l'app : pas de `text/*` ni `application/*` larges qui captaient text/html,
+                 application/x-www-form-urlencoded etc. (l'app les routait en FILE catch-all
+                 sans rendu propre). Restriction au strict utile. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+                <data android:mimeType="video/*" />
+                <data android:mimeType="audio/*" />
+                <data android:mimeType="text/plain" />
+                <data android:mimeType="text/x-vcard" />
+                <data android:mimeType="text/vcard" />
+                <data android:mimeType="application/pdf" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+                <data android:mimeType="video/*" />
+            </intent-filter>
+        </activity>
+
+        <!-- 1) SMS receiver (must be enabled by default SMS app) -->
+        <receiver
+            android:name=".system.receiver.SmsDeliverReceiver"
+            android:exported="true"
+            android:permission="android.permission.BROADCAST_SMS">
+            <intent-filter>
+                <action android:name="android.provider.Telephony.SMS_DELIVER" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 1b) E2E handshake data SMS (probes + bundle replies, port 47832).
+             Data SMS are addressed by port, not by the default-SMS-app role:
+             any app may receive them on its own port. -->
+        <receiver
+            android:name=".system.receiver.E2eDataSmsReceiver"
+            android:exported="true"
+            android:permission="android.permission.BROADCAST_SMS">
+            <intent-filter>
+                <action android:name="android.intent.action.DATA_SMS_RECEIVED" />
+                <data
+                    android:host="localhost"
+                    android:port="47832"
+                    android:scheme="sms" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 1c) E2E handshake sent-intent verdict (round 43, internal only):
+             the radio's accept/reject for a probe/bundle send, delivered
+             to E2eDataSmsSentReceiver. A rejection here means the send
+             never left the phone — the discriminator between a radio
+             that drops handshake SMS and a carrier loss downstream. -->
+        <receiver
+            android:name=".e2e.E2eDataSmsSentReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.relay.sms.e2e.DATA_SMS_SENT" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 2) MMS WAP_PUSH receiver -->
+        <receiver
+            android:name=".system.receiver.MmsWapPushReceiver"
+            android:exported="true"
+            android:permission="android.permission.BROADCAST_WAP_PUSH">
+            <intent-filter>
+                <action android:name="android.provider.Telephony.WAP_PUSH_DELIVER" />
+                <data android:mimeType="application/vnd.wap.mms-message" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 3) Sent / Delivered (internal broadcasts) -->
+        <receiver
+            android:name=".system.receiver.SmsSentReceiver"
+            android:exported="false" />
+        <receiver
+            android:name=".system.receiver.SmsDeliveredReceiver"
+            android:exported="false" />
+        <receiver
+            android:name=".system.receiver.MmsSentReceiver"
+            android:exported="false" />
+        <receiver
+            android:name=".system.receiver.MmsDownloadedReceiver"
+            android:exported="false" />
+
+        <!-- 4) Boot — reschedule scheduled messages.
+             v1.6.1 audit SEC-11 clarification: les trois actions déclarées sont des
+             "protected broadcasts" AOSP — seul le framework (ActivityManagerService) peut
+             les émettre. Le `android:permission="RECEIVE_BOOT_COMPLETED"` ci-dessous est
+             une permission "normal" (pas "signature") : elle peut être détenue par
+             n'importe quelle app et n'ajoute donc PAS de protection effective contre les
+             apps tierces — la vraie protection vient du statut protected-broadcast des
+             actions BOOT_COMPLETED / LOCKED_BOOT_COMPLETED / USER_UNLOCKED, énumérées
+             dans la liste AOSP `frameworks/base/core/res/AndroidManifest.xml`. On conserve
+             la permission pour cohérence avec la convention historique et pour signaler
+             l'intention au lecteur ; ne pas la retirer SANS également remplacer par un
+             check `isOrderedBroadcast()` ou un mécanisme équivalent.
+             QUICKBOOT_POWERON (action HTC legacy non-protégée) retirée. -->
+        <receiver
+            android:name=".system.receiver.BootReceiver"
+            android:exported="true"
+            android:permission="android.permission.RECEIVE_BOOT_COMPLETED">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <!-- Audit M-11: rattrapage des SMS arrivés en direct-boot avant que
+                     l'utilisateur ne déverrouille le téléphone pour la première fois.
+                     ACTION_USER_UNLOCKED est un protected-broadcast AOSP (cf. note ci-dessus). -->
+                <action android:name="android.intent.action.USER_UNLOCKED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 5) Notification actions: Reply / MarkAsRead -->
+        <receiver
+            android:name=".system.notifications.NotificationActionReceiver"
+            android:exported="false" />
+
+        <!-- v1.27.4 — `deleteIntent` du reçu de fin de séquence Safety call : le balayage
+             vaut « j'ai vu » et archive le cycle, sans quoi la notification revenait au
+             démarrage à froid suivant.
+
+             `exported="false"` est une condition de sûreté, pas une convention : ce
+             récepteur écrit dans la configuration du deadman. Il est atteignable
+             UNIQUEMENT via le PendingIntent interne posé sur la notification TERMINALE,
+             où la protection est déjà coupée et où acquitter n'affaiblit donc rien. La
+             démonstration complète est dans SafetyCallReceiptDismissReceiver ; ne pas
+             élargir sa portée sans l'avoir lue. -->
+        <receiver
+            android:name=".system.notifications.SafetyCallReceiptDismissReceiver"
+            android:exported="false" />
+
+        <!-- v1.12.0 — Raccourci urgence (notification persistante lock-screen).
+             `exported=false` : seul Relay peut déclencher les actions
+             SHORTCUT_TRIGGER_EMERGENCY / SHORTCUT_DIAL_112 via PendingIntent
+             interne. Une app tierce ne peut pas forger un Intent et déclencher
+             le SMS d'urgence. -->
+        <receiver
+            android:name=".system.receiver.EmergencyShortcutReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.relay.sms.SHORTCUT_DIAL_112" />
+                <action android:name="com.relay.sms.SHORTCUT_DIAL_POLICE" />
+            </intent-filter>
+        </receiver>
+
+        <!-- v1.27.2 — réveil à l'échéance exacte du Safety call.
+             `exported=false` : l'alarme est posée par un PendingIntent interne
+             visant explicitement ce composant. Aucune application tierce ne peut
+             donc forger l'échéance et faire partir le SMS d'urgence en avance.
+             Aucune permission requise (`setAndAllowWhileIdle`). -->
+        <receiver
+            android:name=".system.receiver.SafetyCallAlarmReceiver"
+            android:exported="false" />
+
+        <!-- 6) HeadlessSmsSendService — required for default SMS app -->
+        <service
+            android:name=".system.service.HeadlessSmsSendService"
+            android:exported="true"
+            android:permission="android.permission.SEND_RESPOND_VIA_MESSAGE">
+            <intent-filter>
+                <action android:name="android.intent.action.RESPOND_VIA_MESSAGE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="sms" />
+                <data android:scheme="smsto" />
+                <data android:scheme="mms" />
+                <data android:scheme="mmsto" />
+            </intent-filter>
+        </service>
+
+        <!-- 7) Long-running migration/backup foreground service via WorkManager -->
+        <service
+            android:name="androidx.work.impl.foreground.SystemForegroundService"
+            android:foregroundServiceType="dataSync"
+            tools:replace="android:foregroundServiceType" />
+
+        <!-- 7-bis) v1.3.10 — Foreground service permanent OPT-IN (Réglages → Avancé →
+             "Mode résistant Xiaomi/Huawei"). Empêche MIUI/HyperOS/EMUI de killer le
+             processus Relay en arrière-plan, ce qui débloque la réception WAP push
+             des MMS + la pose de notifications SMS sur les ROMs qui whitelistent
+             uniquement Google Messages / Mi Messages.
+             android:exported="false" : aucune surface IPC publique, démarré uniquement
+             en interne via [KeepAliveService.start].
+             android:stopWithTask="false" : le service survit au swipe-out de l'app
+             depuis les récents — c'est tout le point pour résister à MIUI.
+
+             v1.27.10 (revue externe GitLab !38458) — le type passe de "dataSync" a
+             "specialUse", et ce n'est pas une retouche de vocabulaire : sous targetSdk 35,
+             "dataSync" porte deux regles qui cassaient la fonctionnalite en silence.
+               1. Android 15 borne un service "dataSync" a 6 h cumulees par tranche de 24 h,
+                  puis appelle Service.onTimeout ; sans arret rapide, l'application est tuee.
+                  Un service dont le SEUL role est de rester vivant en permanence ne peut donc
+                  pas etre de ce type — il mourait toutes les 6 h sans jamais revenir.
+               2. Android 15 interdit de demarrer un service "dataSync" depuis BOOT_COMPLETED.
+                  Le demarrage depuis BootReceiver levait donc une exception, avalee par le
+                  catch defensif : le mode resistant ne reprenait pas apres un redemarrage,
+                  sans le moindre signe visible.
+             "specialUse" n'est soumis ni au minuteur ni a l'interdiction au demarrage, et
+             decrit honnetement ce que fait ce service : rien, sinon exister. Le sous-type est
+             requis par la plateforme des lors qu'on declare ce type. -->
+        <service
+            android:name=".system.service.KeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse"
+            android:stopWithTask="false">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="keep_process_alive_on_oem_roms_that_kill_the_default_sms_app" />
+        </service>
+
+        <!-- 7-ter) Slice 1 — the LAN server (SYNC_PROTOCOL.md): Ktor over
+             TLS on port 47831, advertising `_relay._tcp.` via mDNS, so a
+             linked computer can connect while the app is in the
+             background. Started by MainApplication / BootReceiver when
+             the server toggle is on; stopped when it goes off.
+             `specialUse`, for the same reason as KeepAliveService above:
+             under targetSdk 35 a `dataSync` service is capped at 6 h
+             cumulative per 24 h and cannot start from BOOT_COMPLETED —
+             both fatal to a server that must listen permanently. The
+             subtype property is required by the platform for this type.
+             android:exported="false": no IPC surface, started only
+             internally via [SyncService.start]. -->
+        <service
+            android:name=".sync.SyncService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse"
+            android:stopWithTask="false">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="lan_server_for_linked_devices_tls_websocket" />
+        </service>
+
+        <!-- 7-quater) Client mode — the linked-device client
+             (ClientSyncService): the Ktor client over TLS to the hub
+             phone on port 47831, so a linked tablet or SIM-less phone
+             stays in sync while the app is in the background. Started
+             by MainApplication / BootReceiver when the device is in
+             client mode and linked; stopped on unlink or on the switch
+             back to hub mode. `specialUse`, for the same reason as
+             SyncService above: under targetSdk 35 a `dataSync` service
+             is capped at 6 h cumulative per 24 h and cannot start from
+             BOOT_COMPLETED — both fatal to a link that must stay up.
+             The subtype property is required by the platform for this
+             type. android:exported="false": no IPC surface, started
+             only internally via [ClientSyncService.start]. -->
+        <service
+            android:name=".sync.client.ClientSyncService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse"
+            android:stopWithTask="false">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="lan_client_for_hub_phone_tls_websocket" />
+        </service>
+
+        <!-- 8) WorkManager init — let Hilt take over -->
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge">
+            <meta-data
+                android:name="androidx.work.WorkManagerInitializer"
+                android:value="androidx.startup"
+                tools:node="remove" />
+        </provider>
+
+        <!-- 9) FileProvider — partage des PJ MMS / exports -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_provider_paths" />
+        </provider>
+    </application>
+</manifest>

@@ -1,0 +1,295 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.data.sms
+
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.telephony.SmsManager
+import android.telephony.SubscriptionManager
+import com.relay.sms.core.result.AppError
+import com.relay.sms.core.result.Outcome
+import com.relay.sms.domain.sender.SmsSender
+import dagger.hilt.android.qualifiers.ApplicationContext
+import timber.log.Timber
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * v1.28.3 (F23) — `requestCode` d'un `PendingIntent` de suivi, extrait pour être **mesurable**.
+ *
+ * Ce que la fonction doit garantir, et qui ne se lit pas dans un `PendingIntent` :
+ *  - deux TENTATIVES du même message ne partagent plus le même code. Sans cela,
+ *    `PendingIntent.filterEquals` — qui ignore les extras — les tenait pour un seul et même
+ *    objet, `FLAG_UPDATE_CURRENT` réécrivait les extras du premier, et rien dans l'accusé ne
+ *    disait de quelle tentative il venait ;
+ *  - deux PARTIES d'un même envoi restent distinctes (audit F36) ;
+ *  - deux MESSAGES restent distincts, y compris au-delà de `Int.MAX_VALUE`.
+ *
+ * La tentative est mêlée par XOR sur un multiple impair dérivé du nombre d'or, et non par une
+ * multiplication supplémentaire : `mix` occupe déjà les bits hauts, et l'y décaler encore
+ * rapprocherait les identifiants que F36 avait justement séparés.
+ */
+internal fun smsTrackingRequestCode(action: String, localId: Long, partIndex: Int, attempt: Int): Int {
+    val mix = (localId xor (localId ushr 32)) * SmsSenderImpl.MAX_PARTS + partIndex.toLong()
+    val salt = (attempt.toLong() + 1L) * SmsSenderImpl.GOLDEN_ODD
+    return ((mix xor salt) xor action.hashCode().toLong()).toInt() and 0x7FFFFFFF
+}
+
+/**
+ * v1.29.2 — les parties à envoyer, le découpage du système étant passé en [decoupageSysteme] pour être
+ * mesurable.
+ *
+ * `SmsManager.divideMessage` refuse un long texte Unicode quand la permission Téléphone est refusée
+ * (`SecurityException: getGroupIdLevel1`, cf. [decouperEnUcs2]) : l'envoi échouait alors pour ce seul
+ * texte. Le découpage vient dans ce cas de [decouperEnUcs2] ; toute autre exception reste ce qu'elle était.
+ */
+internal fun partiesAEnvoyer(text: String, decoupageSysteme: (String) -> ArrayList<String>): ArrayList<String> =
+    try {
+        decoupageSysteme(text)
+    } catch (refus: SecurityException) {
+        Timber.w(refus, "divideMessage refusé : découpage Unicode de l'application")
+        ArrayList(decouperEnUcs2(text))
+    }
+
+/**
+ * Wraps the Android [SmsManager] API. Caller is expected to be the default SMS app.
+ *
+ * Pending intent extras encode the local Room message id so receivers can update the DB.
+ */
+@Singleton
+class SmsSenderImpl @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val wireFormatter: PhoneNumberWireFormatter,
+) : SmsSender {
+
+    override fun send(
+        localMessageId: Long,
+        destination: String,
+        text: String,
+        subId: Int?,
+        requestDeliveryReport: Boolean,
+        attempt: Int,
+    ): Outcome<Unit> {
+        return try {
+            val manager = subscriptionAwareManager(subId)
+            // Normalise the destination to E.164 for the wire so a foreign SIM (e.g. a Luxembourg
+            // SIM texting a French `06…`) can route it. Falls back to `destination` verbatim when
+            // the region is unknown or the number is a short code — no regression on domestic
+            // sends. Only the wire address is affected; the Room/provider rows keep the raw form.
+            val wireDestination = wireFormatter.toWireFormat(destination, subId)
+            val parts = partiesAEnvoyer(text) { manager.divideMessage(it) }
+            sendParts(
+                manager = manager,
+                wireDestination = wireDestination,
+                parts = parts,
+                localMessageId = localMessageId,
+                firstPartIndex = 0,
+                partCount = parts.size,
+                requestDeliveryReport = requestDeliveryReport,
+                attempt = attempt,
+                e2eFragment = false,
+            )
+        } catch (t: Throwable) {
+            Outcome.Failure(AppError.Telephony("sendMultipartTextMessage failed", t))
+        }
+    }
+
+    /**
+     * E2E (design §3.4) — one ciphertext fragment, one single-part SMS.
+     * The fragment is already a complete SMS (≤ 160 chars) so it is NOT
+     * passed through `divideMessage` — splitting it again would change
+     * the wire bytes. Its index rides as the part index, so each
+     * fragment gets distinct tracking `PendingIntent`s (plain [send]
+     * would give every fragment part index 0 and collapse them onto one
+     * `PendingIntent` via `FLAG_UPDATE_CURRENT`), and the
+     * `EXTRA_E2E_FRAGMENT` marker lets the delivery receiver hold the
+     * DELIVERED promotion until ALL fragments report delivered.
+     */
+    override fun sendFragment(
+        localMessageId: Long,
+        destination: String,
+        text: String,
+        fragmentIndex: Int,
+        fragmentTotal: Int,
+        subId: Int?,
+        requestDeliveryReport: Boolean,
+        attempt: Int,
+    ): Outcome<Unit> {
+        return try {
+            val manager = subscriptionAwareManager(subId)
+            val wireDestination = wireFormatter.toWireFormat(destination, subId)
+            sendParts(
+                manager = manager,
+                wireDestination = wireDestination,
+                parts = arrayListOf(text),
+                localMessageId = localMessageId,
+                firstPartIndex = fragmentIndex,
+                partCount = fragmentTotal,
+                requestDeliveryReport = requestDeliveryReport,
+                attempt = attempt,
+                e2eFragment = true,
+            )
+        } catch (t: Throwable) {
+            Outcome.Failure(AppError.Telephony("sendMultipartTextMessage failed", t))
+        }
+    }
+
+    /**
+     * Shared dispatch: builds one sent/delivery `PendingIntent` pair per
+     * part (part indices start at [firstPartIndex] and the total is
+     * [partCount] — for a plain send those are 0 and the part count; for
+     * an E2E fragment they are the fragment's index/total within its
+     * set) and hands the parts to the radio.
+     */
+    private fun sendParts(
+        manager: SmsManager,
+        wireDestination: String,
+        parts: ArrayList<String>,
+        localMessageId: Long,
+        firstPartIndex: Int,
+        partCount: Int,
+        requestDeliveryReport: Boolean,
+        attempt: Int,
+        e2eFragment: Boolean,
+    ): Outcome<Unit> {
+        val sentIntents = ArrayList<PendingIntent>(parts.size)
+        val deliveredIntents = ArrayList<PendingIntent>(parts.size)
+        for (i in parts.indices) {
+            val partIndex = firstPartIndex + i
+            sentIntents += buildPendingIntent(
+                ACTION_SMS_SENT,
+                localMessageId,
+                partIndex,
+                partCount,
+                attempt,
+                e2eFragment,
+            )
+            deliveredIntents += buildPendingIntent(
+                ACTION_SMS_DELIVERED,
+                localMessageId,
+                partIndex,
+                partCount,
+                attempt,
+                e2eFragment,
+            )
+        }
+        manager.sendMultipartTextMessage(
+            wireDestination,
+            /* scAddress = */ null,
+            parts,
+            sentIntents,
+            if (requestDeliveryReport) deliveredIntents else null,
+        )
+        return Outcome.Success(Unit)
+    }
+
+    /**
+     * Resolves the right [SmsManager] for the given [subId] (multi-SIM support). On API ≥ 31
+     * (S) we route through the system-service factory; on older releases we fall back to the
+     * legacy static helpers. `SmsManager.getDefault()` itself is deprecated everywhere, so the
+     * `subId == null` branch also prefers the system-service form when available.
+     */
+    private fun subscriptionAwareManager(subId: Int?): SmsManager {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val sm = context.getSystemService(SmsManager::class.java)
+            return if (subId == null) sm else sm.createForSubscriptionId(subId)
+        }
+        return when {
+            subId == null -> @Suppress("DEPRECATION") SmsManager.getDefault()
+            else -> @Suppress("DEPRECATION") SmsManager.getSmsManagerForSubscriptionId(
+                if (subId == SubscriptionManager.INVALID_SUBSCRIPTION_ID) {
+                    SubscriptionManager.getDefaultSmsSubscriptionId()
+                } else subId,
+            )
+        }
+    }
+
+    private fun buildPendingIntent(
+        action: String,
+        localId: Long,
+        partIndex: Int,
+        total: Int,
+        attempt: Int,
+        e2eFragment: Boolean = false,
+    ): PendingIntent {
+        // Audit F36: derive the request code from a 64-bit mix so two distinct (localId, partIndex)
+        // pairs cannot collide on Int wraparound when localId > Int.MAX_VALUE / MAX_PARTS.
+        //
+        // Audit P0-2 (v1.2.0): Intent **explicit** via `setClass`. The previous `setPackage`-only
+        // implicit form was silently dropped on Android 14+ — the SmsSent / SmsDelivered receivers
+        // never fired → outgoing SMS rows stuck in PENDING forever (only the 15 min watchdog in
+        // TelephonySyncWorker promoted them to FAILED, hiding the real bug). Explicit targeting
+        // also removes any need for an `<intent-filter>` on the receiver, keeping it `exported=false`.
+        // Composant ciblé par NOM (string) et non `::class.java` : les receivers vivent dans le
+        // module `:app` (system/), inaccessible depuis `:data`. `setClassName(context, fqcn)` cible
+        // le même composant explicite à l'exécution (package = context.packageName, classe = fqcn),
+        // en debug comme en release — le suffixe `.debug` ne change pas le package de la classe.
+        val targetClassName = when (action) {
+            ACTION_SMS_SENT -> "com.relay.sms.system.receiver.SmsSentReceiver"
+            ACTION_SMS_DELIVERED -> "com.relay.sms.system.receiver.SmsDeliveredReceiver"
+            else -> throw IllegalArgumentException("unknown action: $action")
+        }
+        //
+        // v1.28.3 (F23) — la TENTATIVE entre dans l'identité, pas seulement dans les extras.
+        //
+        // Une relance réutilise le même id Room. `PendingIntent.filterEquals` ignorant les
+        // extras, la tentative 2 retrouvait donc le `PendingIntent` de la tentative 1 — même
+        // action, même composant, même `requestCode` — et `FLAG_UPDATE_CURRENT` se contentait de
+        // réécrire ses extras. Les deux tentatives partageaient une seule adresse de retour, et
+        // rien dans l'accusé ne disait de laquelle il venait. En la mêlant au `requestCode`,
+        // chaque tentative obtient le sien, et celui de la précédente reste distinct au lieu
+        // d'être écrasé : son accusé tardif arrive toujours, mais **identifié**, donc écartable.
+        val intent = Intent(action).setClassName(context, targetClassName).apply {
+            putExtra(EXTRA_LOCAL_ID, localId)
+            putExtra(EXTRA_PART_INDEX, partIndex)
+            putExtra(EXTRA_PART_COUNT, total)
+            putExtra(EXTRA_ATTEMPT, attempt)
+            // E2E — marks this intent as one fragment of an encrypted
+            // message, so the delivery receiver can hold the DELIVERED
+            // promotion until every fragment of the set has reported.
+            // Absent (false) on every plain send: the plain receivers
+            // read the same extras they always did.
+            if (e2eFragment) putExtra(EXTRA_E2E_FRAGMENT, true)
+        }
+        val flags = PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        val request = smsTrackingRequestCode(action, localId, partIndex, attempt)
+        return PendingIntent.getBroadcast(context, request, intent, flags)
+    }
+
+    companion object {
+        const val ACTION_SMS_SENT = "com.relay.sms.action.SMS_SENT"
+        const val ACTION_SMS_DELIVERED = "com.relay.sms.action.SMS_DELIVERED"
+        const val EXTRA_LOCAL_ID = "com.relay.sms.extra.LOCAL_ID"
+        const val EXTRA_PART_INDEX = "com.relay.sms.extra.PART_INDEX"
+        const val EXTRA_PART_COUNT = "com.relay.sms.extra.PART_COUNT"
+
+        /**
+         * v1.28.3 (F23) — numéro de la tentative d'envoi porté par l'accusé.
+         *
+         * Absent des `PendingIntent` créés par une version antérieure et encore en vol au moment
+         * de la mise à jour : les receveurs lisent alors `0`, qui est bien le numéro de tentative
+         * des lignes existantes après la migration 10 → 11. L'accusé s'applique donc normalement.
+         */
+        const val EXTRA_ATTEMPT = "com.relay.sms.extra.ATTEMPT"
+
+        /**
+         * E2E (design §3.4) — `true` when this tracking intent belongs to
+         * one fragment of an encrypted message. The delivery receiver
+         * counts distinct fragment indices per (message, attempt) and
+         * only promotes the row to DELIVERED once every fragment has
+         * reported. Absent on plain sends.
+         */
+        const val EXTRA_E2E_FRAGMENT = "com.relay.sms.extra.E2E_FRAGMENT"
+
+        internal const val MAX_PARTS = 256L
+
+        /** Multiplicateur impair dérivé du nombre d'or, pour disperser le numéro de tentative. */
+        internal const val GOLDEN_ODD = -0x61c8_8647L
+    }
+}

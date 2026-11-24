@@ -1,0 +1,61 @@
+# IDE / OS
+*.iml
+*.ipr
+*.iws
+/.idea/
+.DS_Store
+
+# Gradle
+.gradle/
+build/
+/local.properties
+/captures
+.externalNativeBuild
+.cxx/
+
+# App build outputs (apk/aab + per-flavor folders)
+/app/release/
+/app/debug/
+*.apk
+*.aab
+
+# Signing
+keystore.properties
+*.keystore
+*.jks
+
+# Kotlin
+.kotlin/
+
+# build-log.ps1 outputs (generated locally for diagnostics, never committed)
+/build.log
+/build_errors.log
+replay_pid*.log
+
+# Claude / agent local files
+.claude/
+CLAUDE.md
+ONBOARDING.md
+
+# Crash dumps
+*.hprof
+hs_err_pid*.log
+hs_err_pid*.mdmp
+
+# KSP output (regenerated each build)
+ksp_output.log
+
+# Build agent / Android Studio caches
+.checkov.cache
+.cache/
+
+# Rapports d'audit IA externe — findings NON VERIFIEES par construction.
+# Ne doivent jamais entrer dans le depot : une hallucination versionnee devient
+# une source qu'un futur lecteur prendrait pour un constat etabli.
+audit/
+
+# Les scripts de .github/scripts/ sont importes par leurs propres controles negatifs ;
+# CPython depose alors un __pycache__ a cote d'eux. Il a ete commis une fois (2026-09-17),
+# ce qui versionne un binaire propre a une version de Python.
+__pycache__/
+*.pyc

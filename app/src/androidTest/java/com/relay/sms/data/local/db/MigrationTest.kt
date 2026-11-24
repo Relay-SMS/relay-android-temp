@@ -1,0 +1,1415 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.data.local.db
+
+import androidx.room.testing.MigrationTestHelper
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
+import com.google.common.truth.Truth.assertThat
+import net.zetetic.database.sqlcipher.SupportOpenHelperFactory
+import org.junit.Before
+import org.junit.Rule
+import org.junit.Test
+import org.junit.runner.RunWith
+
+/**
+ * Proves the invariant [Migrations] claims but never verified: every migration is **additive**, so
+ * a row written under the previous schema stays readable byte-for-byte afterwards.
+ *
+ * The helper is wired with SQLCipher's [SupportOpenHelperFactory] on purpose. With Room's default
+ * `FrameworkSQLiteOpenHelperFactory` these tests would run against plaintext SQLite and prove
+ * nothing about the encrypted path the app actually uses — `ALTER TABLE` behaves identically, but
+ * the whole point is to exercise the real open helper.
+ *
+ * The passphrase is a fixed test constant: [DatabaseKeyManager] is not involved here, and
+ * critically the array is **never wiped** — that was the SEC-CRIT defect repaired in v1.24.0
+ * (cf. [LegacyZeroKeyRekey]).
+ */
+@RunWith(AndroidJUnit4::class)
+class MigrationTest {
+
+    private companion object {
+        const val TEST_DB = "migration-test.db"
+        val TEST_PASSPHRASE = ByteArray(32) { (it + 1).toByte() }
+    }
+
+    @get:Rule
+    val helper = MigrationTestHelper(
+        InstrumentationRegistry.getInstrumentation(),
+        AppDatabase::class.java,
+        emptyList(),
+        SupportOpenHelperFactory(TEST_PASSPHRASE),
+    )
+
+    @Before
+    fun setUp() {
+        System.loadLibrary("sqlcipher")
+        // v1.28.1 — `MigrationTestHelper` pose son verrou `.lck` A COTE du fichier de base, sans
+        // creer le dossier `databases/`. Sur un appareil ou l'application vient d'etre installee
+        // et jamais lancee — l'etat exact que produit `connectedAndroidTest`, qui desinstalle
+        // apres chaque campagne — le dossier n'existe pas, et les DIX tests de ce fichier
+        // echouent sur `ENOENT` avant d'avoir rien mesure. La cause n'a rien a voir avec les
+        // migrations : elle les rendait toutes illisibles.
+        InstrumentationRegistry.getInstrumentation()
+            .targetContext
+            .getDatabasePath(TEST_DB)
+            .parentFile
+            ?.mkdirs()
+    }
+
+    /** Inserts one conversation and one message using only columns that exist in schema v1. */
+    private fun seedV1Row(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+        db.execSQL(
+            """
+            INSERT INTO conversations
+                (id, thread_id, addresses_csv, display_name, last_message_at,
+                 last_message_preview, unread_count, pinned, archived, muted, in_vault)
+            VALUES (1, 42, '+33612345678', 'Alice', 1700000000000, 'salut', 1, 0, 0, 0, 0)
+            """.trimIndent(),
+        )
+        db.execSQL(
+            """
+            INSERT INTO messages
+                (id, conversation_id, telephony_uri, address, body, type, direction,
+                 date, read, starred, status, attachments_count)
+            VALUES (1, 1, 'content://sms/1', '+33612345678', 'salut', 0, 0,
+                    1700000000000, 0, 0, 0, 0)
+            """.trimIndent(),
+        )
+    }
+
+    @Test
+    fun migrateAll_v1ToCurrent_preservesUserData() {
+        helper.createDatabase(TEST_DB, 1).use { db ->
+            seedV1Row(db)
+        }
+
+        val migrated = helper.runMigrationsAndValidate(
+            TEST_DB,
+            AppDatabase.SCHEMA_VERSION,
+            true,
+            *Migrations.ALL,
+        )
+
+        migrated.query("SELECT body, address FROM messages WHERE id = 1").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getString(0)).isEqualTo("salut")
+            assertThat(c.getString(1)).isEqualTo("+33612345678")
+        }
+        migrated.query("SELECT display_name, unread_count FROM conversations WHERE id = 1").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getString(0)).isEqualTo("Alice")
+            assertThat(c.getInt(1)).isEqualTo(1)
+        }
+    }
+
+    @Test
+    fun migrate1To2_addsNullableReplyColumn_withoutTouchingRows() {
+        helper.createDatabase(TEST_DB, 1).use { db -> seedV1Row(db) }
+
+        val db = helper.runMigrationsAndValidate(TEST_DB, 2, true, Migrations.MIGRATION_1_2)
+
+        db.query("SELECT reply_to_message_id FROM messages WHERE id = 1").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.isNull(0)).isTrue()
+        }
+    }
+
+    @Test
+    fun migrate2To3_addsNullableMmsSystemId() {
+        helper.createDatabase(TEST_DB, 1).use { db -> seedV1Row(db) }
+        helper.runMigrationsAndValidate(TEST_DB, 2, true, Migrations.MIGRATION_1_2)
+
+        val db = helper.runMigrationsAndValidate(TEST_DB, 3, true, Migrations.MIGRATION_2_3)
+
+        db.query("SELECT mms_system_id FROM messages WHERE id = 1").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.isNull(0)).isTrue()
+        }
+    }
+
+    @Test
+    fun migrate3To5_addsReactionColumnAndDateIndex() {
+        helper.createDatabase(TEST_DB, 1).use { db -> seedV1Row(db) }
+        helper.runMigrationsAndValidate(TEST_DB, 3, true, Migrations.MIGRATION_1_2, Migrations.MIGRATION_2_3)
+
+        val db = helper.runMigrationsAndValidate(
+            TEST_DB,
+            5,
+            true,
+            Migrations.MIGRATION_3_4,
+            Migrations.MIGRATION_4_5,
+        )
+
+        db.query("SELECT reaction_emoji FROM messages WHERE id = 1").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.isNull(0)).isTrue()
+        }
+        db.query("SELECT name FROM sqlite_master WHERE type='index' AND name='index_messages_date'")
+            .use { c -> assertThat(c.moveToFirst()).isTrue() }
+    }
+
+    @Test
+    fun migrate5To6_dropsTheUnusedOverridesTable() {
+        helper.createDatabase(TEST_DB, 1).use { db -> seedV1Row(db) }
+        helper.runMigrationsAndValidate(
+            TEST_DB,
+            5,
+            true,
+            Migrations.MIGRATION_1_2,
+            Migrations.MIGRATION_2_3,
+            Migrations.MIGRATION_3_4,
+            Migrations.MIGRATION_4_5,
+        )
+
+        val db = helper.runMigrationsAndValidate(TEST_DB, 6, true, Migrations.MIGRATION_5_6)
+
+        db.query("SELECT name FROM sqlite_master WHERE type='table' AND name='conversation_overrides'")
+            .use { c -> assertThat(c.moveToFirst()).isFalse() }
+        // The user's messages are untouched by the cleanup.
+        db.query("SELECT body FROM messages WHERE id = 1").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getString(0)).isEqualTo("salut")
+        }
+    }
+
+    @Test
+    fun migrate6To7_addsPerContactAppearanceColumns() {
+        helper.createDatabase(TEST_DB, 1).use { db -> seedV1Row(db) }
+        helper.runMigrationsAndValidate(
+            TEST_DB,
+            6,
+            true,
+            Migrations.MIGRATION_1_2,
+            Migrations.MIGRATION_2_3,
+            Migrations.MIGRATION_3_4,
+            Migrations.MIGRATION_4_5,
+            Migrations.MIGRATION_5_6,
+        )
+
+        val db = helper.runMigrationsAndValidate(TEST_DB, 7, true, Migrations.MIGRATION_6_7)
+
+        db.query("SELECT bubble_color_argb, avatar_uri FROM conversations WHERE id = 1").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.isNull(0)).isTrue()
+            assertThat(c.isNull(1)).isTrue()
+        }
+    }
+
+    /**
+     * v1.27.11 — la migration `7 → 8` normalise `messages.telephony_uri` et efface les doublons
+     * que sa divergence de forme a produits.
+     *
+     * La base de depart reproduit ce qu'un appareil affecte contient reellement :
+     *  - **id 1** : le message tel que l'APPLICATION l'a ecrit, sous `content://sms/sent/9164`,
+     *    avec ce que lui seul porte — ici une reaction et un favori ;
+     *  - **id 2** : le meme message tel que l'IMPORT l'a recree apres une resynchronisation,
+     *    sous `content://sms/9164`, nu ;
+     *  - **id 3** : un message sans rapport, deja canonique, qui ne doit pas bouger.
+     *
+     * Ce que le test exige va au-dela de « il ne reste qu'une ligne » : il exige que ce soit
+     * **la bonne**. Conserver l'import aurait perdu la reaction et le favori — et, sur un vrai
+     * appareil, aurait pu sortir le message du coffre, l'import l'ayant pose dans la
+     * conversation en clair.
+     */
+    @Test
+    fun migrate7To8_normaliseLUriEtSupprimeLeDoublonEnGardantLaLigneDeLApplication() {
+        helper.createDatabase(TEST_DB, 1).use { db -> seedV1Row(db) }
+        helper.runMigrationsAndValidate(
+            TEST_DB,
+            7,
+            true,
+            Migrations.MIGRATION_1_2,
+            Migrations.MIGRATION_2_3,
+            Migrations.MIGRATION_3_4,
+            Migrations.MIGRATION_4_5,
+            Migrations.MIGRATION_5_6,
+            Migrations.MIGRATION_6_7,
+        ).use { db ->
+            db.execSQL("DELETE FROM messages")
+            db.execSQL(
+                """
+                INSERT INTO messages
+                    (id, conversation_id, telephony_uri, address, body, type, direction,
+                     date, date_sent, read, starred, status, error_code, sub_id,
+                     scheduled_at, attachments_count, reaction_emoji)
+                VALUES
+                    (1, 1, 'content://sms/sent/9164', '+33612345678', 'coucou',
+                     0, 1, 1700000000000, 1700000000000, 1, 1, 2, NULL, NULL, NULL, 0, '❤️'),
+                    (2, 1, 'content://sms/9164', '+33612345678', 'coucou',
+                     0, 1, 1700000000000, 1700000000000, 1, 0, 2, NULL, NULL, NULL, 0, NULL),
+                    (3, 1, 'content://sms/7000', '+33612345678', 'sans rapport',
+                     0, 0, 1700000001000, 1700000001000, 1, 0, 2, NULL, NULL, NULL, 0, NULL)
+                """.trimIndent(),
+            )
+        }
+
+        val db = helper.runMigrationsAndValidate(TEST_DB, 8, true, Migrations.MIGRATION_7_8)
+
+        // Le doublon a disparu, et c'est bien la ligne de l'import qui est partie.
+        db.query("SELECT id, telephony_uri, starred, reaction_emoji FROM messages ORDER BY id")
+            .use { c ->
+                assertThat(c.count).isEqualTo(2)
+
+                assertThat(c.moveToNext()).isTrue()
+                assertThat(c.getLong(0)).isEqualTo(1L)
+                assertThat(c.getString(1)).isEqualTo("content://sms/9164")
+                assertThat(c.getInt(2)).isEqualTo(1)
+                assertThat(c.getString(3)).isEqualTo("❤️")
+
+                // Le message etranger n'a pas ete touche.
+                assertThat(c.moveToNext()).isTrue()
+                assertThat(c.getLong(0)).isEqualTo(3L)
+                assertThat(c.getString(1)).isEqualTo("content://sms/7000")
+            }
+    }
+
+    /**
+     * v1.28.1 (revue externe !38458, 3e passe) — **une collision d'URI n'est pas une preuve de
+     * doublon**, et la v1.27.11 la prenait pour telle.
+     *
+     * Le cas est celui que decrit le testeur, et il n'a rien de theorique : la restauration
+     * d'avant la v1.27.10 recopiait les `telephony_uri` du telephone SOURCE. `content://sms/9164`
+     * peut donc designer, dans une meme base, un message d'ici et un message venu d'ailleurs. La
+     * migration supprimait le second sans comparer un seul champ.
+     *
+     * Ce que ce test exige tient en une phrase : **rien n'est touche**. Les deux messages sont
+     * la, chacun avec SA liaison.
+     *
+     * ⚠ Une premiere version de ce test exigeait que la ligne en collision passe a `telephony_uri
+     * = NULL`. C'etait un defaut, trouve en relecture externe le 2026-09-08 : dans cette base,
+     * `NULL` signifie « ce message n'a jamais eu de copie systeme », et `SystemCopyEraser.erase`
+     * en conclut « rien ne survit ». Effacer une liaison legitime aurait donc fait declarer partie
+     * une copie systeme bien vivante. Le test exigeait le mauvais comportement — et il aurait ete
+     * VERT dessus.
+     */
+    @Test
+    fun migrate7To8_deuxMessagesDIFFERENTSSousLaMemeUri_sontTousLesDeuxConserves() {
+        helper.createDatabase(TEST_DB, 1).use { db -> seedV1Row(db) }
+        helper.runMigrationsAndValidate(
+            TEST_DB,
+            7,
+            true,
+            Migrations.MIGRATION_1_2,
+            Migrations.MIGRATION_2_3,
+            Migrations.MIGRATION_3_4,
+            Migrations.MIGRATION_4_5,
+            Migrations.MIGRATION_5_6,
+            Migrations.MIGRATION_6_7,
+        ).use { db ->
+            db.execSQL("DELETE FROM messages")
+            db.execSQL(
+                """
+                INSERT INTO messages
+                    (id, conversation_id, telephony_uri, address, body, type, direction,
+                     date, date_sent, read, starred, status, error_code, sub_id,
+                     scheduled_at, attachments_count, reaction_emoji)
+                VALUES
+                    (1, 1, 'content://sms/sent/9164', '+33612345678', 'ecrit ici',
+                     0, 1, 1700000000000, 1700000000000, 1, 1, 2, NULL, NULL, NULL, 0, NULL),
+                    (2, 1, 'content://sms/9164', '+33698765432', 'restaure d''un autre telephone',
+                     0, 0, 1500000000000, 1500000000000, 1, 0, 2, NULL, NULL, NULL, 0, NULL)
+                """.trimIndent(),
+            )
+        }
+
+        val db = helper.runMigrationsAndValidate(TEST_DB, 8, true, Migrations.MIGRATION_7_8)
+
+        db.query("SELECT id, telephony_uri, body FROM messages ORDER BY id").use { c ->
+            // Le point du test : RIEN n'a ete supprime, et RIEN n'a change de main.
+            assertThat(c.count).isEqualTo(2)
+
+            assertThat(c.moveToNext()).isTrue()
+            assertThat(c.getLong(0)).isEqualTo(1L)
+            // Pas normalisee : la place canonique est occupee par une ligne non prouvee
+            // identique, et on ne la lui prend pas.
+            assertThat(c.getString(1)).isEqualTo("content://sms/sent/9164")
+
+            assertThat(c.moveToNext()).isTrue()
+            assertThat(c.getLong(0)).isEqualTo(2L)
+            assertThat(c.getString(1)).isEqualTo("content://sms/9164")
+            assertThat(c.getString(2)).isEqualTo("restaure d'un autre telephone")
+        }
+    }
+
+    /**
+     * v1.28.1 (relecture externe GPT, point 7) — deux copies identiques peuvent vivre dans DEUX
+     * conversations, l'une dans le coffre et l'autre en clair. Les fusionner reviendrait a
+     * choisir a l'aveugle laquelle des deux visibilites survit, et laisserait la conversation
+     * perdante avec un apercu et un compteur faux. La conversation fait donc partie de la preuve.
+     */
+    @Test
+    fun migrate7To8_deuxCopiesIdentiquesDansDeuxConversations_neSontPasFusionnees() {
+        helper.createDatabase(TEST_DB, 1).use { db -> seedV1Row(db) }
+        helper.runMigrationsAndValidate(
+            TEST_DB,
+            7,
+            true,
+            Migrations.MIGRATION_1_2,
+            Migrations.MIGRATION_2_3,
+            Migrations.MIGRATION_3_4,
+            Migrations.MIGRATION_4_5,
+            Migrations.MIGRATION_5_6,
+            Migrations.MIGRATION_6_7,
+        ).use { db ->
+            db.execSQL("DELETE FROM messages")
+            db.execSQL(
+                """
+                INSERT INTO messages
+                    (id, conversation_id, telephony_uri, address, body, type, direction,
+                     date, date_sent, read, starred, status, error_code, sub_id,
+                     scheduled_at, attachments_count, reaction_emoji)
+                VALUES
+                    (1, 1, 'content://sms/sent/9164', '+33612345678', 'coucou',
+                     0, 1, 1700000000000, 1700000000000, 1, 0, 2, NULL, NULL, NULL, 0, NULL),
+                    (2, 2, 'content://sms/9164', '+33612345678', 'coucou',
+                     0, 1, 1700000000000, 1700000000000, 1, 0, 2, NULL, NULL, NULL, 0, NULL)
+                """.trimIndent(),
+            )
+        }
+
+        val db = helper.runMigrationsAndValidate(TEST_DB, 8, true, Migrations.MIGRATION_7_8)
+
+        db.query("SELECT id, conversation_id, telephony_uri FROM messages ORDER BY id").use { c ->
+            assertThat(c.count).isEqualTo(2)
+            assertThat(c.moveToNext()).isTrue()
+            assertThat(c.getString(2)).isEqualTo("content://sms/sent/9164")
+            assertThat(c.moveToNext()).isTrue()
+            assertThat(c.getString(2)).isEqualTo("content://sms/9164")
+        }
+    }
+
+    // ──────────────────────────── v8 → v9 (F01) ────────────────────────────
+
+    /**
+     * v1.28.3 (F01) — la migration convertit en `NULL` **les deux** sentinelles « pas de fil
+     * système » qui ont existé en base, et ne touche pas à un `thread_id` AOSP réel.
+     *
+     * Le `0L` venait de la composition et de la réception ; les valeurs négatives venaient de
+     * `BackupService`, qui les fabriquait depuis la v1.15.2 pour contourner ce même piège sur
+     * le chemin de la restauration. Les deux disent « inconnu » et doivent finir `NULL`.
+     */
+    @Test
+    fun migrate8To9_convertitLesDeuxSentinellesEnNull_etPreserveUnVraiFilSysteme() {
+        helper.createDatabase(TEST_DB, 8).use { db ->
+            db.execSQL(
+                """
+                INSERT INTO conversations
+                    (id, thread_id, addresses_csv, display_name, last_message_at,
+                     last_message_preview, unread_count, pinned, archived, muted, in_vault)
+                VALUES
+                    (1, 0,           '+33600000001', 'Locale',      1700000000000, 'a', 0, 0, 0, 0, 0),
+                    (2, -1757000000, '+33600000002', 'Restauree',   1700000000000, 'b', 0, 0, 0, 0, 0),
+                    (3, 42,          '+33600000003', 'Importee',    1700000000000, 'c', 0, 0, 0, 0, 0)
+                """.trimIndent(),
+            )
+        }
+
+        val db = helper.runMigrationsAndValidate(TEST_DB, 9, true, Migrations.MIGRATION_8_9)
+
+        db.query("SELECT id, thread_id, display_name FROM conversations ORDER BY id").use { c ->
+            assertThat(c.count).isEqualTo(3)
+            assertThat(c.moveToNext()).isTrue()
+            assertThat(c.isNull(1)).isTrue()
+            assertThat(c.getString(2)).isEqualTo("Locale")
+            assertThat(c.moveToNext()).isTrue()
+            assertThat(c.isNull(1)).isTrue()
+            assertThat(c.getString(2)).isEqualTo("Restauree")
+            assertThat(c.moveToNext()).isTrue()
+            assertThat(c.getLong(1)).isEqualTo(42L)
+            assertThat(c.getString(2)).isEqualTo("Importee")
+        }
+    }
+
+    /**
+     * **Contrôle de la cascade.** [Migrations.MIGRATION_8_9] est la seule migration du projet à
+     * exécuter un `DROP TABLE` sur une table référencée. `messages.conversation_id` pointe
+     * `conversations(id)` en `ForeignKey.CASCADE` : si les clés étrangères étaient actives à ce
+     * moment-là, le `DROP` exécuterait un `DELETE FROM` implicite et **effacerait tous les
+     * messages** de l'utilisateur.
+     *
+     * Room n'active `PRAGMA foreign_keys` que dans `onOpen`, donc après les migrations. Ce test
+     * le VÉRIFIE au lieu de s'y fier, et il vérifie du même coup que les `conversation_id`
+     * continuent de désigner la même conversation après la recréation de table — les `id` sont
+     * recopiés, jamais régénérés.
+     */
+    @Test
+    fun migrate8To9_laRecreationDeTable_neCascadePasSurLesMessages() {
+        helper.createDatabase(TEST_DB, 8).use { db ->
+            db.execSQL(
+                """
+                INSERT INTO conversations
+                    (id, thread_id, addresses_csv, display_name, last_message_at,
+                     last_message_preview, unread_count, pinned, archived, muted, in_vault)
+                VALUES (7, 0, '+33612345678', 'Alice', 1700000000000, 'salut', 1, 0, 0, 0, 0)
+                """.trimIndent(),
+            )
+            db.execSQL(
+                """
+                INSERT INTO messages
+                    (id, conversation_id, telephony_uri, address, body, type, direction,
+                     date, date_sent, read, starred, status, error_code, sub_id,
+                     scheduled_at, attachments_count, reaction_emoji)
+                VALUES (1, 7, 'content://sms/1', '+33612345678', 'a ne pas perdre',
+                        0, 0, 1700000000000, NULL, 0, 0, 1, NULL, NULL, NULL, 0, NULL)
+                """.trimIndent(),
+            )
+        }
+
+        val db = helper.runMigrationsAndValidate(TEST_DB, 9, true, Migrations.MIGRATION_8_9)
+
+        db.query("SELECT conversation_id, body FROM messages").use { c ->
+            assertThat(c.count).isEqualTo(1)
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getLong(0)).isEqualTo(7L)
+            assertThat(c.getString(1)).isEqualTo("a ne pas perdre")
+        }
+    }
+
+    /**
+     * Après la migration, l'index UNIQUE doit avoir été recréé — `DROP TABLE` l'emporte — et
+     * accepter plusieurs `NULL`, ce qui est toute la raison d'être du changement : SQLite tient
+     * deux `NULL` pour distincts sous un index UNIQUE.
+     */
+    @Test
+    fun migrate8To9_lIndexEstRecree_etAccepteAutantDeNullQueVoulu() {
+        helper.createDatabase(TEST_DB, 8).use { db ->
+            db.execSQL(
+                """
+                INSERT INTO conversations
+                    (id, thread_id, addresses_csv, display_name, last_message_at,
+                     last_message_preview, unread_count, pinned, archived, muted, in_vault)
+                VALUES (1, 0, '+33600000001', 'Locale', 1700000000000, 'a', 0, 0, 0, 0, 0)
+                """.trimIndent(),
+            )
+        }
+
+        val db = helper.runMigrationsAndValidate(TEST_DB, 9, true, Migrations.MIGRATION_8_9)
+
+        // Deux conversations locales de plus : c'est le scénario que F01 rendait impossible.
+        db.execSQL(
+            """
+            INSERT INTO conversations
+                (id, thread_id, addresses_csv, display_name, last_message_at,
+                 last_message_preview, unread_count, pinned, archived, muted, in_vault)
+            VALUES
+                (2, NULL, '+33600000002', 'B', 1700000000000, 'b', 0, 0, 0, 0, 0),
+                (3, NULL, '+33600000003', 'C', 1700000000000, 'c', 0, 0, 0, 0, 0)
+            """.trimIndent(),
+        )
+        db.query("SELECT COUNT(*) FROM conversations WHERE thread_id IS NULL").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getInt(0)).isEqualTo(3)
+        }
+
+        // L'index tient toujours sur les valeurs réelles.
+        db.execSQL(
+            """
+            INSERT INTO conversations
+                (id, thread_id, addresses_csv, display_name, last_message_at,
+                 last_message_preview, unread_count, pinned, archived, muted, in_vault)
+            VALUES (4, 99, '+33600000004', 'D', 1700000000000, 'd', 0, 0, 0, 0, 0)
+            """.trimIndent(),
+        )
+        val doublon = runCatching {
+            db.execSQL(
+                """
+                INSERT INTO conversations
+                    (id, thread_id, addresses_csv, display_name, last_message_at,
+                     last_message_preview, unread_count, pinned, archived, muted, in_vault)
+                VALUES (5, 99, '+33600000005', 'E', 1700000000000, 'e', 0, 0, 0, 0, 0)
+                """.trimIndent(),
+            )
+        }
+        assertThat(doublon.isFailure).isTrue()
+    }
+
+    /**
+     * v1.28.3 (F20) — 9 → 10, retour à une migration additive : `scheduled_messages.claimed_at`.
+     *
+     * Ce qui compte n'est pas que la colonne apparaisse — `runMigrationsAndValidate` le vérifie
+     * seul — mais **la valeur qu'y prennent les lignes déjà là**. Une ligne déjà `SENDING` (4)
+     * au moment de la mise à jour est un envoi revendiqué par une exécution qui n'existe plus,
+     * puisque la base vient d'être rouverte. Son `claimed_at` doit valoir `NULL`, que
+     * `markInterruptedIfStale` lit comme un bail expiré : c'est ce qui débloque les envois
+     * restés coincés en vol par les versions précédentes, au lieu de les y laisser à vie.
+     */
+    @Test
+    fun migrate9To10_ajouteLeBail_etLesLignesDejaEnVolLeTrouventExpire() {
+        helper.createDatabase(TEST_DB, 9).use { db ->
+            db.execSQL(
+                """
+                INSERT INTO scheduled_messages
+                    (id, conversation_id, addresses_csv, body, scheduled_at, state, created_at)
+                VALUES
+                    (1, NULL, '+33600000001', 'En attente', 1700000000000, 0, 1700000000000),
+                    (2, NULL, '+33600000002', 'Revendique', 1700000000000, 4, 1700000000000)
+                """.trimIndent(),
+            )
+        }
+
+        val db = helper.runMigrationsAndValidate(TEST_DB, 10, true, Migrations.MIGRATION_9_10)
+
+        db.query("SELECT id, state, claimed_at FROM scheduled_messages ORDER BY id").use { c ->
+            assertThat(c.count).isEqualTo(2)
+            assertThat(c.moveToNext()).isTrue()
+            assertThat(c.getInt(1)).isEqualTo(0)
+            assertThat(c.isNull(2)).isTrue()
+            assertThat(c.moveToNext()).isTrue()
+            assertThat(c.getInt(1)).isEqualTo(4)
+            assertThat(c.isNull(2)).isTrue()
+        }
+
+        // La requête qui conclut : `NULL` compte comme expiré, donc la ligne revendiquée passe
+        // en `INTERRUPTED` (5) — et celle qui est simplement en attente n'est pas touchée.
+        db.execSQL(
+            "UPDATE scheduled_messages SET state = 5 " +
+                "WHERE state = 4 AND (claimed_at IS NULL OR claimed_at <= 0)",
+        )
+        db.query("SELECT id, state FROM scheduled_messages ORDER BY id").use { c ->
+            assertThat(c.moveToNext()).isTrue()
+            assertThat(c.getInt(1)).isEqualTo(0)
+            assertThat(c.moveToNext()).isTrue()
+            assertThat(c.getInt(1)).isEqualTo(5)
+        }
+    }
+
+    /**
+     * v1.28.3 (F23) — 10 → 11, additive : `messages.send_attempt INTEGER NOT NULL DEFAULT 0`.
+     *
+     * `NOT NULL` sans valeur par défaut serait refusé par SQLite sur une table déjà peuplée ; le
+     * `DEFAULT 0` est donc obligatoire ici, et il doit être **répété sur le `@ColumnInfo`** de
+     * l'entité, faute de quoi `runMigrationsAndValidate` — qui compare la table réelle au schéma
+     * exporté — rejetterait l'écart. C'est ce que cet appel vérifie au passage.
+     *
+     * Sur le fond : toute ligne existante devient « tentative 0 », ce qui est exactement son
+     * état, aucune n'ayant été relancée sous une version qui comptait. Un `PendingIntent` créé
+     * avant la mise à jour et encore en vol ne porte pas l'extra ; les receveurs lisent alors
+     * `0`, et son accusé s'applique donc normalement.
+     */
+    @Test
+    fun migrate10To11_ajouteLeCompteurDeTentative_aZeroSurLesLignesExistantes() {
+        helper.createDatabase(TEST_DB, 10).use { db ->
+            db.execSQL(
+                """
+                INSERT INTO conversations
+                    (id, thread_id, addresses_csv, display_name, last_message_at,
+                     last_message_preview, unread_count, pinned, archived, muted, in_vault)
+                VALUES (1, 7, '+33600000001', 'Alice', 1700000000000, 'a', 0, 0, 0, 0, 0)
+                """.trimIndent(),
+            )
+            db.execSQL(
+                """
+                INSERT INTO messages
+                    (id, conversation_id, telephony_uri, address, body, type, direction, date,
+                     date_sent, read, starred, status, attachments_count)
+                VALUES (1, 1, 'content://sms/1', '+33600000001', 'Bonjour', 0, 1, 1700000000000,
+                        NULL, 1, 0, 0, 0)
+                """.trimIndent(),
+            )
+        }
+
+        val db = helper.runMigrationsAndValidate(TEST_DB, 11, true, Migrations.MIGRATION_10_11)
+
+        db.query("SELECT id, body, status, send_attempt FROM messages").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getString(1)).isEqualTo("Bonjour")
+            assertThat(c.getInt(2)).isEqualTo(0)
+            assertThat(c.getInt(3)).isEqualTo(0)
+        }
+
+        // La conséquence utile, celle qui justifie le `DEFAULT 0` : l'accusé d'un `PendingIntent`
+        // créé AVANT la mise à jour ne porte pas d'extra, les receveurs lisent `0` — et cet
+        // accusé-là doit encore s'appliquer à la ligne migrée.
+        db.execSQL("UPDATE messages SET status = 1 WHERE id = 1 AND status < 1 AND send_attempt = 0")
+        db.query("SELECT status FROM messages WHERE id = 1").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getInt(0)).isEqualTo(1)
+        }
+
+        // Contrôle inverse : l'accusé d'une tentative qui n'a jamais eu lieu ne passe pas.
+        db.execSQL("UPDATE messages SET status = 2 WHERE id = 1 AND status < 2 AND send_attempt = 5")
+        db.query("SELECT status FROM messages WHERE id = 1").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getInt(0)).isEqualTo(1)
+        }
+    }
+
+    /** v1.28.3 — groupes nommés : `conversations.custom_name TEXT`, nul sur l'existant. */
+    @Test
+    fun migrate11To12_ajouteLeNomChoisi_nulSurLesLignesExistantes() {
+        helper.createDatabase(TEST_DB, 11).use { db ->
+            db.execSQL(
+                """
+                INSERT INTO conversations
+                    (id, thread_id, addresses_csv, display_name, last_message_at,
+                     last_message_preview, unread_count, pinned, archived, muted, in_vault)
+                VALUES (1, 7, '+33600000001;+33600000002', 'Alice, Bob', 1700000000000, 'a', 0, 0, 0, 0, 0)
+                """.trimIndent(),
+            )
+        }
+
+        val db = helper.runMigrationsAndValidate(TEST_DB, 12, true, Migrations.MIGRATION_11_12)
+
+        db.query("SELECT display_name, custom_name FROM conversations WHERE id = 1").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getString(0)).isEqualTo("Alice, Bob")
+            assertThat(c.isNull(1)).isTrue()
+        }
+        db.execSQL("UPDATE conversations SET custom_name = 'Famille' WHERE id = 1")
+        db.query("SELECT custom_name FROM conversations WHERE id = 1").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getString(0)).isEqualTo("Famille")
+        }
+    }
+
+    /**
+     * v1.28.4 — `hidden` : la sentinelle SMS existante est marquée, le MMS de même forme ne l'est
+     * PAS — c'est lui, le MMS restauré sans légende, que la colonne rend enfin visible.
+     */
+    @Test
+    fun migrate12To13_marqueLesSentinellesSms_etLaisseVisibleLeMmsDeMemeForme() {
+        helper.createDatabase(TEST_DB, 12).use { db ->
+            db.execSQL(
+                """
+                INSERT INTO conversations
+                    (id, thread_id, addresses_csv, display_name, last_message_at,
+                     last_message_preview, unread_count, pinned, archived, muted, in_vault)
+                VALUES (1, 7, '+33600000001', 'Alice', 1700000000000, 'a', 0, 0, 0, 0, 0)
+                """.trimIndent(),
+            )
+            // Une sentinelle de réaction sortante : SMS, corps vide, rien d'autre.
+            db.execSQL(
+                """
+                INSERT INTO messages
+                    (id, conversation_id, telephony_uri, address, body, type, direction, date,
+                     date_sent, read, starred, status, attachments_count)
+                VALUES (1, 1, 'content://sms/1', '+33600000001', '', 0, 1, 1700000000000,
+                        NULL, 1, 0, 1, 0)
+                """.trimIndent(),
+            )
+            // Un MMS restauré sans légende : même forme, autre type.
+            db.execSQL(
+                """
+                INSERT INTO messages
+                    (id, conversation_id, telephony_uri, address, body, type, direction, date,
+                     date_sent, read, starred, status, attachments_count)
+                VALUES (2, 1, NULL, '+33600000001', '', 1, 0, 1700000001000,
+                        NULL, 1, 0, 4, 0)
+                """.trimIndent(),
+            )
+        }
+
+        val db = helper.runMigrationsAndValidate(TEST_DB, 13, true, Migrations.MIGRATION_12_13)
+
+        db.query("SELECT id, hidden FROM messages ORDER BY id").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getInt(0)).isEqualTo(1)
+            assertThat(c.getInt(1)).isEqualTo(1)
+            assertThat(c.moveToNext()).isTrue()
+            assertThat(c.getInt(0)).isEqualTo(2)
+            assertThat(c.getInt(1)).isEqualTo(0)
+        }
+    }
+
+    /**
+     * v1.28.9 (F17) — `mms_transaction_key` : nulle sur l'existant, et UNIQUE. Plusieurs lignes sans clé
+     * coexistent ; une seconde ligne de même clé est refusée — c'est ce qui empêche la reprise d'un PDU
+     * gardé d'écrire deux fois le même MMS.
+     */
+    @Test
+    fun migrate13To14_ajouteLaCleDeTransaction_nulleSurLExistant_etUnique() {
+        helper.createDatabase(TEST_DB, 13).use { db ->
+            db.execSQL(
+                """
+                INSERT INTO conversations
+                    (id, thread_id, addresses_csv, display_name, last_message_at,
+                     last_message_preview, unread_count, pinned, archived, muted, in_vault)
+                VALUES (1, 7, '+33600000001', 'Alice', 1700000000000, 'a', 0, 0, 0, 0, 0)
+                """.trimIndent(),
+            )
+            for (id in 1..2) {
+                db.execSQL(
+                    """
+                    INSERT INTO messages
+                        (id, conversation_id, telephony_uri, address, body, type, direction, date,
+                         date_sent, read, starred, status, attachments_count)
+                    VALUES ($id, 1, NULL, '+33600000001', 'mms', 1, 0, 170000000${id}000,
+                            NULL, 1, 0, 4, 1)
+                    """.trimIndent(),
+                )
+            }
+        }
+
+        val db = helper.runMigrationsAndValidate(TEST_DB, 14, true, Migrations.MIGRATION_13_14)
+
+        db.query("SELECT COUNT(*) FROM messages WHERE mms_transaction_key IS NULL").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getInt(0)).isEqualTo(2)
+        }
+        db.execSQL("UPDATE messages SET mms_transaction_key = 'cle-a' WHERE id = 1")
+        val doublon = runCatching { db.execSQL("UPDATE messages SET mms_transaction_key = 'cle-a' WHERE id = 2") }
+        assertThat(doublon.isFailure).isTrue()
+        assertThat(doublon.exceptionOrNull()?.message.orEmpty()).contains("UNIQUE")
+        // Contrôle positif : une autre clé passe.
+        db.execSQL("UPDATE messages SET mms_transaction_key = 'cle-b' WHERE id = 2")
+    }
+
+    @Test
+    fun migrate16To17_ajouteLaCleClient_nulleSurLExistant_etUnique() {
+        helper.createDatabase(TEST_DB, 16).use { db ->
+            for (id in 1..2) {
+                db.execSQL(
+                    """
+                    INSERT INTO scheduled_messages
+                        (id, conversation_id, addresses_csv, body, scheduled_at, sub_id,
+                         attachments_json, state, work_id, created_at, claimed_at)
+                    VALUES ($id, 1, '+33600000001', 'bonne nuit', 1800000000000, NULL,
+                            NULL, 0, NULL, 1700000000000, NULL)
+                    """.trimIndent(),
+                )
+            }
+        }
+
+        val db = helper.runMigrationsAndValidate(TEST_DB, 17, true, Migrations.MIGRATION_16_17)
+
+        db.query("SELECT COUNT(*) FROM scheduled_messages WHERE client_message_id IS NULL").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getInt(0)).isEqualTo(2)
+        }
+        db.execSQL("UPDATE scheduled_messages SET client_message_id = 'cle-a' WHERE id = 1")
+        val doublon = runCatching {
+            db.execSQL("UPDATE scheduled_messages SET client_message_id = 'cle-a' WHERE id = 2")
+        }
+        assertThat(doublon.isFailure).isTrue()
+        assertThat(doublon.exceptionOrNull()?.message.orEmpty()).contains("UNIQUE")
+        // Contrôle positif : une autre clé passe.
+        db.execSQL("UPDATE scheduled_messages SET client_message_id = 'cle-b' WHERE id = 2")
+    }
+
+    /**
+     * Client mode C2 — 17 → 18 : les trois colonnes `hub_*_id` (nulles
+     * sur l'existant, chacune avec son index UNIQUE) et les trois tables
+     * neuves (`client_sync_state`, `client_conversation_state`,
+     * `synced_contacts`), qui naissent vides. Strictement additive : les
+     * lignes existantes ne bougent pas.
+     */
+    @Test
+    fun migrate17To18_ajouteLesIdsHub_etLesTablesDeSyncClient() {
+        helper.createDatabase(TEST_DB, 17).use { db ->
+            db.execSQL(
+                """
+                INSERT INTO conversations
+                    (id, thread_id, addresses_csv, display_name, last_message_at,
+                     last_message_preview, unread_count, pinned, archived, muted, in_vault)
+                VALUES (1, 7, '+33600000001', 'Alice', 1700000000000, 'a', 0, 0, 0, 0, 0)
+                """.trimIndent(),
+            )
+            db.execSQL(
+                """
+                INSERT INTO messages
+                    (id, conversation_id, telephony_uri, address, body, type, direction, date,
+                     date_sent, read, starred, status, attachments_count)
+                VALUES (1, 1, 'content://sms/1', '+33600000001', 'Bonjour', 0, 1, 1700000000000,
+                        NULL, 1, 0, 0, 0)
+                """.trimIndent(),
+            )
+            db.execSQL(
+                """
+                INSERT INTO attachments
+                    (id, message_id, mime_type, file_name, size_bytes, local_uri,
+                     width, height, duration_ms)
+                VALUES (1, 1, 'image/jpeg', 'photo.jpg', 100, 'content://x/1', 10, 10, NULL)
+                """.trimIndent(),
+            )
+        }
+
+        val db = helper.runMigrationsAndValidate(TEST_DB, 18, true, Migrations.MIGRATION_17_18)
+
+        // Les lignes existantes projettent NULL sur les trois colonnes, et leurs
+        // données ne bougent pas.
+        db.query("SELECT body, hub_message_id FROM messages WHERE id = 1").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getString(0)).isEqualTo("Bonjour")
+            assertThat(c.isNull(1)).isTrue()
+        }
+        db.query("SELECT display_name, hub_conversation_id FROM conversations WHERE id = 1").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getString(0)).isEqualTo("Alice")
+            assertThat(c.isNull(1)).isTrue()
+        }
+        db.query("SELECT hub_attachment_id FROM attachments WHERE id = 1").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.isNull(0)).isTrue()
+        }
+
+        // Les trois tables neuves existent et naissent vides.
+        db.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN " +
+                "('client_sync_state', 'client_conversation_state', 'synced_contacts')",
+        ).use { c -> assertThat(c.count).isEqualTo(3) }
+        db.query("SELECT COUNT(*) FROM client_sync_state").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getInt(0)).isEqualTo(0)
+        }
+        db.query("SELECT COUNT(*) FROM client_conversation_state").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getInt(0)).isEqualTo(0)
+        }
+        db.query("SELECT COUNT(*) FROM synced_contacts").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getInt(0)).isEqualTo(0)
+        }
+
+        // L'index UNIQUE tient sur les valeurs réelles : deux lignes ne peuvent
+        // pas porter le même id hub — c'est lui qui rend l'upsert idempotent.
+        db.execSQL("UPDATE messages SET hub_message_id = 9001 WHERE id = 1")
+        db.execSQL(
+            """
+            INSERT INTO messages
+                (id, conversation_id, telephony_uri, address, body, type, direction, date,
+                 date_sent, read, starred, status, attachments_count)
+            VALUES (2, 1, 'content://sms/2', '+33600000001', 'deux', 0, 1, 1700000001000,
+                    NULL, 1, 0, 0, 0)
+            """.trimIndent(),
+        )
+        val doublon = runCatching { db.execSQL("UPDATE messages SET hub_message_id = 9001 WHERE id = 2") }
+        assertThat(doublon.isFailure).isTrue()
+        assertThat(doublon.exceptionOrNull()?.message.orEmpty()).contains("UNIQUE")
+        // Contrôle positif : une autre clé passe.
+        db.execSQL("UPDATE messages SET hub_message_id = 9002 WHERE id = 2")
+    }
+
+    /**
+     * Round 35 (spam protection) — 19 → 20 : `conversations.sticky_category
+     * TEXT`, nulle sur l'existant, et inscriptible par nom de catégorie.
+     * Strictement additive : les lignes existantes ne bougent pas.
+     *
+     * Nécessite `20.json` dans les assets (émis par Room à la compilation).
+     */
+    @Test
+    fun migrate19To20_ajouteLaCategorieCollante_nulleSurLExistant_etInscriptible() {
+        helper.createDatabase(TEST_DB, 19).use { db ->
+            db.execSQL(
+                """
+                INSERT INTO conversations
+                    (id, thread_id, addresses_csv, display_name, last_message_at,
+                     last_message_preview, unread_count, pinned, archived, muted, in_vault)
+                VALUES (1, 7, '+33600000001', NULL, 1700000000000, 'a', 0, 0, 0, 0, 0)
+                """.trimIndent(),
+            )
+        }
+
+        val db = helper.runMigrationsAndValidate(TEST_DB, 20, true, Migrations.MIGRATION_19_20)
+
+        db.query("SELECT display_name, sticky_category FROM conversations WHERE id = 1").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.isNull(0)).isTrue()
+            assertThat(c.isNull(1)).isTrue()
+        }
+        db.execSQL("UPDATE conversations SET sticky_category = 'PROMOTIONAL' WHERE id = 1")
+        db.query("SELECT sticky_category FROM conversations WHERE id = 1").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getString(0)).isEqualTo("PROMOTIONAL")
+        }
+        db.execSQL("UPDATE conversations SET sticky_category = NULL WHERE id = 1")
+        db.query("SELECT sticky_category FROM conversations WHERE id = 1").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.isNull(0)).isTrue()
+        }
+    }
+
+    /**
+     * Round 36 phase 2 (notes sync + editing) — 20 → 21 :
+     * `note_messages.edited INTEGER NOT NULL DEFAULT 0` et
+     * `client_sync_state.note_last_message_id TEXT NOT NULL DEFAULT
+     * '0'`. Strictement additive : les lignes existantes projettent
+     * les défauts (non modifié, curseur à zéro), et les deux
+     * colonnes sont inscriptibles.
+     *
+     * Nécessite `21.json` dans les assets (émis par Room à la compilation).
+     */
+    @Test
+    fun migrate20To21_ajouteLeMarqueurModifieEtLeCurseurNotes_avecDefauts_etInscriptibles() {
+        helper.createDatabase(TEST_DB, 20).use { db ->
+            db.execSQL(
+                "INSERT INTO notes (uuid, title, created_at, updated_at) " +
+                    "VALUES ('uuid-note-1', 'Courses', 1700000000000, 1700000000000)",
+            )
+            db.execSQL(
+                "INSERT INTO note_messages (uuid, note_id, body, date) " +
+                    "VALUES ('uuid-msg-1', 1, 'lait', 1700000000000)",
+            )
+            db.execSQL(
+                "INSERT INTO client_sync_state " +
+                    "(hub_id, mode, global_last_message_id, initial_sync_done) " +
+                    "VALUES ('hub-1', 'full', '42', 1)",
+            )
+        }
+
+        val db = helper.runMigrationsAndValidate(TEST_DB, 21, true, Migrations.MIGRATION_20_21)
+
+        // Les défauts s'appliquent aux lignes existantes.
+        db.query("SELECT edited FROM note_messages WHERE uuid = 'uuid-msg-1'").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getInt(0)).isEqualTo(0)
+        }
+        db.query(
+            "SELECT global_last_message_id, note_last_message_id " +
+                "FROM client_sync_state WHERE hub_id = 'hub-1'",
+        ).use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getString(0)).isEqualTo("42")
+            assertThat(c.getString(1)).isEqualTo("0")
+        }
+        // Les deux colonnes sont inscriptibles.
+        db.execSQL("UPDATE note_messages SET edited = 1 WHERE uuid = 'uuid-msg-1'")
+        db.query("SELECT edited FROM note_messages WHERE uuid = 'uuid-msg-1'").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getInt(0)).isEqualTo(1)
+        }
+        db.execSQL(
+            "UPDATE client_sync_state SET note_last_message_id = '7' WHERE hub_id = 'hub-1'",
+        )
+        db.query(
+            "SELECT note_last_message_id FROM client_sync_state WHERE hub_id = 'hub-1'",
+        ).use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getString(0)).isEqualTo("7")
+        }
+    }
+
+    /**
+     * Notes phase 1 — 18 → 19 : trois tables neuves (`notes`, `note_messages`,
+     * `note_attachments`), qui naissent vides. Strictement additive : les lignes
+     * existantes ne bougent pas. Les défauts SQL (`pinned`/`archived` 0, `body` '',
+     * `attachments_count` 0) sont vérifiés, ainsi que l'unicité des UUID et la
+     * cascade note → messages → pièces jointes.
+     *
+     * Nécessite `19.json` dans les assets (émis par Room à la compilation).
+     */
+    @Test
+    fun migrate18To19_createsNotesTables_emptyWithDefaultsUniqueUuidsAndCascade() {
+        helper.createDatabase(TEST_DB, 18).use { db ->
+            db.execSQL(
+                """
+                INSERT INTO conversations
+                    (id, thread_id, addresses_csv, display_name, last_message_at,
+                     last_message_preview, unread_count, pinned, archived, muted, in_vault)
+                VALUES (1, 7, '+33600000001', 'Alice', 1700000000000, 'a', 0, 0, 0, 0, 0)
+                """.trimIndent(),
+            )
+        }
+
+        val db = helper.runMigrationsAndValidate(TEST_DB, 19, true, Migrations.MIGRATION_18_19)
+
+        // La ligne existante ne bouge pas.
+        db.query("SELECT display_name FROM conversations WHERE id = 1").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getString(0)).isEqualTo("Alice")
+        }
+
+        // Les trois tables neuves existent et naissent vides, avec les index attendus.
+        db.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN " +
+                "('notes', 'note_messages', 'note_attachments')",
+        ).use { c -> assertThat(c.count).isEqualTo(3) }
+        db.query("SELECT COUNT(*) FROM notes").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getInt(0)).isEqualTo(0)
+        }
+        db.query(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name IN " +
+                "('index_notes_uuid', 'index_note_messages_uuid', 'index_note_attachments_uuid')",
+        ).use { c -> assertThat(c.count).isEqualTo(3) }
+
+        // Les défauts SQL s'appliquent aux colonnes omises.
+        db.execSQL(
+            "INSERT INTO notes (uuid, title, created_at, updated_at) " +
+                "VALUES ('uuid-note-1', 'Courses', 1700000000000, 1700000000000)",
+        )
+        db.query("SELECT pinned, archived FROM notes WHERE uuid = 'uuid-note-1'").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getInt(0)).isEqualTo(0)
+            assertThat(c.getInt(1)).isEqualTo(0)
+        }
+        db.execSQL(
+            "INSERT INTO note_messages (uuid, note_id, date) " +
+                "VALUES ('uuid-msg-1', 1, 1700000000000)",
+        )
+        db.query("SELECT body, attachments_count FROM note_messages WHERE uuid = 'uuid-msg-1'").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getString(0)).isEqualTo("")
+            assertThat(c.getInt(1)).isEqualTo(0)
+        }
+        db.execSQL(
+            """
+            INSERT INTO note_attachments
+                (uuid, note_message_id, mime_type, file_name, size_bytes, local_uri)
+            VALUES ('uuid-att-1', 1, 'image/jpeg', 'photo.jpg', 100, '/notes/uuid-att-1')
+            """.trimIndent(),
+        )
+
+        // L'index UNIQUE tient sur les UUID : un doublon est refusé.
+        val doublon = runCatching {
+            db.execSQL(
+                "INSERT INTO notes (uuid, title, created_at, updated_at) " +
+                    "VALUES ('uuid-note-1', 'Doublon', 1700000000000, 1700000000000)",
+            )
+        }
+        assertThat(doublon.isFailure).isTrue()
+        assertThat(doublon.exceptionOrNull()?.message.orEmpty()).contains("UNIQUE")
+        // Contrôle positif : un autre UUID passe.
+        db.execSQL(
+            "INSERT INTO notes (uuid, title, created_at, updated_at) " +
+                "VALUES ('uuid-note-2', 'Autre', 1700000000000, 1700000000000)",
+        )
+
+        // La cascade efface les messages et les pièces jointes avec la note.
+        db.execSQL("DELETE FROM notes WHERE uuid = 'uuid-note-1'")
+        db.query("SELECT COUNT(*) FROM note_messages WHERE note_id = 1").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getInt(0)).isEqualTo(0)
+        }
+        db.query("SELECT COUNT(*) FROM note_attachments WHERE note_message_id = 1").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getInt(0)).isEqualTo(0)
+        }
+        // L'autre note survit.
+        db.query("SELECT COUNT(*) FROM notes").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getInt(0)).isEqualTo(1)
+        }
+    }
+
+    /**
+     * E2E encryption phase 1 — 21 → 22 : cinq tables neuves (`e2e_account`,
+     * `e2e_peers`, `e2e_sessions`, `e2e_fragments`, `e2e_notices`), qui naissent
+     * vides, + trois colonnes sur `messages` (`encrypted`, `decrypt_failed`,
+     * `ciphertext`). Strictement additive : les lignes existantes projettent les
+     * défauts (non chiffré, déchiffrement non échoué, pas de chiffré), et les
+     * défauts SQL des tables neuves (`verified`/`probe_attempts`/`is_current` à 0)
+     * sont vérifiés, ainsi que l'unicité (adresse, session) et la clé composite
+     * des fragments.
+     *
+     * Nécessite `22.json` dans les assets (émis par Room à la compilation).
+     */
+    @Test
+    fun migrate21To22_createsE2eTablesAndMessageColumns_emptyWithDefaultsAndUniques() {
+        helper.createDatabase(TEST_DB, 21).use { db ->
+            db.execSQL(
+                """
+                INSERT INTO conversations
+                    (id, thread_id, addresses_csv, display_name, last_message_at,
+                     last_message_preview, unread_count, pinned, archived, muted, in_vault)
+                VALUES (1, 7, '+33600000001', 'Alice', 1700000000000, 'a', 0, 0, 0, 0, 0)
+                """.trimIndent(),
+            )
+            db.execSQL(
+                """
+                INSERT INTO messages
+                    (id, conversation_id, telephony_uri, address, body, type, direction,
+                     date, date_sent, read, starred, status, attachments_count)
+                VALUES (1, 1, NULL, '+33600000001', 'salut', 0, 0,
+                        1700000000000, NULL, 1, 0, 4, 0)
+                """.trimIndent(),
+            )
+        }
+
+        val db = helper.runMigrationsAndValidate(TEST_DB, 22, true, Migrations.MIGRATION_21_22)
+
+        // La ligne existante ne bouge pas ; les nouvelles colonnes projettent les défauts.
+        db.query(
+            "SELECT body, encrypted, decrypt_failed, ciphertext FROM messages WHERE id = 1",
+        ).use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getString(0)).isEqualTo("salut")
+            assertThat(c.getInt(1)).isEqualTo(0)
+            assertThat(c.getInt(2)).isEqualTo(0)
+            assertThat(c.isNull(3)).isTrue()
+        }
+
+        // Les cinq tables neuves existent, naissent vides, et l'index unique est là.
+        db.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN " +
+                "('e2e_account', 'e2e_peers', 'e2e_sessions', 'e2e_fragments', 'e2e_notices')",
+        ).use { c -> assertThat(c.count).isEqualTo(5) }
+        db.query("SELECT COUNT(*) FROM e2e_peers").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getInt(0)).isEqualTo(0)
+        }
+        db.query(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name = " +
+                "'index_e2e_sessions_address_session_id'",
+        ).use { c -> assertThat(c.count).isEqualTo(1) }
+
+        // Les défauts SQL s'appliquent aux colonnes omises.
+        db.execSQL("INSERT INTO e2e_account (id, pickle) VALUES (1, 'pickle-1')")
+        db.execSQL(
+            "INSERT INTO e2e_peers (address, state, updated_at) " +
+                "VALUES ('+33600000001', 'UNKNOWN', 1700000000000)",
+        )
+        db.query(
+            "SELECT verified, probe_attempts, last_bundle_reply_at FROM e2e_peers " +
+                "WHERE address = '+33600000001'",
+        ).use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getInt(0)).isEqualTo(0)
+            assertThat(c.getInt(1)).isEqualTo(0)
+            assertThat(c.isNull(2)).isTrue()
+        }
+        db.execSQL(
+            "INSERT INTO e2e_sessions (address, session_id, pickle, created_at, last_used_at) " +
+                "VALUES ('+33600000001', 's1', 'pickle-s1', 1700000000000, 1700000000000)",
+        )
+        db.query(
+            "SELECT is_current FROM e2e_sessions WHERE session_id = 's1'",
+        ).use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getInt(0)).isEqualTo(0)
+        }
+
+        // L'index UNIQUE tient sur (adresse, session) : un doublon est refusé.
+        val doublonSession = runCatching {
+            db.execSQL(
+                "INSERT INTO e2e_sessions (address, session_id, pickle, created_at, last_used_at) " +
+                    "VALUES ('+33600000001', 's1', 'pickle-s1-bis', 1700000000000, 1700000000000)",
+            )
+        }
+        assertThat(doublonSession.isFailure).isTrue()
+        assertThat(doublonSession.exceptionOrNull()?.message.orEmpty()).contains("UNIQUE")
+        // Contrôle positif : une autre session pour le même correspondant passe.
+        db.execSQL(
+            "INSERT INTO e2e_sessions (address, session_id, pickle, created_at, last_used_at) " +
+                "VALUES ('+33600000001', 's2', 'pickle-s2', 1700000000000, 1700000000000)",
+        )
+
+        // La clé composite des fragments refuse un doublon (expéditeur, msg, index).
+        db.execSQL(
+            "INSERT INTO e2e_fragments (sender, msg_id, idx, total, chunk, received_at) " +
+                "VALUES ('+33600000001', 'ab12cd', 0, 2, 'QUJD', 1700000000000)",
+        )
+        val doublonFragment = runCatching {
+            db.execSQL(
+                "INSERT INTO e2e_fragments (sender, msg_id, idx, total, chunk, received_at) " +
+                    "VALUES ('+33600000001', 'ab12cd', 0, 2, 'QUJD', 1700000000000)",
+            )
+        }
+        assertThat(doublonFragment.isFailure).isTrue()
+        assertThat(doublonFragment.exceptionOrNull()?.message.orEmpty()).contains("UNIQUE")
+        // Contrôle positif : l'index suivant du même ensemble passe.
+        db.execSQL(
+            "INSERT INTO e2e_fragments (sender, msg_id, idx, total, chunk, received_at) " +
+                "VALUES ('+33600000001', 'ab12cd', 1, 2, 'REVG', 1700000000000)",
+        )
+
+        // Les avis s'insèrent et se relisent.
+        db.execSQL(
+            "INSERT INTO e2e_notices (conversation_id, kind, date) " +
+                "VALUES (1, 'ACTIVATED', 1700000000000)",
+        )
+        db.query("SELECT kind FROM e2e_notices WHERE conversation_id = 1").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getString(0)).isEqualTo("ACTIVATED")
+        }
+    }
+
+    /**
+     * E2E media encryption (round 48) — 22 → 23 : trois colonnes sur
+     * `e2e_peers` (`media_capable`, `media_announced`,
+     * `handshake_channel`) + une table neuve (`e2e_media_keys`).
+     * Strictement additive : la ligne de pair existante projette les
+     * défauts (non capable, déclaration non envoyée, canal inconnu),
+     * la table naît vide, et sa clé primaire refuse un doublon de
+     * `file_id` (deux clés pour le même fichier ne peuvent pas
+     * coexister — la première gagne).
+     *
+     * Nécessite `23.json` dans les assets (émis par Room à la compilation).
+     */
+    @Test
+    fun migrate22To23_addsMediaCapabilityColumnsAndMediaKeysTable_withDefaultsAndPk() {
+        helper.createDatabase(TEST_DB, 22).use { db ->
+            db.execSQL(
+                "INSERT INTO e2e_peers (address, state, updated_at) " +
+                    "VALUES ('+33600000001', 'ENCRYPTED', 1700000000000)",
+            )
+        }
+
+        val db = helper.runMigrationsAndValidate(TEST_DB, 23, true, Migrations.MIGRATION_22_23)
+
+        // La ligne existante ne bouge pas ; les nouvelles colonnes projettent les défauts.
+        db.query(
+            "SELECT state, media_capable, media_announced, handshake_channel FROM e2e_peers " +
+                "WHERE address = '+33600000001'",
+        ).use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getString(0)).isEqualTo("ENCRYPTED")
+            assertThat(c.getInt(1)).isEqualTo(0)
+            assertThat(c.getInt(2)).isEqualTo(0)
+            assertThat(c.isNull(3)).isTrue()
+        }
+
+        // La table neuve existe et naît vide.
+        db.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name = 'e2e_media_keys'",
+        ).use { c -> assertThat(c.count).isEqualTo(1) }
+        db.query("SELECT COUNT(*) FROM e2e_media_keys").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getInt(0)).isEqualTo(0)
+        }
+
+        // Une clé s'insère et se relit ; le nom est nullable.
+        db.execSQL(
+            "INSERT INTO e2e_media_keys (file_id, key_b64, mime, size, sha256, name, received_at) " +
+                "VALUES ('0123456789abcdef', 'a2V5', 'image/jpeg', 1024, " +
+                "'0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef', " +
+                "NULL, 1700000000000)",
+        )
+        db.query(
+            "SELECT mime, size, name FROM e2e_media_keys WHERE file_id = '0123456789abcdef'",
+        ).use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getString(0)).isEqualTo("image/jpeg")
+            assertThat(c.getLong(1)).isEqualTo(1024L)
+            assertThat(c.isNull(2)).isTrue()
+        }
+
+        // La clé primaire refuse un doublon de file_id.
+        val doublonCle = runCatching {
+            db.execSQL(
+                "INSERT INTO e2e_media_keys (file_id, key_b64, mime, size, sha256, name, received_at) " +
+                    "VALUES ('0123456789abcdef', 'b3RoZXI=', 'image/jpeg', 2048, " +
+                    "'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', " +
+                    "NULL, 1700000000001)",
+            )
+        }
+        assertThat(doublonCle.isFailure).isTrue()
+        assertThat(doublonCle.exceptionOrNull()?.message.orEmpty()).contains("UNIQUE")
+    }
+
+    /**
+     * E2E encrypted groups (round 49) — 23 → 24 : deux colonnes sur
+     * `e2e_peers` (`group_capable`, `group_announced`) + deux tables
+     * neuves (`e2e_group_keys`, `e2e_group_distributions`).
+     * Strictement additive : la ligne de pair existante projette les
+     * défauts (non capable de groupes, déclaration non envoyée), les
+     * tables naissent vides, et la clé primaire composée de
+     * `e2e_group_keys` refuse un doublon de (groupe, expéditeur,
+     * clé) — deux clés différentes ne peuvent pas partager le même
+     * identifiant (la première gagne).
+     *
+     * Nécessite `24.json` dans les assets (émis par Room à la compilation).
+     */
+    @Test
+    fun migrate23To24_addsGroupColumnsTablesAndNoticeSubject_withDefaultsAndPk() {
+        helper.createDatabase(TEST_DB, 23).use { db ->
+            db.execSQL(
+                "INSERT INTO e2e_peers (address, state, media_capable, updated_at) " +
+                    "VALUES ('+33600000001', 'ENCRYPTED', 1, 1700000000000)",
+            )
+        }
+
+        val db = helper.runMigrationsAndValidate(TEST_DB, 24, true, Migrations.MIGRATION_23_24)
+
+        // La ligne existante ne bouge pas ; les nouvelles colonnes projettent les défauts.
+        db.query(
+            "SELECT state, media_capable, group_capable, group_announced FROM e2e_peers " +
+                "WHERE address = '+33600000001'",
+        ).use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getString(0)).isEqualTo("ENCRYPTED")
+            assertThat(c.getInt(1)).isEqualTo(1)
+            assertThat(c.getInt(2)).isEqualTo(0)
+            assertThat(c.getInt(3)).isEqualTo(0)
+        }
+
+        // Les tables neuves existent et naissent vides.
+        db.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name = 'e2e_group_keys'",
+        ).use { c -> assertThat(c.count).isEqualTo(1) }
+        db.query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name = 'e2e_group_distributions'",
+        ).use { c -> assertThat(c.count).isEqualTo(1) }
+        db.query("SELECT COUNT(*) FROM e2e_group_keys").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getInt(0)).isEqualTo(0)
+        }
+        db.query("SELECT COUNT(*) FROM e2e_group_distributions").use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getInt(0)).isEqualTo(0)
+        }
+
+        // Une clé s'insère et se relit ; la clé d'identité de l'expéditeur est nullable.
+        db.execSQL(
+            "INSERT INTO e2e_group_keys (group_id, sender_address, key_id, key_b64, members_csv, " +
+                "key_generation, sender_curve_key_b64, is_own, is_current, created_at) " +
+                "VALUES ('0123456789abcdef0123456789abcdef', '33600000002', " +
+                "'0123456789abcdef', 'a2V5', '33600000001;33600000002;33600000003', " +
+                "1, NULL, 0, 1, 1700000000000)",
+        )
+        db.query(
+            "SELECT members_csv, key_generation, sender_curve_key_b64, is_current " +
+                "FROM e2e_group_keys WHERE group_id = '0123456789abcdef0123456789abcdef'",
+        ).use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getString(0)).isEqualTo("33600000001;33600000002;33600000003")
+            assertThat(c.getInt(1)).isEqualTo(1)
+            assertThat(c.isNull(2)).isTrue()
+            assertThat(c.getInt(3)).isEqualTo(1)
+        }
+
+        // La clé primaire composée refuse un doublon de (groupe, expéditeur, clé).
+        val doublonCle = runCatching {
+            db.execSQL(
+                "INSERT INTO e2e_group_keys (group_id, sender_address, key_id, key_b64, members_csv, " +
+                    "key_generation, sender_curve_key_b64, is_own, is_current, created_at) " +
+                    "VALUES ('0123456789abcdef0123456789abcdef', '33600000002', " +
+                    "'0123456789abcdef', 'b3RoZXI=', '33600000001;33600000002;33600000003', " +
+                    "2, NULL, 0, 0, 1700000000001)",
+            )
+        }
+        assertThat(doublonCle.isFailure).isTrue()
+        assertThat(doublonCle.exceptionOrNull()?.message.orEmpty()).contains("UNIQUE")
+
+        // Une distribution s'insère et se relit.
+        db.execSQL(
+            "INSERT INTO e2e_group_distributions (group_id, member_address, key_id, distributed_at) " +
+                "VALUES ('0123456789abcdef0123456789abcdef', '33600000002', " +
+                "'0123456789abcdef', 1700000000000)",
+        )
+        db.query(
+            "SELECT distributed_at FROM e2e_group_distributions " +
+                "WHERE group_id = '0123456789abcdef0123456789abcdef' " +
+                "AND member_address = '33600000002'",
+        ).use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getLong(0)).isEqualTo(1_700_000_000_000L)
+        }
+
+        // La colonne `subject` de e2e_notices existe, nullable : une
+        // notice de groupe y range l'adresse du membre concerné,
+        // une notice de fil (sans sujet) y laisse NULL.
+        db.execSQL(
+            "INSERT INTO e2e_notices (conversation_id, kind, date, subject) " +
+                "VALUES (11, 'GROUP_KEY_CHANGED', 1700000000000, '33600000002')",
+        )
+        db.execSQL(
+            "INSERT INTO e2e_notices (conversation_id, kind, date) " +
+                "VALUES (11, 'ACTIVATED', 1700000000001)",
+        )
+        db.query(
+            "SELECT kind, subject FROM e2e_notices WHERE conversation_id = 11 ORDER BY date",
+        ).use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getString(0)).isEqualTo("GROUP_KEY_CHANGED")
+            assertThat(c.getString(1)).isEqualTo("33600000002")
+            assertThat(c.moveToNext()).isTrue()
+            assertThat(c.getString(0)).isEqualTo("ACTIVATED")
+            assertThat(c.isNull(1)).isTrue()
+        }
+    }
+}

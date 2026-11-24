@@ -1,0 +1,106 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.domain.repository
+
+import com.relay.sms.core.result.Outcome
+import com.relay.sms.domain.model.PhoneAddress
+import com.relay.sms.domain.model.ScheduledMessage
+import kotlinx.coroutines.flow.Flow
+
+interface ScheduledMessageRepository {
+    fun observePending(): Flow<List<ScheduledMessage>>
+
+    /** v1.25.3 (audit H6) — envois abandonnés, les plus récents d'abord. */
+    fun observeFailed(): Flow<List<ScheduledMessage>>
+
+    /**
+     * v1.28.3 (F20) — envois non réglés, **hors de toute règle d'affichage**.
+     *
+     * Réservé au filet de replanification du démarrage. [observePending] ne convient pas : il
+     * applique la visibilité du coffre, et un envoi programmé depuis une conversation protégée
+     * en disparaît tant que le second facteur n'a pas été donné — c'est-à-dire précisément au
+     * moment où ce filet tourne. Ce qui doit partir ne se décide pas à l'écran.
+     */
+    suspend fun allUnsettled(): List<ScheduledMessage>
+
+    /**
+     * v1.26.0 — [attachments] non vide programme un **MMS**. Les fichiers doivent deja etre
+     * durables : c'est [com.relay.sms.domain.usecase.ScheduleMessageUseCase] qui les promeut.
+     *
+     * Phase 2 — [clientMessageId] est la clé d'idempotence d'un envoi programmé depuis un
+     * appareil lié (`null` pour un envoi programmé depuis le téléphone). Elle est stockée sur
+     * la ligne et transmise au routeur à l'échéance.
+     */
+    suspend fun schedule(
+        conversationId: Long?,
+        addresses: List<PhoneAddress>,
+        body: String,
+        scheduledAt: Long,
+        subId: Int?,
+        attachments: List<com.relay.sms.domain.usecase.SendMediaMmsUseCase.AttachmentPayload> =
+            emptyList(),
+        clientMessageId: String? = null,
+    ): Outcome<Long>
+
+    /**
+     * Phase 2 — retrouve un envoi programmé par sa clé d'idempotence client, ou `null`.
+     * La déduplication des envois programmés depuis un appareil lié : une seconde
+     * `schedule_message` portant la même clé retrouve la ligne existante au lieu d'en
+     * créer une deuxième.
+     */
+    suspend fun findByClientMessageId(clientMessageId: String): ScheduledMessage?
+
+    /**
+     * Client mode C3 — one scheduled row by id. The cancel/retry wire
+     * branches need the row's client key (a keyless row is a hub-mode
+     * leftover with no wire schedule).
+     */
+    suspend fun findById(id: Long): ScheduledMessage?
+
+    /**
+     * v1.26.1 (audit B2) — rend `true` si l'annulation a REELLEMENT pris, `false` si l'envoi
+     * avait deja ete revendique par le worker. Le verdict conditionne la suppression des
+     * pieces jointes : les effacer sous les pieds d'un envoi en cours produirait un MMS
+     * ampute.
+     */
+    suspend fun cancel(id: Long): Outcome<Boolean>
+    suspend fun markSent(id: Long)
+    suspend fun markFailed(id: Long)
+
+    /**
+     * v1.25.3 (audit H6) — remet un envoi abandonné en attente pour [scheduledAt]. Ne re-planifie
+     * rien par lui-même : c'est [com.relay.sms.domain.usecase.RetryScheduledMessageUseCase]
+     * qui enchaîne avec le scheduler.
+     */
+    suspend fun rearmPending(id: Long, scheduledAt: Long)
+
+    /** v1.25.3 (audit H6) — retire définitivement un envoi de la liste. */
+    suspend fun delete(id: Long)
+
+    /**
+     * v1.26.0 — comme [delete], mais efface aussi les pieces jointes durables de l'envoi.
+     * Voir [com.relay.sms.domain.usecase.DeleteScheduledMessageUseCase] : les fichiers vivent
+     * tant que la ligne existe.
+     *
+     * v1.28.9 — un fichier que cite encore un message (tentative déjà écrite, envoi partiel) ou un
+     * autre envoi programmé est CONSERVÉ : il ne part qu'avec sa dernière citation.
+     */
+    suspend fun deleteWithAttachments(id: Long)
+
+    /**
+     * v1.26.0 — efface les pieces jointes durables d'un envoi **sans toucher a la ligne**.
+     *
+     * Pour l'annulation : la ligne subsiste en `CANCELLED` comme trace, mais ses fichiers ne
+     * servent plus a rien — l'envoi ne partira jamais. Sans ce menage ils resteraient sur le
+     * telephone **definitivement** : aucune liste n'affiche les lignes annulees, donc plus
+     * personne ne pourrait jamais les atteindre pour les supprimer.
+     *
+     * v1.28.9 — même règle de citation que [deleteWithAttachments] ; la colonne n'est vidée que si
+     * aucun fichier n'a résisté, pour ne pas effacer la dernière trace d'un fichier resté.
+     */
+    suspend fun clearAttachments(id: Long)
+}

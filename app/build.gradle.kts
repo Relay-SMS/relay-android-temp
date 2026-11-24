@@ -1,0 +1,482 @@
+import java.time.LocalDate
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
+import java.util.Locale
+import java.util.Properties
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
+plugins {
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.kotlin.serialization)
+    alias(libs.plugins.ksp)
+    alias(libs.plugins.hilt)
+    alias(libs.plugins.baselineprofile)
+}
+
+// La version publiee vient de `version.properties`, versionne a la racine — jamais de l'historique.
+//
+// Elle etait derivee de `git rev-list --count HEAD`. Deux defauts, mesures le 2026-08-08 :
+//   - un rebase / squash / une greffe d'historique fait BAISSER le versionCode, et Android refuse
+//     alors d'installer par-dessus : toutes les installations existantes cessent de se mettre a jour ;
+//   - hors depot git (archive source, tarball), `runCatching` retombait sur `getOrDefault(1)` et
+//     produisait versionCode=1 **en silence**. Verifie : `git archive` + `assembleRelease` donnait 1.
+//
+// Le repli silencieux etait le pire des deux : rien dans la sortie de build ne le signalait.
+// Ici, un fichier absent ou malforme fait ECHOUER la configuration, bruyamment.
+val versionProps = Properties().apply {
+    val f = rootProject.file("version.properties")
+    require(f.exists()) { "version.properties absent a la racine du projet." }
+    f.inputStream().use { load(it) }
+}
+val appVersionCode: Int = requireNotNull(versionProps.getProperty("versionCode")?.trim()?.toIntOrNull()) {
+    "versionCode absent ou non entier dans version.properties."
+}
+val appVersionName: String = requireNotNull(versionProps.getProperty("versionName")?.trim()?.ifBlank { null }) {
+    "versionName absent ou vide dans version.properties."
+}
+
+// Build marker (round 40): the short commit SHA + the build date, shown on
+// the Encryption and About screens so a screenshot proves which build is
+// installed — `versionName` never changes per round, so nothing else on
+// screen distinguishes builds. Display-only, so unlike the version above
+// a missing git falls back to "unknown" instead of failing the build:
+// CI checks out shallow, but HEAD still resolves there.
+val gitCommit: String = runCatching {
+    val process = ProcessBuilder("git", "rev-parse", "--short", "HEAD")
+        .directory(rootProject.projectDir)
+        .redirectErrorStream(true)
+        .start()
+    val output = process.inputStream.bufferedReader().readText().trim()
+    process.waitFor()
+    check(output.isNotEmpty()) { "empty git output" }
+    output
+}.getOrElse { "unknown" }
+// Imports, not fully-qualified names: in a .gradle.kts script `java`
+// resolves to the Java plugin extension, so `java.time.…` fails to
+// compile (round-40 CI failure). The classes below come from the imports.
+val buildDate: String = LocalDate.now(ZoneOffset.UTC)
+    .format(DateTimeFormatter.ofPattern("d MMM yyyy", Locale.ENGLISH))
+
+/** Wraps a string as a valid Java string literal for `buildConfigField`. */
+fun String.asJavaStringLiteral(): String =
+    "\"" + replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+
+val keystoreProps = Properties().apply {
+    val f = rootProject.file("keystore.properties")
+    if (f.exists()) f.inputStream().use { load(it) }
+}
+
+android {
+    // AGP glisse par defaut, dans le bloc de signature de l'APK, la liste CHIFFREE de nos
+    // dependances, a destination de la console Play. Relay n'est pas
+    // publiee sur Play : ce bloc ne sert rien ici, et un blob illisible n'a pas sa place dans
+    // un binaire dont tout l'argument est d'etre verifiable. Le scanner F-Droid le refuse
+    // (« found extra signing block 'Dependency metadata' »).
+    //
+    // Mesure sur Agenda Tech : 9085 octets retires. Constate present sur TOUTES les apps du
+    // portefeuille le 2026-08-14 — il ne pouvait pas etre vu plus tot, car les controles
+    // n'analysaient que des APK NON SIGNES, qui n'ont pas de bloc de signature.
+    dependenciesInfo {
+        includeInApk = false
+        includeInBundle = false
+    }
+    namespace = "com.relay.sms"
+    // compileSdk 37 requis par les androidx récents (core-ktx 1.19, lifecycle 2.11,
+    // compose-bom 2026.09, SQLCipher 4.19). targetSdk reste 35 : on compile contre
+    // l'API 37 sans opter dans les changements de comportement des versions suivantes.
+    compileSdk = 37
+
+    defaultConfig {
+        applicationId = "com.relay.sms"
+        minSdk = 26
+        targetSdk = 35
+        versionCode = appVersionCode
+        versionName = appVersionName
+
+        // Build marker (round 40): the commit + date land in BuildConfig
+        // for every build type, so the Encryption and About screens can
+        // show which build is installed. The build type comes from the
+        // per-type LOG_ENABLED field below.
+        buildConfigField("String", "GIT_COMMIT", gitCommit.asJavaStringLiteral())
+        buildConfigField("String", "BUILD_DATE", buildDate.asJavaStringLiteral())
+
+        testInstrumentationRunner = "com.relay.sms.HiltTestRunner"
+
+        // Les deux moitiés du contrôle de mise à jour en place sont hors campagne : le semis n'a
+        // aucun lecteur ici, et la vérification n'a rien à lire — elle ÉCHOUERAIT sur une base
+        // vide, ce que son contrôle négatif exige justement d'elle. Le job dédié les lance une par
+        // une par `am instrument -e class …`, où cet argument ne s'applique pas.
+        // Cf. `com.relay.sms.upgrade.UpgradeTest` et `.github/workflows/upgrade-test.yml`.
+        testInstrumentationRunnerArguments["notAnnotation"] = "com.relay.sms.upgrade.UpgradeTest"
+
+        vectorDrawables { useSupportLibrary = true }
+
+        // Room schema export pour tests de migration
+        ksp {
+            arg("room.schemaLocation", "$projectDir/schemas")
+            arg("room.incremental", "true")
+            arg("room.generateKotlin", "true")
+        }
+
+    }
+
+    // AGP 8.13+: locale filters replace the deprecated `resourceConfigurations`.
+    androidResources {
+        localeFilters += listOf("en", "fr", "de", "it", "es")
+    }
+
+    // v1.24.0 — `MigrationTestHelper` lit les schémas Room depuis les ASSETS de l'APK de test.
+    // Sans cette ligne, `room.schemaLocation` exporte bien les JSON dans `app/schemas/` mais ils
+    // n'atteignent jamais l'appareil : chaque test de migration échoue sur
+    // `FileNotFoundException: Cannot find the schema file in the assets folder`.
+    sourceSets.getByName("androidTest").assets.srcDir("$projectDir/schemas")
+
+    signingConfigs {
+        create("release") {
+            if (keystoreProps.isNotEmpty()) {
+                storeFile = file(keystoreProps.getProperty("storeFile"))
+                storePassword = keystoreProps.getProperty("storePassword")
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                keyPassword = keystoreProps.getProperty("keyPassword")
+            }
+        }
+        // Debug builds used to be signed with the throwaway key Gradle
+        // generates in ~/.android/debug.keystore — a fresh one on every CI
+        // runner, so no two builds shared a signature and Android refused
+        // to install a new build over the old one (uninstall = lost
+        // settings). One committed debug keystore fixes that: every debug
+        // build carries the same signature and installs as an upgrade.
+        // DEBUG key only — the release keystore stays out of the repo,
+        // behind keystore.properties.
+        create("relayDebug") {
+            storeFile = rootProject.file("relay-debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
+    buildTypes {
+        debug {
+            applicationIdSuffix = ".debug"
+            // `versionNameSuffix` removed — the user-facing version string is the same
+            // (`versionName` above) for both build types. Distinguishing debug from release
+            // is still possible via `applicationIdSuffix` (different package id, both can
+            // be installed in parallel) and via `BuildConfig.LOG_ENABLED`.
+            isMinifyEnabled = false
+            isDebuggable = true
+            buildConfigField("boolean", "LOG_ENABLED", "true")
+            // Use the committed debug keystore when it is present; without
+            // it, keep Gradle's generated key so the build still works.
+            if (rootProject.file("relay-debug.keystore").exists()) {
+                signingConfig = signingConfigs.getByName("relayDebug")
+            }
+        }
+        release {
+            // No applicationIdSuffix: the release package id is the plain
+            // applicationId (com.relay.sms).
+            isMinifyEnabled = true
+            isShrinkResources = true
+            isDebuggable = false
+            buildConfigField("boolean", "LOG_ENABLED", "false")
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro",
+            )
+            if (keystoreProps.isNotEmpty()) {
+                signingConfig = signingConfigs.getByName("release")
+            } else if (rootProject.file("relay-debug.keystore").exists()) {
+                // Test-only fallback (round 6): sign the release build with
+                // the committed debug key so CI can produce an installable
+                // release APK for a performance A/B against the debug build.
+                // The real release key still stays out of the repo
+                // (keystore.properties) — this is only for comparing
+                // scrolling smoothness, not for distribution.
+                signingConfig = signingConfigs.getByName("relayDebug")
+            }
+
+            // AGP 8.3+ ecrit META-INF/version-control-info.textproto dans l'APK de release :
+            // le SHA du commit construit. Deux defauts, tous deux mesures sur Agenda Tech :
+            //   - il se PERIME en build incremental — l'APK publie en 1.0.1 portait le commit
+            //     PRECEDENT, donc une provenance fausse dans un binaire cense etre verifiable ;
+            //   - il rend l'APK dependant du commit alors que rien d'autre n'a change. Une
+            //     correction de metadonnees fastlane, qui ne touche pas une ligne de code,
+            //     produit alors un binaire different et impose une nouvelle version publiee.
+            // Retire : F-Droid epingle deja le commit dans sa recette, la provenance ne se perd pas.
+            vcsInfo { include = false }
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+        isCoreLibraryDesugaringEnabled = true
+    }
+
+    buildFeatures {
+        compose = true
+        buildConfig = true
+    }
+
+    packaging {
+        // Reproductibilité. AGP retire les symboles de debug des bibliothèques natives avec
+        // l'outil `strip` du NDK — et deux NDK différents ne produisent pas les mêmes octets.
+        // C'est ce qui faisait échouer la vérification F-Droid en 1.27.5 : `classes.dex` était
+        // identique, seuls les quatre `libdatastore_shared_counter.so` (AndroidX DataStore)
+        // différaient, parce que leur buildserver n'a pas le même NDK que la machine de release.
+        //
+        // En conservant les symboles, AGP ne strip pas : le fichier est recopié tel quel depuis
+        // l'AAR, donc identique partout. Coût : quelques kilo-octets.
+        jniLibs {
+            keepDebugSymbols += "**/libdatastore_shared_counter.so"
+        }
+        resources {
+            excludes += setOf(
+                "/META-INF/{AL2.0,LGPL2.1}",
+                "META-INF/LICENSE*",
+                "META-INF/NOTICE*",
+                "META-INF/DEPENDENCIES",
+                // Round 21 fix — Netty (Ktor server engine) ships 23 jars
+                // that ALL contain META-INF/INDEX.LIST and
+                // META-INF/io.netty.versions.properties, and AGP fails the
+                // build on the duplicates (:app:mergeDebugJavaResource).
+                // Both files are build metadata with no runtime value on
+                // Android (the versions file only feeds Netty's own
+                // version-logging), so exclude them.
+                "META-INF/INDEX.LIST",
+                "META-INF/io.netty.versions.properties",
+            )
+        }
+    }
+
+    testOptions {
+        unitTests {
+            isIncludeAndroidResources = true
+            isReturnDefaultValues = true
+        }
+        unitTests.all { test -> test.useJUnitPlatform() }
+    }
+
+    lint {
+        warningsAsErrors = false
+        abortOnError = true
+        // Étage 2.3 multi-module — lint PAR module : chaque module (`:app`, `:core`, …) analyse
+        // et baseline son propre code. `checkDependencies=false` évite que la lint d'`:app`
+        // re-scanne les sources des modules-lib (sinon leurs findings baselinés côté module
+        // resurgissent ici). La couverture projet est préservée : `check`/`build` lance la lint
+        // de tous les modules.
+        checkDependencies = false
+        baseline = file("lint-baseline.xml")
+    }
+
+    // Splits ABI pour APK plus légers (universal + per-ABI)
+    splits {
+        abi {
+            isEnable = true
+            reset()
+            include("arm64-v8a", "armeabi-v7a", "x86_64")
+            isUniversalApk = true
+        }
+    }
+}
+
+// Kotlin 2.3+ : l'ancien DSL `android { kotlinOptions { ... } }` est supprimé.
+// Migration vers le DSL `compilerOptions` (équivalent strict : jvmTarget 17 + mêmes opt-in).
+kotlin {
+    compilerOptions {
+        jvmTarget.set(JvmTarget.JVM_17)
+        freeCompilerArgs.addAll(
+            "-opt-in=kotlin.RequiresOptIn",
+            "-opt-in=kotlinx.coroutines.ExperimentalCoroutinesApi",
+            "-opt-in=androidx.compose.material3.ExperimentalMaterial3Api",
+            "-opt-in=androidx.compose.foundation.ExperimentalFoundationApi",
+        )
+    }
+}
+
+dependencies {
+    // Modules extraits en Gradle (Étage 2.3)
+    implementation(project(":core"))
+    implementation(project(":domain"))
+    implementation(project(":data"))
+    // Core
+    implementation(libs.androidx.core.ktx)
+    // v1.24.0 — installe le baseline profile généré au premier lancement (démarrage plus rapide).
+    implementation(libs.androidx.profileinstaller)
+    baselineProfile(project(":baselineprofile"))
+    implementation(libs.androidx.splashscreen)
+    implementation(libs.androidx.documentfile)
+    // Audit SEC-M4 (v1.14.8) — `androidx.security:security-crypto:1.1.0-alpha06` retiré.
+    // Dépendance ALPHA depuis 2021, ZÉRO usage confirmé dans le code (pas d'EncryptedSharedPrefs,
+    // pas d'EncryptedFile). Relay utilise son propre AeadCipher + KeystoreManager + DataStore.
+    // Surface d'attaque inutile (alpha = pas de security-patches stables).
+
+    // Lifecycle
+    implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.lifecycle.runtime.compose)
+    implementation(libs.androidx.lifecycle.viewmodel.compose)
+    implementation(libs.androidx.lifecycle.process)
+
+    // Compose
+    implementation(platform(libs.androidx.compose.bom))
+    implementation(libs.androidx.activity.compose)
+    implementation(libs.androidx.compose.ui)
+    implementation(libs.androidx.compose.ui.graphics)
+    implementation(libs.androidx.compose.ui.tooling.preview)
+    implementation(libs.androidx.compose.material3)
+    implementation(libs.androidx.compose.material.icons.extended)
+    debugImplementation(libs.androidx.compose.ui.tooling)
+    debugImplementation(libs.androidx.compose.ui.test.manifest)
+
+    // Navigation Compose
+    implementation(libs.androidx.navigation.compose)
+
+    // DataStore
+    implementation(libs.androidx.datastore.preferences)
+
+    // Room
+    implementation(libs.androidx.room.runtime)
+    implementation(libs.androidx.room.ktx)
+    ksp(libs.androidx.room.compiler)
+
+    // WorkManager + Hilt-Work
+    implementation(libs.androidx.work.runtime.ktx)
+    implementation(libs.hilt.work)
+    ksp(libs.hilt.work.compiler)
+
+    // Hilt
+    implementation(libs.hilt.android)
+    ksp(libs.hilt.compiler)
+    implementation(libs.hilt.navigation.compose)
+
+    // Biometric — stable 1.1.0 (BiometricPrompt API). The "-ktx" variant only exists in 1.2.0-alpha,
+    // which we avoid for a release build.
+    implementation(libs.androidx.biometric)
+
+    // Coil
+    implementation(libs.coil.compose)
+    implementation(libs.coil.video)
+    implementation(libs.coil.svg)
+    implementation(libs.coil.gif)
+    // AndroidSVG — direct: TwemojiAssets imports com.caverock.androidsvg.SVG
+    // to render sticker SVGs at 512px. coil-svg only brings it in as a
+    // runtime dependency, so without this line CI fails to compile.
+    implementation(libs.androidsvg)
+
+    // Accompanist
+    implementation(libs.accompanist.permissions)
+
+    // Coroutines
+    implementation(libs.kotlinx.coroutines.core)
+    implementation(libs.kotlinx.coroutines.android)
+    // v1.7.0 — retiré : kotlinx-coroutines-play-services (était bridge
+    // Task<T>→suspend pour ML Kit), mlkit-translate, mlkit-language-id.
+    // Cf. TranslationService.kt header pour le plan migration FLOSS v1.8.x.
+
+    // Serialization
+    implementation(libs.kotlinx.serialization.json)
+
+    // SQLCipher
+    implementation(libs.sqlcipher.android)
+
+    // Slice 1 — phone <-> desktop linking over the local network (see
+    // SYNC_PROTOCOL.md and the `sync` package). Ktor serves the LAN
+    // WebSocket endpoint, CameraX + ZXing core scan the pairing QR code
+    // (no Play Services), BouncyCastle verifies Ed25519 signatures below
+    // API 33 and builds the fallback TLS certificate. All four are local
+    // open-source libraries with no network use and no telemetry.
+    implementation(libs.ktor.server.core)
+    implementation(libs.ktor.server.netty) {
+        // No HTTP/3: ktor-server-netty pulls netty-codec-http3, which
+        // pulls FIVE platform variants of the QUIC native library
+        // (Linux x86_64 + aarch64, macOS x86_64 + aarch_64, Windows) —
+        // megabytes of native blobs for a protocol the server never
+        // speaks. The Java QUIC API jar stays (harmless); only the
+        // native implementations go.
+        exclude(group = "io.netty", module = "netty-codec-native-quic")
+    }
+    // Netty native-transport API classes (see the version-catalog note):
+    // Ktor's engine references KQueue/Epoll directly, and the plain
+    // -epoll/-kqueue artifacts are empty shells in Netty 4.2.
+    implementation(libs.netty.transport.classes.epoll)
+    implementation(libs.netty.transport.classes.kqueue)
+    implementation(libs.ktor.server.websockets)
+    // Client mode — the Ktor *client* (OkHttp engine) for the
+    // tablet/SIM-less client: the same 3.6.1 pin as the server above.
+    // OkHttp is the battle-tested Android TLS path (the custom TOFU
+    // trust manager plugs into it), and it is already in the APK
+    // transitively via Coil — but a direct import needs a direct dep
+    // (see the AndroidSVG note above).
+    implementation(libs.ktor.client.core)
+    implementation(libs.ktor.client.websockets)
+    implementation(libs.ktor.client.okhttp)
+    implementation(libs.ktor.client.content.negotiation)
+    implementation(libs.ktor.serialization.kotlinx.json)
+    implementation(libs.camerax.core)
+    implementation(libs.camerax.camera2)
+    implementation(libs.camerax.lifecycle)
+    implementation(libs.camerax.view)
+    implementation(libs.zxing.core)
+    implementation(libs.bouncycastle.prov)
+    implementation(libs.bouncycastle.pkix)
+
+    // E2E encryption (Relay-to-Relay 1:1 texts): vodozemac via Trixnity.
+    // Only VodozemacCrypto (com.relay.sms.e2e) imports these types;
+    // everything else talks to the E2eCrypto interface. The artifact
+    // pulls in only kotlin-stdlib + the native-binaries AAR — no Matrix
+    // client, no networking, no telemetry.
+    implementation(libs.trixnity.vodozemac.android)
+
+    // Logging
+    implementation(libs.timber)
+
+    // Desugaring (java.time on minSdk 26 already, but desugar still useful for stable libs)
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.2")
+
+    // Unit tests
+    testImplementation(libs.junit.jupiter.api)
+    testRuntimeOnly(libs.junit.jupiter.engine)
+    testImplementation(libs.junit.jupiter.params)
+    testImplementation(libs.mockk)
+    testImplementation(libs.turbine)
+    testImplementation(libs.truth)
+    testImplementation(libs.robolectric)
+    testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.androidx.room.testing)
+    // v1.27.2 — Hilt dans les tests JVM (Robolectric), pour pouvoir substituer un collaborateur
+    // par un faux qui ÉCHOUE : c'est ainsi qu'on exerce les chemins d'erreur des receveurs, là où
+    // vivaient le SMS perdu et le MMS effacé du 2026-08-04. `hilt-android-testing` n'était déclaré
+    // que pour les tests instrumentés, donc inaccessible sans émulateur.
+    testImplementation(libs.hilt.android.testing)
+    kspTest(libs.hilt.compiler)
+    // `AndroidJUnit4` sert de lanceur aux tests Robolectric ; il n'était lui aussi disponible que
+    // côté instrumenté.
+    testImplementation(libs.androidx.test.ext.junit)
+    // ⚠️ Sans le moteur vintage, une classe JUnit 4 est silencieusement IGNORÉE par la plateforme
+    // JUnit 5 : la tâche passe au vert sans avoir rien exécuté. Le pire des échecs — un test qui
+    // ne teste pas et ne le dit pas.
+    testRuntimeOnly(libs.junit.vintage.engine)
+    // Gradle 9 ne fournit plus le lanceur de la plateforme JUnit. Sans lui, la tâche échoue sur
+    // « Failed to load JUnit Platform » AVANT le premier test — bruyamment, au moins.
+    testRuntimeOnly(libs.junit.platform.launcher)
+
+    // Android tests
+    androidTestImplementation(libs.androidx.test.ext.junit)
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.espresso.core)
+    androidTestImplementation(platform(libs.androidx.compose.bom))
+    androidTestImplementation(libs.androidx.compose.ui.test.junit4)
+    // v1.28.9 — PAS de `mockk-android` dans les tests instrumentés. Son agent réécrit `Object.toString`
+    // pour tout le processus de test, puis fait de la réflexion sur chaque activité lancée : jusqu'à
+    // Android 11, elle bute sur `PictureInPictureUiState` (API 31) et le premier test Compose qui suit
+    // tombe. Vu sur la CI en API 30 (run 34848081641) quand l'émulateur local, en API 34, restait vert.
+    // Un faux écrit à la main, ou le vrai collaborateur.
+    // v1.24.0 — outillage du filet de sécurité instrumenté : assertions Truth, MigrationTestHelper
+    // (tests de migration Room sur le chemin SQLCipher réel), coroutines de test, Hilt.
+    androidTestImplementation(libs.truth)
+    androidTestImplementation(libs.androidx.room.testing)
+    androidTestImplementation(libs.kotlinx.coroutines.test)
+    androidTestImplementation(libs.hilt.android.testing)
+    kspAndroidTest(libs.hilt.compiler)
+}

@@ -1,0 +1,195 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.data.local.db.mapper
+
+import com.relay.sms.data.local.db.dao.AttachmentWithMessage
+import com.relay.sms.data.local.db.dao.MessageStateRow
+import com.relay.sms.data.local.db.entity.AttachmentEntity
+import com.relay.sms.data.local.db.entity.BlockedNumberEntity
+import com.relay.sms.data.local.db.entity.ConversationEntity
+import com.relay.sms.data.local.db.entity.MessageEntity
+import com.relay.sms.data.local.db.entity.QuickReplyEntity
+import com.relay.sms.data.local.db.entity.ScheduledMessageEntity
+import com.relay.sms.domain.model.Attachment
+import com.relay.sms.domain.model.BlockedNumber
+import com.relay.sms.domain.model.Conversation
+import com.relay.sms.domain.model.Message
+import com.relay.sms.domain.model.MessageDirection
+import com.relay.sms.domain.model.MessageState
+import com.relay.sms.domain.model.MessageStatus
+import com.relay.sms.domain.model.MessageType
+import com.relay.sms.domain.model.PhoneAddress
+import com.relay.sms.domain.model.QuickReply
+import com.relay.sms.domain.model.ScheduledMessage
+import com.relay.sms.domain.model.ScheduledState
+
+/**
+ * Room entity → domain model mappers (v1.25.0, Étage 2.1).
+ *
+ * These live in the **data** layer, not in `domain/model`: it is the data layer that knows how to
+ * turn its own Room rows into domain objects, never the reverse. Moving them here removes the last
+ * `domain → data` imports, so `domain/model` no longer depends on Room entities.
+ */
+
+fun AttachmentEntity.toDomain(): Attachment = Attachment(
+    id = id,
+    messageId = messageId,
+    mimeType = mimeType,
+    fileName = fileName,
+    sizeBytes = sizeBytes,
+    localUri = localUri,
+    width = width,
+    height = height,
+    durationMs = durationMs,
+    // Client mode C5 — the UI gates its download tile on this.
+    hubAttachmentId = hubAttachmentId,
+)
+
+/** Round 32 — the media-query projection: the attachment plus its carrying message's date + body. */
+fun AttachmentWithMessage.toDomain(): Attachment = attachment.toDomain().copy(
+    messageDate = messageDate,
+    messageBody = messageBody,
+)
+
+fun BlockedNumberEntity.toDomain(): BlockedNumber = BlockedNumber(
+    id = id,
+    rawNumber = rawNumber,
+    normalizedNumber = normalizedNumber,
+    label = label,
+    createdAt = createdAt,
+)
+
+fun ConversationEntity.toDomain(): Conversation = Conversation(
+    id = id,
+    threadId = threadId,
+    addresses = PhoneAddress.list(addressesCsv),
+    displayName = displayName,
+    lastMessageAt = lastMessageAt,
+    lastMessagePreview = lastMessagePreview,
+    unreadCount = unreadCount,
+    pinned = pinned,
+    archived = archived,
+    muted = muted,
+    inVault = inVault,
+    draft = draft,
+    bubbleColorArgb = bubbleColorArgb,
+    avatarUri = avatarUri,
+    customName = customName,
+    /** Feedback round 5 — message épinglé du fil + date de l'épinglage. */
+    pinnedMessageId = pinnedMessageId,
+    pinnedMessageAt = pinnedMessageAt,
+    /** Round 35 (schema v20) — catégorie collante, voir `StickyCategoryStore`. */
+    stickyCategory = stickyCategory,
+)
+
+fun MessageEntity.toDomain(attachments: List<Attachment> = emptyList()): Message = Message(
+    id = id,
+    conversationId = conversationId,
+    address = address,
+    body = body,
+    type = mapType(type),
+    direction = mapDirection(direction),
+    date = date,
+    dateSent = dateSent,
+    read = read,
+    starred = starred,
+    status = mapStatus(status),
+    errorCode = errorCode,
+    attachmentsCount = attachmentsCount,
+    subId = subId,
+    scheduledAt = scheduledAt,
+    attachments = attachments,
+    replyToMessageId = replyToMessageId,
+    reactionEmoji = reactionEmoji,
+    clientMessageId = clientMessageId,
+    // E2E (schema v22) — the lock on the timestamp line and the undecryptable
+    // placeholder both render from the domain model. `ciphertext` stays on the
+    // entity: it never reaches the UI or the sync layer.
+    encrypted = encrypted,
+    decryptFailed = decryptFailed,
+)
+
+/**
+ * v1.16.0 — Mapping enum DB → enum domain. La conversion `object Int` → `enum class` permet
+ * désormais un `when` EXHAUSTIVE compile-time (pas de `else`) — le compilateur signale tout
+ * cas manquant si on ajoute un statut dans [MessageStatus]. Filet de sécurité K-8 LIGHT
+ * v1.15.0 (Timber + test garde-fou) reste pertinent mais devient redondant en pratique :
+ * le compilateur fait le travail.
+ */
+internal fun mapStatus(status: MessageStatus): Message.Status = when (status) {
+    MessageStatus.PENDING -> Message.Status.PENDING
+    MessageStatus.SENT -> Message.Status.SENT
+    MessageStatus.DELIVERED -> Message.Status.DELIVERED
+    MessageStatus.FAILED -> Message.Status.FAILED
+    MessageStatus.RECEIVED -> Message.Status.RECEIVED
+    MessageStatus.SCHEDULED -> Message.Status.SCHEDULED
+}
+
+internal fun mapType(type: MessageType): Message.Type = when (type) {
+    MessageType.SMS -> Message.Type.SMS
+    MessageType.MMS -> Message.Type.MMS
+}
+
+internal fun mapDirection(direction: MessageDirection): Message.Direction = when (direction) {
+    MessageDirection.INCOMING -> Message.Direction.INCOMING
+    MessageDirection.OUTGOING -> Message.Direction.OUTGOING
+}
+
+/** Slice 2 — the states-watch projection, straight to its domain model. */
+fun MessageStateRow.toDomain(): MessageState = MessageState(
+    id = id,
+    conversationId = conversationId,
+    status = mapStatus(status),
+    reactionEmoji = reactionEmoji,
+    read = read,
+    starred = starred,
+)
+
+fun QuickReplyEntity.toDomain(): QuickReply = QuickReply(
+    id = id,
+    text = text,
+    position = position,
+)
+
+fun QuickReply.toEntity(): QuickReplyEntity = QuickReplyEntity(
+    id = id,
+    text = text,
+    position = position,
+)
+
+fun ScheduledMessageEntity.toDomain(): ScheduledMessage = ScheduledMessage(
+    id = id,
+    conversationId = conversationId,
+    addresses = PhoneAddress.list(addressesCsv),
+    body = body,
+    scheduledAt = scheduledAt,
+    subId = subId,
+    // v1.17.0 — `when` exhaustif compile-time (enum class) — `else` retiré ; le compilateur
+    // signale toute valeur manquante si on ajoute un état dans [ScheduledState].
+    state = when (state) {
+        ScheduledState.PENDING -> ScheduledMessage.State.PENDING
+        // v1.26.1 (audit H6) — `SENDING` est un état de VERROU, interne au worker : il dit
+        // « une exécution a revendiqué cet envoi », pas « l'envoi a changé de nature » pour
+        // l'utilisateur. Côté domaine il reste donc PENDING, ce qui garde la ligne dans
+        // « Programmés » avec son libellé habituel, y compris si le processus meurt en vol.
+        //
+        // ⚠️ v1.28.3 (F20) — cette projection restait vraie tant que `SENDING` était réellement
+        // transitoire. Elle ne l'était pas : rien ne terminait cet état, et la ligne restait
+        // « en attente » à vie. La projection ne change pas — un envoi en vol EST en attente —
+        // mais le verrou a désormais un bail, et son expiration produit `INTERRUPTED`, qui n'est
+        // plus « en attente » de rien.
+        ScheduledState.SENDING -> ScheduledMessage.State.PENDING
+        ScheduledState.SENT -> ScheduledMessage.State.SENT
+        ScheduledState.FAILED -> ScheduledMessage.State.FAILED
+        ScheduledState.CANCELLED -> ScheduledMessage.State.CANCELLED
+        ScheduledState.INTERRUPTED -> ScheduledMessage.State.INTERRUPTED
+    },
+    // v1.26.0 — la colonne existait depuis toujours sans jamais etre lue ni ecrite.
+    attachments = com.relay.sms.data.local.db.ScheduledAttachmentCodec.decode(attachmentsJson),
+    createdAt = createdAt,
+    clientMessageId = clientMessageId,
+)

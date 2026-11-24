@@ -1,0 +1,232 @@
+# Relay — R8/ProGuard rules
+# Tightened per audit F19 (avoid keep-all-classes shotgun rules) + F20 (strip Timber payloads).
+
+-keepattributes Signature,InnerClasses,EnclosingMethod,Exceptions,*Annotation*
+-keepattributes SourceFile,LineNumberTable
+-renamesourcefileattribute SourceFile
+
+# ----- Kotlin -----------------------------------------------------------------------------------
+-dontwarn kotlin.**
+-keepclassmembers class kotlin.Metadata { *; }
+
+# ----- kotlinx.serialization --------------------------------------------------------------------
+-keepattributes RuntimeVisibleAnnotations,AnnotationDefault
+-keepclassmembers @kotlinx.serialization.Serializable class * {
+    static **$* INSTANCE;
+    kotlinx.serialization.KSerializer serializer(...);
+}
+-keep,includedescriptorclasses class com.relay.sms.**$$serializer { *; }
+-keepclassmembers class com.relay.sms.** {
+    *** Companion;
+}
+-keepclasseswithmembers class com.relay.sms.** {
+    kotlinx.serialization.KSerializer serializer(...);
+}
+
+# ----- Coroutines -------------------------------------------------------------------------------
+-dontwarn kotlinx.coroutines.flow.**
+-keepnames class kotlinx.coroutines.internal.MainDispatcherFactory {}
+-keepnames class kotlinx.coroutines.CoroutineExceptionHandler {}
+
+# ----- Hilt / Dagger ----------------------------------------------------------------------------
+# Only keep what the framework needs at runtime (entry-point classes + @HiltViewModel ctors).
+-keep class dagger.hilt.android.internal.managers.** { *; }
+-keep class * extends dagger.hilt.android.HiltAndroidApp
+-keepclasseswithmembers class * {
+    @dagger.hilt.android.lifecycle.HiltViewModel <init>(...);
+}
+-keep class androidx.hilt.work.HiltWorkerFactory { *; }
+-keepclasseswithmembers class * extends androidx.work.ListenableWorker {
+    <init>(android.content.Context, androidx.work.WorkerParameters);
+}
+
+# ----- Androidx ViewModel ----------------------------------------------------------------------
+# Names only — implementation members can be obfuscated. (Was `-keep class *` shotgun.)
+-keepnames class * extends androidx.lifecycle.ViewModel
+
+# ----- Room ------------------------------------------------------------------------------------
+-keep class * extends androidx.room.RoomDatabase
+-keep @androidx.room.Entity class * { *; }
+-keep @androidx.room.Dao interface * { *; }
+-dontwarn androidx.room.paging.**
+
+# ----- Compose ---------------------------------------------------------------------------------
+-keep class androidx.compose.runtime.** { *; }
+-dontwarn androidx.compose.**
+
+# ----- Coil / SVG (Twemoji) ---------------------------------------------------------------------
+# Round 13 fix (2026-11-11) — the emoji/sticker grids load bundled Twemoji SVGs
+# through Coil's SvgDecoder (AndroidSVG). The release build minifies (R8), and
+# without these keeps the decoder/parser is stripped, so the grids render empty
+# (invisible cells) in release while debug (no minification) works fine.
+-keep class coil.decode.SvgDecoder { *; }
+-keep class coil.decode.SvgDecoder$Factory { *; }
+-keep class com.caverock.androidsvg.** { *; }
+-dontwarn com.caverock.androidsvg.**
+
+# ----- Coil / GIF (Klipy) -----------------------------------------------------------------------
+# Round 16 — same R8 trap as the SVG decoder above: the GIF search grid and the
+# thread image bubbles decode GIFs through Coil's GifDecoder, which R8 strips
+# without these keeps (animated GIFs would go back to a static first frame in
+# release while debug works fine).
+-keep class coil.decode.GifDecoder { *; }
+-keep class coil.decode.GifDecoder$Factory { *; }
+
+# ----- Ktor (phone↔desktop sync) --------------------------------------------------------------
+# Round 21 CI fix — the release build failed at :app:minifyReleaseWithR8:
+# Ktor's IntellijIdeaDebugDetector references java.lang.management classes
+# (ManagementFactory, RuntimeMXBean) that exist only on the desktop JVM, not
+# on Android, and R8 treats the missing classes as an error. The detector is
+# a JVM-only "is a debugger attached?" check that never runs on the phone —
+# silencing the two missing classes (exactly what R8's own generated
+# missing_rules.txt suggests) is safe. Debug builds never hit this: minify
+# is off there.
+-dontwarn java.lang.management.ManagementFactory
+-dontwarn java.lang.management.RuntimeMXBean
+
+# ----- Netty (Ktor server engine) -----------------------------------------------------------
+# Round 21 fix — the sync server runs on Netty (CIO has no HTTPS support).
+# Netty references optional native pieces that are deliberately absent on
+# Android (OpenSSL/tcnative — we use the JDK SSL provider; epoll/kqueue
+# native transports — we use NIO; QUIC natives — no HTTP/3). R8 treats
+# those missing classes as errors, so silence them.
+-dontwarn io.netty.**
+
+# Release-server fix (2026-11-15) — the sync server would not start in
+# release builds. First failure: Netty creates its channels REFLECTIVELY
+# through ReflectiveChannelFactory, which requires a public no-arg
+# constructor (Class.getConstructor()). R8 stripped that constructor as
+# unused — it is only ever reached via reflection — so engine start threw
+# "IllegalArgumentException: Class I95 does not have a public non-arg
+# constructor" (I95 = the obfuscated NioServerSocketChannel), reported by
+# the Linked-devices start-failure diagnostic. A constructor-only keep
+# fixed that, but the next build failed differently: "VerifyError:
+# Rejecting class da that attempts to sub-type erroneous class y1" —
+# R8 had stripped something else a Netty class needs to verify. Netty
+# uses reflection pervasively (channel factories, PlatformDependent,
+# FastThreadLocal, ResourceLeakDetector, logger service loading) and
+# ships NO ProGuard rules of its own, so surgical keeps just move the
+# failure to the next class. Keep the whole Netty package, and Ktor's
+# Netty engine with it (small, same engine path). Cost is APK size only,
+# no behavior change. Debug builds never hit any of this: minify is off
+# there. The earlier note here claiming "no -keep needed, everything is
+# reached by direct references" was wrong.
+-keep class io.netty.** { *; }
+-keep class io.ktor.server.netty.** { *; }
+
+# ----- Timber ----------------------------------------------------------------------------------
+-dontwarn org.jetbrains.annotations.**
+
+# ----- SQLCipher -------------------------------------------------------------------------------
+# Native methods reflected through JNI need to stay reachable.
+-keepclasseswithmembernames class net.zetetic.database.sqlcipher.** {
+    native <methods>;
+}
+-keep,includedescriptorclasses class net.zetetic.database.sqlcipher.SQLiteConnection { *; }
+-keep,includedescriptorclasses class net.zetetic.database.sqlcipher.SQLiteDatabase { *; }
+-keep class net.zetetic.database.sqlcipher.SQLiteDatabaseHook { *; }
+
+# ----- Trixnity vodozemac (E2E encryption) --------------------------------------------------
+# E2E round — NEITHER AAR ships consumer ProGuard rules (verified
+# 2026-11-20: no proguard.txt in trixnity-vodozemac-android-5.11.0.aar
+# or trixnity-vodozemac-binaries-android-5.11.0.aar). The JNI entry
+# points are `external` functions on the `*BindingsKt` classes (e.g.
+# `olm/AccountBindingsKt.vodozemac_olm_account_new`, verified by javap
+# on the 5.11.0 classes.jar). libvodozemac.so's JNI_OnLoad registers
+# the natives for ALL 19 bindings classes (olm, megolm, sas,
+# pkencryption, keys, slice — verified from the .so's strings) and
+# returns JNI_ERR if ANY registration fails, so the whole library
+# refuses to load.
+#
+# Round 38 fix (2026-11-21) — the original rule here was
+# `-keepclasseswithmembernames ... { native <methods>; }`, which keeps
+# NAMES only: R8 still strips native-method declarations (and whole
+# classes) with no Kotlin caller. Relay calls only the Olm + keys
+# subset, so the release build lost the Megolm/SAS/PkEncryption
+# bindings — and on device the first `System.loadLibrary("vodozemac")`
+# died with `UnsatisfiedLinkError: JNI_ERR returned from JNI_OnLoad`
+# (Pixel 8, round-37 release APK): the Settings Encryption screen
+# crashed on open, and every probe failed silently, so no thread ever
+# flipped to encrypted. Debug builds never showed it (minify off),
+# JVM unit tests never load the .so, and the instrumented-tests job
+# fails every run — nothing checked the release native load until a
+# device did. Proven with standalone R8 9.5.33 (2026-11-21): under the
+# names-only rule an uncalled native method and a whole uncalled
+# bindings class are both stripped; under the full `-keep` below both
+# survive. The public API classes (Account, Session, OlmMessage, keys)
+# need no keep: they are reached by direct references from
+# VodozemacCrypto. Release R8 verification is CI-only (the local
+# harness never runs R8).
+-keep class de.connect2x.trixnity.vodozemac.bindings.** { *; }
+
+# ----- DataStore (protobuf-free path) ----------------------------------------------------------
+-keep class androidx.datastore.preferences.protobuf.** { *; }
+
+# ----- SMS / Telephony provider columns referenced via reflection -----------------------------
+-keepclassmembers class android.provider.Telephony$** { *; }
+
+# ----- Embedded AOSP MMS PDU classes (v1.3.10 — renamed from com.google.android.mms.*) -------
+# `app/src/main/java/com/relay/sms/pdu/*.java` embeds the AOSP MMS PDU encoder/decoder
+# (SendReq, PduComposer, PduBody, PduPart, EncodedStringValue, PduHeaders, CharacterSets,
+# MmsException, InvalidHeaderValueException…). Originally lived under `com.google.android.mms.*`
+# but Android 10+ enforces a **hidden API blacklist** on that namespace — at runtime the
+# system ClassLoader prefers the framework-bundled (hidden) class over our embedded copy and
+# denies access ("Accessing hidden method PduParser.<init>([B)V (blacklist, linking, denied)"
+# observed on Samsung Galaxy S9 Android 10, 2026-05-18). Result: Relay can't parse any
+# incoming MMS PDU, MMS reception silently broken on Android 10+. Rename to
+# `com.relay.sms.pdu.*` forces the ClassLoader to always pick our embedded copy.
+#
+# Our code drives these classes EXCLUSIVELY via reflection in `MmsBuilder.attachRecipientsCompat`
+# + `MmsBuilder.appendPart` to cross OEM signature divergences (Samsung One UI removed `addTo()`
+# from its bundled SendReq, AOSP doesn't expose `addPart(PduPart)` on certain versions, etc.).
+# Without this keep, R8 sees no direct call site for `setTo` / `addTo` / `addPart` / `getPartsNum`
+# and strips them — `Class.getMethod("setTo", …)` then throws NoSuchMethodException and the
+# whole MMS dispatch silently fails (regression observed v1.3.6 → v1.3.7, fixed v1.3.8).
+-keep class com.relay.sms.pdu.** { *; }
+
+# ----- App-level reflective entry points (manifest-declared receivers / services / Activity) --
+-keepnames class com.relay.sms.MainApplication
+-keepnames class com.relay.sms.MainActivity
+-keepclasseswithmembers class com.relay.sms.system.receiver.* {
+    <init>();
+    void onReceive(android.content.Context, android.content.Intent);
+}
+-keepclasseswithmembers class com.relay.sms.system.service.* {
+    <init>();
+}
+
+# ----- Strip Timber + android.util.Log in release (audit F20 + v1.3.10 SEC-02) ----------------
+# Release builds set BuildConfig.LOG_ENABLED=false and plant NoOpReleaseTree (which drops INFO and
+# below). On top of that, we make every Timber log call a no-op at the bytecode level so that no
+# argument expression is ever evaluated. This stops accidental PII / PIN material from leaking
+# into logcat via the toString of a captured local even if a developer slipped a Timber.w(secret).
+#
+# **v1.3.10 (SEC-02)** : the embedded AOSP MMS PDU classes under `com.relay.sms.pdu.*` use
+# `android.util.Log.*` directly (PduComposer / EncodedStringValue). Without the rule below those
+# calls survive R8 and end up in logcat in release builds — leaking incoming PDU file URIs and
+# similar internal cache paths on any developer-mode device. Strip them with the same
+# `-assumenosideeffects` mechanism.
+-assumenosideeffects class timber.log.Timber {
+    public static *** v(...);
+    public static *** d(...);
+    public static *** i(...);
+    public static *** w(...);
+    public static *** e(...);
+    public static *** wtf(...);
+}
+-assumenosideeffects class timber.log.Timber$Tree {
+    public *** v(...);
+    public *** d(...);
+    public *** i(...);
+    public *** w(...);
+    public *** e(...);
+    public *** wtf(...);
+}
+-assumenosideeffects class android.util.Log {
+    public static *** v(...);
+    public static *** d(...);
+    public static *** i(...);
+    public static *** w(...);
+    public static *** e(...);
+    public static *** wtf(...);
+}
