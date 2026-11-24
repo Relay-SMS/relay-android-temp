@@ -38,7 +38,7 @@ object SyncCallsModule {
     @Singleton
     fun provideCallStateObserver(impl: TelephonyCallStateObserver): CallStateObserver = impl
 
-    /** Dialing goes through the platform ACTION_CALL dialer. */
+    /** Dialing and ending calls go through the platform telecom dialer. */
     @Provides
     @Singleton
     fun provideCallDialer(impl: AndroidCallDialer): CallDialer = impl

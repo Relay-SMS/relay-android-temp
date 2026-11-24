@@ -100,7 +100,8 @@ import javax.inject.Singleton
  * session event, and one listener must not be registered per
  * socket. The dial side is per-session instead — each engine gets
  * the shared [CallDialer] and answers its own session's
- * `dial_request` with `dial_result`.
+ * `dial_request` with `dial_result` and its `end_call_request`
+ * with `end_call_result`.
  *
  * Tunnel — the server also owns the tunnel advertisement: when a
  * VPN tunnel is the phone's active network, the phone's tunnel

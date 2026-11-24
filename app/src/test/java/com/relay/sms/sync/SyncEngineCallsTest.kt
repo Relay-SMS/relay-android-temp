@@ -9,6 +9,7 @@ package com.relay.sms.sync
 
 import com.google.common.truth.Truth.assertThat
 import com.relay.sms.sync.calls.DialOutcome
+import com.relay.sms.sync.calls.EndCallOutcome
 import com.relay.sms.sync.calls.FakeCallDialer
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceUntilIdle
@@ -19,9 +20,12 @@ import org.junit.jupiter.api.Test
 /**
  * Live calls — the dial handler: a `dial_request` reaches the
  * dialer and is answered with `dial_result`, with the outcome
- * mapped 1:1 onto the frame's error codes. The dialer is a fake
- * here — the real ACTION_CALL executor cannot run on the JVM —
- * so "ACTION_CALL attempted" is the fake recording the number.
+ * mapped 1:1 onto the frame's error codes; and the end-call
+ * handler: an `end_call_request` reaches the dialer and is
+ * answered with `end_call_result`, same mapping. The dialer is
+ * a fake here — the real ACTION_CALL executor cannot run on the
+ * JVM — so "ACTION_CALL attempted" is the fake recording the
+ * number, and "end attempted" is the fake counting the call.
  */
 class SyncEngineCallsTest {
 
@@ -80,6 +84,71 @@ class SyncEngineCallsTest {
             engine.onDialRequest(SyncProtocol.DialRequest(number = "+15551234567"))
             advanceUntilIdle()
             assertThat(sent.map { it.frameType() }).containsExactly("dial_result")
+            val ack = sent.first().asObject()
+            assertThat(ack["ok"]?.jsonPrimitive?.content).isEqualTo("false")
+            assertThat(ack["error"]?.jsonPrimitive?.content).isEqualTo("failed")
+        }
+    }
+
+    // -- Live calls: end call -------------------------------------------
+
+    @Test fun `an ended call answers end_call_result ok true`() = runTest {
+        val dialer = FakeCallDialer(endOutcome = EndCallOutcome.Success)
+        runEngineWithDialer(dialer) { engine, sent ->
+            engine.onEndCallRequest()
+            advanceUntilIdle()
+            assertThat(dialer.endCallCount).isEqualTo(1)
+            assertThat(sent.map { it.frameType() }).containsExactly("end_call_result")
+            val ack = sent.first().asObject()
+            assertThat(ack["ok"]?.jsonPrimitive?.content).isEqualTo("true")
+            assertThat(ack.containsKey("error")).isFalse()
+        }
+    }
+
+    @Test fun `a denied end answers end_call_result ok false permission_denied`() = runTest {
+        val dialer = FakeCallDialer(endOutcome = EndCallOutcome.PermissionDenied)
+        runEngineWithDialer(dialer) { engine, sent ->
+            engine.onEndCallRequest()
+            advanceUntilIdle()
+            assertThat(dialer.endCallCount).isEqualTo(1)
+            assertThat(sent.map { it.frameType() }).containsExactly("end_call_result")
+            val ack = sent.first().asObject()
+            assertThat(ack["ok"]?.jsonPrimitive?.content).isEqualTo("false")
+            assertThat(ack["error"]?.jsonPrimitive?.content).isEqualTo("permission_denied")
+        }
+    }
+
+    @Test fun `an end with no call answers end_call_result ok false no_call`() = runTest {
+        val dialer = FakeCallDialer(endOutcome = EndCallOutcome.NoCall)
+        runEngineWithDialer(dialer) { engine, sent ->
+            engine.onEndCallRequest()
+            advanceUntilIdle()
+            assertThat(dialer.endCallCount).isEqualTo(1)
+            assertThat(sent.map { it.frameType() }).containsExactly("end_call_result")
+            val ack = sent.first().asObject()
+            assertThat(ack["ok"]?.jsonPrimitive?.content).isEqualTo("false")
+            assertThat(ack["error"]?.jsonPrimitive?.content).isEqualTo("no_call")
+        }
+    }
+
+    @Test fun `a failed end answers end_call_result ok false failed`() = runTest {
+        val dialer = FakeCallDialer(endOutcome = EndCallOutcome.Failed)
+        runEngineWithDialer(dialer) { engine, sent ->
+            engine.onEndCallRequest()
+            advanceUntilIdle()
+            assertThat(dialer.endCallCount).isEqualTo(1)
+            assertThat(sent.map { it.frameType() }).containsExactly("end_call_result")
+            val ack = sent.first().asObject()
+            assertThat(ack["ok"]?.jsonPrimitive?.content).isEqualTo("false")
+            assertThat(ack["error"]?.jsonPrimitive?.content).isEqualTo("failed")
+        }
+    }
+
+    @Test fun `an engine without a dialer answers end_call_result failed instead of crashing`() = runTest {
+        runEngineWithDialer(dialer = null) { engine, sent ->
+            engine.onEndCallRequest()
+            advanceUntilIdle()
+            assertThat(sent.map { it.frameType() }).containsExactly("end_call_result")
             val ack = sent.first().asObject()
             assertThat(ack["ok"]?.jsonPrimitive?.content).isEqualTo("false")
             assertThat(ack["error"]?.jsonPrimitive?.content).isEqualTo("failed")

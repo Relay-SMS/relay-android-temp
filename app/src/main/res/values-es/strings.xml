@@ -1283,7 +1283,7 @@
     <string name="linked_devices_contacts_write_title">Cambiar fotos de contactos</string>
     <string name="linked_devices_contacts_write_subtitle">Permitir que un dispositivo vinculado cambie la foto de un contacto. Toque para permitirlo.</string>
     <string name="linked_devices_calls_title">Llamadas en dispositivos vinculados</string>
-    <string name="linked_devices_calls_subtitle">Permitir que un dispositivo vinculado vea las llamadas entrantes y llame desde este teléfono. Toque para permitirlo.</string>
+    <string name="linked_devices_calls_subtitle">Permitir que un dispositivo vinculado vea las llamadas entrantes, llame desde este teléfono y finalice la llamada actual. Toque para permitirlo.</string>
     <string name="linked_devices_start_error_title">El servidor no pudo iniciarse</string>
     <string name="linked_devices_start_error_bind_hint">Otra app de Relay en este teléfono ya está usando el puerto de vinculación. Detén primero su servidor y vuelve a intentarlo.</string>
     <string name="linked_devices_link_action">Vincular un dispositivo</string>

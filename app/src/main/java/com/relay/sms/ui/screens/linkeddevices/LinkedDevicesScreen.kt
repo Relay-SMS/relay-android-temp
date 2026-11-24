@@ -194,13 +194,14 @@ private fun HubLinkedDevicesScreen(
     val contactsWrite = rememberPermissionContactsWrite(
         onDenied = { viewModel.setContactsWriteDenied(true) },
     )
-    // Live calls — READ_CALL_LOG + CALL_PHONE, so a linked device
-    // can see incoming calls (with the number) and place calls
-    // from this phone. Asked from the row below, never at launch
-    // and never at server-enable (which already asks
-    // WRITE_CONTACTS — three dialogs at once would be too much).
-    // The row shows while the server is on and either permission
-    // is missing, so a denial leaves the way back in visible.
+    // Live calls — READ_CALL_LOG + CALL_PHONE + ANSWER_PHONE_CALLS,
+    // so a linked device can see incoming calls (with the number),
+    // place calls from this phone, and end the current call. Asked
+    // from the row below, never at launch and never at server-enable
+    // (which already asks WRITE_CONTACTS — three dialogs at once
+    // would be too much). The row shows while the server is on and
+    // any permission is missing, so a denial leaves the way back in
+    // visible.
     val callsPermission = rememberPermissionCalls()
 
     LaunchedEffect(Unit) {
@@ -355,9 +356,9 @@ private fun LinkedDevicesList(
     contactsWriteGranted: Boolean,
     /** Request WRITE_CONTACTS (the photo row's tap). */
     onRequestContactsWrite: () -> Unit,
-    /** READ_CALL_LOG + CALL_PHONE granted — the calls row hides itself when true. */
+    /** READ_CALL_LOG + CALL_PHONE + ANSWER_PHONE_CALLS granted — the calls row hides itself when true. */
     callsGranted: Boolean,
-    /** Request READ_CALL_LOG + CALL_PHONE (the calls row's tap). */
+    /** Request READ_CALL_LOG + CALL_PHONE + ANSWER_PHONE_CALLS (the calls row's tap). */
     onRequestCalls: () -> Unit,
     /** Client mode — the no-SIM nudge shows on a SIM-less device with no default-SMS role. */
     showNudge: Boolean,
@@ -406,7 +407,7 @@ private fun LinkedDevicesList(
             val showContactsWriteRow =
                 !contactsWriteGranted && state.contactsWriteDenied
             // Live calls — the row shows while the server is on and
-            // either call permission is missing: the grant is asked
+            // any call permission is missing: the grant is asked
             // from here, so the row is both the prompt and the way
             // back in after a denial.
             val showCallsRow = state.serverEnabled && !callsGranted
@@ -453,12 +454,14 @@ private fun LinkedDevicesList(
                             )
                         }
                     }
-                    // Live calls — READ_CALL_LOG + CALL_PHONE, so a
-                    // linked device can see incoming calls (with
-                    // the number) and place calls from this phone.
-                    // Tapping asks for both at once, and a
-                    // permanent denial opens the app's system page
-                    // instead (see rememberPermissionCalls).
+                    // Live calls — READ_CALL_LOG + CALL_PHONE +
+                    // ANSWER_PHONE_CALLS, so a linked device can
+                    // see incoming calls (with the number), place
+                    // calls from this phone, and end the current
+                    // call. Tapping asks for all three at once,
+                    // and a permanent denial opens the app's
+                    // system page instead (see
+                    // rememberPermissionCalls).
                     if (showCallsRow) {
                         item(onClick = onRequestCalls) {
                             RelaySettingRow(
@@ -1306,12 +1309,15 @@ private class CallsPermission(
 
 /**
  * Live calls — READ_CALL_LOG (the incoming number, gated on it
- * since Android 9) + CALL_PHONE (dialing from the desktop),
+ * since Android 9) + CALL_PHONE (dialing from the desktop) +
+ * ANSWER_PHONE_CALLS (ending a call from the desktop),
  * requested together, like the location pair in
  * `rememberPermissionLocalisation`. `granted` is true only when
- * BOTH are granted: with only one, the row stays — a phone with
- * CALL_PHONE but no READ_CALL_LOG can dial but never shows who
- * is calling, and the row is the way to finish the grant.
+ * ALL THREE are granted: with only some, the row stays — a phone
+ * with CALL_PHONE but no READ_CALL_LOG can dial but never shows
+ * who is calling, and a phone without ANSWER_PHONE_CALLS can
+ * dial but never hang up, and the row is the way to finish the
+ * grant.
  *
  * Same instant-denial rule as [rememberPermissionContactsWrite]:
  * after two denials Android answers instantly without showing a
@@ -1328,6 +1334,7 @@ private fun rememberPermissionCalls(): CallsPermission {
         permissions = listOf(
             Manifest.permission.READ_CALL_LOG,
             Manifest.permission.CALL_PHONE,
+            Manifest.permission.ANSWER_PHONE_CALLS,
         ),
         onPermissionsResult = { grantedByPermission ->
             val instant = SystemClock.elapsedRealtime() - requestStarted.longValue <

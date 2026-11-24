@@ -1063,6 +1063,42 @@ object SyncProtocol {
         }
     }
 
+    /**
+     * Client → server: end the current call on the phone. No
+     * payload — the phone ends whatever call is in progress (the
+     * foreground call, else the first ACTIVE / DIALING / PULLING
+     * / RINGING / ON_HOLD call) and answers `end_call_result`.
+     * The resulting hangup also arrives as `call_state` `ended`,
+     * so the desktop sees its own end land. Needs only
+     * ANSWER_PHONE_CALLS on the phone — no default-dialer role,
+     * no Bluetooth.
+     */
+    @Serializable
+    data object EndCallRequest
+
+    /**
+     * Server → client: the ack to `end_call_request`. [ok] `false`
+     * means the phone did not end a call — [error] is a short
+     * snake_case code, never a stack trace. A refused end is
+     * never a protocol violation — the socket stays up.
+     */
+    @Serializable
+    data class EndCallResult(
+        @SerialName("ok") val ok: Boolean,
+        @SerialName("error") val error: String? = null,
+    ) {
+        companion object {
+            /** ANSWER_PHONE_CALLS is not granted on the phone. */
+            const val PERMISSION_DENIED = "permission_denied"
+
+            /** No call is in progress, so there is nothing to end. */
+            const val NO_CALL = "no_call"
+
+            /** Anything else: no telephony, or the OS refused. */
+            const val FAILED = "failed"
+        }
+    }
+
     // -- Category mutes (SYNC_PROTOCOL.md, Category mutes) ------------
 
     /**
@@ -1402,7 +1438,16 @@ object SyncProtocol {
         data class AvatarRequest(val value: SyncProtocol.AvatarRequest) : Parsed
         data class CreateConversation(val value: SyncProtocol.CreateConversation) : Parsed
         data class SetContactPhoto(val value: SyncProtocol.SetContactPhoto) : Parsed
-        data class DialRequest(val value: SyncProtocol.DialRequest) : Parsed
+
+        /**
+         * Live-calls commands (round 51): grouped under one sealed
+         * sub-interface so the session handler dispatches them
+         * through a single arm (the main dispatch sits at the
+         * Detekt complexity cap).
+         */
+        sealed interface CallCommand : Parsed
+        data class DialRequest(val value: SyncProtocol.DialRequest) : CallCommand
+        data class EndCallRequest(val value: SyncProtocol.EndCallRequest) : CallCommand
         data class CreateNote(val value: SyncProtocol.CreateNote) : Parsed
         data class SaveNoteMessage(val value: SyncProtocol.SaveNoteMessage) : Parsed
         data class EditNoteMessage(val value: SyncProtocol.EditNoteMessage) : Parsed
@@ -1460,8 +1505,8 @@ object SyncProtocol {
      * The second half of [parse]: the Slice 3 write-back actions, the
      * Slice 4 attachment frames, the Phase 2 schedule frames, the
      * Slice 5 contact frames, the create-conversation frame, the
-     * round-3 contact-photo frame, the live-calls dial frame, and
-     * the category-mute frame. The note frames live in
+     * round-3 contact-photo frame, the live-calls dial and end-call
+     * frames, and the category-mute frame. The note frames live in
      * [parseNoteFrames] — one more `when` arm here would push this
      * function over the Detekt complexity cap (40). A well-formed
      * message of an unknown type comes back as [Parsed.Unknown],
@@ -1485,6 +1530,7 @@ object SyncProtocol {
         "create_conversation" -> decode<CreateConversation>(obj)?.let(Parsed::CreateConversation) ?: Parsed.Malformed
         "set_contact_photo" -> decode<SetContactPhoto>(obj)?.let(Parsed::SetContactPhoto) ?: Parsed.Malformed
         "dial_request" -> decode<DialRequest>(obj)?.let(Parsed::DialRequest) ?: Parsed.Malformed
+        "end_call_request" -> decode<EndCallRequest>(obj)?.let(Parsed::EndCallRequest) ?: Parsed.Malformed
         else -> parseNoteFrames(type, obj)
     }
 
@@ -1601,6 +1647,9 @@ object SyncProtocol {
     fun encodeCallState(value: CallState): String = withType(value, "call_state").toString()
 
     fun encodeDialResult(value: DialResult): String = withType(value, "dial_result").toString()
+
+    fun encodeEndCallResult(value: EndCallResult): String =
+        withType(value, "end_call_result").toString()
 
     // -- Round 36 phase 2: notes sync encoders -------------------------
 

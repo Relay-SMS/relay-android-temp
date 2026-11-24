@@ -1273,7 +1273,7 @@
     <string name="linked_devices_contacts_write_title">Contact photo changes</string>
     <string name="linked_devices_contacts_write_subtitle">Let a linked device set a contact\'s photo. Tap to allow.</string>
     <string name="linked_devices_calls_title">Calls on linked devices</string>
-    <string name="linked_devices_calls_subtitle">Let a linked device show incoming calls and place calls from this phone. Tap to allow.</string>
+    <string name="linked_devices_calls_subtitle">Let a linked device show incoming calls, place calls from this phone, and end the current call. Tap to allow.</string>
     <string name="linked_devices_start_error_title">The server couldn\'t start</string>
     <string name="linked_devices_start_error_bind_hint">Another Relay app on this phone is already using the link port — stop its server first, then try again.</string>
     <string name="linked_devices_link_action">Link a device</string>

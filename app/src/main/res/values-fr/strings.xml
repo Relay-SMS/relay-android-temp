@@ -1258,7 +1258,7 @@
     <string name="linked_devices_contacts_write_title">Modifier les photos de contacts</string>
     <string name="linked_devices_contacts_write_subtitle">Autoriser un appareil lié à modifier la photo d\'un contact. Appuyez pour autoriser.</string>
     <string name="linked_devices_calls_title">Appels sur les appareils liés</string>
-    <string name="linked_devices_calls_subtitle">Autoriser un appareil lié à voir les appels entrants et à appeler depuis ce téléphone. Appuyez pour autoriser.</string>
+    <string name="linked_devices_calls_subtitle">Autoriser un appareil lié à voir les appels entrants, à appeler depuis ce téléphone et à mettre fin à l\'appel en cours. Appuyez pour autoriser.</string>
     <string name="linked_devices_start_error_title">Le serveur n\'a pas pu démarrer</string>
     <string name="linked_devices_start_error_bind_hint">Une autre app Relay sur ce téléphone utilise déjà le port d\'appariement — arrêtez d\'abord son serveur, puis réessayez.</string>
     <string name="linked_devices_link_action">Lier un appareil</string>

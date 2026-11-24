@@ -472,7 +472,7 @@ class SettingsRepository(
                 stickyCategoryBackfilledV20 = p[K.stickyCategoryBackfilledV20] ?: false,
                 stickyCategoryBackfilledV22 = p[K.stickyCategoryBackfilledV22] ?: false,
                 stickyCategoryBackfilledPostImport = p[K.stickyCategoryBackfilledPostImport] ?: false,
-                groupConversationsRepairedV24 = p[K.groupConversationsRepairedV24] ?: false,
+                groupConversationsRepairedV25 = p[K.groupConversationsRepairedV25] ?: false,
             ),
         )
     }
@@ -612,7 +612,7 @@ class SettingsRepository(
         this[K.stickyCategoryBackfilledV20] = s.advanced.stickyCategoryBackfilledV20
         this[K.stickyCategoryBackfilledV22] = s.advanced.stickyCategoryBackfilledV22
         this[K.stickyCategoryBackfilledPostImport] = s.advanced.stickyCategoryBackfilledPostImport
-        this[K.groupConversationsRepairedV24] = s.advanced.groupConversationsRepairedV24
+        this[K.groupConversationsRepairedV25] = s.advanced.groupConversationsRepairedV25
     }
 
     private inline fun <reified E : Enum<E>> enumOr(p: Preferences, key: Preferences.Key<String>, def: E, valueOf: (String) -> E): E =
@@ -859,8 +859,8 @@ class SettingsRepository(
         val stickyCategoryBackfilledPostImport =
             booleanPreferencesKey("advanced.stickyCategoryBackfilledPostImport")
 
-        /** Round 50 — reparation one-shot des conversations de groupe mal classees. */
-        val groupConversationsRepairedV24 =
-            booleanPreferencesKey("advanced.groupConversationsRepairedV24")
+        /** Round 50 — reparation one-shot des conversations de groupe mal classees. Round 52: V25. */
+        val groupConversationsRepairedV25 =
+            booleanPreferencesKey("advanced.groupConversationsRepairedV25")
     }
 }

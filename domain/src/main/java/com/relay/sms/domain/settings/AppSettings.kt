@@ -695,8 +695,15 @@ data class AdvancedSettings(
      * so the pass retries at the next cold start). Independent of
      * [startupDbMigrationsDone]: the installs it targets already have
      * that flag set.
+     *
+     * Round 52 — V25: the V24 pass ran with a broken provider lookup
+     * (it queried the thread's MESSAGES URI, not the thread row, so
+     * it "completed" without repairing anything) — and on a fresh
+     * install the pass ran before the import, on an empty database.
+     * The V25 flag makes every install re-run the pass once with
+     * the fixed lookup.
      */
-    val groupConversationsRepairedV24: Boolean = false,
+    val groupConversationsRepairedV25: Boolean = false,
     /**
      * v1.3.10 — **opt-in** : démarre [com.relay.sms.system.service.KeepAliveService]
      * qui maintient le processus Relay vivant via une notification persistante
@@ -739,9 +746,11 @@ data class AdvancedSettings(
          * Google-framed reactions, which the v3 gate and candidate query
          * never matched — installs that already ran v3 re-run once so
          * already-imported rows of those shapes fold retroactively.
+         * 5 also folds the curly-quote emoji form (`👍 to “…”`), which
+         * the v4 gate, decoder and candidate query never matched.
          * Bump when the reparse learns a new shape, so existing installs
          * re-run it exactly once.
          */
-        const val REACTION_REPARSE_CURRENT_VERSION = 4
+        const val REACTION_REPARSE_CURRENT_VERSION = 5
     }
 }

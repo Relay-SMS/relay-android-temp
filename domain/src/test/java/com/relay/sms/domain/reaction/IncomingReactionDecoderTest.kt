@@ -239,11 +239,47 @@ class IncomingReactionDecoderTest {
         assertThat(result.wasTruncated).isFalse()
     }
 
-    @Test fun `decodes emoji-to-quote tapback with curly quotes`() {
+    @Test fun `decodes emoji-to-quote tapback with guillemets`() {
         val result = IncomingReactionDecoder.decode("❤️ to «Hello»")
         assertThat(result).isNotNull()
         assertThat(result!!.emoji).isEqualTo("❤️")
         assertThat(result.previewPrefix).isEqualTo("Hello")
+    }
+
+    @Test fun `decodes emoji-to-quote tapback with curly quotes and a multiline preview`() {
+        // Round 52 — Kristin's exact message from device testing: curly
+        // quotes `“”` (not straight `"`), a space after the opening
+        // quote and before the closing one, a NEWLINE inside the
+        // preview, and a truncated URL. The v4 regex only knew `«»`
+        // and `"` — this stayed a plain bubble.
+        val result = IncomingReactionDecoder.decode(
+            "👍 to “ Hey Curt, this is the video I was talking about:\n" +
+                "https://www.youtube.com/watch?v=8v2 ”",
+        )
+        assertThat(result).isNotNull()
+        assertThat(result!!.emoji).isEqualTo("👍")
+        assertThat(result.previewPrefix).isEqualTo(
+            "Hey Curt, this is the video I was talking about:\n" +
+                "https://www.youtube.com/watch?v=8v2",
+        )
+        assertThat(result.kind).isEqualTo(IncomingReactionDecoder.DecodedReaction.Kind.Tapback)
+        assertThat(result.wasTruncated).isFalse()
+    }
+
+    @Test fun `decodes emoji-to-quote tapback with curly quotes and no connector word`() {
+        val result = IncomingReactionDecoder.decode("👍 “Hello”")
+        assertThat(result).isNotNull()
+        assertThat(result!!.emoji).isEqualTo("👍")
+        assertThat(result.previewPrefix).isEqualTo("Hello")
+        assertThat(result.wasTruncated).isFalse()
+    }
+
+    @Test fun `decodes emoji-to-quote tapback with truncated curly quote`() {
+        val result = IncomingReactionDecoder.decode("👍 to “Hey Curt, about the trip")
+        assertThat(result).isNotNull()
+        assertThat(result!!.emoji).isEqualTo("👍")
+        assertThat(result.previewPrefix).isEqualTo("Hey Curt, about the trip")
+        assertThat(result.wasTruncated).isTrue()
     }
 
     // ──────────────── Google Messages invisible-char format ────────────────

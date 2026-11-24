@@ -21,7 +21,8 @@ import javax.inject.Inject
 
 /**
  * The real [CallDialer]: places a cellular call from a linked
- * desktop's `dial_request`.
+ * desktop's `dial_request`, and ends the current call for an
+ * `end_call_request`.
  *
  * The dial goes through `TelecomManager.placeCall`, NOT an
  * `ACTION_CALL` intent — that is the whole point of this class.
@@ -35,9 +36,18 @@ import javax.inject.Inject
  * instead of an activity start, so the background-activity-start
  * block does not apply: the telecom service itself brings up the
  * default dialer's in-call UI. It needs CALL_PHONE (checked
- * first, same as before) and works for any app holding it — only
- * answering/ending a call needs the default-dialer role, which
- * is why those go over Bluetooth HFP.
+ * first, same as before) and works for any app holding it.
+ *
+ * Ending goes through `TelecomManager.endCall`, which needs
+ * only ANSWER_PHONE_CALLS — NOT the default-dialer role (the
+ * round-29 note claiming otherwise was wrong: verified from
+ * AOSP `TelecomServiceImpl`, `endCall` enforces only the
+ * answer-call permission, no dialer-role check anywhere). It
+ * ends the foreground call, else the first ACTIVE / DIALING /
+ * PULLING / RINGING / ON_HOLD call, and the OS refuses emergency
+ * calls and self-managed calls — a `false` return is that
+ * refusal (or the call ending in the race), not a crash. Only
+ * ANSWERING a call still goes over Bluetooth HFP.
  *
  * `ACTION_CALL` stays as a fallback if `placeCall` throws: a
  * throw means the call was NOT placed, so the fallback cannot
@@ -55,7 +65,8 @@ import javax.inject.Inject
  * phone would, and the desktop's audio path (Bluetooth HFP) is
  * separate work on the desktop side. The observer reports the
  * resulting off-hook transition back as `call_state` `active`,
- * so the desktop sees its own dial land.
+ * so the desktop sees its own dial land — and the hangup as
+ * `call_state` `ended`, so the desktop sees its own end land.
  */
 class AndroidCallDialer @Inject constructor(
     @ApplicationContext private val context: Context,
@@ -91,6 +102,39 @@ class AndroidCallDialer @Inject constructor(
             // the foreground. If that throws too, the dial failed.
             Timber.w(t, "AndroidCallDialer: placeCall failed, trying ACTION_CALL")
             dialViaIntent(uri)
+        }
+    }
+
+    override suspend fun endCall(): EndCallOutcome {
+        val granted = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ANSWER_PHONE_CALLS,
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!granted) {
+            Timber.w("AndroidCallDialer: ANSWER_PHONE_CALLS not granted — end refused")
+            return EndCallOutcome.PermissionDenied
+        }
+        // No telephony on this device, no call to end.
+        val telecom = context.getSystemService(TelecomManager::class.java)
+            ?: return EndCallOutcome.Failed
+        if (!telecom.isInCall) return EndCallOutcome.NoCall
+        return try {
+            if (telecom.endCall()) {
+                EndCallOutcome.Success
+            } else {
+                // The OS refused (emergency or self-managed
+                // call), or the call ended in the race.
+                Timber.w("AndroidCallDialer: endCall refused by the OS")
+                EndCallOutcome.Failed
+            }
+        } catch (se: SecurityException) {
+            // `endCall` can only throw this for the missing
+            // permission — revoked between the check and the call.
+            Timber.w(se, "AndroidCallDialer: end refused by the OS")
+            EndCallOutcome.PermissionDenied
+        } catch (t: Throwable) {
+            Timber.w(t, "AndroidCallDialer: endCall failed")
+            EndCallOutcome.Failed
         }
     }
 

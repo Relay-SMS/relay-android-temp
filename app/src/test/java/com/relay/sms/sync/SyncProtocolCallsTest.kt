@@ -15,10 +15,11 @@ import org.junit.jupiter.api.Test
 
 /**
  * Live calls — the call-signaling wire types: `dial_request`
- * parses (the desktop's request), and `incoming_call`,
- * `call_state` and `dial_result` encode (the phone's frames).
- * The frame shapes are the contract the desktop creates against,
- * so the field names and the required fields are pinned here.
+ * and `end_call_request` parse (the desktop's requests), and
+ * `incoming_call`, `call_state`, `dial_result` and
+ * `end_call_result` encode (the phone's frames). The frame
+ * shapes are the contract the desktop creates against, so the
+ * field names and the required fields are pinned here.
  */
 class SyncProtocolCallsTest {
 
@@ -93,5 +94,53 @@ class SyncProtocolCallsTest {
         assertThat(
             SyncProtocol.parse("""{"type":"dial_result","ok":true}"""),
         ).isEqualTo(SyncProtocol.Parsed.Unknown("dial_result"))
+    }
+
+    @Test fun `end_call_request parses with no fields`() {
+        assertThat(
+            SyncProtocol.parse("""{"type":"end_call_request"}"""),
+        ).isEqualTo(
+            SyncProtocol.Parsed.EndCallRequest(SyncProtocol.EndCallRequest),
+        )
+    }
+
+    @Test fun `end_call_request ignores extra fields`() {
+        // The request carries no payload: a stray field is not a
+        // parse error, it is ignored (like the `type` key itself).
+        assertThat(
+            SyncProtocol.parse("""{"type":"end_call_request","number":"+15551234567"}"""),
+        ).isEqualTo(
+            SyncProtocol.Parsed.EndCallRequest(SyncProtocol.EndCallRequest),
+        )
+    }
+
+    @Test fun `end_call_result ok true omits the error`() {
+        val json = SyncProtocol.encodeEndCallResult(SyncProtocol.EndCallResult(ok = true))
+        val obj = Json.parseToJsonElement(json).jsonObject
+        assertThat(obj["type"]?.jsonPrimitive?.content).isEqualTo("end_call_result")
+        assertThat(obj["ok"]?.jsonPrimitive?.content).isEqualTo("true")
+        assertThat(obj.containsKey("error")).isFalse()
+    }
+
+    @Test fun `end_call_result ok false carries the snake_case error`() {
+        val json = SyncProtocol.encodeEndCallResult(
+            SyncProtocol.EndCallResult(
+                ok = false,
+                error = SyncProtocol.EndCallResult.NO_CALL,
+            ),
+        )
+        val obj = Json.parseToJsonElement(json).jsonObject
+        assertThat(obj["type"]?.jsonPrimitive?.content).isEqualTo("end_call_result")
+        assertThat(obj["ok"]?.jsonPrimitive?.content).isEqualTo("false")
+        assertThat(obj["error"]?.jsonPrimitive?.content).isEqualTo("no_call")
+    }
+
+    @Test fun `end_call_result round-trips through parse as unknown (server-only frame)`() {
+        // The phone never receives its own ack: an
+        // `end_call_result` arriving on the socket is an unknown
+        // type, not a parse error — the connection stays up.
+        assertThat(
+            SyncProtocol.parse("""{"type":"end_call_result","ok":true}"""),
+        ).isEqualTo(SyncProtocol.Parsed.Unknown("end_call_result"))
     }
 }

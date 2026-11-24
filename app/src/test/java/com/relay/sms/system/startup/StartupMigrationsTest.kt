@@ -340,7 +340,7 @@ class StartupMigrationsTest {
         migrations(settings).run()
 
         coVerify(exactly = 1) { groupRepair.repair() }
-        assertThat(state.first().advanced.groupConversationsRepairedV24).isTrue()
+        assertThat(state.first().advanced.groupConversationsRepairedV25).isTrue()
     }
 
     @Test
@@ -352,7 +352,7 @@ class StartupMigrationsTest {
         migrations(settings).run()
 
         coVerify(exactly = 1) { groupRepair.repair() }
-        assertThat(state.first().advanced.groupConversationsRepairedV24).isFalse()
+        assertThat(state.first().advanced.groupConversationsRepairedV25).isFalse()
     }
 
     @Test
@@ -360,7 +360,7 @@ class StartupMigrationsTest {
         coEvery { mirror.dedupeSameNumberConversations() } returns false
         val (settings, _) = fakeSettings(
             AppSettings().copy(
-                advanced = AppSettings().advanced.copy(groupConversationsRepairedV24 = true),
+                advanced = AppSettings().advanced.copy(groupConversationsRepairedV25 = true),
             ),
         )
 
@@ -394,6 +394,6 @@ class StartupMigrationsTest {
         migrations(settings).run()
 
         coVerify(exactly = 1) { groupRepair.repair() }
-        assertThat(state.first().advanced.groupConversationsRepairedV24).isTrue()
+        assertThat(state.first().advanced.groupConversationsRepairedV25).isTrue()
     }
 }

@@ -37,7 +37,8 @@ import java.util.Base64
  * the same way. Create conversation adds the `create_conversation`
  * frame, dispatched the same way. Round 3 adds the contact-photo
  * frame (`set_contact_photo`), dispatched the same way. Live calls
- * add the dial frame (`dial_request`), dispatched the same way.
+ * add the dial frame (`dial_request`) and the end-call frame
+ * (`end_call_request`), dispatched the same way.
  * Category mutes add the `set_category_muted` frame, dispatched
  * the same way. Round 36 phase 2 adds the note frames
  * (`create_note`, `save_note_message`, `edit_note_message`,
@@ -107,7 +108,9 @@ class SyncSessionHandler(
             is SyncProtocol.Parsed.AvatarRequest -> onAvatarRequest(parsed.value)
             is SyncProtocol.Parsed.CreateConversation -> onCreateConversation(parsed.value)
             is SyncProtocol.Parsed.SetContactPhoto -> onSetContactPhoto(parsed.value)
-            is SyncProtocol.Parsed.DialRequest -> onDialRequest(parsed.value)
+            // Live-calls commands share one arm — the sub-interface
+            // keeps this dispatch under the Detekt complexity cap (40).
+            is SyncProtocol.Parsed.CallCommand -> dispatchCalls(parsed)
             is SyncProtocol.Parsed.CreateNote -> onCreateNote(parsed.value)
             is SyncProtocol.Parsed.SaveNoteMessage -> onSaveNoteMessage(parsed.value)
             is SyncProtocol.Parsed.EditNoteMessage -> onEditNoteMessage(parsed.value)
@@ -130,6 +133,14 @@ class SyncSessionHandler(
         when (parsed) {
             is SyncProtocol.Parsed.SetE2eVerified -> onSetE2eVerified(parsed.value)
             is SyncProtocol.Parsed.RetryE2eProbe -> onRetryE2eProbe(parsed.value)
+        }
+    }
+
+    /** Live-calls command dispatch (round 51): one arm in [onText], split out here. */
+    private suspend fun dispatchCalls(parsed: SyncProtocol.Parsed.CallCommand) {
+        when (parsed) {
+            is SyncProtocol.Parsed.DialRequest -> onDialRequest(parsed.value)
+            is SyncProtocol.Parsed.EndCallRequest -> onEndCallRequest()
         }
     }
 
@@ -361,6 +372,17 @@ class SyncSessionHandler(
      */
     private suspend fun onDialRequest(request: SyncProtocol.DialRequest) {
         withEngine { it.onDialRequest(request) }
+    }
+
+    /**
+     * Live calls — the end-call frame needs auth too: an
+     * unauthenticated end frame is a protocol violation, like an
+     * unauthenticated send. The engine runs it in its own job,
+     * never on the frame loop. No payload (like `mark_all_read`),
+     * so there is nothing to pass through.
+     */
+    private suspend fun onEndCallRequest() {
+        withEngine { it.onEndCallRequest() }
     }
 
     /**

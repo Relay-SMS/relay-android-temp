@@ -811,10 +811,11 @@ Slice 5 scope note still stands.
 
 The phone forwards its cellular call state to every linked
 device, and a linked device can place a cellular call on the
-phone. Signaling + dial only: the audio itself travels over
-Bluetooth HFP on the desktop side, outside this protocol. Same
-JSON envelope, same `type` field, same rules. No protocol bump:
-every addition is additive.
+phone and end the current call. Signaling + dial + hangup
+only: the audio itself travels over Bluetooth HFP on the
+desktop side, outside this protocol. Same JSON envelope, same
+`type` field, same rules. No protocol bump: every addition is
+additive.
 
 | Direction | Message | Shape |
 |---|---|---|
@@ -822,6 +823,8 @@ every addition is additive.
 | Server → client | `call_state` | `{"type":"call_state","state":"ringing","number":"+15551234567"}` |
 | Client → server | `dial_request` | `{"type":"dial_request","number":"+15551234567"}` |
 | Server → client | `dial_result` | `{"type":"dial_result","ok":true}` |
+| Client → server | `end_call_request` | `{"type":"end_call_request"}` |
+| Server → client | `end_call_result` | `{"type":"end_call_result","ok":true}` |
 
 `incoming_call` is sent when the phone starts ringing, together
 with a `call_state` `ringing` for the same transition — the
@@ -857,6 +860,24 @@ as `call_state` `dialing`, so the desktop sees its own dial
 land. A `dial_request` before auth is a protocol violation,
 like any other post-auth frame.
 
+`end_call_request` ends the current call on the phone (no
+payload — the phone ends whatever call is in progress) and is
+answered with `end_call_result` — `ok: true` when a call was
+ended, `ok: false` with a short snake_case `error` otherwise:
+`permission_denied` (ANSWER_PHONE_CALLS is not granted on the
+phone — the user grants it from the Linked devices screen,
+together with READ_CALL_LOG + CALL_PHONE), `no_call` (no call
+is in progress), `failed` (anything else: no telephony on the
+device, or the OS refused — emergency and self-managed calls
+cannot be ended this way). A refused end is never a protocol
+violation — the socket stays up. The resulting hangup also
+arrives as `call_state` `ended`, so the desktop sees its own
+end land. An `end_call_request` before auth is a protocol
+violation, like any other post-auth frame. Ending needs only
+ANSWER_PHONE_CALLS — no default-dialer role, no Bluetooth —
+so a desktop without Bluetooth can hang up a call it dialed
+(or one the phone is on) from the sync link alone.
+
 Listening needs READ_PHONE_STATE (requested at cold start, as
 a critical SMS permission — the observer reuses that granted
 state); without it the observer stays off and no call frames
@@ -864,14 +885,17 @@ are sent. The observer runs while the server runs — one
 listener for the whole server, not one per session — and stops
 with it.
 
-Android clients consume the same four frames: a linked tablet
+Android clients consume the same six frames: a linked tablet
 shows a small incoming-call dropdown on `incoming_call` /
 `call_state` `ringing` (avatar + name from its synced contacts,
 one chat button that opens the conversation with that number),
 dismisses it on `call_state` `ended` (or `active`, answered
 elsewhere), and dials from a 1:1 thread with `dial_request`.
-No answer/hangup frames exist: a linked Android device cannot
-answer or end a call, and call audio stays on the phone.
+The tablet gets no hangup UI this round — it drops the
+`end_call_result` frame harmlessly — but the phone answers an
+`end_call_request` from any authenticated client. No answer
+frame exists: a linked Android device cannot answer a call,
+and call audio stays on the phone.
 
 ## Category mutes (protocol version 1)
 
@@ -1284,7 +1308,7 @@ thin, explicit glue:
    (`RelaySettingsGroup`, `RelaySwitchRow`, …) — the one visual
    dependency. The screen also owns the runtime permission prompts
    the sync layer cannot show itself (WRITE_CONTACTS for contact
-   photos; READ_CALL_LOG + CALL_PHONE for live calls) — the
+   photos; READ_CALL_LOG + CALL_PHONE + ANSWER_PHONE_CALLS for live calls) — the
    background service has no Activity to ask from.
 4. **The message-store seam** (`sync/SyncMessageSource.kt`):
    the interface the sync engine calls, plus the wire DTOs

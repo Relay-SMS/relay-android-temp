@@ -768,6 +768,10 @@ interface MessageDao {
      * in rows imported from the provider, which the live receiver
      * never stripped).
      *
+     * Round 52 — two more arms, mirroring the gate again: either curly
+     * quote `“` / `”` (the `👍 to “…”` emoji+quote form, whose closing
+     * quote may never have arrived when the preview was truncated).
+     *
      * Deliberately NOT paged: the leading-wildcard arms (`% a réagi par %`,
      * `%»%`) would force a full-table scan per page. One scan returning the
      * (rare) candidates is cheaper than N scans, and the list stays small —
@@ -800,6 +804,8 @@ interface MessageDao {
             body LIKE '% a réagi par %' OR
             body LIKE '%»%' OR
             body LIKE '%«%' OR
+            body LIKE '%“%' OR
+            body LIKE '%”%' OR
             body LIKE '%"%' OR
             substr(body, 1, 1) = char(8202)
           )

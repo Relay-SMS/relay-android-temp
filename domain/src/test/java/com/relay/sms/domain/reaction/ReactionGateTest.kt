@@ -75,6 +75,34 @@ class ReactionGateTest {
         assertThat(IncomingReactionDecoder.decode(body)).isNotNull()
     }
 
+    // ──────────────────── Round 52: emoji + curly quotes ────────────────────
+
+    @Test
+    fun `emoji tapback with curly quotes passes the gate and decodes`() {
+        // The iPhone rendering of the same shape: the v4 gate knew only
+        // guillemets and straight quotes, so this stayed a plain bubble.
+        val body = "👍 to “See you at six”"
+
+        assertThat(IncomingReactionDecoder.looksLikeReactionText(body)).isTrue()
+        val decoded = IncomingReactionDecoder.decode(body)
+        assertThat(decoded).isNotNull()
+        assertThat(decoded!!.emoji).isEqualTo("👍")
+        assertThat(decoded.previewPrefix).isEqualTo("See you at six")
+        assertThat(decoded.wasTruncated).isFalse()
+    }
+
+    @Test
+    fun `emoji tapback with truncated curly quote passes the gate and decodes`() {
+        // No closing `”`: only the opening quote is there, like the
+        // truncated guillemet case above.
+        val body = "👍 to “See you at"
+
+        assertThat(IncomingReactionDecoder.looksLikeReactionText(body)).isTrue()
+        val decoded = IncomingReactionDecoder.decode(body)
+        assertThat(decoded).isNotNull()
+        assertThat(decoded!!.wasTruncated).isTrue()
+    }
+
     // ──────────────────── The arms the old gate already had ────────────────────
 
     @Test

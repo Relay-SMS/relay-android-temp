@@ -8,7 +8,6 @@
 package com.relay.sms.sync
 
 import com.relay.sms.sync.calls.CallDialer
-import com.relay.sms.sync.calls.DialOutcome
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -64,8 +63,10 @@ import java.util.concurrent.ConcurrentHashMap
  * Round 3 adds the contact-photo handler ([onSetContactPhoto]) in
  * the same shape; the runner is file-scope like the Slice 4 ones.
  *
- * Live calls add the dial handler ([onDialRequest]) in the same
- * shape; the runner is file-scope like the Slice 4 ones. The
+ * Live calls add the dial handler ([onDialRequest]) and the
+ * end-call handler ([onEndCallRequest]) in the same shape; the
+ * runners live file-scope in SyncEngineCalls.kt (SyncEngine.kt
+ * is at the Detekt function limit). The
  * inbound call frames (`incoming_call`, `call_state`) are NOT an
  * engine concern — the server broadcasts them from the shared
  * observer (see [SyncServer]), so every session hears them.
@@ -123,9 +124,10 @@ import java.util.concurrent.ConcurrentHashMap
  * @param send carries one outbound text frame to the client.
  * @param wakelock the bounded partial wakelock, held only while a
  * sync stream runs (see [onSyncRequest]).
- * @param callDialer the dial executor for `dial_request`, or null
- * when the session has none (tests): a dial then answers
- * `dial_result` `failed` instead of crashing.
+ * @param callDialer the dial/end executor for `dial_request`
+ * and `end_call_request`, or null when the session has none
+ * (tests): a dial or an end then answers `failed` instead of
+ * crashing.
  * @param noteSource the note store seam, or null when the session
  * has none (tests): the notes phase is skipped and note frames are
  * ignored.
@@ -546,7 +548,7 @@ class SyncEngine(
         }
     }
 
-    // -- Live calls: dial ----------------------------------------------
+    // -- Live calls: dial + end call -----------------------------------
     // Same shape as the other handlers: starts a job and returns
     // immediately, so a slow dial never blocks the frame loop.
 
@@ -564,6 +566,25 @@ class SyncEngine(
             } catch (t: Throwable) {
                 Timber.w(t, "SyncEngine: dial request failed")
                 runCatching { send(dialResultInternal()) }
+            }
+        }
+    }
+
+    /**
+     * Handles an `end_call_request`: answered with
+     * `end_call_result` (`ok: true` when a call was ended,
+     * `ok: false` with a snake_case code on refusal — see
+     * [SyncProtocol.EndCallResult]).
+     */
+    fun onEndCallRequest() {
+        scope.launch {
+            try {
+                runEndCallRequest(callDialer, send)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (t: Throwable) {
+                Timber.w(t, "SyncEngine: end call request failed")
+                runCatching { send(endCallResultInternal()) }
             }
         }
     }
@@ -1462,48 +1483,10 @@ private fun setContactPhotoFailedInternal(address: String): String =
         ),
     )
 
-// -- Live calls: dial (file scope, not a class member: the runner
-// touches no engine state beyond the dialer and the send lambda,
-// and the class is at the Detekt function limit) ----------------------
-
-/**
- * Runs one `dial_request`: the dialer places the call (or refuses
- * it), and the outcome maps 1:1 onto the `dial_result` frame — a
- * session without a dialer (tests) answers `failed`. A refused
- * dial is never a protocol violation: the socket stays up, and
- * the desktop shows the reason.
- */
-private suspend fun runDialRequest(
-    dialer: CallDialer?,
-    send: suspend (String) -> Unit,
-    request: SyncProtocol.DialRequest,
-) {
-    val outcome = dialer?.dial(request.number) ?: DialOutcome.Failed
-    val result = when (outcome) {
-        DialOutcome.Success -> SyncProtocol.DialResult(ok = true)
-        DialOutcome.PermissionDenied -> SyncProtocol.DialResult(
-            ok = false,
-            error = SyncProtocol.DialResult.PERMISSION_DENIED,
-        )
-        DialOutcome.NoNumber -> SyncProtocol.DialResult(
-            ok = false,
-            error = SyncProtocol.DialResult.NO_NUMBER,
-        )
-        DialOutcome.Failed -> SyncProtocol.DialResult(
-            ok = false,
-            error = SyncProtocol.DialResult.FAILED,
-        )
-    }
-    send(SyncProtocol.encodeDialResult(result))
-}
-
-private fun dialResultInternal(): String =
-    SyncProtocol.encodeDialResult(
-        SyncProtocol.DialResult(
-            ok = false,
-            error = SyncProtocol.DialResult.FAILED,
-        ),
-    )
+// -- Live calls: dial + end call --------------------------------------
+// The runners live in SyncEngineCalls.kt (file scope, like the
+// Slice 4 ones here) — SyncEngine.kt is at the Detekt function
+// limit, so the call runners moved out to keep the pair together.
 
 // -- Slice 4: attachment bytes (file scope, not class members: these
 // runners touch no engine state beyond the source and the send lambda,

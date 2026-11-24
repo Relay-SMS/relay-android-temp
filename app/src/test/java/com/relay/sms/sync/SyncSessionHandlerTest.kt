@@ -9,6 +9,7 @@ package com.relay.sms.sync
 
 import com.google.common.truth.Truth.assertThat
 import com.relay.sms.sync.calls.DialOutcome
+import com.relay.sms.sync.calls.EndCallOutcome
 import com.relay.sms.sync.calls.FakeCallDialer
 import io.mockk.coEvery
 import io.mockk.coVerify
@@ -739,6 +740,50 @@ class SyncSessionHandlerTest {
             assertThat(engineSent).hasSize(1)
             val ack = Json.parseToJsonElement(engineSent.first()).jsonObject
             assertThat(ack["type"]?.jsonPrimitive?.content).isEqualTo("dial_result")
+            assertThat(ack["ok"]?.jsonPrimitive?.content).isEqualTo("true")
+            assertThat(harness.closes).isEmpty()
+        } finally {
+            engine.stop()
+            advanceUntilIdle()
+        }
+    }
+
+    // -- Live calls: end call -------------------------------------------
+
+    @Test fun `an unauthenticated end_call_request fails with protocol and closes`() = runTest {
+        val harness = Harness(mapOf(DEVICE_ID to device))
+        harness.handler.onText(
+            """{"type":"end_call_request"}""",
+        )
+        assertThat(harness.lastAuthFailedReason())
+            .isEqualTo(SyncProtocol.AuthFailed.PROTOCOL)
+        assertThat(harness.closes).hasSize(1)
+    }
+
+    @Test fun `an authenticated end_call_request reaches the engine and answers end_call_result`() = runTest {
+        val dialer = FakeCallDialer(endOutcome = EndCallOutcome.Success)
+        val engineSent = mutableListOf<String>()
+        val engine = SyncEngine(
+            FakeSyncMessageSource(),
+            this,
+            send = { engineSent += it },
+            wakelock = NoOpSyncWakelock,
+            callDialer = dialer,
+        )
+        val harness = Harness(mapOf(DEVICE_ID to device), engine = engine)
+        try {
+            harness.handler.onText(helloJson())
+            harness.handler.onText(authJson(harness.challengeBytes()))
+            assertThat(harness.handler.isAuthenticated).isTrue()
+
+            harness.handler.onText(
+                """{"type":"end_call_request"}""",
+            )
+            advanceUntilIdle()
+            assertThat(dialer.endCallCount).isEqualTo(1)
+            assertThat(engineSent).hasSize(1)
+            val ack = Json.parseToJsonElement(engineSent.first()).jsonObject
+            assertThat(ack["type"]?.jsonPrimitive?.content).isEqualTo("end_call_result")
             assertThat(ack["ok"]?.jsonPrimitive?.content).isEqualTo("true")
             assertThat(harness.closes).isEmpty()
         } finally {

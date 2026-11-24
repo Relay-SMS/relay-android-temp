@@ -440,18 +440,34 @@ class TelephonyReader @Inject constructor(
      * Round 50 — the recipient set of one system thread, as Android
      * itself keys it.
      *
-     * `content://mms-sms/conversations/{threadId}` carries `recipient_ids`
-     * (space-separated ids into `canonical-addresses`); resolving them
-     * yields the addresses the provider groups under this thread. The
-     * provider keys a thread by its recipient set EXCLUDING ourselves,
-     * so the result is exactly the conversation's member list — with no
-     * own-number lookup needed, unlike the per-message `addr` table,
-     * whose TO list includes us (and whose FROM is only one member).
+     * `content://mms-sms/conversations/{threadId}/recipients` returns
+     * the thread row carrying `recipient_ids` (space-separated ids into
+     * `canonical-addresses`); resolving them yields the addresses the
+     * provider groups under this thread. The provider keys a thread by
+     * its recipient set EXCLUDING ourselves, so the result is exactly
+     * the conversation's member list — with no own-number lookup needed,
+     * unlike the per-message `addr` table, whose TO list includes us
+     * (and whose FROM is only one member).
+     *
+     * Round 52 — the `/recipients` suffix is load-bearing. AOSP's
+     * `MmsSmsProvider` maps `conversations/#` (no suffix) to
+     * `URI_CONVERSATIONS_MESSAGES` — the thread's MESSAGES (SMS+MMS
+     * union, no `recipient_ids` column) — so querying it with a
+     * `recipient_ids` projection throws. Only
+     * `conversations/#/recipients` maps to
+     * `URI_CONVERSATIONS_RECIPIENTS` → `getConversationById`, which
+     * reads the `threads` table and returns the row WITH
+     * `recipient_ids`. Round 50 queried the bare URI; the throw was
+     * swallowed and every group silently filed as a 1:1. Do not
+     * "simplify" this URI back.
      *
      * `null` = the provider could not be read (query failed or threw) —
      * distinct from "thread has no recipients" (empty set: the thread
      * is gone or degenerate, nothing to repair). Callers treat `null`
      * as fail-soft: file 1:1 for now, retry the lookup later.
+     * Failures are logged (Timber) instead of silently swallowed —
+     * the silent swallow is what hid the round-50 URI bug for a
+     * whole round.
      */
     fun readThreadRecipients(threadId: Long): Set<String>? {
         // Local: the thread's canonical-address ids, or null when the
@@ -460,15 +476,29 @@ class TelephonyReader @Inject constructor(
         // so the caller can tell "retry later" from "nothing here".
         fun threadRecipientIds(): List<Long>? {
             if (threadId <= 0L) return emptyList()
+            // Round 52 — `/recipients`: the bare `conversations/#`
+            // URI returns the thread's MESSAGES, not the thread row
+            // (see the KDoc above). A failure is logged, not
+            // swallowed: the caller needs `null` to mean "retry
+            // later", and the log is the only trace of why.
             val cursor = runCatching {
                 resolver.query(
-                    Uri.parse("content://mms-sms/conversations/$threadId"),
+                    Uri.parse("content://mms-sms/conversations/$threadId/recipients"),
                     arrayOf("recipient_ids"),
                     null,
                     null,
                     null,
                 )
-            }.getOrNull() ?: return null
+            }.onFailure {
+                Timber.w(it, "readThreadRecipients: thread query failed (threadId=%d)", threadId)
+            }.getOrNull()
+            if (cursor == null) {
+                Timber.w(
+                    "readThreadRecipients: provider returned a null cursor (threadId=%d)",
+                    threadId,
+                )
+                return null
+            }
             val raw = cursor.use { c -> if (!c.moveToFirst()) null else c.getString(0) }
             return raw?.split(' ')?.mapNotNull { it.toLongOrNull() }?.distinct().orEmpty()
         }
@@ -483,6 +513,12 @@ class TelephonyReader @Inject constructor(
                 "_id IN ($placeholders)",
                 args,
                 null,
+            )
+        }.onFailure {
+            Timber.w(
+                it,
+                "readThreadRecipients: canonical-addresses query failed (threadId=%d)",
+                threadId,
             )
         }.getOrNull() ?: return null
         val out = HashSet<String>()

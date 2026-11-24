@@ -168,7 +168,9 @@ object IncomingReactionDecoder {
      *     with an arbitrary sender name (`READABLE_FR_NAMED_*`);
      *   - `»` / `«` — any guillemet-quoted form, including a truncated
      *     emoji+quote body whose closing guillemet never arrived
-     *     ([decodeEmojiWithQuote]);
+     *     ([decodeEmojiWithQuote]); round 52 adds the curly quotes
+     *     `“` / `”` — the iPhone rendering of the same shape
+     *     (`👍 to “…”`), which the v4 gate never matched;
      *   - emoji-first token + straight quote — the `👍 to "…"` /
      *     `👍 "…"` shape ([decodeEmojiWithQuote] with the ASCII fallback
      *     quote). THE round-50 gap: the old gate only knew word prefixes
@@ -199,6 +201,7 @@ object IncomingReactionDecoder {
         val wordOrQuote = REACTION_TEXT_PREFIXES.any { body.startsWith(it) } ||
             body.contains(" a réagi par ") ||
             body.contains('»') || body.contains('«') ||
+            body.contains('”') || body.contains('“') ||
             body.startsWith(GOOGLE_FRAME) ||
             emojiQuote
         return body.isNotEmpty() && wordOrQuote
@@ -389,8 +392,12 @@ object IncomingReactionDecoder {
         // Round 50 — the opening guillemet counts too: a truncated body
         // (`👍 «See you at`, closing `»` never arrived) carries only `«`,
         // and the old fast-path rejected it before the regex — whose
-        // closing quote is optional — ever ran.
-        if (!trimmed.contains('»') && !trimmed.contains('«') && trimmed.lastIndexOf('"') <= 0) {
+        // closing quote is optional — ever ran. Round 52 — same for
+        // the curly quotes `“”`: a truncated `👍 to “See you at`
+        // carries only `“`. (One `none { it in … }` check, not four
+        // `contains` arms — Detekt's ComplexCondition caps an `if`
+        // at 4.)
+        if (trimmed.none { it in "»«”“" } && trimmed.lastIndexOf('"') <= 0) {
             return DecodeAttempt.NotMatched
         }
         return EMOJI_WITH_QUOTE_REGEX.matchEntire(trimmed)?.let { m ->
@@ -400,7 +407,8 @@ object IncomingReactionDecoder {
             // Feedback round 9 — the closing quote may be absent when the
             // carrier truncated the preview (e.g. `👍 to "Hey Curt, …` ends
             // mid-sentence): that is a truncation, not a non-reaction.
-            val hasClosingQuote = trimmed.endsWith('»') || trimmed.endsWith('"')
+            val hasClosingQuote = trimmed.endsWith('»') || trimmed.endsWith('"') ||
+                trimmed.endsWith('”')
             when {
                 emoji.isEmpty() || emoji.none { isLikelyEmojiChar(it) } ->
                     DecodeAttempt.NotMatched
@@ -810,7 +818,12 @@ object IncomingReactionDecoder {
      *     (`👍 to "Hey Curt, … about:` ends with `:` and no `"`). The preview
      *     then runs to end-of-string and the caller marks it truncated.
      *
-     * **Audit fix SEC-6** : la classe négative `[^»"]+` remplace `.+?` pour
+     * Round 52 — the curly quotes `“”` join the opening and closing
+     * classes (`👍 to “…”` is how the iPhone renders the same shape;
+     * the v4 regex only knew `«»` and `"`). The preview class excludes
+     * `”` so the closing quote terminates the match.
+     *
+     * **Audit fix SEC-6** : la classe négative `[^»"”]+` remplace `.+?` pour
      * éliminer tout risque de backtracking catastrophique sur input
      * pathologique (ex: `❤️ «aaaa...` sans guillemet fermant). L'engine
      * ne peut plus revenir en arrière puisque chaque caractère est soit
@@ -818,7 +831,7 @@ object IncomingReactionDecoder {
      * (les réactions sont mono-ligne).
      */
     private val EMOJI_WITH_QUOTE_REGEX = Regex(
-        """^(\S+)\s+(?:(?i:to)\s+)?[«"]([^»"]{1,200})(?:[»"]|$)""",
+        """^(\S+)\s+(?:(?i:to)\s+)?[«"“]([^»"”]{1,200})(?:[»"”]|$)""",
     )
 
     /**

@@ -1256,7 +1256,7 @@
     <string name="linked_devices_contacts_write_title">Kontaktfotos ändern</string>
     <string name="linked_devices_contacts_write_subtitle">Einem verknüpften Gerät erlauben, das Foto eines Kontakts zu ändern. Zum Erlauben tippen.</string>
     <string name="linked_devices_calls_title">Anrufe auf verknüpften Geräten</string>
-    <string name="linked_devices_calls_subtitle">Einem verknüpften Gerät erlauben, eingehende Anrufe zu sehen und von diesem Telefon aus anzurufen. Zum Erlauben tippen.</string>
+    <string name="linked_devices_calls_subtitle">Einem verknüpften Gerät erlauben, eingehende Anrufe zu sehen, von diesem Telefon aus anzurufen und den aktuellen Anruf zu beenden. Zum Erlauben tippen.</string>
     <string name="linked_devices_start_error_title">Der Server konnte nicht gestartet werden</string>
     <string name="linked_devices_start_error_bind_hint">Eine andere Relay-App auf diesem Telefon nutzt bereits den Verknüpfungsport — beenden Sie zuerst deren Server und versuchen Sie es dann erneut.</string>
     <string name="linked_devices_link_action">Gerät verknüpfen</string>

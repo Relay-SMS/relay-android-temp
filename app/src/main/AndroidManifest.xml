@@ -81,6 +81,12 @@
          hardcodés dans `EmergencyCallHelper.placeEmergencyCall(number)`,
          pas de paramètre user-modifiable. -->
     <uses-permission android:name="android.permission.CALL_PHONE" />
+    <!-- Round 51 — live calls: ending a call from a linked device
+         (end_call_request → TelecomManager.endCall). Needs only
+         ANSWER_PHONE_CALLS — no default-dialer role (see
+         AndroidCallDialer). Requested at runtime from the Linked
+         devices screen, together with READ_CALL_LOG + CALL_PHONE. -->
+    <uses-permission android:name="android.permission.ANSWER_PHONE_CALLS" />
 
     <!-- v1.3.5 G3 audit fix — SCHEDULE_EXACT_ALARM + USE_EXACT_ALARM retirées :
          l'envoi planifié passe exclusivement par WorkManager.enqueueUniqueWork (cf.

@@ -270,13 +270,18 @@ class StartupMigrations @Inject constructor(
      * filed as 1:1s (see [GroupConversationRepair]). The flag is set
      * only when the pass completed: a provider read failure leaves it
      * unset so the pass retries at the next cold start.
+     *
+     * Round 52 — the flag is V25: the V24 pass ran with a broken
+     * provider lookup (wrong URI — it read the thread's messages,
+     * not the thread row), so every install re-runs the pass once
+     * with the fixed lookup.
      */
     private suspend fun repairGroupConversations(advanced: AdvancedSettings) {
-        if (advanced.groupConversationsRepairedV24) return
+        if (advanced.groupConversationsRepairedV25) return
         val result = groupRepair.get().repair()
         if (result.complete) {
             settings.update { s ->
-                s.copy(advanced = s.advanced.copy(groupConversationsRepairedV24 = true))
+                s.copy(advanced = s.advanced.copy(groupConversationsRepairedV25 = true))
             }
         }
         if (result.repaired > 0 || result.merged > 0) {
