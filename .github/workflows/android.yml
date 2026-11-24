@@ -1,0 +1,184 @@
+name: Android CI
+
+on:
+  push:
+    branches: [ main, develop, 'fix/**', 'feat/**', 'build/**' ]
+    # 🔴 v1.27.2 (2026-08-05) — LES TAGS DECLENCHENT LA CI, eux aussi.
+    #
+    # Sans cette ligne, un tag ne verifiait RIEN par lui-meme. Le 2026-08-05, la sequence a ete :
+    # tag v1.27.2 pousse sur `main` -> la CI demarre sur le commit de branche -> la release GitHub
+    # est creee A LA MAIN 33 secondes plus tard -> la CI echoue 10 minutes apres, sur deux tests
+    # instrumentes. Quatre APK etaient en ligne bien avant que quiconque puisse le savoir.
+    #
+    # ⚠️ La publication reste MANUELLE (`gh release create` : les APK sont signees en local, la
+    # cle n'est pas dans la CI). Ce declencheur ne peut donc pas BLOQUER une publication — il
+    # garantit seulement qu'un tag est integralement verifie, tests instrumentes compris, et que
+    # l'echec est visible sur le tag lui-meme et non noye dans l'historique de la branche.
+    #
+    # La regle qui reste humaine : ne jamais publier avant que la CI du tag soit verte.
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, develop ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      # v1.28.12 - PARITE DES TRADUCTIONS, avant toute compilation : le controle coute une
+      # seconde la ou un echec de build en coute dix minutes. Une langue qui perd des cles ne
+      # devient pas incomplete au grand jour, elle le devient EN SILENCE : l'ecran retombe en
+      # anglais mot par mot et personne ne le voit avant l'utilisateur. C'est exactement
+      # l'objection posee publiquement sur l'issue #15, « the app changes with every release ».
+      # Le script lance d'abord son propre controle negatif : mesurer avec un instrument dont
+      # on n'a pas verifie qu'il devie est ce qui a deja donne a ce projet des tests verts sur
+      # le defaut qu'ils visaient. Marche a suivre pour les traducteurs : TRANSLATING.md.
+      - name: i18n parity
+        run: ./.github/scripts/i18n-parite.sh
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Cache Gradle
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties', 'gradle/libs.versions.toml') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      # Ktlint stays non-blocking on purpose: it reports pure formatting nits with no defensive
+      # value, and `ignoreFailures` is already set in build.gradle.kts.
+      - name: Ktlint (non-blocking)
+        run: ./gradlew ktlintCheck --no-daemon || echo "ktlint warnings — non-blocking"
+
+      # v1.24.0 — detekt et lint sont désormais BLOQUANTS. La dette historique est absorbée par
+      # `app/detekt-baseline.xml` (1 153 issues) et `app/lint-baseline.xml` (45 erreurs,
+      # 202 warnings) : seules les violations NOUVELLES font échouer le build. Ne jamais
+      # régénérer une baseline pour faire taire un problème introduit par un changement.
+      - name: Detekt
+        run: ./gradlew detekt --no-daemon
+
+      - name: Lint
+        run: ./gradlew lintDebug --no-daemon
+
+      # Round 13 — INTERNET is back in the manifest, for GIF search via Klipy only (see PERMISSIONS.md). The merged RELEASE manifest decides; the check reads the XML, holds a reviewed list, and first proves it can fail (fabricated faulty manifests). It also refuses any unreviewed ProtectedPermissions lint exception in the source manifests.
+      - name: Permissions (reviewed list, no unreviewed permission)
+
+        run: |
+          python3 .github/scripts/permissions-manifeste.py --controle-negatif
+          ./gradlew :app:processReleaseMainManifest --no-daemon
+          python3 .github/scripts/permissions-manifeste.py
+
+      - name: Unit tests
+        run: ./gradlew testDebugUnitTest --no-daemon
+
+      # Le filet instrumenté (tests de migration Room sur le chemin SQLCipher réel + preuve du
+      # correctif SEC-CRIT de la clé nulle) doit au minimum compiler à chaque push. L'exécution
+      # sur émulateur est un job séparé — `connectedAndroidTest` EFFACE les données de l'appareil
+      # et ne doit jamais tourner ailleurs que sur un émulateur jetable.
+      - name: Compile instrumented tests
+        run: ./gradlew assembleDebugAndroidTest --no-daemon
+
+      - name: Assemble debug
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: relay-debug-apks
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn
+
+  instrumented:
+    name: Instrumented tests (emulator)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Cache Gradle
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties', 'gradle/libs.versions.toml') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Make gradlew executable
+        run: chmod +x ./gradlew
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # Room migration tests + the SEC-CRIT zero-key rekey proof need the real SQLCipher native
+      # library, so they can only run on a device. This emulator is disposable — the same command
+      # must NEVER be pointed at a personal handset: `connectedAndroidTest` wipes app data.
+      - name: Run instrumented tests
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          target: default
+          disable-animations: true
+          # v1.27.11 — le role SMS est accorde AVANT les tests, sinon
+          # `SystemProviderContractTest` s'ignore en entier et ne garde rien ici.
+          #
+          # Ces cinq tests figent le comportement du vrai fournisseur systeme : la forme d'URI
+          # que rend `insert`, le refus de la forme avec dossier en suppression, l'unite de la
+          # colonne `date`. Ils exigent donc d'ecrire dans `content://sms`, ce qui exige le role.
+          # Sans lui, leur precondition fonctionnelle les fait sauter proprement — et une CI qui
+          # les compte « verts » sans les executer est exactement le piege qu'ils existent pour
+          # empecher.
+          #
+          # Trois faits mesures le 2026-09-07 qui rendent ces trois lignes suffisantes :
+          #   - `cmd role add-role-holder` fonctionne par adb (verifie sur Android 10 et 16) ;
+          #   - le role SURVIT a `install -r`, donc le reinstall que fait
+          #     `connectedDebugAndroidTest` juste apres ne l'annule pas ;
+          #   - `READ_SMS` en decoule (`GRANTED_BY_ROLE`), aucun `pm grant` n'est necessaire.
+          #
+          # Si l'image d'emulateur refusait la commande, les tests retomberaient sur leur saut
+          # propre : l'echec possible est le retour a l'etat anterieur, pas une CI cassee.
+          script: |
+            ./gradlew :app:installDebug --no-daemon
+            adb shell cmd role add-role-holder android.app.role.SMS com.filestech.sms.debug
+            adb shell dumpsys role | grep -A2 "android.app.role.SMS"
+            ./gradlew :app:connectedDebugAndroidTest --no-daemon
+
+      - name: Upload instrumentation report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: relay-instrumented-report
+          path: app/build/reports/androidTests/connected/**
+          if-no-files-found: warn
