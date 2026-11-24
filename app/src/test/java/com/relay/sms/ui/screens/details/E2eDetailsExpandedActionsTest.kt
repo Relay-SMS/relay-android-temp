@@ -1,0 +1,123 @@
+/*
+ * Copyright 2026 Relay Messaging. All rights reserved.
+ *
+ * This file is proprietary to Relay Messaging and is not licensed under the
+ * Apache License 2.0. See LICENSE-RELAY for the terms.
+ */
+
+package com.relay.sms.ui.screens.details
+
+import com.google.common.truth.Truth.assertThat
+import com.relay.sms.data.local.db.entity.E2ePeerState
+import org.junit.jupiter.api.Test
+
+/**
+ * Round 45 — the encryption box's expanded area: which actions show
+ * per peer state. Non-encrypted states offer the two manual retries
+ * (data SMS first, then the regular-SMS handshake); ENCRYPTED offers
+ * the safety-number sheet instead — a retry is meaningless once a
+ * session is live. An action only appears when its handler exists.
+ *
+ * Round 47 — a verified peer has no expanded actions at all: the
+ * dropdown is gone, so the box renders with no chevron and its tap
+ * opens the sheet directly (see [E2eDetailsRowTapTest]).
+ *
+ * Round 48 — ENCRYPTED has no expanded actions at all, verified
+ * or not: the row opens the sheet directly either way, so the
+ * one-item "View safety number" dropdown is gone. The dropdown
+ * now holds retries only.
+ */
+class E2eDetailsExpandedActionsTest {
+
+    @Test
+    fun `encrypted shows no expanded actions`() {
+        assertThat(
+            e2eDetailsExpandedActions(
+                peerState = E2ePeerState.ENCRYPTED,
+                hasRetryProbe = true,
+                hasRetryViaSms = true,
+            ),
+        ).isEmpty()
+    }
+
+    @Test
+    fun `probing shows both retries with the data SMS retry first`() {
+        assertThat(
+            e2eDetailsExpandedActions(
+                peerState = E2ePeerState.PROBING,
+                hasRetryProbe = true,
+                hasRetryViaSms = true,
+            ),
+        ).isEqualTo(
+            listOf(
+                E2eDetailsExpandedAction.RetryProbe,
+                E2eDetailsExpandedAction.RetryViaSms,
+            ),
+        )
+    }
+
+    @Test
+    fun `unknown shows both retries`() {
+        assertThat(
+            e2eDetailsExpandedActions(
+                peerState = E2ePeerState.UNKNOWN,
+                hasRetryProbe = true,
+                hasRetryViaSms = true,
+            ),
+        ).isEqualTo(
+            listOf(
+                E2eDetailsExpandedAction.RetryProbe,
+                E2eDetailsExpandedAction.RetryViaSms,
+            ),
+        )
+    }
+
+    @Test
+    fun `not relay shows both retries`() {
+        assertThat(
+            e2eDetailsExpandedActions(
+                peerState = E2ePeerState.NOT_RELAY,
+                hasRetryProbe = true,
+                hasRetryViaSms = true,
+            ),
+        ).isEqualTo(
+            listOf(
+                E2eDetailsExpandedAction.RetryProbe,
+                E2eDetailsExpandedAction.RetryViaSms,
+            ),
+        )
+    }
+
+    @Test
+    fun `a missing data SMS handler hides only that retry`() {
+        assertThat(
+            e2eDetailsExpandedActions(
+                peerState = E2ePeerState.UNKNOWN,
+                hasRetryProbe = false,
+                hasRetryViaSms = true,
+            ),
+        ).isEqualTo(listOf(E2eDetailsExpandedAction.RetryViaSms))
+    }
+
+    @Test
+    fun `a missing SMS handler hides only that retry`() {
+        assertThat(
+            e2eDetailsExpandedActions(
+                peerState = E2ePeerState.UNKNOWN,
+                hasRetryProbe = true,
+                hasRetryViaSms = false,
+            ),
+        ).isEqualTo(listOf(E2eDetailsExpandedAction.RetryProbe))
+    }
+
+    @Test
+    fun `no handlers shows nothing for a non-encrypted peer`() {
+        assertThat(
+            e2eDetailsExpandedActions(
+                peerState = E2ePeerState.PROBING,
+                hasRetryProbe = false,
+                hasRetryViaSms = false,
+            ),
+        ).isEmpty()
+    }
+}

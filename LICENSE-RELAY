@@ -1,0 +1,12 @@
+Relay Proprietary License
+
+Copyright 2026 Relay Messaging. All rights reserved.
+
+This license applies ONLY to files in this repository that carry the Relay
+proprietary header ("Copyright 2026 Relay Messaging. All rights reserved.").
+Those files are the exclusive property of Relay Messaging and may not be
+copied, modified, distributed, or used, in whole or in part, without prior
+written permission from Relay Messaging.
+
+All other files in this repository are licensed under the Apache License,
+Version 2.0 (see LICENSE), unless a file states otherwise.

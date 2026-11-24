@@ -1,0 +1,276 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.system.receiver
+
+import com.google.common.truth.Truth.assertThat
+import com.relay.sms.data.local.db.dao.MessageDao
+import com.relay.sms.data.local.db.entity.MessageEntity
+import com.relay.sms.data.mms.IntegrationMmsRecu
+import com.relay.sms.data.mms.IntegrationMmsRecu.Resultat
+import com.relay.sms.data.sms.PhoneIdentity
+import com.relay.sms.data.sms.SimSelfNumber
+import com.relay.sms.domain.model.PhoneAddress
+import com.relay.sms.domain.settings.AppSettings
+import com.relay.sms.domain.settings.AppSettingsSource
+import com.relay.sms.domain.settings.SendingSettings
+import com.relay.sms.pdu.EncodedStringValue
+import com.relay.sms.pdu.PduBody
+import com.relay.sms.pdu.RetrieveConf
+import com.relay.sms.system.notifications.IncomingMessageNotifier
+import com.relay.sms.system.notifications.MmsFailureNotifier
+import io.mockk.coEvery
+import io.mockk.coVerify
+import io.mockk.every
+import io.mockk.mockk
+import io.mockk.verify
+import kotlinx.coroutines.test.runTest
+import org.junit.jupiter.api.Test
+
+/**
+ * v1.28.9 (F17) — **le sort du PDU et les notifications, pour chaque issue de l'écriture.**
+ *
+ * Le traitement est partagé par le receveur et la reprise : une issue mal rendue garderait un PDU pour
+ * rien, ou pire, effacerait la seule copie d'un média non écrit. L'écriture est simulée — elle a son test
+ * sur un vrai Room, `IntegrationMmsRecuTest` — ; ce qui est tenu ici, c'est ce qu'on DÉCIDE de chacun de
+ * ses résultats, et ce qu'on passe jusqu'à elle.
+ */
+class TraitementMmsRecuTest {
+
+    private val blocage = mockk<IncomingBlockPolicy> { coEvery { doitEcarter(any()) } returns false }
+    private val reglages = mockk<AppSettingsSource> { coEvery { hydratedOrNull() } returns AppSettings() }
+    private val identite = mockk<PhoneIdentity> { coEvery { snapshot() } returns PhoneIdentity.Snapshot("FR") }
+    private val simSelf = mockk<SimSelfNumber> { every { ownNumber(any()) } answers { null } }
+    private val integration = mockk<IntegrationMmsRecu>()
+    private val messages = mockk<MessageDao> {
+        coEvery { findById(ID) } returns mockk<MessageEntity> { every { conversationId } returns CONVERSATION }
+    }
+    private val notifier = mockk<IncomingMessageNotifier>(relaxed = true)
+    private val echecs = mockk<MmsFailureNotifier>(relaxed = true)
+
+    private val traitement =
+        TraitementMmsRecu(blocage, reglages, identite, simSelf, integration, messages, notifier, echecs)
+
+    private fun conf() = RetrieveConf().apply {
+        setFrom(EncodedStringValue("$ALICE/TYPE=PLMN"))
+        setDate(1_700_000_000L)
+        setBody(PduBody())
+    }
+
+    private suspend fun traiter(resultat: Resultat, conf: RetrieveConf = conf()): TraitementMmsRecu.Issue {
+        coEvery { integration.integrer(any(), any(), any(), any(), any(), any()) } returns resultat
+        return traitement.traiter(conf, CLE, 1, null) { true }
+    }
+
+    @Test
+    fun `un expediteur ecarte ne fait rien ecrire, et son PDU part sans etre consigne`() = runTest {
+        // L'adresse soumise à la liste noire est déjà NETTOYÉE du suffixe de passerelle (audit H5).
+        coEvery { blocage.doitEcarter(ALICE) } returns true
+
+        val issue = traitement.traiter(conf(), CLE, 1, null) { true }
+
+        assertThat(issue).isEqualTo(TraitementMmsRecu.Issue(garderLePdu = false, consigner = false))
+        coVerify(exactly = 0) { integration.integrer(any(), any(), any(), any(), any(), any()) }
+    }
+
+    @Test
+    fun `un MMS sans aucun expediteur n'est pas ecrit sous une adresse vide`() = runTest {
+        val sansFrom = RetrieveConf().apply {
+            setDate(1_700_000_000L)
+            setBody(PduBody())
+        }
+
+        val issue = traitement.traiter(sansFrom, CLE, 1, null) { true }
+
+        assertThat(issue).isEqualTo(TraitementMmsRecu.Issue(garderLePdu = false, consigner = false))
+        coVerify(exactly = 0) { integration.integrer(any(), any(), any(), any(), any(), any()) }
+        coVerify(exactly = 0) { notifier.notifyIncoming(any(), any(), any(), any()) }
+    }
+
+    /** Contrôle : sans `From:`, l'indice de la notification WAP-Push suffit — le garde ne doit pas l'écarter. */
+    @Test
+    fun `sans From, l'indice WAP-Push donne l'expediteur et le message est ecrit`() = runTest {
+        coEvery { integration.integrer(any(), any(), any(), any(), any(), any()) } returns Resultat.Ecrit(ID)
+        val sansFrom = RetrieveConf().apply {
+            setDate(1_700_000_000L)
+            setBody(PduBody())
+        }
+
+        val issue = traitement.traiter(sansFrom, CLE, 1, "$ALICE/TYPE=PLMN") { true }
+
+        assertThat(issue).isEqualTo(TraitementMmsRecu.Issue(garderLePdu = false, consigner = true))
+        coVerify(exactly = 1) { notifier.notifyIncoming(ALICE, any(), ID, CONVERSATION) }
+    }
+
+    @Test
+    fun `un message ecrit est notifie et son PDU part`() = runTest {
+        val issue = traiter(Resultat.Ecrit(ID))
+
+        assertThat(issue).isEqualTo(TraitementMmsRecu.Issue(garderLePdu = false, consigner = true))
+        coVerify(exactly = 1) { notifier.notifyIncoming(ALICE, any(), ID, CONVERSATION) }
+        coVerify(exactly = 0) { echecs.notifyFailure(any(), any(), any()) }
+    }
+
+    @Test
+    fun `un media non ecrit garde le PDU et le dit`() = runTest {
+        val issue = traiter(Resultat.EcritIncomplet(ID))
+
+        assertThat(issue).isEqualTo(TraitementMmsRecu.Issue(garderLePdu = true, consigner = true))
+        coVerify(exactly = 1) { echecs.notifyFailure(MmsFailureNotifier.Reason.DOWNLOAD_FAILED, ALICE, any()) }
+        coVerify(exactly = 1) { notifier.notifyIncoming(ALICE, any(), ID, CONVERSATION) }
+    }
+
+    @Test
+    fun `une reprise qui ne complete toujours pas garde le PDU, sans notifier de nouveau`() = runTest {
+        val issue = traiter(Resultat.ToujoursIncomplet(ID))
+
+        assertThat(issue).isEqualTo(TraitementMmsRecu.Issue(garderLePdu = true, consigner = true))
+        coVerify(exactly = 0) { notifier.notifyIncoming(any(), any(), any(), any()) }
+        coVerify(exactly = 0) { echecs.notifyFailure(any(), any(), any()) }
+    }
+
+    /** Un message supprimé depuis est consigné lui aussi : son exemplaire suivant ne doit pas le ressusciter. */
+    @Test
+    fun `un doublon, une completion ou un message disparu consomment le PDU sans notifier`() = runTest {
+        for (resultat in listOf(Resultat.DejaComplet(ID), Resultat.Complete(ID), Resultat.Disparu)) {
+            assertThat(traiter(resultat)).isEqualTo(TraitementMmsRecu.Issue(garderLePdu = false, consigner = true))
+        }
+        coVerify(exactly = 0) { notifier.notifyIncoming(any(), any(), any(), any()) }
+        coVerify(exactly = 0) { echecs.notifyFailure(any(), any(), any()) }
+    }
+
+    @Test
+    fun `une notification qui leve ne change pas le sort du PDU`() = runTest {
+        coEvery { notifier.notifyIncoming(any(), any(), any(), any()) } throws IllegalStateException("canal")
+
+        val issue = traiter(Resultat.Ecrit(ID))
+
+        assertThat(issue).isEqualTo(TraitementMmsRecu.Issue(garderLePdu = false, consigner = true))
+    }
+
+    @Test
+    fun `la cle, la SIM et la porte du PDU vont jusqu'a l'ecriture`() = runTest {
+        var porteLue = false
+        coEvery { integration.integrer(any(), 1, null, false, CLE, any()) } answers {
+            porteLue = arg<() -> Boolean>(5).invoke()
+            Resultat.DejaComplet(ID)
+        }
+
+        val issue = traitement.traiter(conf(), CLE, 1, null) { true }
+
+        assertThat(issue.garderLePdu).isFalse()
+        assertThat(porteLue).isTrue()
+    }
+
+    @Test
+    fun `un MMS de groupe porte ses membres jusqu'a l'ecriture quand le reglage et mon numero le permettent`() =
+        runTest {
+            coEvery { reglages.hydratedOrNull() } returns
+                AppSettings(sending = SendingSettings(groupMms = true, userMsisdn = MOI))
+            val vus = mutableListOf<List<PhoneAddress>?>()
+            coEvery { integration.integrer(any(), any(), captureNullable(vus), any(), any(), any()) } returns
+                Resultat.DejaComplet(ID)
+            val conf = conf().apply {
+                addTo(EncodedStringValue(MOI))
+                addTo(EncodedStringValue(BOB))
+            }
+
+            traitement.traiter(conf, CLE, 1, null) { true }
+
+            assertThat(vus.single()?.map { it.raw }).containsExactly(ALICE, BOB).inOrder()
+        }
+
+    @Test
+    fun `sans mon numero, le meme MMS passe ses participants avec inclutSoi`() = runTest {
+        coEvery { reglages.hydratedOrNull() } returns
+            AppSettings(sending = SendingSettings(groupMms = true, userMsisdn = null))
+        val vus = mutableListOf<List<PhoneAddress>?>()
+        val drapeaux = mutableListOf<Boolean>()
+        coEvery {
+            integration.integrer(any(), any(), captureNullable(vus), capture(drapeaux), any(), any())
+        } returns Resultat.DejaComplet(ID)
+        val conf = conf().apply {
+            addTo(EncodedStringValue(MOI))
+            addTo(EncodedStringValue(BOB))
+        }
+
+        traitement.traiter(conf, CLE, 1, null) { true }
+
+        // Les participants bruts, nous compris (ALICE est l'expéditrice, MOI et BOB en To).
+        assertThat(vus.single()?.map { it.raw }).containsExactly(ALICE, MOI, BOB).inOrder()
+        assertThat(drapeaux.single()).isTrue()
+    }
+
+    /** Round 14 — sans « Mon numéro » saisi, le numéro de la SIM reconstitue le groupe. */
+    @Test
+    fun `sans mon numero saisi, le numero SIM reconstitue le groupe sans inclutSoi`() = runTest {
+        coEvery { reglages.hydratedOrNull() } returns
+            AppSettings(sending = SendingSettings(groupMms = true, userMsisdn = null))
+        every { simSelf.ownNumber(any()) } returns MOI
+        val vus = mutableListOf<List<PhoneAddress>?>()
+        val drapeaux = mutableListOf<Boolean>()
+        coEvery {
+            integration.integrer(any(), any(), captureNullable(vus), capture(drapeaux), any(), any())
+        } returns Resultat.DejaComplet(ID)
+        val conf = conf().apply {
+            addTo(EncodedStringValue(MOI))
+            addTo(EncodedStringValue(BOB))
+        }
+
+        traitement.traiter(conf, CLE, 1, null) { true }
+
+        // MOI est retiré grâce à la SIM : les membres sont ceux du groupe, sans drapeau.
+        assertThat(vus.single()?.map { it.raw }).containsExactly(ALICE, BOB).inOrder()
+        assertThat(drapeaux.single()).isFalse()
+    }
+
+    /** Round 14 — le réglage gagne sur la SIM quand il est renseigné (la SIM n'est pas lue). */
+    @Test
+    fun `mon numero saisi gagne sur le numero SIM`() = runTest {
+        coEvery { reglages.hydratedOrNull() } returns
+            AppSettings(sending = SendingSettings(groupMms = true, userMsisdn = MOI))
+        every { simSelf.ownNumber(any()) } returns BOB
+        val vus = mutableListOf<List<PhoneAddress>?>()
+        coEvery { integration.integrer(any(), any(), captureNullable(vus), any(), any(), any()) } returns
+            Resultat.DejaComplet(ID)
+        val conf = conf().apply {
+            addTo(EncodedStringValue(MOI))
+            addTo(EncodedStringValue(BOB))
+        }
+
+        traitement.traiter(conf, CLE, 1, null) { true }
+
+        // MOI (le réglage) est retiré, BOB reste membre : la SIM n'a pas servi.
+        assertThat(vus.single()?.map { it.raw }).containsExactly(ALICE, BOB).inOrder()
+        verify(exactly = 0) { simSelf.ownNumber(any()) }
+    }
+
+    @Test
+    fun `sans le reglage, le meme MMS reste une conversation ordinaire`() = runTest {
+        coEvery { reglages.hydratedOrNull() } returns
+            AppSettings(sending = SendingSettings(groupMms = false, userMsisdn = MOI))
+        val vus = mutableListOf<List<PhoneAddress>?>()
+        coEvery { integration.integrer(any(), any(), captureNullable(vus), any(), any(), any()) } returns
+            Resultat.DejaComplet(ID)
+        val conf = conf().apply {
+            addTo(EncodedStringValue(MOI))
+            addTo(EncodedStringValue(BOB))
+        }
+
+        traitement.traiter(conf, CLE, 1, null) { true }
+
+        assertThat(vus).containsExactly(null)
+    }
+
+    private companion object {
+        const val ID = 42L
+        const val CONVERSATION = 7L
+        const val ALICE = "+33600000001"
+        const val BOB = "+33600000002"
+        const val MOI = "+33600000009"
+        val CLE = "b".repeat(64)
+    }
+}

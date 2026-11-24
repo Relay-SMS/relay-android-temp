@@ -1,0 +1,143 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.domain.model
+
+import kotlinx.serialization.KSerializer
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.descriptors.PrimitiveKind
+import kotlinx.serialization.descriptors.PrimitiveSerialDescriptor
+import kotlinx.serialization.descriptors.SerialDescriptor
+import kotlinx.serialization.encoding.Decoder
+import kotlinx.serialization.encoding.Encoder
+
+/**
+ * Business enums for a message, moved out of `data/local/db/entity` (v1.24.0, Étage 2.1).
+ *
+ * These describe domain concepts — what a message *is* and where it stands — not a storage detail,
+ * so they belong in the domain layer. Room stores them as `INTEGER` via
+ * [com.relay.sms.data.local.db.MessageEnumConverters]; the backup format serialises them via
+ * the custom serialisers below, which write [rawValue] as an `Int`. Both representations are
+ * package-independent, so this move changes nothing on disk or on the wire.
+ *
+ * `@Serializable(with = …Serializer)` uses a `PrimitiveKind.INT` descriptor, so the JSON stays
+ * `"field": 0` exactly as in every prior version.
+ */
+@Serializable(with = MessageTypeSerializer::class)
+enum class MessageType(val rawValue: Int) {
+    SMS(0),
+    MMS(1);
+    companion object {
+        fun fromRaw(rawValue: Int): MessageType = entries.firstOrNull { it.rawValue == rawValue }
+            ?: SMS.also { timber.log.Timber.w("Unknown MessageType int %d — defaulting to SMS", rawValue) }
+    }
+}
+
+object MessageTypeSerializer : KSerializer<MessageType> {
+    override val descriptor: SerialDescriptor = PrimitiveSerialDescriptor("MessageType", PrimitiveKind.INT)
+    override fun serialize(encoder: Encoder, value: MessageType) = encoder.encodeInt(value.rawValue)
+    override fun deserialize(decoder: Decoder): MessageType = MessageType.fromRaw(decoder.decodeInt())
+}
+
+@Serializable(with = MessageDirectionSerializer::class)
+enum class MessageDirection(val rawValue: Int) {
+    INCOMING(0),
+    OUTGOING(1);
+    companion object {
+        fun fromRaw(rawValue: Int): MessageDirection = entries.firstOrNull { it.rawValue == rawValue }
+            ?: INCOMING.also { timber.log.Timber.w("Unknown MessageDirection int %d — defaulting to INCOMING", rawValue) }
+    }
+}
+
+object MessageDirectionSerializer : KSerializer<MessageDirection> {
+    override val descriptor: SerialDescriptor = PrimitiveSerialDescriptor("MessageDirection", PrimitiveKind.INT)
+    override fun serialize(encoder: Encoder, value: MessageDirection) = encoder.encodeInt(value.rawValue)
+    override fun deserialize(decoder: Decoder): MessageDirection = MessageDirection.fromRaw(decoder.decodeInt())
+}
+
+@Serializable(with = MessageStatusSerializer::class)
+enum class MessageStatus(val rawValue: Int) {
+    PENDING(0),
+    SENT(1),
+    DELIVERED(2),
+    FAILED(3),
+    RECEIVED(4),
+    SCHEDULED(5);
+    companion object {
+        fun fromRaw(rawValue: Int): MessageStatus = entries.firstOrNull { it.rawValue == rawValue }
+            ?: PENDING.also { timber.log.Timber.w("Unknown MessageStatus int %d — defaulting to PENDING", rawValue) }
+    }
+}
+
+object MessageStatusSerializer : KSerializer<MessageStatus> {
+    override val descriptor: SerialDescriptor = PrimitiveSerialDescriptor("MessageStatus", PrimitiveKind.INT)
+    override fun serialize(encoder: Encoder, value: MessageStatus) = encoder.encodeInt(value.rawValue)
+    override fun deserialize(decoder: Decoder): MessageStatus = MessageStatus.fromRaw(decoder.decodeInt())
+}
+
+/**
+ * Sentinel values for a message's error code when its status is [MessageStatus.FAILED].
+ *
+ * The distinction matters for retry idempotence (audit M-1): a [WATCHDOG_TIMEOUT] row may actually
+ * have been accepted by the radio (we just never received the sent-broadcast), so retrying it can
+ * produce a duplicate at the recipient. A [SYNCHRONOUS] row was rejected by `SmsManager` before
+ * dispatch and is always safe to re-send.
+ *
+ * Positive integer values are reserved for OS-provided error codes (`SmsManager.RESULT_ERROR_*`)
+ * propagated through `SmsSentReceiver`.
+ */
+object SendErrorCode {
+    /** Synchronous failure: `SmsManager.sendMultipartTextMessage` threw. Safe to retry. */
+    const val SYNCHRONOUS: Int = -1
+
+    /** [com.relay.sms.system.scheduler.TelephonySyncWorker] timed out a stale PENDING row.
+     *  The message *may* have reached the recipient — UI should warn on retry. */
+    const val WATCHDOG_TIMEOUT: Int = -2
+
+    /**
+     * v1.28.3 (F21) — l'application a refusé d'envoyer : le destinataire figure dans la liste de
+     * blocage de l'utilisateur.
+     *
+     * Rien n'est parti sur le réseau, et **rien n'a été écrit chez le fournisseur système** — la
+     * ligne n'existe que dans le miroir local, précisément pour que l'utilisateur voie qu'il a
+     * écrit à quelqu'un qu'il avait bloqué. La boucle d'envoi se contentait auparavant d'un
+     * `continue` muet : ni ligne, ni message, ni compte, et le message disparaissait entre le
+     * moment où on tapait « Envoyer » et rien du tout.
+     *
+     * Distinct de [SYNCHRONOUS] : ce n'est pas une panne, et `RetrySendUseCase` refusera de
+     * relancer tant que le blocage tient — ce qui est le comportement voulu, pas un défaut.
+     */
+    const val RECIPIENT_BLOCKED: Int = -3
+
+    /**
+     * Client mode C3 — the hub refused a wire send, mapped from the
+     * `message_failed` code so the failed row keeps the reason.
+     * `blocked_recipient` reuses [RECIPIENT_BLOCKED]; `send_failed`,
+     * `internal` and `upload_expired` reuse [SYNCHRONOUS].
+     */
+    const val CLIENT_HUB_NOT_DEFAULT_SMS: Int = -10
+    const val CLIENT_UNKNOWN_CONVERSATION: Int = -11
+    const val CLIENT_MESSAGE_TOO_LONG: Int = -12
+
+    /**
+     * 2026-10-29 (issue #53) — le serveur MMS de l'opérateur a REFUSÉ le message, après qu'Android
+     * le lui a remis (`RESULT_OK` + m-send-conf au statut d'échec). Plage à part, qui CONSERVE le
+     * statut : `MMSC_REFUSED_BASE - statut`, soit -1129 à -1255. L'écran l'affiche, pour que
+     * l'utilisateur puisse nous le transmettre — c'est ce code qui dit ce que l'opérateur refuse.
+     */
+    private const val MMSC_REFUSED_BASE: Int = -1000
+    private val MMSC_REFUSAL_STATUSES = 0x81..0xFF
+
+    /** Code d'erreur stocké pour un refus de l'opérateur de statut [responseStatus] (0x81-0xFF). */
+    fun mmscRefused(responseStatus: Int): Int {
+        require(responseStatus in MMSC_REFUSAL_STATUSES) { "not a refusal status: $responseStatus" }
+        return MMSC_REFUSED_BASE - responseStatus
+    }
+
+    /** Le statut de l'opérateur si [errorCode] est un refus de l'opérateur, `null` sinon. */
+    fun mmscRefusalStatus(errorCode: Int?): Int? =
+        errorCode?.let { MMSC_REFUSED_BASE - it }?.takeIf { it in MMSC_REFUSAL_STATUSES }
+}

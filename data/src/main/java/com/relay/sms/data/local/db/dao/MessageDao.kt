@@ -1,0 +1,1443 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.data.local.db.dao
+
+import androidx.room.Dao
+import androidx.room.Insert
+import androidx.room.OnConflictStrategy
+import androidx.room.Query
+import androidx.room.Update
+import com.relay.sms.data.local.db.entity.MessageEntity
+import com.relay.sms.domain.model.MessageSearchHit
+import kotlinx.coroutines.flow.Flow
+
+@Dao
+interface MessageDao {
+
+    /**
+     * v1.4.1 — excludes the **reaction sentinel rows** so the thread doesn't paint
+     * an empty bubble for every Tapback-folded reaction. Two flavors of sentinel
+     * exist :
+     *
+     *   - **Incoming sentinel** — inserted by [com.relay.sms.data.repository
+     *     .ConversationMirror.upsertReactionSentinel] after we fold an incoming
+     *     Tapback SMS into a reaction badge. Carries the `telephony_uri` of the
+     *     system inbox row so the UNIQUE index blocks
+     *     [com.relay.sms.data.sync.TelephonySyncManager] from re-importing
+     *     the `Reacted ❤️ to «…»` body as a phantom text bubble.
+     *   - **Outgoing sentinel** — inserted by [com.relay.sms.data.repository
+     *     .ConversationMirror.upsertOutgoingSms] when [SendReactionUseCase]
+     *     passes `localMirrorBody = ""`. The Tapback SMS is still on the wire +
+     *     in the system inbox (read by other SMS apps / the correspondent), but
+     *     the reactor doesn't see a redundant outgoing text bubble in their own
+     *     thread — they already have the local badge on the message they
+     *     reacted to.
+     *
+     * Both sentinels used to be recognised by their SHAPE — `body = ''` + no attachment + no
+     * reaction emoji — on the assumption that a legitimate empty body always carries an
+     * attachment. **That assumption was false**: a captionless MMS restored from a backup
+     * comes back without its attachments (the backup does not carry them) and took exactly
+     * that shape — imported, counted, shown nowhere.
+     *
+     * v1.28.4 — the sentinel now DECLARES itself (`hidden = 1`, set by its only two producers)
+     * and every reader filters on that column, never on the shape.
+     */
+    @Query(
+        """
+        SELECT * FROM messages
+        WHERE conversation_id = :conversationId
+          AND hidden = 0
+        ORDER BY date ASC, id ASC
+        """
+    )
+    fun observeForConversation(conversationId: Long): Flow<List<MessageEntity>>
+
+    /**
+     * Bounded window: the [limit] most recent messages, returned oldest-first for the UI.
+     *
+     * v1.24.0 (finding A) — [observeForConversation] has no `LIMIT`, so every incoming SMS and
+     * every draft keystroke re-read, re-mapped and re-diffed the whole thread. On a 5 000-message
+     * conversation that is 5 000 rows of work per emission. The thread UI uses this window
+     * instead; [observeForConversation] stays unbounded because the PDF export
+     * (`ExportConversationPdfUseCase`) must see the entire history — bounding it would silently
+     * export a truncated document.
+     *
+     * The `id` tie-breaker is **not optional**. `date` alone is not unique — a multipart MMS lands
+     * with identical timestamps — and without a total order the window boundary is
+     * non-deterministic, so a row can be dropped or duplicated between two emissions.
+     *
+     * The `(conversation_id, date)` index covers this ordering; no new index is needed.
+     *
+     * The exclusion predicate is kept verbatim from [observeForConversation] — it hides the
+     * reaction sentinels documented there.
+     */
+    @Query(
+        """
+        SELECT * FROM (
+            SELECT * FROM messages
+            WHERE conversation_id = :conversationId
+              AND hidden = 0
+            ORDER BY date DESC, id DESC
+            LIMIT :limit
+        ) ORDER BY date ASC, id ASC
+        """
+    )
+    fun observeWindowForConversation(conversationId: Long, limit: Int): Flow<List<MessageEntity>>
+
+    /**
+     * Whole-thread statistics, computed in SQL over **every** message — never over the loaded
+     * window.
+     *
+     * The conversation info panel shows "N messages, from … to …". Deriving those from the window
+     * would quietly report the window's own bounds as the conversation's, so a 5 000-message
+     * thread would claim to hold 200 and to start last Tuesday. `COUNT`/`MIN`/`MAX` over the
+     * indexed `(conversation_id, date)` pair is cheap enough to observe continuously.
+     *
+     * Same exclusion predicate as [observeWindowForConversation].
+     */
+    @Query(
+        """
+        SELECT COUNT(*) AS total, MIN(date) AS firstAt, MAX(date) AS lastAt FROM messages
+        WHERE conversation_id = :conversationId
+          AND hidden = 0
+        """
+    )
+    fun observeStatsForConversation(conversationId: Long): Flow<ThreadStats>
+
+    /**
+     * Feedback round 5 — full-history thread search: ids of the messages in
+     * [conversationId] whose body contains the (already escaped) LIKE [pattern],
+     * oldest first, over the WHOLE thread — not just the loaded window. `LIKE`
+     * keeps the literal-substring semantics of the thread search (an FTS `MATCH`
+     * would only match whole tokens, so "trad" would miss "trading"). The caller
+     * builds the pattern as `"%" + escapeLikePattern(query) + "%"`; SQLite `LIKE`
+     * is ASCII-only case-insensitive, so an accented query ("café") misses an
+     * all-caps accented body ("CAFÉ") — the UI-side range computation is
+     * Unicode-aware, so a match the SQL finds is always highlighted.
+     *
+     * A `Flow` (not a one-shot suspend): Room re-runs it on table invalidation,
+     * so the match count stays fresh if a matching message arrives mid-search.
+     */
+    @Query(
+        """
+        SELECT id FROM messages
+        WHERE conversation_id = :conversationId
+          AND hidden = 0
+          AND body LIKE :pattern ESCAPE '\'
+        ORDER BY date ASC, id ASC
+        """
+    )
+    fun observeSearchIdsInConversation(conversationId: Long, pattern: String): Flow<List<Long>>
+
+    /**
+     * Feedback round 5 — bounded window ENDING at a message: the [limit] most
+     * recent messages at or before ([anchorDate], [anchorId]), oldest first.
+     * The target message is the LAST row of the window, so the thread lands on it
+     * at the bottom with its preceding messages as context. The keyset predicate
+     * mirrors the tail window's ordering (`date DESC, id DESC`) — the `id`
+     * tie-breaker is not optional, multipart MMS parts share timestamps.
+     *
+     * The caller passes `limit + 1` and drops the oldest row when more arrive:
+     * that is how it knows whether older messages exist beyond the window
+     * (a stats-based `messages.size < total` check would lie near the thread
+     * start — the window can be smaller than the thread while no older message
+     * exists past the anchor).
+     */
+    @Query(
+        """
+        SELECT * FROM (
+            SELECT * FROM messages
+            WHERE conversation_id = :conversationId
+              AND hidden = 0
+              AND (date < :anchorDate OR (date = :anchorDate AND id <= :anchorId))
+            ORDER BY date DESC, id DESC
+            LIMIT :limit
+        ) ORDER BY date ASC, id ASC
+        """
+    )
+    fun observeWindowEndingAt(
+        conversationId: Long,
+        anchorDate: Long,
+        anchorId: Long,
+        limit: Int,
+    ): Flow<List<MessageEntity>>
+
+    @Query("SELECT * FROM messages WHERE id = :id")
+    suspend fun findById(id: Long): MessageEntity?
+
+    @Query("SELECT * FROM messages WHERE telephony_uri = :uri LIMIT 1")
+    suspend fun findByTelephonyUri(uri: String): MessageEntity?
+
+    /**
+     * Slice 3 — the idempotency lookup: the one row carrying a linked
+     * device's send key, if any. The unique index on
+     * `client_message_id` makes this at most one row.
+     */
+    @Query("SELECT * FROM messages WHERE client_message_id = :key LIMIT 1")
+    suspend fun findByClientMessageId(key: String): MessageEntity?
+
+    /**
+     * Client mode (schema v18) — the message synced from the hub
+     * message [hubId], or null. The upsert key for `messages_batch` /
+     * `message_new` / `message_updated`.
+     */
+    @Query("SELECT * FROM messages WHERE hub_message_id = :hubId LIMIT 1")
+    suspend fun findByHubMessageId(hubId: Long): MessageEntity?
+
+    /**
+     * Client mode C3 — the ids of the unread messages in one
+     * conversation. The `mark_read` write-back captures them BEFORE
+     * marking read, so an `ok:false` can restore the exact unread set
+     * (the hub is authoritative, but a refused mark must not silently
+     * clear the badge).
+     */
+    @Query("SELECT id FROM messages WHERE conversation_id = :conversationId AND read = 0")
+    suspend fun findUnreadIds(conversationId: Long): List<Long>
+
+    /**
+     * "Mark unread" — the latest incoming, non-hidden message of
+     * one conversation, or null when it has none (outgoing-only).
+     * The mark flips this row back to unread and recomputes the
+     * counter, so the badge survives the cold-start recompute.
+     * Same predicate as [ConversationDao.recomputeUnreadCount]:
+     * a folded reaction (`hidden = 1`) never counts as unread.
+     */
+    @Query(
+        """
+        SELECT id FROM messages
+        WHERE conversation_id = :conversationId
+          AND direction = 0
+          AND hidden = 0
+        ORDER BY date DESC, id DESC LIMIT 1
+        """,
+    )
+    suspend fun findLatestIncomingId(conversationId: Long): Long?
+
+    /**
+     * Client mode — how many messages a conversation holds locally.
+     * Fetch-on-open uses it for the complete-but-empty check: a
+     * complete thread with cached messages needs no fetch, a
+     * complete-but-empty one fetches once per session.
+     */
+    @Query("SELECT COUNT(*) FROM messages WHERE conversation_id = :conversationId")
+    suspend fun countForConversation(conversationId: Long): Int
+
+    /**
+     * Marks every cached message of one conversation read. Used by
+     * hub-mode mark-read and, in client mode, by the mirror: a
+     * `conversation_updated` with `unread: 0` IS the read signal
+     * (the hub user read the thread on the phone) — the counter is
+     * set from the hub value by the mirror, and this flips the rows
+     * so the thread view agrees.
+     */
+    @Query("UPDATE messages SET read = 1 WHERE conversation_id = :conversationId AND read = 0")
+    suspend fun markConversationRead(conversationId: Long)
+
+    /**
+     * Client mode — deletes every message mirrored from a hub. A
+     * safety net for the wipe: conversation deletion already cascades
+     * to its messages, but a message whose conversation row is gone
+     * (or never existed) would otherwise survive.
+     */
+    @Query("DELETE FROM messages WHERE hub_message_id IS NOT NULL")
+    suspend fun deleteSynced(): Int
+
+    /** One-shot suspend snapshot used by deletion paths that need each row's telephony URI. */
+    @Query("SELECT * FROM messages WHERE conversation_id = :conversationId")
+    suspend fun findByConversation(conversationId: Long): List<MessageEntity>
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insert(message: MessageEntity): Long
+
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertAll(messages: List<MessageEntity>): List<Long>
+
+    @Update
+    suspend fun update(message: MessageEntity)
+
+    /**
+     * v1.8.0 (post-audit fix unread badges) — marque TOUS les messages INCOMING
+     * comme lus en masse. Utilisé pour la migration one-shot vers v1.8.0 qui
+     * purge l'état legacy v1.7.1 (compteurs inflated + flags `read=0`
+     * désynchronisés du système Android). Aligne le cache Room sur la réalité
+     * usuelle de l'utilisateur (les messages anciens sont déjà lus, dans
+     * Relay ou ailleurs).
+     *
+     * Direction INCOMING = `0`. Idempotent — re-exécuter ne change rien.
+     * Aussi exposé via Settings → Avancé "Tout marquer comme lu" pour permettre
+     * à l'utilisateur de re-aligner à tout moment si Room se désynchronise
+     * à nouveau (lecture dans une autre app SMS).
+     */
+    /*
+     * v1.27.2 (relecture Gemini du 2026-08-05) — le Coffre est désormais EXCLU.
+     *
+     * La requête écrivait sur toute la base. « Tout marquer comme lu », depuis les Réglages ou
+     * depuis la migration de démarrage, marquait donc lus les messages du Coffre **alors qu'il est
+     * verrouillé** : une écriture dans une zone censée être inaccessible, et la perte de l'état
+     * « non lu » que l'utilisateur retrouverait en l'ouvrant.
+     *
+     * Sous-requête plutôt que `JOIN` : SQLite n'accepte pas de jointure dans un `UPDATE`. L'index
+     * sur `in_vault` (cf. [ConversationEntity]) la rend négligeable.
+     */
+    @Query(
+        """
+        UPDATE messages SET read = 1
+        WHERE direction = 0 AND read = 0
+          AND conversation_id IN (SELECT id FROM conversations WHERE in_vault = 0)
+        """,
+    )
+    suspend fun markAllIncomingAsRead(): Int
+
+    @Query("UPDATE messages SET read = :read WHERE id = :id")
+    suspend fun setRead(id: Long, read: Boolean)
+
+    @Query("UPDATE messages SET starred = :starred WHERE id = :id")
+    suspend fun setStarred(id: Long, starred: Boolean)
+
+    // v1.16.0 — Paramètre `status` typé MessageStatus (était Int). Le TypeConverter
+    // [com.relay.sms.data.local.db.MessageEnumConverters] convertit en Int pour
+    // le binding SQL. Type safety au call-site, schéma DB inchangé.
+    /**
+     * v1.26.1 (audit M6) — détecte un doublon lors d'une RESTAURATION, pour les lignes qui n'ont
+     * pas de `telephony_uri`.
+     *
+     * La déduplication de la restauration repose sur l'index `UNIQUE(telephony_uri)` combiné à
+     * `OnConflictStrategy.IGNORE`. Or la colonne est NULLABLE, et SQLite considère deux NULL
+     * comme distincts : l'index ne dédoublonne donc RIEN pour les lignes sans URI — tous les MMS
+     * sortants, et les SMS dont l'écriture dans la base système avait échoué. Restaurer deux fois
+     * la même sauvegarde les dupliquait sans limite, alors que la chaîne affichée à l'utilisateur
+     * affirme « les messages existants sont conservés (pas de doublons) ».
+     *
+     * Clé de repli : même conversation, même horodatage, même sens, même corps.
+     *
+     * # v1.28.3 (F25) — quatre criteres ne suffisaient pas, et l'erreur etait SILENCIEUSE
+     *
+     * La sauvegarde ne transporte ni la table `attachments` ni les fichiers : un MMS restaure est
+     * une ligne au corps souvent VIDE. La cle se reduisait alors a « meme conversation, meme
+     * milliseconde, meme sens » — et deux photos distinctes envoyees dans la meme seconde y
+     * repondaient de la meme facon. La seconde etait comptee « ignoree » et PERDUE, sans trace,
+     * alors que l'utilisateur venait de restaurer pour la retrouver.
+     *
+     * Trois criteres de plus, tous deja presents dans la sauvegarde et tous NULL-safe la ou il le
+     * faut (`IS` et non `=`, sans quoi une colonne nulle ne s'egale jamais elle-meme) :
+     *
+     *  - **`type`** — un SMS et un MMS ne se confondent plus ;
+     *  - **`date_sent`** — pose par le reseau, il separe deux envois que `date` rapproche ;
+     *  - **`sub_id`** — deux SIM, deux lignes distinctes.
+     *
+     * Le resserrement ne peut RIEN dupliquer de ce qui etait dedoublonne : restaurer deux fois la
+     * meme sauvegarde produit des lignes identiques sur les sept criteres, qui se rencontrent
+     * donc toujours. Il ne fait qu'ecarter des rapprochements que rien ne prouvait — et entre
+     * perdre un message en silence et en montrer un en double, seul le second se voit et se
+     * corrige.
+     */
+    @Query(
+        """
+        SELECT id FROM messages
+        WHERE conversation_id = :conversationId AND date = :date
+          AND direction = :direction AND body = :body
+          AND type = :type
+          AND date_sent IS :dateSent
+          AND sub_id IS :subId
+        LIMIT 1
+        """,
+    )
+    suspend fun findRestoreDuplicate(
+        conversationId: Long,
+        date: Long,
+        direction: com.relay.sms.domain.model.MessageDirection,
+        body: String,
+        type: com.relay.sms.domain.model.MessageType,
+        dateSent: Long?,
+        subId: Int?,
+    ): Long?
+
+    @Query("UPDATE messages SET status = :status, error_code = :errorCode WHERE id = :id")
+    suspend fun updateStatus(id: Long, status: com.relay.sms.domain.model.MessageStatus, errorCode: Int? = null)
+
+    /**
+     * v1.26.1 (audit M8) — promotion de statut qui NE PEUT PAS écraser un échec.
+     *
+     * Un SMS long part en plusieurs parties, et `SmsSenderImpl` construit un `PendingIntent` par
+     * partie. Chaque accusé écrivait le statut sans agrégation : sur un message de trois
+     * segments, un échec de la partie 0 posait `FAILED`, puis les accusés positifs des parties 1
+     * et 2 le repassaient à `SENT`. Le destinataire recevait un message TRONQUÉ, l'expéditeur le
+     * croyait envoyé — et comme la bulle n'était pas en échec, la relance n'était même pas
+     * proposée.
+     *
+     * Les accusés n'arrivent pas dans l'ordre : plutôt que de parier sur l'index de la dernière
+     * partie, la promotion est MONOTONE — un statut ne peut que progresser. L'échelle du chemin
+     * sortant est `PENDING(0) < SENT(1) < DELIVERED(2) < FAILED(3)`, si bien que la règle donne
+     * gratuitement les trois garanties voulues :
+     *  - un échec de partie ne peut plus être écrasé par l'accusé positif d'une autre partie ;
+     *  - un accusé de réception ne peut plus être rétrogradé en « envoyé » par un accusé
+     *    d'envoi arrivé après lui ;
+     *  - un échec tardif marque toujours le message, même déjà passé « envoyé ».
+     *
+     * [statusRaw] double [status] parce que SQLite compare la colonne à un entier ; les deux
+     * doivent décrire le MÊME statut.
+     *
+     * # v1.28.3 (F23) — la monotonie ne suffisait pas après une RELANCE
+     *
+     * La règle ci-dessus protège les parties d'un même envoi les unes des autres. Elle ne
+     * protégeait rien entre deux TENTATIVES, parce que la relance rétrograde délibérément la
+     * ligne en `PENDING` ([com.relay.sms.domain.repository.OutgoingMessageMirror
+     * .resetOutgoingForRetry]) : l'accusé tardif de la tentative précédente retrouvait alors une
+     * ligne au bas de l'échelle et s'y appliquait comme s'il était le sien. Un `FAILED` en
+     * retard d'une minute écrivait `3`, sommet de l'échelle, que le succès réel de la nouvelle
+     * tentative ne pouvait **plus jamais** promouvoir : bulle rouge définitive sur un message
+     * bel et bien reçu.
+     *
+     * [attempt] identifie la tentative dont provient l'accusé. `NULL` signifie « quelle que soit
+     * la tentative en cours » et reste le bon choix pour ce qui n'est pas un accusé : l'échec
+     * synchrone écrit juste après la remise, la sentinelle du chien de garde, le suivi MMS.
+     */
+    @Query(
+        """
+        UPDATE messages
+           SET status = :status, error_code = :errorCode
+         WHERE id = :id
+           AND status < :statusRaw
+           AND (:attempt IS NULL OR send_attempt = :attempt)
+        """,
+    )
+    suspend fun promoteStatusMonotonic(
+        id: Long,
+        status: com.relay.sms.domain.model.MessageStatus,
+        statusRaw: Int,
+        errorCode: Int? = null,
+        attempt: Int? = null,
+    ): Int
+
+    /**
+     * v1.28.3 (F23) — ouvre une NOUVELLE tentative d'envoi : statut ramené à `PENDING`, erreur
+     * effacée, compteur incrémenté.
+     *
+     * Les trois écritures dans le même UPDATE, et c'est la raison d'être de cette requête : si
+     * l'incrément était séparé de la rétrogradation, il existerait un instant où la ligne est
+     * `PENDING` sous l'ancien numéro de tentative — exactement la fenêtre dans laquelle un
+     * accusé tardif s'appliquerait à tort.
+     */
+    @Query(
+        "UPDATE messages SET status = 0, error_code = NULL, send_attempt = send_attempt + 1 WHERE id = :id",
+    )
+    suspend fun openNextSendAttempt(id: Long)
+
+    /** v1.28.3 (F23) — numéro de la tentative en cours, ou `null` si la ligne n'existe plus. */
+    @Query("SELECT send_attempt FROM messages WHERE id = :id")
+    suspend fun sendAttemptOf(id: Long): Int?
+
+    /**
+     * v1.15.2 — Remapping post-restore du `reply_to_message_id`. Utilisé par
+     * [com.relay.sms.data.backup.BackupService.importPayload] passe 2 pour réécrire les
+     * citations contextuelles : l'id Room du message cité change entre source et cible, donc
+     * la 1ʳᵉ passe d'insert pose `reply_to_message_id = NULL` et celle-ci remet la cible
+     * via le mapping <oldId → newId> construit pendant la passe 1.
+     */
+    @Query("UPDATE messages SET reply_to_message_id = :replyTargetId WHERE id = :id")
+    suspend fun setReplyTarget(id: Long, replyTargetId: Long)
+
+    /**
+     * v1.2.6 audit F2 : stocke l'`_id` `content://mms` que `MmsSystemWriteback.insertOutbox`
+     * a renvoyé pour ce message Room. Permet à la prochaine tentative (retry après échec) de
+     * détecter et supprimer la row OUTBOX/FAILED précédente avant d'en insérer une nouvelle.
+     */
+    @Query("UPDATE messages SET mms_system_id = :mmsSystemId WHERE id = :id")
+    suspend fun setMmsSystemId(id: Long, mmsSystemId: Long?)
+
+    /**
+     * v1.22.x — déplace tous les messages d'une conversation source vers une conversation cible
+     * (fusion des doublons du même numéro, cf. [com.relay.sms.data.repository.ConversationMirror
+     * .dedupeSameNumberConversations]). **Doit être appelé AVANT** la suppression de la conversation
+     * source : la FK `messages.conversation_id` est `onDelete = CASCADE`, donc supprimer la
+     * conversation d'abord effacerait ses messages. Aucun conflit d'unicité — l'index unique porte
+     * sur `telephony_uri` seul, pas sur `conversation_id`.
+     */
+    @Query("UPDATE messages SET conversation_id = :toConversationId WHERE conversation_id = :fromConversationId")
+    suspend fun reparentMessages(fromConversationId: Long, toConversationId: Long)
+
+    /** Inverse de [setMmsSystemId] — utilisé par le retry pour récupérer la row à purger. */
+    @Query("SELECT mms_system_id FROM messages WHERE id = :id")
+    suspend fun findMmsSystemId(id: Long): Long?
+
+    /**
+     * v1.28.3 (F18) — **journal de propriété** : tous les identifiants de lignes
+     * `content://mms` que Relay a écrites lui-même.
+     *
+     * Sert au chien de garde de l'OUTBOX système
+     * ([com.relay.sms.data.mms.MmsSystemWriteback.purgeStaleOutbox]), qui supprimait
+     * jusqu'ici **toute** ligne du fournisseur en `msg_box = OUTBOX` plus vieille que quinze
+     * minutes, sans se demander qui l'avait créée. Une application tierce ayant laissé un MMS
+     * en échec — une application constructeur cohabitante, ou celle utilisée avant Relay —
+     * voyait sa ligne détruite par un chien de garde qui n'avait rien à y faire.
+     *
+     * La colonne existait déjà et servait déjà de preuve de propriété ailleurs :
+     * `MmsSentReceiver` s'en sert précisément pour refuser d'agir sur une ligne qui n'est pas
+     * la sienne. La purge était le seul chemin destructeur du dépôt à ne pas faire ce contrôle,
+     * alors qu'elle est de loin le plus large.
+     *
+     * Conséquence assumée : une ligne dont Relay a perdu la trace en Room — message
+     * supprimé localement, base réinitialisée — n'est plus purgée. C'est le bon sens de
+     * l'échec : mieux vaut laisser une ligne orpheline qu'en détruire une qui ne nous
+     * appartient pas.
+     */
+    @Query("SELECT mms_system_id FROM messages WHERE mms_system_id IS NOT NULL")
+    suspend fun ownedMmsSystemIds(): List<Long>
+
+    /**
+     * v1.3.0 — set / clear la réaction emoji posée par l'utilisateur sur un message. `null`
+     * = retire la réaction. Aucun écho côté SMS/MMS (réactions non standardisées en SMS).
+     */
+    @Query("UPDATE messages SET reaction_emoji = :emoji WHERE id = :id")
+    suspend fun setReaction(id: Long, emoji: String?)
+
+    /**
+     * E2E (schema v22) — marks a row encrypted on the wire. The send/receive paths
+     * usually insert the row with the flag already set; this is for rows whose crypto
+     * outcome is known only after the insert (optimistic send, late decrypt).
+     */
+    @Query("UPDATE messages SET encrypted = 1 WHERE id = :id")
+    suspend fun markEncrypted(id: Long)
+
+    /**
+     * E2E (schema v22) — marks a row as an undecryptable placeholder and keeps the raw
+     * base64 ciphertext for a later retry, once a re-probe re-establishes the session.
+     */
+    @Query(
+        "UPDATE messages SET encrypted = 1, decrypt_failed = 1, ciphertext = :ciphertext " +
+            "WHERE id = :id",
+    )
+    suspend fun markDecryptFailed(id: Long, ciphertext: String)
+
+    /**
+     * E2E (schema v22) — a kept ciphertext decrypted on retry: the placeholder clears
+     * (the body is rewritten by the caller via [update]) and the ciphertext is dropped
+     * — it must not linger once it has served. `encrypted` stays 1: the message was
+     * encrypted on the wire.
+     */
+    @Query("UPDATE messages SET decrypt_failed = 0, ciphertext = NULL WHERE id = :id")
+    suspend fun markDecrypted(id: Long)
+
+    /**
+     * E2E media (schema v23, round 48) — marks an encrypted-media
+     * row as undecryptable (bad GCM tag, SHA/size mismatch, or the
+     * key never arrived within 24 h). No ciphertext argument: the
+     * media ciphertext lives in the attachment file, not the
+     * `ciphertext` column — and unlike the text path there is no
+     * retry (a media key that never arrived will not arrive on a
+     * re-probe; the row stays failed). The thread already renders
+     * any `decrypt_failed` row as "This message couldn't be
+     * decrypted.", so no UI branch is needed for this state. The
+     * text retry path ([com.relay.sms.e2e.E2eHandshakeHandler.retryDecryptFailed])
+     * skips media rows safely: it reads the (null) `ciphertext`
+     * column and `decryptKept` returns null on a null ciphertext.
+     */
+    @Query("UPDATE messages SET encrypted = 1, decrypt_failed = 1 WHERE id = :id")
+    suspend fun markMediaDecryptFailed(id: Long)
+
+    /**
+     * E2E (schema v22) — keeps the raw base64 ciphertext on an OUTGOING
+     * encrypted row, so a retry re-sends the EXACT bytes of the first
+     * attempt (same fragment set, same message id — the receiver dedupes
+     * by sender + id + index). Re-encrypting on retry would produce
+     * different bytes under the same id and mix two ciphertexts into one
+     * set at the receiver. Only the send path writes this; the column is
+     * never synced and never backed up.
+     */
+    @Query("UPDATE messages SET ciphertext = :ciphertext WHERE id = :id")
+    suspend fun setCiphertext(id: Long, ciphertext: String)
+
+    /**
+     * E2E (schema v22) — every undecryptable placeholder from one peer, oldest first:
+     * the retry input after a re-probe re-establishes the session (§4.4). The full
+     * rows come back because the retry needs the id and the ciphertext.
+     */
+    @Query(
+        "SELECT * FROM messages WHERE address = :address AND decrypt_failed = 1 ORDER BY date ASC",
+    )
+    suspend fun findDecryptFailed(address: String): List<MessageEntity>
+
+    /**
+     * E2E (round 47) — the date of the earliest OUTGOING encrypted message in
+     * [conversationId] dated at or after [since] (the peer's establishment time,
+     * approximated by the peer row's `updated_at`), or null when no encrypted
+     * message went out on this session yet. The peer-left fallback's grace guard
+     * ([com.relay.sms.e2e.E2eReceiveManager]) measures from it: the peer can
+     * only have flipped to encrypted sending after our first encrypted (pre-key)
+     * message reached them, so a plain message within the grace window of that
+     * send may predate their flip. Outgoing rows carry the phone-clock send time
+     * in `date`, the same clock domain as `updated_at`.
+     */
+    @Query(
+        """
+        SELECT MIN(date) FROM messages
+        WHERE conversation_id = :conversationId
+          AND direction = 1
+          AND encrypted = 1
+          AND date >= :since
+        """,
+    )
+    suspend fun firstOutgoingEncryptedSince(conversationId: Long, since: Long): Long?
+
+    /**
+     * E2E (round 48) — the number of CONSECUTIVE plain incoming SMS in
+     * [conversationId] since the last encrypted incoming message on this
+     * session, or since [since] (the peer's establishment time, approximated
+     * by the peer row's `updated_at`) when the peer never sent encrypted on
+     * this session. The peer-left fallback's grace guard
+     * ([com.relay.sms.e2e.E2eReceiveManager]) uses it for the
+     * consecutive-plain override: 3 plain in a row within the grace window
+     * means the peer switched apps, not a race.
+     *
+     * Consecutive is derived from the message table — no new column:
+     * plain incoming SMS (direction 0, type 0, encrypted 0) whose row id
+     * is past the newest encrypted incoming row's id. Ids (insertion
+     * order) anchor the streak, not dates — two messages can share a
+     * millisecond, and insertion order is the true arrival order. The
+     * `date >= :since` floor keeps pre-establishment plain history out
+     * of the count: before the flip, plain was expected, so without it
+     * a peer who never sent encrypted would fire on their first plain
+     * message. Hidden rows (reaction sentinels) don't count — they
+     * aren't messages. An undecryptable placeholder (encrypted 1)
+     * resets the streak: the peer sent encrypted, even if we couldn't
+     * read it.
+     */
+    @Query(
+        """
+        SELECT COUNT(*) FROM messages m
+        WHERE m.conversation_id = :conversationId
+          AND m.direction = 0
+          AND m.type = 0
+          AND m.encrypted = 0
+          AND m.hidden = 0
+          AND m.date >= :since
+          AND m.id > COALESCE(
+            (SELECT MAX(id) FROM messages
+             WHERE conversation_id = :conversationId
+               AND direction = 0
+               AND encrypted = 1
+               AND date >= :since),
+            0
+          )
+        """,
+    )
+    suspend fun countPlainIncomingSinceLastEncrypted(conversationId: Long, since: Long): Int
+
+    /**
+     * E2E — the conversations whose LATEST visible message is an
+     * undecryptable placeholder. The list preview is derived from that
+     * message, and a placeholder's stored body is empty — so the row
+     * renders "This message couldn't be decrypted." instead of a blank
+     * preview (or the attachment fallback).
+     *
+     * "Latest" mirrors the mirror's own definition: the newest
+     * non-hidden message by (`date`, `id`) — hidden rows (reaction
+     * sentinels) never touch the conversation, so they can never be
+     * the preview's message. The outer filter runs on the rare
+     * `decrypt_failed = 1` rows, so the correlated subquery only
+     * executes for those; the `(conversation_id, date)` index covers
+     * the ordering. Ordered by conversation id so a
+     * `distinctUntilChanged` downstream is stable.
+     */
+    @Query(
+        """
+        SELECT m.conversation_id FROM messages m
+        WHERE m.hidden = 0
+          AND m.decrypt_failed = 1
+          AND m.id = (
+            SELECT m2.id FROM messages m2
+            WHERE m2.conversation_id = m.conversation_id
+              AND m2.hidden = 0
+            ORDER BY m2.date DESC, m2.id DESC
+            LIMIT 1
+          )
+        ORDER BY m.conversation_id ASC
+        """,
+    )
+    fun observeDecryptFailedLatestConversationIds(): Flow<List<Long>>
+
+    /**
+     * v3 reaction reparse — every message carrying a stored reaction, for
+     * normalizing legacy multi-emoji values ("👍😂😅") down to a single
+     * emoji. Only reacted messages are read (a small set); the full rows
+     * come back because the reparse needs the id and the reaction only.
+     */
+    @Query("SELECT * FROM messages WHERE reaction_emoji IS NOT NULL")
+    suspend fun findMessagesWithReactions(): List<MessageEntity>
+
+    /**
+     * v1.4.1 — finds the most recent OUTGOING message in [conversationId] whose body
+     * starts with [bodyPrefix] (used by the incoming Tapback parser to match a remote
+     * "Reacted ❤️ to «hello…»" SMS back to the original outgoing message it was reacting
+     * to). The lookup is scoped to outgoing messages because a reaction-back can only
+     * target something WE sent.
+     *
+     * The `bodyPrefix` is fed as the LHS of a SQL `LIKE :bodyPrefix || '%'` so the
+     * caller must escape any `%` / `_` / `\` it contains beforehand.
+     */
+    @Query(
+        """
+        SELECT * FROM messages
+        WHERE conversation_id = :conversationId
+          AND direction = 1
+          AND body LIKE :bodyPrefix || '%' ESCAPE '\'
+        ORDER BY date DESC
+        LIMIT 1
+        """
+    )
+    suspend fun findMostRecentOutgoingByBodyPrefix(
+        conversationId: Long,
+        bodyPrefix: String,
+    ): MessageEntity?
+
+    /**
+     * v1.4.1 — finds the most recent OUTGOING message in [conversationId] regardless of
+     * its body. Used when the incoming Tapback has no `to «…»` segment (the reacting
+     * party reacted to a message with no text body, e.g. voice MMS or image-only).
+     */
+    @Query(
+        """
+        SELECT * FROM messages
+        WHERE conversation_id = :conversationId
+          AND direction = 1
+        ORDER BY date DESC
+        LIMIT 1
+        """
+    )
+    suspend fun findMostRecentOutgoing(conversationId: Long): MessageEntity?
+
+    /**
+     * Reactions can target ANY message in the thread — not only one we sent.
+     * In a group thread the other participants react to each other's texts,
+     * and on iPhone you can even react to your own. These three queries are
+     * the direction-agnostic twins of the outgoing-only ones above, used by
+     * [com.relay.sms.data.repository.ConversationMirror
+     * .applyIncomingReaction] for Tapback kinds. The emoji-only path keeps
+     * its outgoing-only queries: a bare "❤️" is ambiguous with a real message
+     * and must never be folded onto a message the sender received.
+     */
+    @Query(
+        """
+        SELECT * FROM messages
+        WHERE conversation_id = :conversationId
+          AND body LIKE :bodyPrefix || '%' ESCAPE '\'
+        ORDER BY date DESC
+        LIMIT 1
+        """
+    )
+    suspend fun findMostRecentByBodyPrefix(
+        conversationId: Long,
+        bodyPrefix: String,
+    ): MessageEntity?
+
+    @Query(
+        """
+        SELECT * FROM messages
+        WHERE conversation_id = :conversationId
+        ORDER BY date DESC
+        LIMIT 1
+        """
+    )
+    suspend fun findMostRecent(conversationId: Long): MessageEntity?
+
+    /**
+     * Feedback round 7 — candidates for the retroactive reaction reparse
+     * ([com.relay.sms.data.repository.ConversationMirror
+     * .reparseStoredReactions]).
+     *
+     * The `LIKE` pre-filter is deliberately a SUPERSET of what
+     * [com.relay.sms.domain.reaction.IncomingReactionDecoder.decode] can
+     * match: every wire prefix it knows (`Reacted …`, the six iOS tapback
+     * verbs, `Removed …`, the French `Réagi …` / `J'ai réagi …` forms, the
+     * named `<Nom> a réagi par …` form, and the `»` that closes an
+     * emoji+quote body). False positives are harmless — `decode()` re-validates
+     * each candidate strictly in Kotlin. False negatives would lose a reaction
+     * forever, so when in doubt a shape is included.
+     *
+     * Deliberately NOT paged: the leading-wildcard arms (`% a réagi par %`,
+     * `%»%`) would force a full-table scan per page. One scan returning the
+     * (rare) candidates is cheaper than N scans, and the list stays small —
+     * reaction texts are a tiny fraction of any history.
+     *
+     * Both directions: an incoming row is someone reacting to us; an outgoing
+     * row is OUR OWN reaction, sent from this phone — the sending app mirrors
+     * it with an empty body, but the full text sits in the system sent box,
+     * and a second install imports it as a text row. The fold treats the two
+     * cases differently (see [ConversationMirror.applyIncomingReaction]).
+     * Sentinels (`hidden = 1`) are excluded — their empty body could never
+     * decode anyway.
+     */
+    @Query(
+        """
+        SELECT * FROM messages
+        WHERE hidden = 0
+          AND (
+            body LIKE 'Reacted %' OR
+            body LIKE 'Loved %' OR
+            body LIKE 'Liked %' OR
+            body LIKE 'Disliked %' OR
+            body LIKE 'Laughed at %' OR
+            body LIKE 'Emphasized %' OR
+            body LIKE 'Questioned %' OR
+            body LIKE 'Removed %' OR
+            body LIKE 'Réagi %' OR
+            body LIKE 'J''ai réagi %' OR
+            body LIKE 'J’ai réagi %' OR
+            body LIKE '% a réagi par %' OR
+            body LIKE '%»%'
+          )
+        ORDER BY id ASC
+        """
+    )
+    suspend fun findReactionCandidates(): List<MessageEntity>
+
+    @Query(
+        """
+        SELECT * FROM messages
+        WHERE conversation_id = :conversationId
+        ORDER BY date DESC
+        LIMIT :limit
+        """
+    )
+    suspend fun findRecentForConversation(
+        conversationId: Long,
+        limit: Int,
+    ): List<MessageEntity>
+
+    /**
+     * Round 35 — the sticky-category backfill's window: the [limit] most
+     * recent INCOMING messages of [conversationId] that arrived after the
+     * latest OUTGOING message in the thread (newest first). Direction
+     * INCOMING = `0`, OUTGOING = `1` (cf. [com.relay.sms.domain.model
+     * .MessageDirection]). A thread the user replied to last yields an
+     * empty list — nothing to file. Reaction sentinels (`hidden = 1`)
+     * stay in: their empty body classifies Personal and can never file
+     * a thread as Promotional.
+     */
+    @Query(
+        """
+        SELECT * FROM messages
+        WHERE conversation_id = :conversationId
+          AND direction = 0
+          AND date > (
+              SELECT COALESCE(MAX(date), 0) FROM messages
+              WHERE conversation_id = :conversationId AND direction = 1
+          )
+        ORDER BY date DESC
+        LIMIT :limit
+        """
+    )
+    suspend fun findRecentIncomingSinceLastOutgoing(
+        conversationId: Long,
+        limit: Int,
+    ): List<MessageEntity>
+
+    /**
+     * v1.6.2 (Tapback fold bugfix) — returns the [limit] most recent OUTGOING messages of
+     * [conversationId]. Used as a fallback by [com.relay.sms.data.repository
+     * .ConversationMirror.applyIncomingReaction] when the SQL `LIKE prefix%` match fails
+     * because the encoder normalizes whitespace (newlines, tabs → single space) in the
+     * Tapback preview while the stored OUTGOING body keeps the original separators.
+     * The caller fetches a bounded window then matches in Kotlin after collapsing
+     * whitespace on BOTH sides — bulletproof and < 1 ms on real conversations.
+     */
+    @Query(
+        """
+        SELECT * FROM messages
+        WHERE conversation_id = :conversationId
+          AND direction = 1
+        ORDER BY date DESC
+        LIMIT :limit
+        """
+    )
+    suspend fun findRecentOutgoingForConversation(
+        conversationId: Long,
+        limit: Int,
+    ): List<MessageEntity>
+
+    /**
+     * v1.4.1 — finds the most recent OUTGOING message in [conversationId] whose `date`
+     * is strictly greater than [sinceMs] (epoch ms). Used by the emoji-only reaction
+     * decode path : a bare emoji SMS is only folded onto an outgoing message if that
+     * message was sent within the last ~5 minutes, so a standalone "❤️" sent days
+     * later cannot be silently glued onto an unrelated past message.
+     */
+    @Query(
+        """
+        SELECT * FROM messages
+        WHERE conversation_id = :conversationId
+          AND direction = 1
+          AND date > :sinceMs
+        ORDER BY date DESC
+        LIMIT 1
+        """
+    )
+    suspend fun findMostRecentOutgoingAfter(
+        conversationId: Long,
+        sinceMs: Long,
+    ): MessageEntity?
+
+    /**
+     * Audit M-5 + M-1: stalls-watchdog. Bulk-promotes outgoing messages stuck in `PENDING`
+     * (status 0) past [olderThanMs] to `FAILED` (status 3) **and tags them with the
+     * dedicated `error_code = -2` (WATCHDOG_TIMEOUT) sentinel** to distinguish them from
+     * synchronously-failed sends (which use `-1`).
+     *
+     * The discrimination matters for idempotence: a watchdog-promoted row may have been
+     * accepted by the radio (we just never received the sent-broadcast), so a retry could
+     * produce a duplicate SMS at the recipient. Synchronously-failed rows are guaranteed
+     * never to have reached the radio (SmsManager threw before dispatch) and can be retried
+     * freely. The UI consumes `errorCode` to show the appropriate warning on retry.
+     *
+     * Direction filter: only `OUTGOING` rows (direction=1) — incoming RECEIVED-status
+     * messages never sit in PENDING.
+     */
+    @Query(
+        """
+        UPDATE messages
+           SET status = 3, error_code = -2
+         WHERE status = 0
+           AND direction = 1
+           AND date < :olderThanMs
+        """,
+    )
+    suspend fun timeoutStalePending(olderThanMs: Long): Int
+
+    /**
+     * Snapshot read for backup pipeline.
+     *
+     * v1.6.0 (audit S2) — exclut les rows sentinels (`hidden = 1` depuis la v1.28.4 ; avant,
+     * reconnues à leur forme) qui sont des artefacts internes Tapback :
+     *   - `upsertReactionSentinel` (incoming Tapback déjà folded sur le message d'origine) ;
+     *   - `upsertOutgoingSms(localMirrorBody = "")` (la propre réaction sortante du user,
+     *     dont seul le badge est exposé en UI).
+     *
+     * Ces lignes sont strictement internes au mécanisme anti-réimport TelephonySync — les
+     * inclure dans un backup produirait des bulles vides à la restauration.
+     */
+    @Query(
+        """
+        SELECT * FROM messages
+        WHERE hidden = 0
+        ORDER BY conversation_id ASC, date ASC
+        """
+    )
+    suspend fun listAll(): List<MessageEntity>
+
+    /**
+     * v1.2.3 audit P4: rewritten as `EXISTS` so SQLite stops at the first hit instead of
+     * scanning every row of `messages` (no index on `type`). The sync manager only cares about
+     * "zero vs. non-zero" — first-run import trigger vs. fresh DB after package switch — so a
+     * 1-bit answer is enough. Cuts the recurring per-sync cost from ~10-30 ms on a 50k-message
+     * DB down to ~1 ms.
+     */
+    @Query("SELECT EXISTS(SELECT 1 FROM messages WHERE type = 1 LIMIT 1)")
+    suspend fun hasAnyMms(): Boolean
+
+    @Query("DELETE FROM messages WHERE id = :id")
+    suspend fun delete(id: Long)
+
+    @Query("DELETE FROM messages WHERE conversation_id = :conversationId")
+    suspend fun deleteAllForConversation(conversationId: Long)
+
+    /**
+     * Returns every non-vault `telephony_uri` we have mirrored. Used by [TelephonySyncManager]
+     * to detect rows that have been deleted from the system content provider (by any actor)
+     * so we can drop them locally and stay convergent with the OS. Vault rows are filtered out
+     * here because they exist only in our SQLCipher DB — they have no telephony_uri to compare.
+     */
+    @Query(
+        """
+        SELECT m.telephony_uri FROM messages m
+        JOIN conversations c ON c.id = m.conversation_id
+        WHERE m.telephony_uri IS NOT NULL AND c.in_vault = 0
+        ORDER BY m.telephony_uri
+        """,
+    )
+    suspend fun listMirroredTelephonyUris(): List<String>
+
+    /**
+     * Bulk-deletes Room rows whose [MessageEntity.telephonyUri] is in [uris]. Used by the sync
+     * manager's deletion-reconciliation pass. SQLite caps `IN (…)` at 999 host parameters; the
+     * caller chunks larger inputs.
+     */
+    /**
+     * 🔴 v1.27.2 (audit Codex du 2026-08-05, LP-03) — LE PREDICAT COFFRE EST DANS LA REQUETE.
+     *
+     * `listMirroredTelephonyUris` excluait bien `in_vault = 1`, mais cette lecture a lieu AVANT les
+     * sondes provider. Entre-temps, `moveToVault` peut poser `in_vault = 1` dans une autre
+     * transaction : la suppression effacait alors du contenu que l utilisateur venait tout juste de
+     * mettre a l abri, irreversiblement.
+     *
+     * Un `findById` avant le DELETE recreerait la meme course. La condition doit etre SQL, donc
+     * evaluee atomiquement avec l ecriture.
+     */
+    @Query(
+        """
+        DELETE FROM messages
+        WHERE telephony_uri IN (:uris)
+          AND conversation_id IN (SELECT id FROM conversations WHERE in_vault = 0)
+        """,
+    )
+    suspend fun deleteByTelephonyUris(uris: List<String>): Int
+
+    /**
+     * v1.27.2 (relecture Codex 2026-08-04) — conversations touchées par un lot de suppressions,
+     * À LIRE AVANT le `DELETE` (après, les lignes n'existent plus).
+     *
+     * Sert à `TelephonySyncManager.reconcileDeletions` pour ne recalculer QUE les aperçus des
+     * fils réellement concernés. Le recalcul global qui l'a précédée réécrivait l'aperçu de
+     * TOUTES les conversations, y compris celles qu'aucune suppression ne touchait — voir le
+     * commentaire de cette passe pour ce que ça coûtait.
+     */
+    /** v1.27.2 (audit Codex, LP-03) — meme exclusion du Coffre que la suppression qui suit. */
+    @Query(
+        """
+        SELECT DISTINCT conversation_id FROM messages
+        WHERE telephony_uri IN (:uris)
+          AND conversation_id IN (SELECT id FROM conversations WHERE in_vault = 0)
+        """,
+    )
+    suspend fun findConversationIdsByTelephonyUris(uris: List<String>): List<Long>
+
+    /**
+     * v1.28.7 — les messages que [deleteByTelephonyUris] va effacer, avec leur conversation, À
+     * LIRE AVANT le `DELETE`. Même clause, coffre exclu compris.
+     */
+    @Query(
+        """
+        SELECT id, conversation_id FROM messages
+        WHERE telephony_uri IN (:uris)
+          AND conversation_id IN (SELECT id FROM conversations WHERE in_vault = 0)
+        """,
+    )
+    suspend fun findRefsByTelephonyUris(uris: List<String>): List<MessageRef>
+
+    /**
+     * v1.28.8 (issue #17) — recherche plein texte, enfin branchée à l'écran.
+     *
+     * Elle existait sans aucun appelant, alors que le champ de recherche promet « un message » :
+     * seul l'aperçu du DERNIER message de chaque conversation était cherché.
+     *
+     * - `messages_fts.body MATCH` : le TEXTE seulement. L'index porte aussi `address` ; sans ce
+     *   ciblage, taper `06` remontait tous les messages des numéros en 06 (relecture GPT 5.2). La
+     *   recherche par numéro reste celle du filtre des conversations.
+     * - `c.in_vault = 0` (v1.11.0 audit SEC-V1) : jamais un message du coffre, ni en session normale
+     *   ni en session leurre, qui voit la même liste hors coffre. L'index, lui, couvre tout.
+     * - `m.hidden = 0` : les lignes de service (traces de réaction) ne sont jamais affichées.
+     * - `:archivedOnly` : l'écran des archives ne cherche que dans les conversations archivées.
+     * - `snippet(…, 0, …)` : extrait de la colonne `body` (la 0ᵉ de `messages_fts`), passages
+     *   trouvés encadrés par les marqueurs de [MessageSearchHit]. C'est l'index qui dit ce qui a
+     *   correspondu, accents compris (`unicode61`) : l'écran n'a rien à redeviner.
+     *
+     * **En deux temps**, mesuré avant d'être écrit. En une seule requête, `snippet()` était
+     * calculé pour TOUTES les correspondances avant le tri et le `LIMIT` : sur un Galaxy S9 avec
+     * 100 000 messages, 83 à 269 ms par recherche large, contre 18 à 60 ms sans extrait. La
+     * sous-requête choisit d'abord les [SEARCH_LIMIT] plus récents ; l'extrait n'est calculé que
+     * pour eux : 32 à 91 ms, mêmes messages dans le même ordre sur les six requêtes mesurées.
+     * Tous les filtres vivent dans la sous-requête : c'est elle qui décide de ce qui est montré.
+     *
+     * `m.id DESC` départage deux dates égales (parties d'un MMS) : sans ordre total, la frontière
+     * des [SEARCH_LIMIT] ne serait pas déterministe.
+     *
+     * `Flow` : Room relance la requête quand `messages` ou `conversations` changent.
+     */
+    @Query(
+        """
+        SELECT m.id AS id, m.conversation_id AS conversation_id, m.date AS date,
+            snippet(messages_fts, '${MessageSearchHit.MARK_START}', '${MessageSearchHit.MARK_END}', '…', 0, $SEARCH_EXCERPT_TOKENS) AS excerpt
+        FROM messages_fts
+        JOIN messages m ON m.id = messages_fts.rowid
+        WHERE messages_fts.body MATCH :query
+          AND m.id IN (
+            SELECT m.id FROM messages_fts
+            JOIN messages m ON m.id = messages_fts.rowid
+            JOIN conversations c ON c.id = m.conversation_id
+            WHERE messages_fts.body MATCH :query
+              AND m.hidden = 0
+              AND c.in_vault = 0
+              AND (:archivedOnly = 0 OR c.archived = 1)
+            ORDER BY m.date DESC, m.id DESC
+            LIMIT $SEARCH_LIMIT
+          )
+        ORDER BY m.date DESC, m.id DESC
+        """,
+    )
+    fun observeSearch(query: String, archivedOnly: Boolean): Flow<List<MessageSearchRow>>
+
+    @Query(
+        """
+        SELECT COUNT(*) FROM messages
+        WHERE conversation_id = :conversationId AND date >= :since
+        """,
+    )
+    suspend fun countSince(conversationId: Long, since: Long): Int
+
+    /**
+     * Purge les messages dont la date est antérieure à [olderThan] et qui ne sont pas starred.
+     *
+     * v1.3.0 audit Q2/Q3 : le caller doit pré-calculer `olderThan` en intégrant le safety net
+     * (`min(now - retentionDays·DAY, now - SAFETY_NET_DAYS·DAY)`). On ne fait pas ce calcul ici
+     * pour éviter une 2ᵉ surcharge SQL dont la condition `date < safetyNet` est impliquée par
+     * `date < olderThan` dès que `retentionDays >= SAFETY_NET_DAYS` — c'était un faux filet de
+     * sécurité côté DB. La logique reste centralisée côté worker, observable et testable.
+     */
+    /*
+     * v1.28.3 (F11) — le Coffre est EXCLU, comme il l'est deja de `markAllIncomingAsRead`, de
+     * `search`, de `listMirroredTelephonyUris` et de trois autres requetes de ce fichier. La
+     * retention etait la seule ecriture destructrice a ne pas le faire.
+     *
+     * Ce que cela produisait, et qui est pire que la suppression elle-meme : la ligne locale
+     * partait `quoi qu'il arrive` (contrat assume de `ConversationEraser.purgeHistory`), y compris
+     * quand sa copie systeme avait resiste. Le lien disparaissait donc avec elle, et la
+     * resynchronisation suivante reimportait le message HORS du coffre, dans une conversation
+     * ordinaire. Un contenu protege ressuscitait en clair, sans que personne ne l'ait demande —
+     * l'utilisateur n'ayant regle qu'une duree de conservation pour son historique courant.
+     *
+     * Le coffre a sa propre purge, explicite et authentifiee (`purgeVault`), dont le contrat est
+     * l'inverse : la ligne locale ne part que si la preuve de suppression systeme est faite.
+     */
+    @Query(
+        """
+        DELETE FROM messages
+         WHERE date < :olderThan AND starred = 0
+           AND conversation_id IN (SELECT id FROM conversations WHERE in_vault = 0)
+        """,
+    )
+    suspend fun purgeOlderThan(olderThan: Long): Int
+
+    /**
+     * v1.28.7 — ce que [purgeOlderThan] va effacer, désigné sans contenu, à lire DANS la même
+     * transaction et AVANT elle. La clause est celle du `DELETE`, mot pour mot : deux critères
+     * qui divergeraient annuleraient la notification d'un message conservé, ou oublieraient celle
+     * d'un message effacé.
+     */
+    @Query(
+        """
+        SELECT id, conversation_id FROM messages
+         WHERE date < :olderThan AND starred = 0
+           AND conversation_id IN (SELECT id FROM conversations WHERE in_vault = 0)
+        """,
+    )
+    suspend fun findRefsOlderThan(olderThan: Long): List<MessageRef>
+
+    /**
+     * v1.28.9 (septième note d'Andrew, constat 3) — les chemins des pièces jointes que
+     * [purgeOlderThan] emporte en cascade.
+     *
+     * La rétention supprimait les lignes `attachments` avec leurs messages, sans jamais lire leurs
+     * `local_uri` : les fichiers de `filesDir/mms_attachments` restaient sur le téléphone, sans
+     * plus aucune ligne pour y mener. À lire DANS la transaction du `DELETE` et avant lui ; la
+     * clause est celle du `DELETE`, mot pour mot, pour la même raison que [findRefsOlderThan].
+     */
+    @Query(
+        """
+        SELECT a.local_uri FROM attachments a
+          JOIN messages m ON m.id = a.message_id
+         WHERE m.date < :olderThan AND m.starred = 0
+           AND m.conversation_id IN (SELECT id FROM conversations WHERE in_vault = 0)
+        """,
+    )
+    suspend fun findAttachmentUrisOlderThan(olderThan: Long): List<String>
+
+    /**
+     * v1.28.9 (F17) — le message qui porte cette clé de transaction, s'il existe. Lue DANS la
+     * transaction d'écriture de [com.relay.sms.data.repository.ConversationMirror.inscrireMmsRecu] :
+     * le receveur et la reprise d'un PDU gardé ne peuvent pas écrire deux fois le même MMS.
+     */
+    @Query("SELECT id FROM messages WHERE mms_transaction_key = :cle LIMIT 1")
+    suspend fun findIdByTransactionKey(cle: String): Long?
+
+    /** v1.28.9 (F17) — les clés des MMS entrants d'une conversation, pour effacer avec elle leurs PDU gardés. */
+    @Query(
+        """
+        SELECT mms_transaction_key FROM messages
+         WHERE conversation_id = :conversationId AND mms_transaction_key IS NOT NULL
+        """,
+    )
+    suspend fun findTransactionKeysForConversation(conversationId: Long): List<String>
+
+    /**
+     * v1.28.9 (F17) — les clés des messages que [purgeOlderThan] va effacer, pour que leurs PDU gardés
+     * partent avec eux. Même clause que le `DELETE`, mot pour mot.
+     */
+    @Query(
+        """
+        SELECT mms_transaction_key FROM messages
+         WHERE date < :olderThan AND starred = 0
+           AND conversation_id IN (SELECT id FROM conversations WHERE in_vault = 0)
+           AND mms_transaction_key IS NOT NULL
+        """,
+    )
+    suspend fun findTransactionKeysOlderThan(olderThan: Long): List<String>
+
+    /** v1.28.9 (F17) — le nombre de pièces d'un message, réécrit quand la reprise complète un MMS reçu. */
+    @Query("UPDATE messages SET attachments_count = :nombre WHERE id = :id")
+    suspend fun setAttachmentsCount(id: Long, nombre: Int)
+
+    /**
+     * v1.28.1 — les messages que [purgeOlderThan] va effacer **et qui ont une copie dans le
+     * fournisseur du systeme**, page par page.
+     *
+     * # Pourquoi cette requete existe
+     *
+     * La purge de retention n'effacait qu'en local : les messages que l'utilisateur croyait
+     * supprimes restaient dans `content://sms`, lisibles par toute application ayant `READ_SMS`,
+     * et une resynchronisation complete — le bouton qui remet le curseur a zero — les ramenait.
+     * `delete`, `deleteMessage` et `deleteAllInVault` propageaient depuis longtemps ; la
+     * retention, non, sans que rien ne le documente.
+     *
+     * # Pourquoi paginer, et pourquoi filtrer sur `telephony_uri`
+     *
+     * La premiere purge d'un historique ancien peut porter sur des dizaines de milliers de
+     * lignes. Les charger d'un bloc mettrait leurs corps entiers en memoire ; la pagination par
+     * cle (`id > :apresId`, jamais `OFFSET`) garde une empreinte constante. Le filtre
+     * `telephony_uri IS NOT NULL` ecarte d'emblee les lignes qui n'ont rien a propager — brouillons,
+     * messages jamais miroites — au lieu de les charger pour ne rien en faire.
+     *
+     * v1.28.3 (F10) — `OR mms_system_id IS NOT NULL`. Ce filtre-la EXCLUAIT tous les MMS
+     * SORTANTS : `ConversationMirror` les ecrit avec `telephonyUri = null`, leur seul lien vers le
+     * fournisseur etant `mms_system_id`. La retention ne propageait donc jamais leur suppression,
+     * et ils restaient indefiniment dans `content://mms`.
+     *
+     * v1.28.3 (F11) — et le Coffre en est desormais exclu, comme il l'est de la suppression qui
+     * suit ; voir le KDoc de [purgeOlderThan] pour ce que l'absence de ce filtre produisait.
+     *
+     * Le critere de selection est **exactement** celui de [purgeOlderThan], au filtre de liaison
+     * pres : deux criteres qui divergeraient feraient propager la suppression de lignes qui
+     * resteraient en base, ou l'inverse.
+     */
+    @Query(
+        """
+        SELECT * FROM messages
+         WHERE date < :olderThan AND starred = 0 AND id > :apresId
+           AND (telephony_uri IS NOT NULL OR mms_system_id IS NOT NULL)
+           AND conversation_id IN (SELECT id FROM conversations WHERE in_vault = 0)
+         ORDER BY id
+         LIMIT :limite
+        """,
+    )
+    suspend fun findMirroredOlderThan(olderThan: Long, apresId: Long, limite: Int): List<MessageEntity>
+
+    /**
+     * v1.3.3 G1 audit fix — après une purge, refresh `last_message_at` +
+     * `last_message_preview` de TOUTES les conversations (post-purge sur 1 transaction).
+     * Sans ça, les conv dont tous les messages ont été purgés gardent l'ancien preview en
+     * clair (leak privacy : le contenu purgé reste visible sur l'écran de liste).
+     *
+     * Logique :
+     *  - Si une conv n'a plus aucun message : `last_message_at = 0`, `preview = NULL`.
+     *  - Sinon : recalcul depuis le message le plus récent restant.
+     *
+     * O(N) sur le nombre de conversations (typiquement <500), exécuté UNIQUEMENT après une
+     * purge effective. Pas d'impact perf en steady state.
+     */
+    /**
+     * v1.26.1 (audit B4) — le prédicat d'exclusion des SENTINELLES DE RÉACTION a été ajouté, et
+     * le départage `id DESC` avec.
+     *
+     * Ses deux requêtes sœurs — `refreshConversationPreview` et `repairStaleConversationPreviews`
+     * — portent toutes deux `NOT (body = '' AND attachments_count = 0 AND reaction_emoji IS
+     * NULL)` ; celle-ci ne l'avait pas. Après une purge, une conversation dont la ligne restante
+     * la plus récente était une sentinelle Tapback — invisible dans le fil — recevait donc un
+     * aperçu VIDE et un `last_message_at` calé sur cette ligne fantôme, ce qui faussait aussi
+     * l'ordre de tri de la liste.
+     */
+    @Query(
+        """
+        UPDATE conversations
+        SET
+          last_message_at = COALESCE(
+              (SELECT MAX(date) FROM messages
+               WHERE conversation_id = conversations.id
+                 AND hidden = 0),
+              0
+          ),
+          last_message_preview = (
+              SELECT body FROM messages
+              WHERE conversation_id = conversations.id
+                AND hidden = 0
+              ORDER BY date DESC, id DESC LIMIT 1
+          )
+        """,
+    )
+    suspend fun refreshAllConversationPreviewsAfterPurge(): Int
+
+    /**
+     * v1.24.0 (bug suppression) — recalcule `last_message_at` + `last_message_preview` pour UNE
+     * conversation, à partir de son message le plus récent restant.
+     *
+     * Sans ça, supprimer le dernier message d'un fil laissait la liste afficher indéfiniment le
+     * message supprimé (`deleteMessage` effaçait la ligne `messages` mais ne touchait jamais la
+     * ligne `conversations`). Bug confirmé sur une vraie sauvegarde le 2026-07-23.
+     *
+     * Exclut les sentinelles de réaction (même prédicat que `observeForConversation`) pour ne pas
+     * exposer un `body` vide. Départage `date DESC, id DESC` — cohérent avec la fenêtre du fil.
+     * Si le fil n'a plus aucun message affichable, `last_message_at = 0` et `preview = NULL`.
+     */
+    @Query(
+        """
+        UPDATE conversations
+        SET
+          last_message_at = COALESCE(
+              (SELECT MAX(date) FROM messages
+               WHERE conversation_id = :conversationId
+                 AND hidden = 0),
+              0
+          ),
+          last_message_preview = (
+              SELECT body FROM messages
+              WHERE conversation_id = :conversationId
+                AND hidden = 0
+              ORDER BY date DESC, id DESC LIMIT 1
+          )
+        WHERE id = :conversationId
+        """,
+    )
+    suspend fun refreshConversationPreview(conversationId: Long)
+
+    /**
+     * v1.24.0 (bug suppression, réparation one-shot) — corrige les aperçus déjà périmés par des
+     * suppressions passées, sur les versions ≤ 1.23.4 qui ne recalculaient pas la conversation.
+     *
+     * **Ciblage strict** : seules les conversations dont le `last_message_at` stocké est SUPÉRIEUR
+     * au `date` du message le plus récent réellement présent (= le dernier message a été supprimé)
+     * sont recalculées. Une conversation saine (`last_message_at == MAX(date)`) n'est jamais
+     * touchée — pas de réordonnancement ni de perte de libellé sur les autres. La détection de
+     * péremption compte TOUS les messages ; l'aperçu se reconstruit hors sentinelles.
+     */
+    @Query(
+        """
+        UPDATE conversations
+        SET
+          last_message_at = COALESCE(
+              (SELECT MAX(date) FROM messages
+               WHERE conversation_id = conversations.id
+                 AND hidden = 0),
+              0
+          ),
+          last_message_preview = (
+              SELECT body FROM messages
+              WHERE conversation_id = conversations.id
+                AND hidden = 0
+              ORDER BY date DESC, id DESC LIMIT 1
+          )
+        WHERE last_message_at > COALESCE(
+            (SELECT MAX(date) FROM messages WHERE conversation_id = conversations.id),
+            0
+        )
+        """,
+    )
+    suspend fun repairStaleConversationPreviews(): Int
+
+    /**
+     * v1.3.0 — compte combien de messages seraient effacés par [purgeOlderThan] avec ce
+     * même `olderThan`. Sert au bouton "Effacer maintenant" du dialog réglages : on
+     * affiche d'abord à l'utilisateur "X messages vont être effacés, continuer ?" pour
+     * éviter un wipe massif accidentel. Utilise le même filtre `starred = 0` pour la
+     * cohérence parfaite avec la purge réelle.
+     *
+     * v1.28.3 (F11) — et la MEME exclusion du Coffre. Ce nombre est montré à l'utilisateur juste
+     * avant qu'il confirme : le laisser diverger du `DELETE` qu'il annonce ferait promettre
+     * l'effacement de messages que la purge ne touche plus. « Le même filtre pour la cohérence
+     * parfaite » était déjà l'intention écrite ici ; elle vaut aussi pour ce filtre-ci.
+     */
+    @Query(
+        """
+        SELECT COUNT(*) FROM messages
+         WHERE date < :olderThan AND starred = 0
+           AND conversation_id IN (SELECT id FROM conversations WHERE in_vault = 0)
+        """,
+    )
+    suspend fun countOlderThan(olderThan: Long): Int
+
+    /**
+     * Slice 2 — one page of one conversation, newest first, keyed on
+     * [beforeId] (0 = newest page). `hidden = 0`: reaction sentinels
+     * never sync. Do NOT reuse [findRecentForConversation] for sync —
+     * it lacks the filter.
+     *
+     * Ordered by `id DESC`, not `date DESC`: paging is id-keyed (the
+     * next page filters `id < last id of this page`), so the order must
+     * match the key. A date-ordered page can skip a late-imported
+     * backfill — old date, high id — that sorts below the page boundary
+     * while its id sits above the next cursor. The desktop renders in
+     * timestamp order at read time, so batch order never affects
+     * display.
+     */
+    @Query(
+        """
+        SELECT * FROM messages
+        WHERE conversation_id = :conversationId
+          AND hidden = 0
+          AND (:beforeId = 0 OR id < :beforeId)
+        ORDER BY id DESC
+        LIMIT :limit
+        """,
+    )
+    suspend fun findBefore(conversationId: Long, beforeId: Long, limit: Int): List<MessageEntity>
+
+    /**
+     * Slice 2 — messages above [afterId], oldest first: the live path
+     * and the reconnect delta. Same `hidden = 0` filter as [findBefore].
+     * No LIMIT by design — the caller chunks what it sends.
+     */
+    @Query(
+        """
+        SELECT * FROM messages
+        WHERE conversation_id = :conversationId
+          AND hidden = 0
+          AND id > :afterId
+        ORDER BY id ASC
+        """,
+    )
+    suspend fun findAfter(conversationId: Long, afterId: Long): List<MessageEntity>
+
+    /**
+     * Slice 2 — per-conversation message counts over the syncable
+     * scope: visible messages of non-vault conversations.
+     * Conversations with no visible message produce no row.
+     */
+    @Query(
+        """
+        SELECT conversation_id, COUNT(*) AS message_count FROM messages
+        WHERE hidden = 0
+          AND conversation_id IN (SELECT id FROM conversations WHERE in_vault = 0)
+        GROUP BY conversation_id
+        """,
+    )
+    suspend fun countByConversation(): List<ConversationMessageCount>
+
+    /**
+     * Slice 2 — current max message id over the syncable scope, or
+     * null when the mirror holds no visible message. The "now" cursor
+     * for `new_only` syncs.
+     */
+    @Query(
+        """
+        SELECT MAX(id) FROM messages
+        WHERE hidden = 0
+          AND conversation_id IN (SELECT id FROM conversations WHERE in_vault = 0)
+        """,
+    )
+    suspend fun maxId(): Long?
+
+    /**
+     * Slice 2 — live states for a bounded id set. Vault conversations
+     * are excluded at the SQL level: a message whose conversation
+     * moved to the vault mid-session simply stops emitting. The
+     * caller never passes an empty list (see the repository guard).
+     */
+    @Query(
+        """
+        SELECT id, conversation_id, status, reaction_emoji, read, starred FROM messages
+        WHERE id IN (:ids)
+          AND conversation_id IN (SELECT id FROM conversations WHERE in_vault = 0)
+        """,
+    )
+    fun observeStates(ids: List<Long>): Flow<List<MessageStateRow>>
+}

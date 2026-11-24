@@ -1,0 +1,347 @@
+package com.relay.sms.data.mms
+
+import android.content.Context
+import com.relay.sms.domain.mms.MmsAttachment
+import com.relay.sms.pdu.CharacterSets
+import com.relay.sms.pdu.EncodedStringValue
+import com.relay.sms.pdu.PduBody
+import com.relay.sms.pdu.PduComposer
+import com.relay.sms.pdu.PduHeaders
+import com.relay.sms.pdu.PduPart
+import com.relay.sms.pdu.SendReq
+import dagger.hilt.android.qualifiers.ApplicationContext
+import timber.log.Timber
+import java.io.File
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Builds an MMS `m-send.req` PDU from a recorded voice clip + a list of recipients.
+ *
+ * Encoding follows OMA-MMS-ENC-V1_3 §6.1.1. The body is a multipart/related document with two
+ * parts: a SMIL "page" (root, for clients that expect a layout) plus the audio attachment
+ * itself. Even though many modern viewers ignore SMIL, including it keeps compatibility with
+ * legacy carrier gateways and feature-phone clients.
+ */
+@Singleton
+class MmsBuilder @Inject constructor(
+    @ApplicationContext private val context: Context,
+) {
+
+    /**
+     * Voice MMS shorthand — preserves the v1.1 API so existing callers compile unchanged.
+     * Internally a single-attachment wrapper around [buildMultipartSendReq].
+     *
+     * **v1.3.10 (revert)** : `textBody = null` restauré. La tentative d'injecter "🎤" comme
+     * caption (anti-filter OEM voicemail spam) a régressé l'envoi MMS vocal sur Samsung One
+     * UI (test S24 FE 2026-05-18). Hypothèse à creuser séparément avant de re-tenter.
+     */
+    fun buildVoiceSendReq(
+        audioFile: File,
+        mimeType: String,
+        recipients: List<String>,
+        subject: String? = null,
+        requestDeliveryReport: Boolean = false,
+    ): ByteArray? = buildMultipartSendReq(
+        attachments = listOf(MmsAttachment(audioFile, mimeType, MmsAttachment.Kind.AUDIO)),
+        textBody = null,
+        recipients = recipients,
+        subject = subject,
+        requestDeliveryReport = requestDeliveryReport,
+    )
+
+    /**
+     * Encodes a generic SendReq PDU with one or more attachments and an optional text body
+     * (#1 + #2). The SMIL document is generated from the attachment list so legacy gateways
+     * and feature-phone clients still receive a navigable presentation.
+     *
+     * Constraints:
+     *  - at least one attachment OR a non-blank text body must be present;
+     *  - per-recipient validation matches the voice path (rejects email-style routing).
+     *
+     * @return the encoded PDU bytes, or null if encoding failed (invalid recipient, IO error,
+     *   composer rejection). Callers treat null as a hard send failure.
+     */
+    fun buildMultipartSendReq(
+        attachments: List<MmsAttachment>,
+        textBody: String?,
+        recipients: List<String>,
+        subject: String? = null,
+        requestDeliveryReport: Boolean = false,
+    ): ByteArray? {
+        if (recipients.isEmpty()) return null
+        // v1.3.10 (Q1) — extract the trimmed caption ONCE so downstream uses smart-cast it as
+        // non-null instead of relying on `!!` after a separate `hasText` flag.
+        val caption = textBody?.takeIf { it.isNotBlank() }
+        if (attachments.isEmpty() && caption == null) return null
+        for (a in attachments) {
+            if (!a.file.exists() || a.file.length() == 0L) return null
+        }
+
+        val req = SendReq()
+        // Audit S-P2-7: refuse the build entirely if *any* recipient cannot be normalised to a
+        // PLMN-routable phone number. A single bad address can no longer slip through with the
+        // others; the caller (MmsSender) interprets the null return as a hard send failure and
+        // surfaces it to the UI rather than silently routing some recipients via email.
+        //
+        // BUG-MMS-Samsung (2026-05-15): Samsung One UI's bundled `SendReq` (under
+        // `/system/framework/framework.jar!classes6.dex`) **does NOT expose** the AOSP `addTo(
+        // EncodedStringValue)` method that ships with vanilla Android. Calling it throws
+        // `NoSuchMethodError` at runtime → the app crashes the moment the user hits Send.
+        // The setter `setTo(EncodedStringValue[])` IS present on every OEM (it's the
+        // foundational mutator used by AOSP's own `addTo` under the hood), so we pre-build
+        // the array and assign it once. Functionally equivalent, portable across Samsung,
+        // Pixel, Xiaomi, etc.
+        val recipientValues = ArrayList<EncodedStringValue>(recipients.size)
+        for (raw in recipients) {
+            val formatted = formatAddressForMms(raw) ?: return null
+            recipientValues += utf8(formatted)
+        }
+        if (!attachRecipientsCompat(req, recipientValues)) {
+            Timber.w("MmsBuilder: neither setTo(array) nor addTo(value) available on this OEM's SendReq")
+            return null
+        }
+        if (!subject.isNullOrBlank()) req.subject = utf8(subject)
+        // Optional for the standard, but sent by AOSP Messaging on every MMS: same values (issue #53).
+        req.messageClass = PduHeaders.MESSAGE_CLASS_PERSONAL_STR.toByteArray()
+        req.expiry = EXPIRY_SECONDS
+        req.priority = PduHeaders.PRIORITY_NORMAL
+        req.deliveryReport = if (requestDeliveryReport) PduHeaders.VALUE_YES else PduHeaders.VALUE_NO
+        req.readReport = PduHeaders.VALUE_NO
+
+        val body = PduBody()
+        var totalSize = 0L
+
+        // Optional text part — encoded as UTF-8 text/plain, named "text.txt".
+        val textPart: PduPart? = caption?.let { text ->
+            val bytes = text.toByteArray(Charsets.UTF_8)
+            totalSize += bytes.size
+            PduPart().apply {
+                contentType = "text/plain".toByteArray()
+                contentId = "text".toByteArray()
+                contentLocation = "text.txt".toByteArray()
+                data = bytes
+                charset = CharacterSets.UTF_8
+            }
+        }
+
+        // Indexed attachment parts — each gets a stable content-id ("a0", "a1", …) referenced
+        // from the SMIL document. Names are passed through `safeAttachmentName` so a future
+        // caller feeding arbitrary `file.name` cannot break the multipart envelope.
+        val attachmentParts = attachments.mapIndexed { idx, a ->
+            val safeName = safeAttachmentName(a.file.name, idx)
+            val bytes = runCatching { a.file.readBytes() }.getOrNull() ?: return null
+            totalSize += bytes.size
+            PduPart().apply {
+                contentType = a.mimeType.toByteArray()
+                contentLocation = safeName.toByteArray()
+                contentId = "a$idx".toByteArray()
+                name = safeName.toByteArray()
+                data = bytes
+            }
+        }
+
+        // SMIL part is the root presentation document — must be index 0 in the body. Build the
+        // markup with the attachment list (and optional text) so the SMIL stays in sync with
+        // what we actually send.
+        val smilXml = buildSmil(
+            attachments = attachments.mapIndexed { idx, a -> Pair(safeAttachmentName(a.file.name, idx), a.kind) },
+            includeText = caption != null,
+        )
+        val smilPart = PduPart().apply {
+            contentType = "application/smil".toByteArray()
+            contentId = "smil".toByteArray()
+            contentLocation = "smil.xml".toByteArray()
+            // No charset, as in AOSP Messaging: file names are reduced to ASCII by safeAttachmentName.
+            data = smilXml.toByteArray(Charsets.UTF_8)
+        }
+        appendPart(body, 0, smilPart)
+        totalSize += smilPart.data.size
+
+        textPart?.let { appendPart(body, it) }
+        for (p in attachmentParts) appendPart(body, p)
+        req.body = body
+        req.messageSize = totalSize
+
+        return try {
+            PduComposer(context, req).make()
+        } catch (t: Throwable) {
+            Timber.w(t, "PduComposer failed")
+            null
+        }
+    }
+
+    /**
+     * Builds a minimal SMIL page describing the attachments. Each entry produces one `<par>`
+     * with the element matching the [MmsAttachment.Kind] (audio → `<audio>`, image → `<img>`,
+     * video → `<video>`, other → `<ref>`). The optional text body precedes the attachments so
+     * gateways that render only the SMIL "first paragraph" still surface the user's caption.
+     *
+     * Audit S-P2-5: every filename is XML-escaped via [xmlEscape] before interpolation so an
+     * attacker-controlled name (future share-target intent) cannot break out of the attribute.
+     *
+     * Regions and elements are those of AOSP Messaging (`MmsUtils`), so that a carrier's gateway reading
+     * the SMIL finds the layout it sees from Android's own client (issue #53).
+     */
+    private fun buildSmil(
+        attachments: List<Pair<String, MmsAttachment.Kind>>,
+        includeText: Boolean,
+    ): String {
+        val parts = buildString {
+            if (includeText) append("""<par dur="5000ms"><text src="text.txt" region="Text" /></par>""")
+            for ((rawName, kind) in attachments) {
+                val safe = xmlEscape(rawName)
+                append(
+                    when (kind) {
+                        MmsAttachment.Kind.AUDIO ->
+                            """<par dur="60000ms"><audio src="$safe" dur="60000ms" /></par>"""
+                        MmsAttachment.Kind.IMAGE ->
+                            """<par dur="5000ms"><img src="$safe" region="Image" /></par>"""
+                        MmsAttachment.Kind.VIDEO ->
+                            """<par dur="60000ms"><video src="$safe" dur="60000ms" region="Image" /></par>"""
+                        MmsAttachment.Kind.OTHER ->
+                            """<par dur="5000ms"><ref src="$safe" /></par>"""
+                    },
+                )
+            }
+        }
+        val hasVisual = attachments.any { (_, kind) ->
+            kind == MmsAttachment.Kind.IMAGE || kind == MmsAttachment.Kind.VIDEO
+        }
+        val regions = when {
+            hasVisual && includeText ->
+                """<region id="Image" fit="meet" top="0" left="0" height="80%" width="100%"/>""" +
+                    """<region id="Text" top="80%" left="0" height="20%" width="100%"/>"""
+            hasVisual -> """<region id="Image" fit="meet" top="0" left="0" height="100%" width="100%"/>"""
+            includeText -> """<region id="Text" top="0" left="0" height="100%" width="100%"/>"""
+            else -> ""
+        }
+        return """<smil><head><layout><root-layout/>$regions</layout></head><body>$parts</body></smil>"""
+    }
+
+    /** UTF-8, as AOSP does: `EncodedStringValue(String)` here means ISO-8859-1. */
+    private fun utf8(text: String) = EncodedStringValue(CharacterSets.UTF_8, text.toByteArray(Charsets.UTF_8))
+
+    /**
+     * Cross-OEM helper to append a [PduPart] at the end of a [PduBody]. Samsung One UI 6 also
+     * dropped the 1-arg `addPart(PduPart)` method on top of removing `SendReq.addTo`, so we
+     * mirror the same reflection strategy: prefer the 1-arg form, fall back to the 2-arg
+     * indexed variant using the current parts count as the insertion position.
+     */
+    private fun appendPart(body: PduBody, part: PduPart) {
+        // 1-arg addPart — AOSP standard, missing on Samsung One UI 6+.
+        runCatching {
+            val method = body.javaClass.getMethod("addPart", PduPart::class.java)
+            method.invoke(body, part)
+            return
+        }.onFailure { Timber.d("MmsBuilder.addPart(PduPart) reflection miss: %s", it.message) }
+        // 2-arg addPart(int, PduPart) — present everywhere (it's the underlying mutator).
+        runCatching {
+            val countMethod = body.javaClass.getMethod("getPartsNum")
+            val count = countMethod.invoke(body) as Int
+            val method = body.javaClass.getMethod("addPart", Int::class.javaPrimitiveType, PduPart::class.java)
+            method.invoke(body, count, part)
+            return
+        }.onFailure { Timber.d("MmsBuilder.addPart(int, PduPart) reflection miss: %s", it.message) }
+        Timber.w("MmsBuilder: no addPart variant available — PDU will be missing parts")
+    }
+
+    /** Indexed variant — only used for inserting the SMIL part at position 0. */
+    private fun appendPart(body: PduBody, index: Int, part: PduPart) {
+        runCatching {
+            val method = body.javaClass.getMethod("addPart", Int::class.javaPrimitiveType, PduPart::class.java)
+            method.invoke(body, index, part)
+            return
+        }.onFailure { Timber.d("MmsBuilder.addPart(int, PduPart) reflection miss: %s", it.message) }
+        Timber.w("MmsBuilder: indexed addPart unavailable — SMIL part may end up at wrong position")
+    }
+
+    /**
+     * Cross-OEM helper to attach the recipients to a [SendReq]. The vanilla AOSP `SendReq`
+     * exposes `addTo(EncodedStringValue)`, but Samsung One UI 6+ ships a variant that **only**
+     * has the parent-class `setTo(EncodedStringValue[])` — calling `addTo` there throws
+     * `NoSuchMethodError` at runtime (the SDK stub claims the method exists, the OEM's
+     * `framework.jar` doesn't, the linker is happy at compile but explodes when the bytecode
+     * runs). We reach the right setter via reflection and try both routes so the code keeps
+     * working on Pixel / AOSP / Samsung / Xiaomi without a build matrix per OEM.
+     *
+     * Returns `true` if at least one form took. `false` only when the device's framework has
+     * **neither** signature, which would be a deep OEM regression — we surface it to the
+     * caller as a hard build failure rather than producing a recipientless PDU.
+     */
+    private fun attachRecipientsCompat(req: SendReq, values: List<EncodedStringValue>): Boolean {
+        // Preferred route: setTo([]). Defined on `MultimediaMessagePdu` (parent class of SendReq)
+        // and present on every Android version since the API was added in Froyo. Universal.
+        runCatching {
+            val arr = java.lang.reflect.Array.newInstance(EncodedStringValue::class.java, values.size)
+            for ((i, v) in values.withIndex()) java.lang.reflect.Array.set(arr, i, v)
+            val method = req.javaClass.getMethod("setTo", arr.javaClass)
+            method.invoke(req, arr)
+            return true
+        }.onFailure { Timber.d("MmsBuilder.setTo reflection miss: %s", it.message) }
+
+        // Fallback: addTo() one-by-one. AOSP standard, missing on Samsung One UI 6+.
+        runCatching {
+            val method = req.javaClass.getMethod("addTo", EncodedStringValue::class.java)
+            for (v in values) method.invoke(req, v)
+            return true
+        }.onFailure { Timber.d("MmsBuilder.addTo reflection miss: %s", it.message) }
+
+        return false
+    }
+
+    /**
+     * Sanitises an attachment filename for SMIL/Content-Location use. We strip every character
+     * outside the conservative `[A-Za-z0-9._-]` set and fall back to a stable indexed name
+     * when the input degenerates to an empty string. Keeps the encoded PDU portable across
+     * legacy gateways that choke on Unicode in part headers.
+     */
+    private fun safeAttachmentName(raw: String, index: Int): String {
+        val cleaned = raw.replace(UNSAFE_NAME_CHARS, "_").trim('_')
+        return if (cleaned.isEmpty()) "attachment_$index" else cleaned.take(64)
+    }
+
+    /** Minimal XML attribute escape covering the five entities required by XML 1.0 §2.4. */
+    private fun xmlEscape(input: String): String = buildString(input.length) {
+        for (ch in input) when (ch) {
+            '&' -> append("&amp;")
+            '<' -> append("&lt;")
+            '>' -> append("&gt;")
+            '"' -> append("&quot;")
+            '\'' -> append("&apos;")
+            else -> append(ch)
+        }
+    }
+
+    /**
+     * Normalises a recipient phone number for MMS routing. Strips spaces / dashes / parentheses
+     * and appends the "/TYPE=PHONE" suffix the MMSC uses to route over PLMN rather than email.
+     *
+     * Audit S-P2-7: **refuses email-style addresses** (`@`). The MMSC accepts them as routing
+     * targets, which would otherwise allow a manipulated composer (future re-forward, share-target
+     * intent) to exfiltrate a voice message to `attacker@evil.example` over the operator's MMS
+     * gateway — a discreet side-channel the user would never see. Returns `null` so the caller
+     * can fail the send loudly rather than silently re-route.
+     */
+    private fun formatAddressForMms(raw: String): String? {
+        val clean = raw.replace(PHONE_NOISE, "")
+        if (clean.contains('@')) return null
+        if (clean.endsWith("/TYPE=PLMN")) return clean
+        // Basic E.164-ish sanity: + optional, digits only, 6 to 15 chars.
+        if (!clean.matches(E164_LIKE)) return null
+        return "$clean/TYPE=PLMN"
+    }
+
+    private companion object {
+        /** Seven days, AOSP Messaging's `DEFAULT_EXPIRY_TIME_IN_SECONDS`. */
+        private const val EXPIRY_SECONDS = 7L * 24L * 60L * 60L
+
+        /** v1.3.10 (P3) — Regex patterns hoisted to module-level constants. `Regex(...)` compiles
+         *  an NFA at construction; running it from the hot path of every recipient × every
+         *  attachment allocated a fresh automaton each time. Single shared instances are safe
+         *  because [Regex] is thread-safe (immutable matcher state). */
+        private val UNSAFE_NAME_CHARS = Regex("[^A-Za-z0-9._-]")
+        private val PHONE_NOISE = Regex("[\\s\\-()]")
+        private val E164_LIKE = Regex("^\\+?\\d{6,15}$")
+    }
+}

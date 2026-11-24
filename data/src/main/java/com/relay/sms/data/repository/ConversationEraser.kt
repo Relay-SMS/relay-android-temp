@@ -1,0 +1,684 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.data.repository
+
+import androidx.room.withTransaction
+import com.relay.sms.core.result.runCatchingCancellable
+import com.relay.sms.data.local.db.AppDatabase
+import com.relay.sms.data.local.db.ScheduledAttachmentCodec
+import com.relay.sms.data.local.db.dao.ConversationDao
+import com.relay.sms.data.local.db.dao.MessageDao
+import com.relay.sms.data.sms.SystemCopyEraser
+import com.relay.sms.domain.notification.ConversationNotificationCanceller
+import com.relay.sms.domain.repository.ConversationDeleteResult
+import com.relay.sms.domain.repository.VaultPurgeResult
+import timber.log.Timber
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * v1.28.1 (revue externe GitLab !38458, 3e passe) — la suppression d'une conversation, **et sa
+ * copie dans le fournisseur du systeme**.
+ *
+ * # Pourquoi ce code a quitte `ConversationRepositoryImpl`
+ *
+ * Il y etait `private`, entoure de onze dependances dont neuf ne le concernent pas. Le tester
+ * demandait de construire tout le repository ; personne ne l'a fait, et le meme chemin a laisse
+ * passer trois defauts en trois versions. Ici les dependances sont peu nombreuses et toutes
+ * concernees, dont deux interfaces — un test peut donner un [SystemCopyEraser] qui refuse
+ * toujours et verifier ce qu'il advient de la conversation, sans appareil et sans role SMS.
+ *
+ * v1.28.3 — elles sont passees de trois a sept, et le KDoc disait encore « trois ». La hausse
+ * est assumee : la suppression d'une conversation a un cycle de vie plus large qu'on ne le
+ * croyait, et c'est precisement ce que la relecture externe a montre (F03, F04). Ce qui restait
+ * dehors ne disparaissait pas — les envois programmes et les fichiers de pieces jointes lui
+ * survivaient.
+ */
+@Singleton
+class ConversationEraser @Inject constructor(
+    private val database: AppDatabase,
+    private val conversationDao: ConversationDao,
+    private val messageDao: MessageDao,
+    private val systemCopy: SystemCopyEraser,
+    // v1.28.3 (F03) — les envois programmés d'une conversation doivent partir avec elle. Sans
+    // cela, une purge du coffre laissait un envoi futur porteur du contenu qu'elle prétendait
+    // détruire. `conversation_id` n'étant pas une clé étrangère, aucune cascade ne s'en chargeait.
+    private val scheduledDao: com.relay.sms.data.local.db.dao.ScheduledMessageDao,
+    private val scheduler: com.relay.sms.domain.scheduler.ScheduledMessageScheduler,
+    // v1.28.3 (F04) — les lignes `attachments` partaient en cascade, jamais leurs FICHIERS.
+    private val attachmentDao: com.relay.sms.data.local.db.dao.AttachmentDao,
+    // v1.28.9 (septième note d'Andrew, constat 1) — un fichier peut être cité par plusieurs lignes :
+    // il ne part que lorsque plus aucune ne le cite. La règle et le bac à sable vivent là-bas.
+    private val fichiers: FichiersDePiecesJointes,
+    // v1.28.4 (F13) — la purge lève une barrière : on n'entre pas au coffre pendant qu'on le vide.
+    private val barriere: com.relay.sms.security.VaultPurgeBarrier,
+    // v1.28.6 — ce qui est supprimé ne doit plus être affiché. Les notifications déjà posées
+    // survivaient à toute suppression : le seul appel d'annulation du dépôt vivait dans
+    // « marquer comme lu ». Supprimer une conversation non lue laissait donc son expéditeur et
+    // son texte dans le volet système, et « Supprimer toutes mes données » les y laissait tous.
+    // L'annulation est posée ICI, dans la règle unique de suppression, et non chez les
+    // appelants : c'est la place qui couvre la liste, le fil, la purge du coffre et la purge
+    // totale — le motif de défaut de ce dépôt étant précisément le correctif posé sur un seul
+    // des chemins jumeaux.
+    //
+    // Les trois chemins qui suppriment SANS passer par [erase] ni [eraseMessage] annulent eux
+    // aussi depuis la v1.28.7, chacun à sa manière : [purgeHistory] et la réconciliation de
+    // `TelephonySyncManager` par lot ([ConversationNotificationCanceller.cancelForMessages]),
+    // la fusion de doublons de `ConversationMirror` par conversation victime. Consignés en
+    // 1.28.6 par la relecture sécurité du delta final (S2/S3), où un premier commentaire
+    // affirmait à tort que ce point les couvrait tous.
+    private val notifications: ConversationNotificationCanceller,
+    // E2E (schema v22) — les notices « Messages are now end-to-end
+    // encrypted » / « security code changed » d'une conversation partent
+    // avec elle. Le DAO direct, pas le store (`:app` est inaccessible
+    // depuis `:data`) ; la suppression a lieu dans la transaction finale
+    // d'[erase], avec la ligne de conversation elle-même.
+    private val noticeDao: com.relay.sms.data.local.db.dao.E2eNoticeDao,
+) {
+
+    private companion object {
+        /**
+         * Une purge de retention peut porter sur des dizaines de milliers de lignes. On les lit
+         * par paquets, jamais d'un bloc : le corps des messages y passerait en entier.
+         */
+        const val TAILLE_DE_PAGE = 200
+    }
+
+    /**
+     * Supprime la conversation [id] localement ET la copie systeme de chacun de ses messages.
+     * Rend `true` si la copie systeme est demontrablement partie pour TOUS ses messages.
+     *
+     * La propagation precede le `DELETE` local : sans elle, une reimportation (rafraichissement
+     * manuel, retour du role SMS, restauration d'usine) ressusciterait chaque message et la
+     * conversation reapparaitrait de nulle part.
+     *
+     * v1.27.11 (revue externe GitLab !38458, constat 2) — la fonction **rend compte**. Elle
+     * gobait l'echec : le `runCatching` etait sans `onFailure`, et l'effacement systeme jetait le
+     * nombre de lignes. `ConversationRepository.delete` n'a rien a en faire — l'utilisateur qui
+     * efface un fil voit la ligne disparaitre, c'est ce qu'il a demande — mais [purgeVault] en a
+     * besoin : la, une copie systeme laissee derriere finit par revenir.
+     *
+     * v1.28.9 — ce n'est plus vrai du coffre : le geste de l'utilisateur passe par [supprimer], qui
+     * choisit [Mode.COFFRE] pour une conversation du coffre et laisse l'écran dire qu'elle est restée.
+     *
+     * v1.28.1 (meme revue, 3e passe, constat reproduit sur emulateur) — **rendre compte ne
+     * suffisait pas** : la ligne Room partait quand meme, y compris quand la copie systeme
+     * restait. Le premier essai de la porte « PIN oublie » refusait donc correctement de retirer
+     * le PIN, mais avait deja efface la conversation ; au second essai `idsInVault()` etait vide,
+     * [VaultPurgeResult] valait `0/0/0`, et `isComplete` etait vrai **par vacuite**. Le PIN
+     * partait, la copie systeme survivait, et la resynchronisation suivante la ressuscitait en
+     * clair. Exactement l'etat que la v1.27.11 pretendait empecher.
+     *
+     * [Mode.COFFRE] est le correctif, et il n'a pas besoin d'un journal de purge
+     * persistant : **la ligne du coffre EST le journal**. Conservee, elle est relue par
+     * `idsInVault()` au prochain essai comme apres un redemarrage, elle compte dans `remaining`,
+     * et la suppression systeme est retentee. Une ligne deja partie du fournisseur se declare
+     * absente : l'operation est idempotente.
+     *
+     * La suppression ordinaire reste en [Mode.ORDINAIRE] et doit le rester : qui efface un fil a
+     * demande qu'il disparaisse, et lui laisser une ligne qu'il croyait supprimee serait un
+     * mensonge dans l'autre sens. v1.28.9 — une exception, dite à l'écran : un PDU gardé qui résiste
+     * garde la ligne, sans quoi la reprise ressusciterait le message (cf. plus bas).
+     *
+     * v1.28.5 (sixième note d'Andrew, point 1) — **le drapeau booléen mentait par omission.**
+     * `purgeVault(force = true)` appelait `erase(preserveOnSystemFailure = false)`, et ce même
+     * drapeau gardait AUSSI le compte des dépendants et la relecture d'arrivée tardive. Sous
+     * `force`, un `delete()` refusé ou un `cancel()` qui lève passait donc à la suppression du
+     * parent avec `localeComplete = true` : la sortie assumée, qui ne doit lever que la condition
+     * « copie système », effaçait le journal de reprise et se disait localement complète. Ma note
+     * du 10 septembre affirmait le contraire du code. Trois contrats, trois noms : [Mode].
+     */
+    suspend fun erase(id: Long, mode: Mode = Mode.ORDINAIRE): Issue {
+        var systemCopyGone = true
+        var connus: Set<Long> = emptySet()
+        // v1.28.9 — une annulation de coroutine n'est pas une copie système qui résiste : elle remonte
+        // (relecture GPT 5.2 du 2026-09-14, constat 3).
+        runCatchingCancellable {
+            val balayes = messageDao.findByConversation(id)
+            for (m in balayes) if (!systemCopy.erase(m)) systemCopyGone = false
+            connus = balayes.mapTo(HashSet(balayes.size)) { it.id }
+        }.onFailure {
+            systemCopyGone = false
+            Timber.w(it, "delete: system-provider sweep failed for conversation %d", id)
+        }
+        // Seule condition que la sortie assumée lève : la copie système qui résiste.
+        if (!systemCopyGone && mode == Mode.COFFRE) {
+            Timber.w("delete: conversation %d kept locally, its system copy survives", id)
+            return Issue(systemCopyGone = false, localeComplete = true, conservee = true)
+        }
+
+        // v1.28.4 (relecture externe, R01/R02) — les dépendants RENDENT COMPTE. Le travail
+        // WorkManager et les fichiers sont traités HORS transaction : idempotents, retentables,
+        // et l'on ne tient pas un verrou SQLite sur de l'entrée-sortie. Un seul échec et, pour
+        // le coffre, le parent est CONSERVÉ : c'est lui qui permettra de retrouver l'orphelin au
+        // prochain essai — supprimé, plus rien n'y mènerait, et la purge se dirait complète.
+        // v1.28.5 — forcée ou non : un dépendant qui reste est un échec LOCAL, et `force` n'y
+        // change rien. Il est retentable, contrairement à une liaison système durablement fausse.
+        // v1.28.9 (septième note d'Andrew, constat 1) — les fichiers des envois programmés ne sont
+        // plus effacés dans l'annulation : ils rejoignent ceux des messages, et partent ensemble
+        // s'ils ne sont plus cités hors de cette conversation.
+        val programmes = annulerLesTravauxProgrammes(id)
+        val possedes = supprimerFichiersPossedes(id, programmes.chemins)
+        // v1.28.9 (F17) — les PDU gardés de ses MMS, avant ses lignes : rejoués ensuite, ils la
+        // ressusciteraient. Même règle que les autres dépendants — un échec garde le parent du coffre.
+        val pdus = effacerPdusGardes(id)
+        val echecs = programmes.echecs + possedes.echecs + pdus.echecs
+        // v1.28.9 (relecture GPT 5.2 du code F17, constat 2) — un PDU qui résiste garde le parent EN MODE
+        // ORDINAIRE AUSSI. Un fichier orphelin est un résidu ; un PDU laissé derrière ses lignes est rejoué
+        // par la reprise, qui ne trouve plus la clé et réécrit le message : la conversation supprimée
+        // revenait. `eraseMessage` s'arrêtait déjà dans ce cas ; son jumeau, la conversation, ne le faisait
+        // pas. L'écran dit « non supprimée, réessayez » (`KEPT_LOCAL_FAILURE`).
+        if ((echecs > 0 && mode != Mode.ORDINAIRE) || pdus.echecs > 0) {
+            Timber.w("delete: conversation %d kept locally, %d dependant(s) not cleaned", id, echecs)
+            return Issue(systemCopyGone, localeComplete = false, conservee = true)
+        }
+
+        // v1.28.4 (relecture externe, R03) — la FIN est atomique : relecture et suppression dans
+        // UNE transaction d'écriture. SQLite n'a qu'un écrivain à la fois : un import ou une
+        // réception qui commet pendant la purge attend notre verrou, et ne peut plus se glisser
+        // entre la relecture et la suppression pour être emporté par la cascade avec sa copie
+        // système intacte. Un message arrivé AVANT est vu par la relecture et garde le parent.
+        // v1.28.5 — sous `force`, ce message part avec le parent, comme l'utilisateur l'a
+        // accepté ; mais sa copie système n'a jamais été présentée au fournisseur, et cela se
+        // DIT : résidu système, pas « supprimé ».
+        //
+        // v1.28.9 (B5, registre du 11 septembre) — la même relecture pour les FICHIERS. Une pièce
+        // jointe écrite entre la lecture de [supprimerFichiersPossedes] et cette transaction — la
+        // reprise d'un MMS reçu, par exemple — partait en cascade avec sa ligne, et son fichier
+        // restait sur le téléphone sans plus rien pour y mener. Relue ici, sous le verrou
+        // d'écriture : pour le coffre elle garde le parent, comme un message tardif ; ailleurs son
+        // fichier suit la conversation, une fois la transaction validée.
+        var cheminsTardifs: List<String> = emptyList()
+        val conservation = database.withTransaction {
+            // v1.28.9 (F17, audit de cohérence du 2026-09-14, C1) — un MMS arrivé pendant la suppression dont le
+            // PDU gardé est ENCORE LÀ garde le parent, dans tous les modes. L'effacement préalable ne l'a pas vu ;
+            // effacé après la validation, un échec ne pouvait plus que se journaliser, et la reprise réécrivait le
+            // message supprimé. Le prochain essai l'efface avant les lignes, comme les autres. La présence se relit
+            // par un listage du dossier des PDU : la seule entrée-sortie tenue sous ce verrou, courte, sans
+            // suppression.
+            val pduTardif = messageDao.findTransactionKeysForConversation(id)
+                .filterNot { it in pdus.cles }
+                .let { cles -> cles.isNotEmpty() && fichiers.pdusGardesPresents(cles) }
+            val tardif = mode != Mode.ORDINAIRE && messageDao.findByConversation(id).any { it.id !in connus }
+            val programmesRestants = scheduledDao.findForConversation(id)
+            cheminsTardifs = (
+                attachmentDao.findForConversation(id).map { it.localUri } +
+                    programmesRestants.flatMap { envoi ->
+                        ScheduledAttachmentCodec.decode(envoi.attachmentsJson).map { it.file.absolutePath }
+                    }
+                ).filterNot { it in possedes.chemins }
+            when {
+                tardif && mode == Mode.COFFRE -> Conservation.MESSAGE_TARDIF
+                // Sous `force` aussi : une pièce tardive est un dépendant pas encore traité, et
+                // `force` ne lève que la condition « copie système ». Partie avec le parent, son
+                // fichier deviendrait orphelin au premier effacement raté, sans plus aucun parent
+                // pour le retrouver — et le coffre relu vide se dirait complet.
+                cheminsTardifs.isNotEmpty() && mode != Mode.ORDINAIRE -> Conservation.PIECE_TARDIVE
+                pduTardif -> Conservation.PDU_TARDIF
+                else -> {
+                    if (tardif) systemCopyGone = false
+                    for (envoi in programmesRestants) scheduledDao.delete(envoi.id)
+                    // E2E — les notices de chiffrement de la conversation
+                    // partent avec elle, dans la même transaction.
+                    noticeDao.deleteForConversation(id)
+                    conversationDao.delete(id)
+                    null
+                }
+            }
+        }
+        conservation?.let { cause ->
+            Timber.w("delete: %s during sweep of conversation %d, parent kept", cause, id)
+            // Un message tardif n'a jamais été présenté au fournisseur ; une pièce ou un PDU tardif est un
+            // dépendant pas encore traité. Un seul retour : `erase` est à la limite de detekt.
+            return if (cause == Conservation.MESSAGE_TARDIF) {
+                Issue(systemCopyGone = false, localeComplete = true, conservee = true)
+            } else {
+                Issue(systemCopyGone, localeComplete = false, conservee = true)
+            }
+        }
+        // Les lignes sont parties avec la conversation : plus aucune citation à écarter.
+        val echecsTardifs = if (cheminsTardifs.isEmpty()) 0 else fichiers.effacerSiPlusCites(cheminsTardifs)
+        if (echecsTardifs > 0) {
+            Timber.w("delete: %d late file(s) of conversation %d not erased", echecsTardifs, id)
+        }
+        // La ligne locale est partie — et seulement dans ce cas. Les trois sorties ci-dessus
+        // CONSERVENT le parent : annuler ses notifications y aurait masqué une conversation
+        // toujours présente, l'inverse du contrat.
+        notifications.cancelAllForConversation(id)
+        // v1.28.9 — `localeComplete` dit la vérité en mode ordinaire aussi : la ligne est partie,
+        // mais un fichier ou un envoi programmé qui a résisté reste sur le téléphone, et la purge
+        // totale doit pouvoir le dire. Les modes du coffre n'arrivent jamais ici avec un échec :
+        // ils sont sortis plus haut, parent conservé.
+        return Issue(systemCopyGone, localeComplete = echecs == 0 && echecsTardifs == 0, conservee = false)
+    }
+
+    /**
+     * v1.28.5 — les trois contrats d'effacement, nommés, parce qu'un booléen en portait deux à
+     * la fois et que la sortie assumée en héritait un qu'elle n'aurait pas dû lever.
+     */
+    enum class Mode {
+        /** Suppression ordinaire : la ligne locale part quoi qu'il arrive. */
+        ORDINAIRE,
+
+        /** Purge du coffre : le parent est CONSERVÉ sur tout échec — copie système, dépendant, arrivée tardive. */
+        COFFRE,
+
+        /**
+         * Sortie assumée : SEULE la condition « copie système » est levée. Un dépendant qui
+         * résiste garde le parent ; un message arrivé tard part, compté en résidu système.
+         */
+        COFFRE_FORCE,
+    }
+
+    /**
+     * v1.28.4 — ce qu'un effacement laisse derrière lui, dit séparément : la copie système
+     * ([systemCopyGone]) et les dépendants locaux — envois programmés, fichiers
+     * ([localeComplete]). Un parent conservé pour l'un ou l'autre motif compte dans `remaining`.
+     *
+     * v1.28.9 — [conservee] dit si la ligne locale est restée. Il ne se déduit pas des deux autres :
+     * sous `force`, une copie système qui résiste n'empêche pas la ligne de partir, et en mode
+     * ordinaire un fichier qui résiste non plus. Sans valeur par défaut : chaque sortie doit le dire.
+     */
+    data class Issue(val systemCopyGone: Boolean, val localeComplete: Boolean, val conservee: Boolean)
+
+    /**
+     * v1.28.9 (septième note d'Andrew, MR !38458, point 5) — **la suppression demandée par
+     * l'utilisateur**, celle de la liste et du fil.
+     *
+     * Elle appelait [erase] en [Mode.ORDINAIRE] pour toute conversation, coffre compris. Une
+     * conversation du coffre dont la copie système résiste — Relay n'est pas l'application SMS
+     * par défaut, ou l'identité de la ligne n'est pas prouvée — perdait alors sa ligne locale, et
+     * avec elle `in_vault`, le seul drapeau qui la protège : la synchronisation suivante la
+     * réimportait HORS du coffre, en clair. C'est le retour que F11 a fermé pour la rétention, et
+     * que son commentaire qualifie de pire que la suppression elle-même.
+     *
+     * Une conversation du coffre passe donc en [Mode.COFFRE] : conservée sur tout échec, et
+     * l'appelant le dit. Hors coffre, le contrat ordinaire ne change pas — la purge totale et la
+     * purge du leurre continuent d'appeler [erase] directement.
+     *
+     * Un état illisible n'est pas « hors coffre » : on ne supprime pas ce qu'on ne sait pas protéger.
+     * Limite assumée : le mode est choisi à la lecture. Une conversation déplacée au coffre PENDANT
+     * sa propre suppression suivrait le mode lu ; l'interface ne permet pas ce geste, et la barrière
+     * de purge ne peut pas servir ici — elle refuse deux balayages simultanés.
+     */
+    suspend fun supprimer(id: Long): ConversationDeleteResult {
+        val conversation = runCatchingCancellable { conversationDao.findById(id) }.getOrElse {
+            Timber.w(it, "delete: etat de la conversation %d illisible, rien n'est supprime", id)
+            return ConversationDeleteResult.KEPT_LOCAL_FAILURE
+        } ?: return ConversationDeleteResult.DELETED
+        val mode = if (conversation.inVault) Mode.COFFRE else Mode.ORDINAIRE
+        // Une exception ici vient de la transaction finale : annulée, la conversation est restée.
+        val issue = runCatchingCancellable { erase(id, mode) }.getOrElse {
+            Timber.w(it, "delete: conversation %d non supprimee", id)
+            return ConversationDeleteResult.KEPT_LOCAL_FAILURE
+        }
+        return when {
+            !issue.conservee -> ConversationDeleteResult.DELETED
+            !issue.localeComplete -> ConversationDeleteResult.KEPT_LOCAL_FAILURE
+            else -> ConversationDeleteResult.KEPT_SYSTEM_COPY
+        }
+    }
+
+    /**
+     * v1.28.3 (F03) — annule et efface les envois programmés d'une conversation qui disparaît.
+     *
+     * `scheduled_messages.conversation_id` n'est pas une clé étrangère — c'est délibéré, un envoi
+     * programmé pouvant survivre à une fusion de doublons — mais rien n'exigeait en retour que la
+     * conversation parente survive. Une purge du coffre laissait donc partir, plus tard, un
+     * message porteur du contenu qu'elle venait d'annoncer détruit, PIN retiré.
+     *
+     * Appliqué aussi à la suppression ordinaire, et non au seul coffre : un envoi programmé vers
+     * un fil que l'utilisateur a effacé n'a pas plus de raison de partir. Poser le garde sur le
+     * seul chemin qui l'a motivé est précisément ce qui a produit la moitié des défauts de cette
+     * relecture.
+     *
+     * L'annulation `WorkManager` passe avant l'effacement de la ligne, comme dans
+     * `CancelScheduledMessageUseCase` : l'ordre inverse laisserait un worker se réveiller sur une
+     * ligne absente. Chaque envoi est isolé — un échec ne doit pas empêcher les suivants ni la
+     * suppression de la conversation.
+     */
+    private suspend fun annulerLesTravauxProgrammes(conversationId: Long): Dependants {
+        // v1.28.4 (R01) — une énumération qui échoue n'est PAS une liste vide : c'est un échec.
+        val programmes = runCatchingCancellable { scheduledDao.findForConversation(conversationId) }
+            .onFailure { Timber.w(it, "delete: lecture des envois programmes de %d echouee", conversationId) }
+            .getOrNull() ?: return Dependants(echecs = 1, chemins = emptySet())
+        var echecs = 0
+        val chemins = LinkedHashSet<String>()
+        for (envoi in programmes) {
+            runCatching {
+                scheduler.cancel(envoi.id)
+                // v1.28.9 (septième note d'Andrew, constat 1) — les fichiers ne sont plus effacés
+                // ici. Les messages que cet envoi a produits les citent aussi, dans cette
+                // conversation ou dans une autre : ils rejoignent ceux des messages et partent
+                // ensemble, s'ils ne sont plus cités ailleurs.
+                //
+                // Un envoi dont l'annulation lève compte en échec : en mode coffre le parent est
+                // conservé, fichiers compris. En mode ordinaire sa ligne part quand même avec la
+                // conversation dans la transaction finale, et ses fichiers la suivent, relus en
+                // tardifs : le worker qui se réveille ne trouve plus de ligne et n'envoie rien.
+                // Limite antérieure, inchangée : un envoi DÉJÀ en vol à cet instant peut perdre ses
+                // fichiers sous lui (relecture GPT 5.2 du 2026-09-14, constat 2).
+                ScheduledAttachmentCodec.decode(envoi.attachmentsJson).mapTo(chemins) { it.file.absolutePath }
+            }.onFailure {
+                echecs++
+                Timber.w(it, "delete: envoi programme %d non annule", envoi.id)
+            }
+        }
+        // La ligne elle-même part dans la transaction finale d'[erase], avec le parent.
+        if (programmes.isNotEmpty()) {
+            Timber.i(
+                "delete: %d envoi(s) programme(s) annule(s) avec la conversation %d (%d echec(s))",
+                programmes.size,
+                conversationId,
+                echecs,
+            )
+        }
+        return Dependants(echecs, chemins)
+    }
+
+    /**
+     * v1.28.9 — ce qu'une aide d'[erase] a laissé derrière elle ([echecs]), et les fichiers qu'elle
+     * a pris en charge ([chemins]) : la transaction finale relit la conversation et traite comme
+     * tardif tout fichier qui n'y figure pas.
+     */
+    private data class Dependants(val echecs: Int, val chemins: Set<String>)
+
+    /**
+     * v1.28.9 (F17) — les PDU MMS gardés pour reprise des messages de la conversation, effacés AVANT ses
+     * lignes : rejoués ensuite, ils la ressusciteraient. [PdusGardes.cles] sont celles vues ici ; la
+     * transaction finale traite en tardives celles qui n'y figurent pas.
+     */
+    private suspend fun effacerPdusGardes(conversationId: Long): PdusGardes {
+        val cles = runCatchingCancellable { messageDao.findTransactionKeysForConversation(conversationId) }
+            .onFailure { Timber.w(it, "delete: cles de transaction de %d illisibles", conversationId) }
+            .getOrNull() ?: return PdusGardes(echecs = 1, cles = emptySet())
+        return PdusGardes(fichiers.effacerPdusGardes(cles), cles.toSet())
+    }
+
+    private data class PdusGardes(val echecs: Int, val cles: Set<String>)
+
+    /**
+     * v1.28.9 (B5) — pourquoi la transaction finale d'[erase] a gardé le parent. [PDU_TARDIF] (audit de cohérence
+     * du 2026-09-14, C1) vaut dans tous les modes : un PDU gardé encore là ressusciterait le message effacé avec la
+     * conversation.
+     */
+    private enum class Conservation { MESSAGE_TARDIF, PIECE_TARDIVE, PDU_TARDIF }
+
+    /**
+     * v1.28.3 (F04) — efface les FICHIERS des pièces jointes, que la cascade Room laissait
+     * derrière elle.
+     *
+     * `AttachmentEntity` est en `ForeignKey.CASCADE` : ses lignes partaient bien, mais
+     * `local_uri` désigne un fichier de `filesDir`, et plus rien ne le référençait ensuite. Le
+     * contenu d'une conversation purgée du coffre — images, audio — restait donc en clair sur
+     * l'appareil jusqu'à une désinstallation ou un effacement d'urgence. `AutoLockObserver`
+     * documente d'ailleurs que ce dossier n'est volontairement pas purgé par le verrouillage,
+     * en renvoyant au nettoyage d'urgence : personne n'avait vu que la purge du coffre, elle,
+     * aurait dû s'en charger.
+     *
+     * Deux garde-fous :
+     *
+     *  - les `content://` sont ignorés. Ce sont les parties du fournisseur système d'un MMS
+     *    importé, pas nos fichiers ; leur sort relève de [SystemCopyEraser].
+     *  - un chemin hors du bac à sable de l'application est refusé et journalisé. Une sauvegarde
+     *    restaurée d'un AUTRE appareil peut porter des `local_uri` étrangers — c'est le défaut
+     *    exact que la v1.27.11 a fermé sur `telephony_uri`, et un chemin de suppression ne doit
+     *    pas le rouvrir sous une autre forme.
+     */
+    /*
+     * v1.28.9 (septième note d'Andrew, constat 1) — les deux garde-fous ci-dessus vivent désormais
+     * dans [FichiersDePiecesJointes], avec la règle qui manquait : un fichier encore cité HORS de
+     * cette conversation — par le fil individuel d'un destinataire, par l'écho de groupe, par un
+     * envoi programmé d'ailleurs — reste. [cheminsProgrammes] sont ceux des envois programmés de la
+     * conversation, relevés après leur annulation.
+     */
+    private suspend fun supprimerFichiersPossedes(conversationId: Long, cheminsProgrammes: Set<String>): Dependants {
+        // v1.28.4 (R02) — une énumération qui échoue n'est PAS une liste vide : c'est un échec.
+        // v1.28.9 — et rien n'est pris en charge : la transaction finale traitera en tardif tout ce
+        // qu'elle trouvera, au lieu de laisser des fichiers derrière des lignes supprimées.
+        val pieces = runCatchingCancellable { attachmentDao.findForConversation(conversationId) }
+            .onFailure { Timber.w(it, "delete: lecture des pieces jointes de %d echouee", conversationId) }
+            .getOrNull() ?: return Dependants(echecs = 1, chemins = emptySet())
+        val chemins = LinkedHashSet<String>()
+        pieces.mapTo(chemins) { it.localUri }
+        chemins += cheminsProgrammes
+        val echecs = fichiers.effacerSiPlusCites(
+            chemins,
+            FichiersDePiecesJointes.Exclusion.Conversation(conversationId),
+        )
+        return Dependants(echecs, chemins)
+    }
+
+    /**
+     * v1.28.5 (audit de cohérence C1) — **la suppression d'UN message emporte ses fichiers**, comme
+     * celle d'une conversation depuis F04. `deleteMessage` vivait dans le repository, hors de cet
+     * effaceur : la ligne `attachments` partait en cascade, le fichier de `filesDir` restait en
+     * clair. C'est la classe de défaut fermée en 1.28.3 pour la conversation entière, rouverte
+     * sur le chemin le plus fréquent — supprimer UN MMS gênant plutôt que tout le fil.
+     *
+     * Contrat de la suppression ordinaire : la ligne locale part quoi qu'il arrive ; un fichier
+     * qui résiste est journalisé, pas retenu — il n'y a ici aucune décision de sécurité qui
+     * dépende de la propagation (cf. [purgeHistory]).
+     */
+    suspend fun eraseMessage(messageId: Long) {
+        val msg = messageDao.findById(messageId) ?: return
+        // v1.28.9 (septième note d'Andrew, point mineur 3) — les pièces jointes sont lues AVANT de
+        // toucher à quoi que ce soit, et une lecture qui échoue ARRÊTE la suppression. Elle rendait
+        // une liste vide : le message partait, ses lignes `attachments` en cascade, et ses fichiers
+        // restaient sur le téléphone sans plus rien pour y mener. Le message reste à l'écran —
+        // l'utilisateur voit que rien n'a été supprimé et peut réessayer —, et sa copie système
+        // n'est pas touchée : une copie partie sous une ligne restée serait l'état incohérent.
+        val pieces = runCatchingCancellable { attachmentDao.findForMessage(messageId) }
+            .onFailure { Timber.w(it, "deleteMessage: lecture des pieces jointes de %d echouee, abandon", messageId) }
+            .getOrNull() ?: return
+        // v1.28.9 (F17) — le PDU gardé de ce MMS part AVANT lui : rejoué après la suppression, il le
+        // ressusciterait. S'il résiste, la suppression s'arrête, comme pour une lecture ratée — le message
+        // reste à l'écran et le geste peut être refait.
+        val cle = msg.mmsTransactionKey
+        if (cle != null && fichiers.effacerPdusGardes(listOf(cle)) > 0) {
+            Timber.w("deleteMessage: PDU garde de %d non efface, abandon", messageId)
+            return
+        }
+        runCatching { systemCopy.erase(msg) }
+            .onFailure { Timber.w(it, "deleteMessage: system copy of %d not erased", messageId) }
+        // v1.28.9 (constat 1) — un fichier que cite un autre message — autre destinataire, écho de
+        // groupe — ou un envoi programmé reste : seul ce message est écarté du compte.
+        val connus = pieces.mapTo(LinkedHashSet()) { it.localUri }
+        val echecs = fichiers.effacerSiPlusCites(connus, FichiersDePiecesJointes.Exclusion.Message(messageId))
+        if (echecs > 0) Timber.w("deleteMessage: %d fichier(s) de %d non efface(s)", echecs, messageId)
+        // v1.24.0 (bug suppression) — atomique : effacer le message ET recalculer l'aperçu de la
+        // conversation. Sans le refresh, supprimer le dernier message d'un fil laissait la liste
+        // afficher le message supprimé indéfiniment (confirmé sur une vraie sauvegarde 2026-07-23).
+        // v1.28.9 (B5) — et relire ses pièces jointes sous le verrou d'écriture, comme [erase] : une
+        // pièce écrite depuis la lecture partirait en cascade en laissant son fichier.
+        var tardives: List<String> = emptyList()
+        database.withTransaction {
+            tardives = attachmentDao.findForMessage(messageId).map { it.localUri }.filterNot { it in connus }
+            messageDao.delete(messageId)
+            messageDao.refreshConversationPreview(msg.conversationId)
+        }
+        if (tardives.isNotEmpty()) {
+            val echecsTardifs = fichiers.effacerSiPlusCites(tardives)
+            if (echecsTardifs > 0) {
+                Timber.w("deleteMessage: %d fichier(s) tardif(s) de %d non efface(s)", echecsTardifs, messageId)
+            }
+        }
+        // v1.28.6 — et sa notification, qui portait son texte.
+        notifications.cancelForMessage(msg.conversationId, messageId)
+    }
+
+    /**
+     * v1.28.1 — la purge de RETENTION, copie systeme comprise.
+     *
+     * # Le defaut, trouve en audit de coherence le 2026-09-08
+     *
+     * `delete`, `deleteMessage` et `deleteAllInVault` propageaient au fournisseur du systeme.
+     * La retention, **non** : elle faisait un `DELETE` SQL et s'arretait la. Deux consequences,
+     * aucune documentee nulle part — ni dans le code, ni dans le KDoc de l'interface :
+     *
+     *  1. les messages que l'utilisateur croyait effaces restaient dans `content://sms`, lisibles
+     *     par toute application ayant `READ_SMS`. La retention est un reglage de CONFIDENTIALITE ;
+     *     ne pas propager la vidait de son sens ;
+     *  2. le bouton « Resynchroniser », qui remet le curseur d'import a zero, les ramenait tous.
+     *
+     * # La recette etait ecrite DEUX fois
+     *
+     * `ConversationRepositoryImpl.purgeHistoryNow` et le cycle mensuel de `TelephonySyncWorker`
+     * portaient chacun leur transaction, leur `purgeOlderThan` et leur rafraichissement d'apercus
+     * — le commentaire du worker disait meme « comme le jumeau ». Corriger l'un sans l'autre
+     * aurait laisse la purge automatique, celle qui tourne sans que personne ne regarde, avec
+     * l'ancien comportement. Les deux appellent desormais ceci.
+     *
+     * # Le contrat, et pourquoi il differe de [purgeVault]
+     *
+     * La ligne locale part **quoi qu'il arrive**, comme pour une suppression ordinaire. Le coffre
+     * fait l'inverse, et la difference n'est pas un oubli : la seule regle qui vaille est
+     * *« la ligne locale ne survit a un echec de propagation que si une decision de SECURITE
+     * depend de cette propagation »*. Retirer le PIN du coffre est une telle decision — on exige
+     * donc la preuve. Une purge de retention n'en leve aucune protection : conserver la ligne y
+     * enfermerait l'utilisateur dans un historique qu'il a demande a voir disparaitre, sans rien
+     * proteger de plus.
+     *
+     * Ce qui n'a pas pu partir du fournisseur est journalise, pas tu.
+     *
+     * @return le nombre de lignes effacees en base, ce que l'interface promet depuis la v1.3.0.
+     */
+    suspend fun purgeHistory(cutoff: Long): Int {
+        var survivants = 0
+        var apresId = 0L
+        while (true) {
+            val page = messageDao.findMirroredOlderThan(cutoff, apresId, TAILLE_DE_PAGE)
+            if (page.isEmpty()) break
+            for (m in page) if (!systemCopy.erase(m)) survivants++
+            apresId = page.last().id
+        }
+        if (survivants > 0) {
+            Timber.w("purgeHistory: %d system copies survived the sweep", survivants)
+        }
+        // v1.26.1 (audit H9) — les deux ecritures sont ATOMIQUES. Sans transaction, il suffisait
+        // que le processus meure entre le DELETE et le rafraichissement pour que
+        // `conversations.last_message_preview` conserve LE CORPS EN CLAIR du message purge, et
+        // rien ne reparait cet etat : l'apercu perime etait PERMANENT.
+        // v1.28.7 — les notifications des messages purges partent avec eux. La retention faisait un
+        // DELETE de masse sans les annuler : un message efface restait lisible dans le volet. Les
+        // references sont lues dans la MEME transaction que le DELETE, avec la meme clause ;
+        // l'annulation vient apres la validation, jamais avant.
+        var purges: List<com.relay.sms.data.local.db.dao.MessageRef> = emptyList()
+        // v1.28.9 (septième note d'Andrew, constat 3) — les FICHIERS des pièces jointes purgées.
+        // Le `DELETE` emportait leurs lignes en cascade sans jamais lire leurs `local_uri` : les
+        // images et l'audio restaient dans `filesDir`, sans plus rien pour y mener. Relevés dans la
+        // même transaction et avec la même clause, effacés APRÈS la validation, et seulement s'ils
+        // ne sont plus cités : un écho de groupe récent, un favori ou un envoi programmé peut citer
+        // le même fichier qu'un message purgé.
+        //
+        // Ordre assumé, à l'inverse d'[erase] : ici aucun parent ne doit survivre à un échec, et
+        // décider AVANT le `DELETE` obligerait à recopier sa clause pour écarter les lignes purgées.
+        // Le prix est une fenêtre : un processus tué entre la validation et l'effacement laisse ces
+        // fichiers orphelins — journalisé, jamais présenté comme effacé.
+        var cheminsPurges: List<String> = emptyList()
+        // v1.28.9 (F17) — les PDU gardés des MMS purgés partent AVANT eux : rejoués ensuite, ils les
+        // ressusciteraient. Le contrat de la rétention ne change pas — les lignes partent quoi qu'il
+        // arrive ; un PDU qui résiste est journalisé. Ceux des messages entrés dans la clause entre
+        // cette lecture et la transaction sont relus dedans, et effacés après la validation.
+        val clesAvant = runCatchingCancellable { messageDao.findTransactionKeysOlderThan(cutoff) }
+            .onFailure { Timber.w(it, "purgeHistory: cles de transaction illisibles") }
+            .getOrDefault(emptyList())
+        val echecsPdu = fichiers.effacerPdusGardes(clesAvant)
+        var clesPurgees: List<String> = emptyList()
+        val efface = database.withTransaction {
+            purges = messageDao.findRefsOlderThan(cutoff)
+            cheminsPurges = messageDao.findAttachmentUrisOlderThan(cutoff)
+            clesPurgees = messageDao.findTransactionKeysOlderThan(cutoff)
+            val n = messageDao.purgeOlderThan(cutoff)
+            if (n > 0) {
+                // v1.3.3 (audit G1) — une conversation videe garderait sinon son apercu en clair.
+                messageDao.refreshAllConversationPreviewsAfterPurge()
+            }
+            n
+        }
+        if (efface > 0) notifications.cancelForMessages(purges.groupBy({ it.conversationId }, { it.id }))
+        if (cheminsPurges.isNotEmpty()) {
+            val echecs = fichiers.effacerSiPlusCites(cheminsPurges)
+            if (echecs > 0) Timber.w("purgeHistory: %d attachment file(s) not erased", echecs)
+        }
+        val echecsPduTardifs = fichiers.effacerPdusGardes(clesPurgees - clesAvant.toSet())
+        if (echecsPdu + echecsPduTardifs > 0) {
+            Timber.w("purgeHistory: %d kept MMS PDU(s) not erased", echecsPdu + echecsPduTardifs)
+        }
+        return efface
+    }
+
+    /**
+     * v1.27.10 — voir `ConversationRepository.deleteAllInVault`.
+     *
+     * Boucle sur [erase] plutot qu'un `DELETE` de masse : chaque conversation doit d'abord
+     * disparaitre du fournisseur du systeme, sinon la resynchronisation suivante la ressuscite
+     * hors du coffre. Une conversation qui echoue n'interrompt pas les autres — un coffre
+     * partiellement purge vaut mieux qu'un coffre intact dont l'utilisateur croit qu'il est vide.
+     *
+     * v1.27.11 (meme revue, constat 2) — ce qui a echoue est desormais COMPTE, et le coffre est
+     * RELU apres la boucle. L'appelant decide alors s'il retire le PIN ; il ne le retire plus sur
+     * un simple nombre de succes. Voir [VaultPurgeResult].
+     *
+     * v1.28.2 — [force] est la SORTIE ASSUMEE, et elle n'existe que parce que le refus prudent
+     * pouvait devenir une impasse definitive. Une liaison durablement fausse — un
+     * `telephony_uri` restaure d'un autre telephone — fait echouer le garde d'identite a chaque
+     * essai, a l'identique : l'utilisateur qui a oublie son PIN n'avait alors plus d'issue.
+     *
+     * Sous [force], la ligne locale part meme si sa copie systeme resiste. Ce n'est PAS un
+     * assouplissement du garde : la copie systeme n'est toujours pas supprimee sans preuve
+     * d'identite — on refuse toujours de toucher au message d'autrui. Ce qui change est
+     * l'arbitrage LOCAL, et il appartient a l'utilisateur, qui l'a explicitement demande apres
+     * qu'on lui a dit ce qui subsisterait. Le resultat continue de rendre `failed` : l'appelant
+     * doit le lui montrer, pas le taire.
+     *
+     * v1.28.5 (sixième note d'Andrew, point 2) — [apresPurge] s'exécute **sous la barrière**,
+     * avec le résultat. C'est là que l'appelant retire le PIN : entre le retour de cette fonction
+     * et le retrait, la barrière retombait, et une entrée au coffre pouvait se glisser après la
+     * relecture de `remaining`. Le PIN partait alors sur un coffre qui venait de se remplir.
+     */
+    suspend fun purgeVault(
+        force: Boolean = false,
+        apresPurge: suspend (VaultPurgeResult) -> Unit = {},
+    ): VaultPurgeResult = barriere.pendant {
+        var deleted = 0
+        var systemResidue = 0
+        var localFailures = 0
+        val mode = if (force) Mode.COFFRE_FORCE else Mode.COFFRE
+        for (id in conversationDao.idsInVault()) {
+            // v1.28.3 (F09) — les deux natures d'echec sont desormais comptees separement.
+            // `erase` attrape lui-meme tout ce qui touche au fournisseur du systeme : ce qui
+            // remonte jusqu'ici ne peut donc venir que de `conversationDao.delete`, c'est-a-dire
+            // d'un echec LOCAL. La distinction n'est pas cosmetique — elle decide si la sortie
+            // forcee a le droit de retirer le PIN. Cf. [VaultPurgeResult].
+            runCatching { erase(id, mode) }
+                .onSuccess { issue ->
+                    when {
+                        // v1.28.4 (R01/R02) — un dépendant resté derrière est un échec LOCAL, le
+                        // parent est conservé et compte dans `remaining` : jamais « complet ».
+                        !issue.localeComplete -> localFailures++
+                        issue.systemCopyGone -> deleted++
+                        else -> systemResidue++
+                    }
+                }
+                .onFailure {
+                    localFailures++
+                    Timber.w(it, "deleteAllInVault: conversation %d not deleted", id)
+                }
+        }
+        // Relu APRES la boucle, et non deduit d'elle : une conversation deplacee dans le coffre
+        // pendant la purge n'apparait dans aucun des compteurs ci-dessus.
+        val resultat = VaultPurgeResult(
+            deleted = deleted,
+            systemResidue = systemResidue,
+            localFailures = localFailures,
+            remaining = conversationDao.idsInVault().size,
+        )
+        apresPurge(resultat)
+        resultat
+    }
+}

@@ -1,0 +1,44 @@
+Relay is an ad-free, tracker-free SMS / MMS app for Android. It replaces the stock messaging app while keeping every message on your device — no cloud, no analytics, no third-party SDK shipping your data anywhere.
+
+<b>End-to-end encrypted messaging</b>
+
+Messages between two Relay users are end-to-end encrypted with vodozemac — text, reactions, photos, videos and voice messages, and texts in groups — sent as ordinary SMS/MMS directly between phones, with no server, no internet and no account. Keys never leave your phone. Safety numbers let you verify a contact's identity if you want to; verification is optional. Messages to people who don't use Relay stay plain SMS/MMS over the carrier, as they are everywhere else.
+
+<b>Your messages on every device</b>
+
+Link a desktop or tablet over your local network and read, search and send from there — the link itself is end-to-end encrypted, and it works with no internet connection. Or pair a second phone as a client: it mirrors your conversations without taking over the SIM.
+
+<b>Features</b>
+
+<ul>
+<li>SMS and MMS — full default-SMS-app support on Android 8 (API 26) through 15+</li>
+<li>Voice messages — push-to-talk recording sent as a real MMS, capped at 120 s / 280 KB so every carrier accepts it</li>
+<li>Notes — private local-only threads for text, photos, files and voice, never sent as SMS, with their own passphrase-protected backup</li>
+<li>Encrypted vault — hide sensitive conversations behind SQLCipher, with the key wrapped in the Android Keystore. Toggle "Lock vault on leave" to re-lock it every time the app goes to background</li>
+<li>Decoy PIN — a second PIN that opens the app in a decoy view where the vault stays invisible and inaccessible</li>
+<li>Emergency mode — hold the button for 3 s to send an alert SMS to your Safety Call contacts, with a single GPS fix if you granted location; without that permission the SMS still goes out, only without coordinates. Quick access to the emergency numbers of the country your phone is connected to, and shortcuts on the lockscreen notification. Placing the call directly is opt-in: by default the dialer simply opens pre-filled</li>
+<li>Biometric unlock — fingerprint or face, with a PIN fallback you set yourself</li>
+<li>Contextual reply — long-press a message, pick "Reply" and your composer shows a mini-quote so the recipient sees what you are answering</li>
+<li>Delegated translation — long-press a message and pick "Translate" to hand the text to whichever translation app you have installed (Google Translate, DeepL, Aves Translate …) through a system Intent. No translation model is bundled, and Relay itself sends nothing anywhere</li>
+<li>Scheduled messages — write an SMS, pick a date and time, and it is sent at that moment even if the app is closed</li>
+<li>OS-wide blocked numbers — at first launch, Relay mirrors the system blocklist (Phone app, Samsung Messages) and retroactively deletes the conversations that match</li>
+<li>Attachment picker — Photo, Video, File, Contact card. Photos are automatically re-encoded as JPEG to fit MMS carrier caps</li>
+<li>Full-text search across every conversation, with FTS4 indexing</li>
+<li>Export a conversation as a PDF for archival</li>
+<li>Encrypted local backup using a passphrase distinct from your unlock PIN</li>
+<li>Themes — Light / Dark / AMOLED / "Dark Tech" slate-blue accent</li>
+<li>English, French, German, Italian and Spanish UI</li>
+<li>Confirmation toggle in Settings → Send → "Confirm before send" requires a confirmation dialog before any SMS, MMS or attachment is dispatched</li>
+</ul>
+
+<b>Privacy</b>
+
+<ul>
+<li>No analytics, no crash reporters, no third-party tracking SDK</li>
+<li>No account, no server: Relay-to-Relay encryption and multi-device linking work with no internet connection at all. Only two features touch the internet, and only when you use them: GIF search (Klipy) and link previews</li>
+<li>Location and phone-call permissions serve Emergency mode only. Both are opt-in, neither is ever used in the background, and the app works without granting either</li>
+<li>Open source — source code at https://github.com/relay-sms/relay-android</li>
+<li>Security model documented at https://github.com/relay-sms/relay-android/blob/main/SECURITY.md</li>
+</ul>
+
+Project home: https://getrelaysms.com

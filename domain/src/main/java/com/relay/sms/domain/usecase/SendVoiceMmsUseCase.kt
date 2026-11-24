@@ -1,0 +1,268 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.domain.usecase
+
+import com.relay.sms.core.result.AppError
+import com.relay.sms.core.result.Outcome
+import com.relay.sms.domain.e2e.E2eMediaGate
+import com.relay.sms.domain.e2e.MediaFileInput
+import com.relay.sms.domain.mms.MmsDispatcher
+import com.relay.sms.domain.mms.OutgoingAttachmentStore
+import com.relay.sms.domain.model.PhoneAddress
+import com.relay.sms.domain.model.SendReport
+import com.relay.sms.domain.ownnumber.OwnNumberEnsurer
+import com.relay.sms.domain.repository.BlockedNumberRepository
+import com.relay.sms.domain.repository.OutgoingMessageMirror
+import com.relay.sms.domain.sender.DefaultSmsAppChecker
+import com.relay.sms.domain.settings.AppSettings
+import com.relay.sms.domain.settings.AppSettingsSource
+import kotlinx.coroutines.flow.first
+import java.io.File
+import javax.inject.Inject
+
+/**
+ * Sends a voice clip as an MMS to one or more recipients. Mirrors the broadcast semantics of
+ * [SendSmsUseCase]: one MMS row + dispatch per non-blocked recipient. For each recipient:
+ *
+ *  1. Mirror an OUTGOING/PENDING row in Room (with the audio AttachmentEntity)
+ *  2. Encode the SendReq PDU and hand it to [MmsDispatcher]
+ *  3. On dispatch failure (synchronous), flip the row to FAILED; the network-side
+ *     SENT/FAILED outcome arrives asynchronously via [MmsSentReceiver].
+ *
+ * Group-send own-number fix — the voice path bypasses
+ * [EnvoyerMessageUseCase], so a group voice MMS carries the same
+ * just-in-time own-number guard here ([OwnNumberEnsurer]): a
+ * still-blank number after detection fails fast with
+ * [AppError.OwnNumberMissing], before any mirror row exists.
+ *
+ * Round 48 — media encryption (1:1 only, never for groups), same
+ * shape as [SendMediaMmsUseCase]: the gate prepares (decide +
+ * encrypt + key-send) before any mirror row exists, the mirror
+ * row keeps the plaintext sender copy and carries the `encrypted`
+ * flag, and an encrypted voice clip dispatches via
+ * [MmsDispatcher.sendMediaMms] — NOT `sendVoiceMms`, which forces
+ * the AUDIO kind in the SMIL while a ciphertext part is an
+ * octet-stream OTHER. The voice path has no size cap today, so
+ * the gate gets none here (a Refuse can never fire for voice).
+ */
+class SendVoiceMmsUseCase @Inject constructor(
+    private val defaultAppManager: DefaultSmsAppChecker,
+    private val blockedRepo: BlockedNumberRepository,
+    private val mirror: OutgoingMessageMirror,
+    private val sender: MmsDispatcher,
+    private val settings: AppSettingsSource,
+    private val attachmentStore: OutgoingAttachmentStore,
+    private val ownNumberEnsurer: OwnNumberEnsurer,
+    private val mediaGate: E2eMediaGate = E2eMediaGate.NoOp,
+) {
+    private val envoi = EnvoiParDestinataire(blockedRepo, mirror)
+
+    suspend operator fun invoke(
+        recipients: List<PhoneAddress>,
+        audioFile: File,
+        mimeType: String,
+        durationMs: Long,
+        subId: Int? = null,
+        /** v1.28.3 (groupes) — cf. [SendSmsUseCase.invoke]. */
+        echoInGroup: Boolean = false,
+        /** v1.28.4 — MMS de groupe, même règle que [SendMediaMmsUseCase]. */
+        groupMms: Boolean = false,
+    ): Outcome<SendReport> {
+        // Group-send own-number fix — same guard as the router, same
+        // condition as the group branch below: a group voice MMS with
+        // a still-blank number fails fast here, before the audio is
+        // promoted and before any mirror row exists. 1:1 voice sends
+        // never reach this guard.
+        //
+        // One early failure, two sources, in order: the refusal
+        // check runs first (it never touches the number), the
+        // group-number guard second.
+        val groupeMms = groupMms && recipients.size > 1
+        val earlyFailure = refusPrealable(recipients, audioFile)
+            ?: if (groupeMms && !ownNumberEnsurer.ensureForGroupSend()) {
+                AppError.OwnNumberMissing
+            } else {
+                null
+            }
+        if (earlyFailure != null) return Outcome.Failure(earlyFailure)
+
+        // Audit H3 (v1.14.8) — on évite `flow.first()` (ouverture DataStore) sur chaque envoi.
+        //
+        // v1.27.2 — mais pas via `state.value`, qui rend les valeurs PAR DÉFAUT sur un processus
+        // non hydraté. Aligné sur [SendSmsUseCase] et [SendMediaMmsUseCase] : les trois chemins
+        // d'envoi lisent désormais la même chose de la même façon.
+        val s = settings.hydratedOrNull() ?: AppSettings()
+        val deliveryReports = s.sending.deliveryReports
+        val effectiveSubId = subId ?: s.sending.defaultSubId
+
+        // Promote the recorded clip out of `cacheDir/voice_mms/` (wiped on every lock cycle by
+        // AutoLockObserver + pruned by VoiceRecorder.pruneOld) into durable storage BEFORE
+        // mirroring/dispatch, so the sent voice bubble keeps playing back after a lock or a reboot.
+        // Cf. [OutgoingAttachmentStore].
+        val durableAudio = attachmentStore.promoteToDurable(audioFile)
+
+        if (groupMms && recipients.size > 1) {
+            return envoiDeGroupe(recipients, durableAudio, mimeType, durationMs, effectiveSubId, deliveryReports)
+        }
+
+        val now = System.currentTimeMillis()
+
+        // Round 48 — préparation du chiffrement AVANT toute ligne
+        // miroir (même raison que [SendMediaMmsUseCase]) : un seul
+        // fichier, et pas de plafond — la voix n'en a pas
+        // aujourd'hui, on n'en ajoute pas (un Refuse ne peut donc
+        // jamais se produire ici, mais le gate reste le même).
+        val prepared = mutableMapOf<String, E2eMediaGate.PrepareResult.Encrypted>()
+        try {
+            for (r in recipients) {
+                if (blockedRepo.isBlocked(r.raw)) continue
+                when (
+                    val result = mediaGate.prepareMediaSend(
+                        address = r.raw,
+                        files = listOf(MediaFileInput(durableAudio, mimeType)),
+                        maxTotalBytes = Long.MAX_VALUE,
+                        date = now,
+                        subId = effectiveSubId,
+                    )
+                ) {
+                    is E2eMediaGate.PrepareResult.Encrypted -> prepared[r.raw] = result
+                    is E2eMediaGate.PrepareResult.Plain,
+                    E2eMediaGate.PrepareResult.FallbackToPlain -> Unit
+                    is E2eMediaGate.PrepareResult.Refuse ->
+                        return Outcome.Failure(AppError.Validation(result.message))
+                }
+            }
+            // v1.28.3 (F21, second passage) — troisième occurrence du même `continue` muet, sur la
+            // voie VOCALE que personne ne citait. v1.28.4 — la boucle n'existe plus qu'une fois,
+            // dans [EnvoiParDestinataire] ; les trois voies ne peuvent plus diverger.
+            return envoi.parDestinataire(
+                recipients = recipients,
+                sansRemise = "no MMS dispatched",
+                miroir = { r, _ ->
+                    mirror.upsertOutgoingMms(
+                        address = r.raw,
+                        audioFile = durableAudio,
+                        mimeType = mimeType,
+                        durationMs = durationMs,
+                        date = now,
+                        subId = effectiveSubId,
+                        encrypted = prepared.containsKey(r.raw),
+                    )
+                },
+                envoi = { localId, r ->
+                    val encrypted = prepared[r.raw]
+                    try {
+                        if (encrypted != null) {
+                            // Voix chiffrée : sendMediaMms, pas
+                            // sendVoiceMms — ce dernier force le
+                            // genre AUDIO dans le SMIL, alors que
+                            // la partie chiffrée est un
+                            // octet-stream OTHER.
+                            sender.sendMediaMms(
+                                localMessageId = localId,
+                                recipients = listOf(r.raw),
+                                attachments = encrypted.attachments,
+                                textBody = null,
+                                subId = effectiveSubId,
+                                requestDeliveryReport = deliveryReports,
+                            )
+                        } else {
+                            sender.sendVoiceMms(
+                                localMessageId = localId,
+                                recipients = listOf(r.raw),
+                                audioFile = durableAudio,
+                                mimeType = mimeType,
+                                subId = effectiveSubId,
+                                requestDeliveryReport = deliveryReports,
+                            )
+                        }
+                    } finally {
+                        encrypted?.attachments?.forEach {
+                            runCatching { it.file.delete() }
+                        }
+                    }
+                },
+                echoDeGroupe = if (echoInGroup) {
+                    { statut ->
+                        mirror.upsertGroupEcho(
+                            addresses = recipients,
+                            body = "",
+                            date = now,
+                            subId = effectiveSubId,
+                            status = statut,
+                            attachments = listOf(
+                                com.relay.sms.domain.mms.MediaAttachmentSpec(
+                                    durableAudio,
+                                    mimeType,
+                                    durationMs = durationMs,
+                                ),
+                            ),
+                        )
+                    }
+                } else {
+                    null
+                },
+            )
+        } finally {
+            deletePrepared(prepared)
+        }
+    }
+
+    /** Round 48 — supprime les fichiers chiffrés temporaires préparés (best-effort). */
+    private fun deletePrepared(prepared: Map<String, E2eMediaGate.PrepareResult.Encrypted>) {
+        for (result in prepared.values) {
+            for (attachment in result.attachments) {
+                runCatching { attachment.file.delete() }
+            }
+        }
+    }
+
+    /** v1.28.3 (F21, second passage) — cf. le jumeau de [SendMediaMmsUseCase]. */
+    /** v1.28.4 — le MMS vocal de groupe : un seul PDU, une seule ligne dans le groupe. */
+    @Suppress("LongParameterList")
+    private suspend fun envoiDeGroupe(
+        recipients: List<PhoneAddress>,
+        audio: File,
+        mimeType: String,
+        durationMs: Long,
+        subId: Int?,
+        deliveryReports: Boolean,
+    ): Outcome<SendReport> = envoi.enGroupe(
+        recipients = recipients,
+        sansRemise = "no MMS dispatched",
+        // v1.28.5 — le miroir porte les CIBLES, pas la liste d'origine : cf. `EnvoiParDestinataire.enGroupe`.
+        miroir = { cibles ->
+            mirror.upsertOutgoingGroupMms(
+                addresses = cibles,
+                attachments = listOf(
+                    com.relay.sms.domain.mms.MediaAttachmentSpec(audio, mimeType, durationMs = durationMs),
+                ),
+                textBody = "",
+                date = System.currentTimeMillis(),
+                subId = subId,
+            )
+        },
+        envoi = { localId, cibles ->
+            sender.sendVoiceMms(
+                localMessageId = localId,
+                recipients = cibles.map { it.raw },
+                audioFile = audio,
+                mimeType = mimeType,
+                subId = subId,
+                requestDeliveryReport = deliveryReports,
+            )
+        },
+    )
+
+    private fun refusPrealable(recipients: List<PhoneAddress>, audioFile: File): AppError? = when {
+        !defaultAppManager.isDefault() -> AppError.NotDefaultSmsApp
+        recipients.isEmpty() -> AppError.Validation("no recipients")
+        !audioFile.exists() || audioFile.length() == 0L ->
+            AppError.Validation("audio file missing or empty")
+        else -> null
+    }
+}

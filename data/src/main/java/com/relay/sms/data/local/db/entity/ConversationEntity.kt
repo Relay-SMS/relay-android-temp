@@ -1,0 +1,127 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.data.local.db.entity
+
+import androidx.room.ColumnInfo
+import androidx.room.Entity
+import androidx.room.Index
+import androidx.room.PrimaryKey
+import com.relay.sms.domain.categories.MessageCategory
+import kotlinx.serialization.Serializable
+
+/**
+ * A conversation aggregates messages exchanged with one or more addresses.
+ *
+ * Mirrors the thread_id concept of Android's Telephony provider so we can map back and forth.
+ */
+@Serializable
+@Entity(
+    tableName = "conversations",
+    indices = [
+        Index(value = ["thread_id"], unique = true),
+        Index(value = ["pinned", "last_message_at"]),
+        Index(value = ["archived"]),
+        Index(value = ["in_vault"]),
+        // Client mode (schema v18) — the hub conversation id is the
+        // upsert key for every synced frame that names a conversation.
+        // UNIQUE: one local row per hub conversation, so a re-sync can
+        // never duplicate one (SQLite admits several NULLs, so
+        // hub-mode rows are unaffected).
+        Index(value = ["hub_conversation_id"], unique = true),
+    ],
+)
+data class ConversationEntity(
+    @PrimaryKey(autoGenerate = true)
+    val id: Long = 0,
+    /**
+     * `thread_id` AOSP du fournisseur système, ou **`null` tant qu'aucun n'est connu**.
+     *
+     * v1.28.3 — cette colonne était `NOT NULL` et les conversations sans fil système y
+     * portaient la sentinelle `0L`. Comme l'index ci-dessus est UNIQUE, deux conversations
+     * locales ne pouvaient pas coexister : la seconde insertion entrait en conflit et
+     * `OnConflictStrategy.REPLACE` **supprimait la première**, ses messages et ses pièces
+     * jointes partant avec elle par `ForeignKey.CASCADE`. Reproduit sur émulateur par la
+     * relecture externe (F01) : deux brouillons créés d'affilée, le premier disparaît.
+     *
+     * Le mécanisme était connu à deux endroits du code, qui le contournaient chacun à sa
+     * façon — `ensureConversationByThread` en exigeant un identifiant système réel, et
+     * `BackupService` en fabriquant des sentinelles négatives — mais ni la composition ni
+     * la réception ne l'appliquaient. `null` est la réponse juste : SQLite considère deux
+     * `NULL` comme distincts sous un index UNIQUE, donc autant de conversations sans fil
+     * système que nécessaire peuvent coexister, et l'absence de valeur cesse d'être codée
+     * par une valeur.
+     *
+     * Invariant : jamais `0L` ni négatif. Un `thread_id` AOSP est toujours ≥ 1.
+     */
+    @ColumnInfo(name = "thread_id") val threadId: Long?,
+    @ColumnInfo(name = "addresses_csv") val addressesCsv: String,
+    @ColumnInfo(name = "display_name") val displayName: String?,
+    @ColumnInfo(name = "last_message_at") val lastMessageAt: Long,
+    @ColumnInfo(name = "last_message_preview") val lastMessagePreview: String?,
+    @ColumnInfo(name = "unread_count") val unreadCount: Int = 0,
+    @ColumnInfo(name = "pinned") val pinned: Boolean = false,
+    @ColumnInfo(name = "archived") val archived: Boolean = false,
+    @ColumnInfo(name = "muted") val muted: Boolean = false,
+    @ColumnInfo(name = "in_vault") val inVault: Boolean = false,
+    @ColumnInfo(name = "draft") val draft: String? = null,
+    @ColumnInfo(name = "notification_channel_id") val notificationChannelId: String? = null,
+    /**
+     * v1.11.0 — Apparence par contact. `null` = utilise le bleu marque par défaut
+     * pour la bulle sortante. Sinon, ARGB Int stocké tel quel ([android.graphics.Color])
+     * et appliqué uniquement à la bulle SORTANTE (les bulles entrantes restent
+     * sur le slate-blue marque pour lisibilité). Les couleurs sont choisies parmi
+     * une palette restreinte côté UI ([BubbleColorPalette]) pour garantir le
+     * contraste WCAG AA avec le texte blanc.
+     */
+    @ColumnInfo(name = "bubble_color_argb") val bubbleColorArgb: Int? = null,
+    /**
+     * v1.11.0 — URI persistante d'un avatar custom (image choisie depuis la
+     * galerie via `ActivityResultContracts.PickVisualMedia`). `null` = fallback
+     * à l'avatar contact Android natif. L'URI est `content://` granted via
+     * `FLAG_GRANT_READ_URI_PERMISSION` au moment du pick et persisté via
+     * `ContentResolver.takePersistableUriPermission` côté caller.
+     */
+    @ColumnInfo(name = "avatar_uri") val avatarUri: String? = null,
+    /** v1.28.3 (schéma 12) — nom choisi d'un groupe, local ; prime sur `display_name`. */
+    @ColumnInfo(name = "custom_name") val customName: String? = null,
+    /**
+     * Feedback round 5 (schéma 15) — message épinglé du fil (un seul par
+     * conversation pour l'instant). `null` = rien d'épinglé. L'horodatage
+     * ([pinnedMessageAt]) est celui de l'épinglage, pas du message : c'est
+     * lui que la bannière affiche (« Pinned · 11/3/26 at 9:41 PM »).
+     */
+    @ColumnInfo(name = "pinned_message_id") val pinnedMessageId: Long? = null,
+    @ColumnInfo(name = "pinned_message_at") val pinnedMessageAt: Long? = null,
+    /**
+     * Client mode (schema v18) — **the hub's Room id for this
+     * conversation** (wire `id`): the upsert key for `conversations` /
+     * `conversation_updated` / `conversation_deleted`, and the join
+     * key for every frame that names a conversation. `null` on
+     * hub-mode rows. Local `id` stays the stable primary key.
+     *
+     * `@Transient` for the backup, like `client_message_id` on
+     * messages: the hub id only means something on THIS link, and the
+     * backup parser is strict about unknown keys.
+     */
+    @kotlinx.serialization.Transient
+    @ColumnInfo(name = "hub_conversation_id") val hubConversationId: Long? = null,
+    /**
+     * Round 35 (schema v20) — the sticky category: the category the
+     * latest incoming message earned at receive time, computed from its
+     * FULL body and stored by name (`MessageCategory` ↔ TEXT via
+     * `MessageEnumConverters`), so a plain follow-up cannot re-file the
+     * conversation. `null` = no stored category; contacts and groups
+     * never store one, and any outgoing message in the thread clears it.
+     *
+     * `@Transient` for the backup, like `hubConversationId`: the sticky
+     * value is derived state (the backfill recomputes it, and every new
+     * incoming message refreshes it), and the backup parser is strict
+     * about unknown keys.
+     */
+    @kotlinx.serialization.Transient
+    @ColumnInfo(name = "sticky_category") val stickyCategory: MessageCategory? = null,
+)

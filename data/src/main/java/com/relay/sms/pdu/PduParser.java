@@ -1,0 +1,553 @@
+/*
+ * Copyright (C) 2007-2008 Esmertec AG.
+ * Copyright (C) 2007-2008 The Android Open Source Project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.relay.sms.pdu;
+
+import android.util.Log;
+
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.UnsupportedEncodingException;
+
+/**
+ * Decodes a binary OMA-MMS PDU (typically a NotificationInd from WAP_PUSH or a RetrieveConf
+ * fetched by SmsManager.downloadMultimediaMessage) into a typed [GenericPdu] subtype.
+ *
+ * Mirrors AOSP PduParser, stripped down to the headers Relay actually consumes. Unknown
+ * headers are skipped gracefully so a future OMA-MMS-ENC revision doesn't break the pipeline.
+ */
+public class PduParser {
+    private static final String TAG = "PduParser";
+
+    private static final int TYPE_GENERIC_PDU       = 0;
+    private static final int THE_FIRST_PART         = 0;
+    private static final int THE_LAST_PART          = 1;
+
+    private final ByteArrayInputStream mPduDataStream;
+    /** Far above any real Content-Type's parameters; what a PDU announces beyond this is skipped, not copied. */
+    private static final int MAX_CONTENT_TYPE_PARAMETERS = 4096;
+
+    private int mCharsetParam = CharacterSets.ANY_CHARSET; // last content-type's "charset" parameter
+
+    public PduParser(byte[] data) {
+        mPduDataStream = new ByteArrayInputStream(data);
+    }
+
+    public GenericPdu parse() {
+        if (mPduDataStream == null) return null;
+        PduHeaders headers = parseHeaders(mPduDataStream);
+        if (headers == null) return null;
+        int messageType = headers.getOctet(PduHeaders.MESSAGE_TYPE);
+        switch (messageType) {
+            case PduHeaders.MESSAGE_TYPE_SEND_REQ: {
+                PduBody body = parseParts(mPduDataStream);
+                return new SendReq(headers, body);
+            }
+            case PduHeaders.MESSAGE_TYPE_NOTIFICATION_IND:
+                return new NotificationInd(headers);
+            case PduHeaders.MESSAGE_TYPE_RETRIEVE_CONF: {
+                PduBody body = parseParts(mPduDataStream);
+                return new RetrieveConf(headers, body);
+            }
+            case PduHeaders.MESSAGE_TYPE_NOTIFYRESP_IND:
+            case PduHeaders.MESSAGE_TYPE_ACKNOWLEDGE_IND:
+            case PduHeaders.MESSAGE_TYPE_DELIVERY_IND:
+            case PduHeaders.MESSAGE_TYPE_SEND_CONF:
+            case PduHeaders.MESSAGE_TYPE_READ_REC_IND:
+            case PduHeaders.MESSAGE_TYPE_READ_ORIG_IND:
+            default: {
+                GenericPdu g = new GenericPdu();
+                g.mPduHeaders = headers;
+                return g;
+            }
+        }
+    }
+
+    /* ─── Header parsing ───────────────────────────────────────────────────── */
+
+    private PduHeaders parseHeaders(ByteArrayInputStream in) {
+        if (in == null) return null;
+        PduHeaders headers = new PduHeaders();
+        boolean keepParsing = true;
+        while (keepParsing && in.available() > 0) {
+            in.mark(1);
+            int headerField = extractByteValue(in);
+            switch (headerField) {
+                case PduHeaders.MESSAGE_TYPE: {
+                    int value = extractByteValue(in);
+                    try { headers.setOctet(value, PduHeaders.MESSAGE_TYPE); }
+                    catch (InvalidHeaderValueException e) { return null; }
+                    break;
+                }
+                case PduHeaders.MMS_VERSION: {
+                    int v = extractByteValue(in);
+                    try { headers.setOctet(v, PduHeaders.MMS_VERSION); } catch (Exception ignored) {}
+                    break;
+                }
+                case PduHeaders.STATUS:
+                case PduHeaders.REPORT_ALLOWED:
+                case PduHeaders.PRIORITY:
+                case PduHeaders.DELIVERY_REPORT:
+                case PduHeaders.READ_REPORT:
+                case PduHeaders.READ_STATUS:
+                case PduHeaders.RETRIEVE_STATUS:
+                case PduHeaders.CONTENT_CLASS:
+                // 2026-10-29 (issue #53) — le verdict de l'opérateur dans un m-send-conf. Il
+                // tombait dans « en-tête inconnu, sauté » : l'application ne pouvait pas savoir
+                // qu'un MMS avait été REFUSÉ, et l'affichait envoyé. Cf. VerdictOperateur.
+                case PduHeaders.RESPONSE_STATUS: {
+                    int v = extractByteValue(in);
+                    try { headers.setOctet(v, headerField); } catch (Exception ignored) {}
+                    break;
+                }
+                case PduHeaders.TRANSACTION_ID:
+                case PduHeaders.CONTENT_LOCATION:
+                case PduHeaders.MESSAGE_ID:
+                case PduHeaders.RESPONSE_TEXT:
+                case PduHeaders.RETRIEVE_TEXT: {
+                    byte[] text = parseWapString(in, TYPE_TEXT_STRING);
+                    if (text != null) headers.setTextString(text, headerField);
+                    break;
+                }
+                case PduHeaders.MESSAGE_CLASS: {
+                    // Per OMA-WAP-MMS-ENC: class-identifier (octet, MSB set, 0x80=Personal,
+                    // 0x81=Advertisement, 0x82=Informational, 0x83=Auto) OR token-text.
+                    // Bug pre-v1.3.10 was forcing text-string even on class-identifier — the
+                    // 0x8x byte was then consumed as the first character and parseWapString
+                    // looped until the next 0x00, devouring Message-Size + Expiry + Content-Location.
+                    in.mark(1);
+                    int firstByte = extractByteValue(in);
+                    if ((firstByte & 0x80) != 0) {
+                        String cls;
+                        switch (firstByte & 0x7F) {
+                            case 0x00: cls = "personal"; break;
+                            case 0x01: cls = "advertisement"; break;
+                            case 0x02: cls = "informational"; break;
+                            case 0x03: cls = "auto"; break;
+                            default: cls = "personal";
+                        }
+                        headers.setTextString(cls.getBytes(), PduHeaders.MESSAGE_CLASS);
+                    } else {
+                        in.reset();
+                        byte[] text = parseWapString(in, TYPE_TEXT_STRING);
+                        if (text != null) headers.setTextString(text, PduHeaders.MESSAGE_CLASS);
+                    }
+                    break;
+                }
+                case PduHeaders.SUBJECT: {
+                    EncodedStringValue v = parseEncodedStringValue(in);
+                    if (v != null) headers.setEncodedStringValue(v, headerField);
+                    break;
+                }
+                case PduHeaders.TO:
+                case PduHeaders.CC:
+                case PduHeaders.BCC: {
+                    EncodedStringValue v = parseEncodedStringValue(in);
+                    if (v != null) headers.appendEncodedStringValue(v, headerField);
+                    break;
+                }
+                case PduHeaders.FROM: {
+                    int length = parseValueLength(in);
+                    if (length > 0) {
+                        int fromType = extractByteValue(in);
+                        if (fromType == PduHeaders.FROM_ADDRESS_PRESENT_TOKEN) {
+                            EncodedStringValue v = parseEncodedStringValue(in);
+                            if (v != null) headers.setEncodedStringValue(v, PduHeaders.FROM);
+                        } else {
+                            // insert-address-token — no string follows
+                            headers.setEncodedStringValue(
+                                    new EncodedStringValue(PduHeaders.FROM_INSERT_ADDRESS_TOKEN_STR),
+                                    PduHeaders.FROM);
+                        }
+                    }
+                    break;
+                }
+                case PduHeaders.MESSAGE_SIZE:
+                case PduHeaders.DATE: {
+                    long v = parseLongInteger(in);
+                    headers.setLongInteger(v, headerField);
+                    break;
+                }
+                case PduHeaders.EXPIRY:
+                case PduHeaders.DELIVERY_TIME:
+                case PduHeaders.REPLY_CHARGING_DEADLINE: {
+                    // value-length + (token absolute=0x80 / relative=0x81) + long-integer
+                    int length = parseValueLength(in);
+                    int token = extractByteValue(in);
+                    long v = parseLongInteger(in);
+                    if (token == 0x81) v = System.currentTimeMillis() / 1000L + v;
+                    headers.setLongInteger(v, headerField);
+                    // length already consumed
+                    break;
+                }
+                case PduHeaders.CONTENT_TYPE: {
+                    // Content-Type ends the header section in OMA-MMS-ENC. After it the body
+                    // (multipart) starts.
+                    byte[] ct = parseContentType(in, null);
+                    if (ct != null) headers.setTextString(ct, PduHeaders.CONTENT_TYPE);
+                    keepParsing = false;
+                    break;
+                }
+                default: {
+                    // Unknown header. Try to skip its value heuristically.
+                    skipUnknownValue(in);
+                    break;
+                }
+            }
+        }
+        return headers;
+    }
+
+    /** Reads a single byte without sign extension. Returns -1 on EOF. */
+    /**
+     * v1.27.2 — la fin de flux se distingue à nouveau d'un octet {@code 0xFF}.
+     *
+     * <p>Cette méthode rendait {@code in.read() & 0xFF}. Or {@link ByteArrayInputStream#read()}
+     * rend {@code -1} en fin de flux, et {@code -1 & 0xFF} vaut <b>255</b> : la fin de flux
+     * devenait donc un octet ordinaire, et <b>tous les tests {@code == -1} du fichier étaient
+     * morts</b> — ils ne pouvaient jamais être vrais.
+     *
+     * <p>Conséquence atteignable : dans {@code parseWapString}, la boucle
+     * {@code while ((b = extractByteValue(in)) != 0)} n'a pour sortie que sa propre garde
+     * {@code if (b == -1) break;}. Sur un PDU dont la chaîne n'est pas terminée par un zéro, elle
+     * tournait <b>sans fin</b> en écrivant 255 dans un {@code ByteArrayOutputStream} qui grossit
+     * jusqu'à l'{@code OutOfMemoryError}. Le PDU arrive du réseau opérateur et son contenu est
+     * choisi par l'expéditeur : un MMS malformé, ou piégé, tuait le processus de l'application
+     * SMS par défaut.
+     *
+     * <p>Trouvé par {@code PduParserRobustnessTest} au premier tour de fuzz, sur 17 octets
+     * aléatoires. L'audit externe avait bien pointé ce fichier, mais sur les allocations de
+     * {@code parseParts} — bornées en v1.27.2 également, et qui n'étaient pas le chemin
+     * réellement atteint.
+     *
+     * <p>Rendre {@code -1} réarme d'un coup toutes les gardes de fin de flux du fichier.
+     */
+    private static int extractByteValue(ByteArrayInputStream in) {
+        int b = in.read();
+        return b < 0 ? -1 : (b & 0xFF);
+    }
+
+    /** WSP value-length: short (0..30), or 0x1F + uintvar. */
+    private static int parseValueLength(ByteArrayInputStream in) {
+        int first = extractByteValue(in);
+        if (first < 31) return first;
+        if (first == 0x1F) return (int) parseUintvarInteger(in);
+        // Already a long-integer length-byte → unread is hard; treat as 0 to bail safely.
+        return 0;
+    }
+
+    private static long parseUintvarInteger(ByteArrayInputStream in) {
+        long result = 0;
+        int b;
+        while (true) {
+            b = extractByteValue(in);
+            result = (result << 7) | (b & 0x7F);
+            if ((b & 0x80) == 0) return result;
+            if (in.available() == 0) return result;
+        }
+    }
+
+    /** Long-integer: 1 length octet + N bytes BE. */
+    private static long parseLongInteger(ByteArrayInputStream in) {
+        int size = extractByteValue(in);
+        if (size > 8) return 0;
+        long v = 0;
+        for (int i = 0; i < size; i++) v = (v << 8) | (extractByteValue(in) & 0xFFL);
+        return v;
+    }
+
+    /** Integer-value: short (MSB set) or long-integer. */
+    private static int parseIntegerValue(ByteArrayInputStream in) {
+        in.mark(1);
+        int first = extractByteValue(in);
+        if ((first & 0x80) != 0) return first & 0x7F;
+        in.reset();
+        return (int) parseLongInteger(in);
+    }
+
+    /** Text-string with the leading 0x7F quote prefix stripped if present. */
+    private static final int TYPE_TEXT_STRING = 1;
+    private static final int TYPE_QUOTED_STRING = 2;
+    private static final int TYPE_TOKEN_STRING = 3;
+
+    private static byte[] parseWapString(ByteArrayInputStream in, int stringType) {
+        in.mark(1);
+        int first = extractByteValue(in);
+        if (first == -1) return null;
+        if (stringType == TYPE_QUOTED_STRING && first == 0x22) {
+            // strip leading 0x22, read until 0
+        } else if (first == 0x7F) {
+            // strip leading quote
+        } else {
+            in.reset();
+        }
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        int b;
+        while ((b = extractByteValue(in)) != 0) {
+            if (b == -1) break;
+            out.write(b);
+        }
+        return out.toByteArray();
+    }
+
+    /** Encoded-string-value: text-string OR value-length + charset + text-string. */
+    private static EncodedStringValue parseEncodedStringValue(ByteArrayInputStream in) {
+        in.mark(1);
+        int first = extractByteValue(in);
+        if (first == -1) return null;
+        if (first < 32) {
+            // value-length follows — char-set then text-string
+            int length;
+            if (first < 31) length = first;
+            else length = (int) parseUintvarInteger(in);
+            int marker = in.available();
+            int charset = parseIntegerValue(in);
+            byte[] text = parseWapString(in, TYPE_TEXT_STRING);
+            // Note: we trust the length field for skipping but it might over/under-shoot; on
+            // well-formed PDUs it's exact.
+            try {
+                return new EncodedStringValue(charset, text == null ? new byte[0] : text);
+            } catch (Exception e) {
+                return new EncodedStringValue(text == null ? new byte[0] : text);
+            }
+        } else {
+            in.reset();
+            byte[] text = parseWapString(in, TYPE_TEXT_STRING);
+            return text == null ? null : new EncodedStringValue(text);
+        }
+    }
+
+    /**
+     * Content-type-value: well-known short-int OR text-string OR (value-length + content-type +
+     * parameters). For our purposes we only need the MIME string.
+     */
+    private byte[] parseContentType(ByteArrayInputStream in, HashMapPlaceholder unused) {
+        mCharsetParam = CharacterSets.ANY_CHARSET;
+        in.mark(1);
+        int first = extractByteValue(in);
+        if (first == -1) return null;
+        if ((first & 0x80) != 0) {
+            int idx = first & 0x7F;
+            String[] table = PduContentTypes.contentTypes;
+            if (idx < table.length) return table[idx].getBytes();
+            return null;
+        }
+        if (first < 31 || first == 0x1F) {
+            // value-length form
+            int length;
+            if (first < 31) length = first;
+            else length = (int) parseUintvarInteger(in);
+            int startAvail = in.available();
+            byte[] ct;
+            in.mark(1);
+            int b = extractByteValue(in);
+            if ((b & 0x80) != 0) {
+                int idx = b & 0x7F;
+                String[] table = PduContentTypes.contentTypes;
+                ct = (idx < table.length ? table[idx] : "application/octet-stream").getBytes();
+            } else {
+                in.reset();
+                ct = parseWapString(in, TYPE_TEXT_STRING);
+            }
+            // Parameters are read from their own value-length window: a value of unexpected form can no
+            // longer run past it and swallow the headers that follow.
+            int consumed = startAvail - in.available();
+            // The length comes from the PDU: only a bounded window is copied, however much it announces.
+            int remaining = Math.min(Math.max(length - consumed, 0), in.available());
+            byte[] window = new byte[Math.min(remaining, MAX_CONTENT_TYPE_PARAMETERS)];
+            int windowRead = in.read(window, 0, window.length);
+            if (windowRead > 0) parseContentTypeParameters(new ByteArrayInputStream(window, 0, windowRead));
+            skipNBytes(in, remaining - window.length);
+            return ct;
+        }
+        // text-string form
+        in.reset();
+        return parseWapString(in, TYPE_TEXT_STRING);
+    }
+
+    /**
+     * Keeps `charset`, written as a well-known token or by name (Typed- or Untyped-parameter); any other
+     * parameter is skipped according to the form of its value, not assumed to be a Text-string.
+     */
+    private void parseContentTypeParameters(ByteArrayInputStream params) {
+        while (params.available() > 0) {
+            params.mark(1);
+            int token = extractByteValue(params);
+            boolean isCharset;
+            if ((token & 0x80) != 0) {
+                isCharset = token == (PduPart.P_CHARSET | 0x80);
+            } else {
+                params.reset();
+                isCharset = "charset".equalsIgnoreCase(new String(parseWapString(params, TYPE_TEXT_STRING)));
+            }
+            if (isCharset) {
+                mCharsetParam = parseCharset(params);
+            } else {
+                skipUnknownValue(params);
+            }
+        }
+    }
+
+    /**
+     * Well-known-charset: Any-charset (0x80, read as 0) or Integer-value; some gateways write the name as
+     * a Text-string instead, as AOSP's parser allows. An unknown name or a missing value reads as 0,
+     * "any charset".
+     */
+    private static int parseCharset(ByteArrayInputStream params) {
+        if (params.available() == 0) return CharacterSets.ANY_CHARSET;
+        params.mark(1);
+        int first = extractByteValue(params);
+        params.reset();
+        if ((first >= 0x20 && first <= 0x7F) || first == 0) {
+            byte[] name = parseWapString(params, TYPE_TEXT_STRING);
+            try {
+                return CharacterSets.getMibEnumValue(new String(name));
+            } catch (java.io.UnsupportedEncodingException e) {
+                return CharacterSets.ANY_CHARSET;
+            }
+        }
+        return parseIntegerValue(params);
+    }
+
+    /* ─── Body parsing (multipart) ─────────────────────────────────────────── */
+
+    private PduBody parseParts(ByteArrayInputStream in) {
+        if (in == null || in.available() == 0) return null;
+        long parts = parseUintvarInteger(in);
+        PduBody body = new PduBody();
+        for (long i = 0; i < parts; i++) {
+            // v1.27.2 (audit externe Gemini 2026-08-04) — le flux est vide : on sort au lieu de
+            // tourner. `parts` vient du PDU, donc d'une entrée non fiable : sans cette sortie,
+            // un compteur absurde combiné à des longueurs nulles faisait boucler la lecture.
+            if (in.available() <= 0) break;
+            int headersLength = (int) parseUintvarInteger(in);
+            int dataLength = (int) parseUintvarInteger(in);
+            if (headersLength <= 0) continue;
+            // v1.27.2 (audit externe Gemini 2026-08-04) — les DEUX longueurs sont bornées par ce
+            // qui RESTE réellement dans le flux avant toute allocation.
+            //
+            // `headersLength` et `dataLength` sortent de `parseUintvarInteger`, donc du PDU
+            // lui-même — une entrée non contrôlée, reçue par un receiver. Un MMS malformé ou
+            // piégé annonçant une longueur énorme faisait allouer un tableau de cette taille et
+            // partait en OutOfMemory, perdant le message et pouvant emporter le processus.
+            //
+            // La borne est logiquement indiscutable : un bloc ne peut pas être plus long que ce
+            // qui reste à lire. Aucun PDU légitime n'est donc rejeté — s'il annonce N octets,
+            // c'est qu'il les porte. Le contrôle `n != headersLength` juste en dessous détectait
+            // bien la troncature, mais APRÈS l'allocation, c'est-à-dire trop tard.
+            //
+            // Gemini n'avait signalé que le bloc d'en-têtes ; `dataBytes` portait exactement le
+            // même défaut, deux lignes plus bas.
+            int remaining = in.available();
+            if (headersLength > remaining || dataLength > remaining) break;
+            // Read the headers block
+            byte[] hdrBytes = new byte[headersLength];
+            int n = in.read(hdrBytes, 0, headersLength);
+            if (n != headersLength) break;
+            // Read the data block
+            byte[] dataBytes = new byte[Math.max(0, dataLength)];
+            if (dataLength > 0) {
+                int m = in.read(dataBytes, 0, dataLength);
+                if (m != dataLength) break;
+            }
+            PduPart part = decodePartHeaders(hdrBytes);
+            part.setData(dataBytes);
+            body.addPart(part);
+        }
+        return body;
+    }
+
+    private PduPart decodePartHeaders(byte[] hdrBytes) {
+        ByteArrayInputStream in = new ByteArrayInputStream(hdrBytes);
+        PduPart part = new PduPart();
+        // First: Content-Type (value-length + content-type-value + parameters)
+        byte[] ct = parseContentType(in, null);
+        if (ct != null) part.setContentType(ct);
+        if (mCharsetParam != CharacterSets.ANY_CHARSET) part.setCharset(mCharsetParam);
+        // Remaining: well-known header fields (P_CONTENT_LOCATION, P_CONTENT_ID, etc.)
+        while (in.available() > 0) {
+            int hdr = extractByteValue(in);
+            switch (hdr) {
+                case PduPart.P_CONTENT_LOCATION: {
+                    // P_CONTENT_LOCATION = 0x8E already has the high bit set (well-known
+                    // header encoding per OMA-WAP-MMS-ENC), so no `+ 0x80` variant is needed.
+                    byte[] v = parseWapString(in, TYPE_TEXT_STRING);
+                    if (v != null) part.setContentLocation(v);
+                    break;
+                }
+                case PduPart.P_CONTENT_ID: {
+                    byte[] v = parseWapString(in, TYPE_QUOTED_STRING);
+                    if (v != null && v.length > 0) {
+                        try { part.setContentId(v); } catch (Exception ignored) {}
+                    }
+                    break;
+                }
+                case PduPart.P_CONTENT_DISPOSITION:
+                case PduPart.P_CONTENT_DISPOSITION_OLD: {
+                    int len = parseValueLength(in);
+                    int marker = in.available();
+                    int disp = extractByteValue(in);
+                    if (disp == 0xC0) part.setContentDisposition(PduPart.DISPOSITION_ATTACHMENT);
+                    else if (disp == 0xC1) part.setContentDisposition(PduPart.DISPOSITION_INLINE);
+                    // skip any extra parameter bytes
+                    int consumed = marker - in.available();
+                    skipNBytes(in, len - consumed);
+                    break;
+                }
+                default:
+                    // Try to parse as a parameter-value (text-string)
+                    byte[] discard = parseWapString(in, TYPE_TEXT_STRING);
+                    if (discard == null) return part;
+                    break;
+            }
+        }
+        return part;
+    }
+
+    private static void skipNBytes(ByteArrayInputStream in, int n) {
+        for (int i = 0; i < n && in.available() > 0; i++) in.read();
+    }
+
+    /** Heuristic skip when we hit a header we don't know how to parse. */
+    private static void skipUnknownValue(ByteArrayInputStream in) {
+        if (in.available() == 0) return;
+        in.mark(1);
+        int first = extractByteValue(in);
+        if (first == -1) return;
+        if ((first & 0x80) != 0) {
+            // Short-integer — already consumed.
+            return;
+        }
+        if (first < 31) {
+            // value-length: consume that many bytes.
+            skipNBytes(in, first);
+            return;
+        }
+        if (first == 0x1F) {
+            int len = (int) parseUintvarInteger(in);
+            skipNBytes(in, len);
+            return;
+        }
+        // text-string: consume until 0.
+        in.reset();
+        parseWapString(in, TYPE_TEXT_STRING);
+    }
+
+    /** Placeholder type so the signature stays close to AOSP. */
+    private static class HashMapPlaceholder {}
+}

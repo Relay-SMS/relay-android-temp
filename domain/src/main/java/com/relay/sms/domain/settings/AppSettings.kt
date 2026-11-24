@@ -1,0 +1,718 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.domain.settings
+
+import com.relay.sms.domain.categories.MessageCategory
+import com.relay.sms.domain.model.ReactionFormat
+
+/** User-facing immutable snapshot of all preferences. */
+// v1.28.12 — `locale: LocaleSettings` retiré. Ses deux champs, `languageTag` et
+// `firstDayOfWeek`, étaient écrits, persistés et relus, et JAMAIS consultés par une
+// seule ligne de code de production ni exposés par un écran : un réglage fantôme, qui
+// promettait un contrôle inexistant. Même motif que `retryFailedAutomatically` (F26,
+// v1.28.3) et `blockShortCodes` (v1.3.5).
+//
+// Ils ne manquent à rien. La langue de l'application passe par le mécanisme Android par
+// application (`system/locale/LangueDeLApplication.kt`), pas par un champ à nous —
+// `languageTag` était un vestige d'une approche non retenue. Et le premier jour de la
+// semaine suit désormais UNE seule locale, celle de la configuration, au lieu de deux qui
+// divergeaient. Vérifié avant retrait : aucun lecteur, et la sauvegarde ne les sérialise
+// pas, donc aucun fichier `.smsbk` existant n'en dépend.
+data class AppSettings(
+    /**
+     * Client mode — whether this device is a hub phone (it sends and
+     * receives SMS/MMS itself) or a linked device (it shows a hub
+     * phone's messages over the LAN). An explicit choice in Settings
+     * → Linked devices, never automatic; default [DeviceMode.HUB], so
+     * every existing install stays a phone. Persisted by enum NAME
+     * (`app.mode`); an unknown name reads back as [DeviceMode.HUB].
+     */
+    val mode: DeviceMode = DeviceMode.HUB,
+    val appearance: Appearance = Appearance(),
+    val conversations: ConversationSettings = ConversationSettings(),
+    val sending: SendingSettings = SendingSettings(),
+    val notifications: NotificationSettings = NotificationSettings(),
+    val security: SecuritySettings = SecuritySettings(),
+    val encryption: EncryptionSettings = EncryptionSettings(),
+    val blocking: BlockingSettings = BlockingSettings(),
+    val backup: BackupSettings = BackupSettings(),
+    val advanced: AdvancedSettings = AdvancedSettings(),
+)
+
+/**
+ * Client mode — the two roles a device can play. [HUB] is the phone
+ * that owns the SIM and the message store; [CLIENT] is a tablet or
+ * SIM-less phone linked to a hub over the LAN, showing the hub's
+ * messages and sending through it.
+ *
+ * ⚠️ Persisted BY NAME (`app.mode`): add a mode, never rename or
+ * remove one. An unknown name — an older version reading a newer
+ * value — falls back to [HUB] (`SettingsRepository.enumOr`).
+ */
+enum class DeviceMode { HUB, CLIENT }
+
+data class Appearance(
+    val themeMode: ThemeMode = ThemeMode.SYSTEM,
+    // Round 19 — OFF by default: dynamic colours re-derive the palette from
+    // the wallpaper, so they only apply when the user turns them on. (The old
+    // default was `true`, from when the toggle was a no-op; the stored key
+    // changed with it — see `SettingsRepository.K.dynamicColors`.)
+    val dynamicColors: Boolean = false,
+    val customAccentArgb: Int? = null,
+    val textScale: TextScale = TextScale.MEDIUM,
+    val density: ListDensity = ListDensity.STANDARD,
+    val amoledTrueBlack: Boolean = false,
+)
+
+/**
+ * Feedback round 4 (2026-11-07) — `DARK_TECH` is removed: Settings offers System,
+ * Light and Dark only. A stored `DARK_TECH` value falls back to [SYSTEM] at read
+ * time (`SettingsRepository.enumOr` returns the default for an unknown name), which
+ * is the same dark-or-light behaviour it produced — DarkTech always resolved onto
+ * the Dark scheme (see `RelayTheme`).
+ */
+enum class ThemeMode { SYSTEM, LIGHT, DARK }
+
+/**
+ * Taille du texte des messages (Réglages → Apparence). Le coefficient de chaque cran vit côté
+ * interface (`ui/theme/MessageTextSize.kt`), qui seul sait ce qu'il agrandit.
+ *
+ * ⚠️ Persisté PAR SON NOM (`appearance.textScale`) : on ajoute un cran, on n'en renomme ni n'en
+ * retire aucun. Un nom inconnu — une version plus ancienne qui lit `XXL` — retombe sur [MEDIUM]
+ * (`SettingsRepository.enumOr`), sans planter.
+ *
+ * 2026-10-29 — `XXL` ajouté pour une demande d'utilisateur malvoyant : le cran le plus haut
+ * restait trop proche du texte normal. Jusque-là ce réglage était FANTÔME (persisté, restauré,
+ * jamais affiché ni appliqué — relevé par l'audit du 2026-08-03).
+ */
+enum class TextScale { XS, S, MEDIUM, L, XL, XXL }
+enum class ListDensity { COMFORT, STANDARD, COMPACT }
+
+data class ConversationSettings(
+    val sortMode: SortMode = SortMode.DATE,
+    // Two preview lines (was 1): the list shows more of each message.
+    val previewLines: Int = 2,
+    val showAvatars: Boolean = true,
+    /**
+     * Round 12 — whether the category tab row shows on the main screen.
+     * Toggled in Settings → Appearance. When OFF the list shows every
+     * conversation unfiltered and no tab row is rendered.
+     */
+    val showCategories: Boolean = true,
+    val signature: String? = null,
+    /**
+     * Round 11 — categories whose messages do not trigger a notification.
+     * Toggled from a tab's long-press or from Settings → Notifications.
+     * Persisted by enum NAME (`conv.mutedCategories`); unknown names are
+     * dropped at read time, like every other stored enum.
+     */
+    val mutedCategories: Set<MessageCategory> = emptySet(),
+    /**
+     * Round 13 — the category tab the user last selected (`null` = All).
+     * Persisted by enum NAME (`conv.selectedCategory`); an unknown name
+     * reads back as `null` (All), like every other stored enum. UI state
+     * only — there is no Settings row for it.
+     */
+    val selectedCategory: MessageCategory? = null,
+    /**
+     * Contacts-permission fix — the user dismissed the "names and
+     * photos need the contact permission" banner on the conversation
+     * list. Persisted (`conv.contactsBannerDismissed`) so the banner
+     * never nags again across launches. A later grant hides the
+     * banner by the permission check instead; a later revoke after a
+     * dismissal stays dismissed (the compose screen still shows its
+     * own refused-contacts row). UI state only — no Settings row.
+     */
+    val contactsBannerDismissed: Boolean = false,
+    /**
+     * The number under a conversation's name when two conversations
+     * share a contact name (the v1.23.x disambiguation). OFF by
+     * default — most people never have two threads with the same
+     * name, and the number under one row reads as a glitch.
+     * Toggled in Settings → Appearance.
+     */
+    val showDuplicateNameNumber: Boolean = false,
+)
+
+/**
+ * v1.28.8 (issue #17) — `PINNED_FIRST` est retiré : les conversations épinglées sont désormais en
+ * tête dans TOUS les tris. Une valeur `PINNED_FIRST` encore enregistrée retombe sur [DATE] à la
+ * lecture (`SettingsRepository.enumOr`), ce qui donne exactement l'ordre qu'elle produisait.
+ */
+enum class SortMode { DATE, UNREAD_FIRST }
+
+data class SendingSettings(
+    val confirmBeforeBroadcast: Boolean = false,
+    val convertToMmsAfterSegments: Int = 3,
+    val mmsImageQuality: MmsImageQuality = MmsImageQuality.BALANCED,
+    val deliveryReports: Boolean = true,
+    // v1.28.3 (F26) — `retryFailedAutomatically` RETIRE. C'etait un champ fantome, comme
+    // `blockShortCodes` avant lui (v1.3.5) : affiche, persiste, restitue — et jamais lu par le
+    // moindre code de production. `RetrySendUseCase` ne consulte aucun reglage, et son unique
+    // appelant est un appui MANUEL sur une bulle en echec ; aucun worker de relance n'existe.
+    //
+    // Retire plutot que cable : le cabler reviendrait a ecrire une fonctionnalite d'envoi
+    // automatique, avec ses risques propres — doublons factures, message reparti sans que
+    // l'utilisateur le veuille. C'est une decision produit, pas une correction de defaut. Un
+    // interrupteur qui ne fait rien est un mensonge ; le retirer coute moins que de le laisser.
+    val defaultSubId: Int? = null,
+    /**
+     * v1.28.4 — **MMS de groupe** : un seul MMS adressé à tous les membres, et chaque réponse
+     * revient au groupe (ce que font Google et Samsung Messages). Désactivé par défaut, décision
+     * de Patrice du 2026-09-10 : le comportement historique — un message par destinataire —
+     * reste celui de tous les utilisateurs existants, et un MMS a un coût selon le forfait.
+     *
+     * Activé, tout envoi depuis un groupe part en MMS, texte seul compris ; et un MMS reçu dont
+     * l'en-tête porte plusieurs destinataires ouvre (ou retrouve) la conversation de groupe —
+     * à condition que [userMsisdn] soit renseigné, faute de quoi on ne sait pas se retirer de
+     * la liste. Cf. `GroupMmsMembers`.
+     */
+    val groupMms: Boolean = true,
+    /**
+     * v1.2.6 audit F4 — MSISDN saisi par l'utilisateur quand la détection automatique via
+     * `SubscriptionManager.getActiveSubscriptionInfoForSubscriptionId(subId).number` retourne
+     * `null` (Free Mobile FR, MVNO, certaines configs Samsung One UI). Utilisé par
+     * `MmsSentReceiver.finalizeFromAddress` pour remplacer le placeholder `"insert-address-token"`
+     * de la row FROM dans `content://mms` après dispatch réussi.
+     *
+     * `null` = pas configuré ; on tente la détection auto puis on laisse le placeholder.
+     */
+    val userMsisdn: String? = null,
+    /**
+     * v1.3.1 — quand `true` (défaut), poser une réaction emoji sur un message reçu envoie
+     * automatiquement un SMS au correspondant afin qu'il sache que vous avez réagi
+     * (forme textuelle Apple `Liked "…"` par défaut). Quand `false`, la réaction
+     * reste strictement locale (badge visible uniquement dans Relay).
+     *
+     * Le **changement** d'une réaction (A → B) envoie le nouvel emoji et le
+     * **retrait** envoie `Removed a like from "…"` : le correspondant voit
+     * l'état final, sans quoi il garderait une réaction retirée.
+     */
+    val sendReactionsToRecipient: Boolean = true,
+    /**
+     * v1.3.6 (legacy) — flag boolean conservé pour rétro-compat DataStore. Supplanté
+     * en v1.8.0 par [reactionFormat] qui propose 3 options. Migration côté
+     * [com.relay.sms.data.local.datastore.SettingsRepository] : pour un user
+     * existant, `reactionEmojiOnly=true` → `reactionFormat=EMOJI_ONLY`, `false` →
+     * `reactionFormat=TAPBACK_EN` (l'ancien défaut). Pour les nouveaux users, le
+     * défaut est désormais `READABLE_FR`. La valeur reste écrite à chaque persist
+     * pour ne pas perdre la rétro-compat si un downgrade vers v1.7.x se produit.
+     */
+    val reactionEmojiOnly: Boolean = false,
+    /**
+     * v1.8.0 (bug 5 fix) — format du SMS envoyé au correspondant lors d'une réaction
+     * emoji. Quatre options exposées dans Settings → Envoi → "Format des réactions" :
+     *
+     *   - [ReactionFormat.IOS_TAPBACK] (défaut) : `Liked "aperçu"`. Forme
+     *     textuelle Apple, lisible par tout destinataire et affichée comme
+     *     badge natif par iPhone (texte), Google Messages et Relay.
+     *     Guillemets droits ASCII : contrairement aux `«»` de
+     *     [ReactionFormat.EMOJI_WITH_QUOTE], ils survivent aux transcodages
+     *     opérateur (les `«»` arrivaient en `<<>>` côté correspondant).
+     *   - [ReactionFormat.EMOJI_WITH_QUOTE] : `"❤️ «aperçu»"`.
+     *     Compact + contexte préservé. Le destinataire voit l'emoji ET le
+     *     bout de message d'origine. Pas de phrase parasite. Pattern proche
+     *     de l'expérience Tapback mais plus court et indépendant de la langue.
+     *   - [ReactionFormat.READABLE_FR] : `"J'ai réagi par ❤️ à : «aperçu»"`.
+     *     Format français lisible que tout destinataire Android francophone
+     *     comprend immédiatement. Décodé par Relay (regex FR) pour afficher
+     *     la bulle de réaction native. Default v1.8.0–v1.14.3.
+     *   - [ReactionFormat.TAPBACK_EN] : `"Reacted ❤️ to «aperçu»"`. Format
+     *     Apple/Google Tapback détecté nativement par iMessage (iPhone) et
+     *     Google Messages récent qui l'affichent comme une bulle réaction
+     *     visuelle attachée au message d'origine. Conserve la compat iPhone.
+     *   - [ReactionFormat.EMOJI_ONLY] : `"❤️"` seul. Plus propre sur apps SMS
+     *     legacy mais le destinataire perd tout contexte du message d'origine.
+     *
+     * v1.14.4 — défaut changé `READABLE_FR` → `EMOJI_WITH_QUOTE` (demande user).
+     * Défaut changé `EMOJI_WITH_QUOTE` → `IOS_TAPBACK` : les `«»` du format
+     * précédent étaient déformés en `<<>>` par les opérateurs, le destinataire
+     * voyait `👍<<Hi>>` au lieu d'une réaction. Les users existants sur
+     * `EMOJI_WITH_QUOTE` sont migrés une fois (voir
+     * [AdvancedSettings.reactionFormatMigreIosTapback]) ; les autres choix
+     * explicites sont conservés.
+     * Les users existants conservent leur choix (DataStore persiste). Seuls les
+     * NOUVEAUX installs voient le nouveau défaut.
+     */
+    val reactionFormat: ReactionFormat = ReactionFormat.IOS_TAPBACK,
+    /**
+     * v1.8.1 — nom personnel à inclure dans les SMS de réaction sortants
+     * (format `"<Nom> a réagi par ❤️ à votre message : «…»"`). Pour aider
+     * le destinataire à identifier l'auteur de la réaction de manière
+     * explicite, en plus du nom de contact que son app SMS affiche déjà.
+     *
+     *  - `null` ou chaîne vide → résolution automatique via
+     *    `ContactsContract.Profile` (le "moi" Android, si l'utilisateur a
+     *    renseigné son profil dans Contacts). Si Profile est absent / vide,
+     *    fallback au format anonyme `"Réagi par ❤️ à votre message : «…»"`.
+     *  - chaîne non-vide → override explicite, utilisé tel quel (priorité
+     *    sur Profile).
+     *
+     *  Saisissable depuis Settings → Envoi → "Mon nom dans les réactions".
+     *  Cappé à 40 caractères au save pour rester dans 1 segment UCS-2 même
+     *  avec un emoji multi-codepoint et un preview de message d'origine.
+     */
+    val senderDisplayName: String? = null,
+    /**
+     * v1.21.0 — indicatif pays par défaut (ISO 3166-1 alpha-2, ex. `"FR"`, `"LU"`) utilisé
+     * pour convertir les numéros **nationaux** (`06…`) au format international E.164 **avant
+     * l'envoi**, via [com.relay.sms.data.sms.PhoneNumberWireFormatter].
+     *
+     *  - `null` / vide = **Auto** : on utilise le pays de la SIM (comportement par défaut).
+     *  - valeur explicite = **override** : indispensable quand la SIM est étrangère mais que
+     *    les contacts sont enregistrés en national d'un autre pays. Ex. amie avec une SIM 🇱🇺
+     *    qui écrit à des contacts français `06…` : régler `FR` fait envoyer `+33…` et les SMS
+     *    arrivent enfin. Sans override, `06…` sur SIM 🇱🇺 est ininterprétable → non routable.
+     *
+     * N'affecte QUE l'adresse sur le fil ; le stockage, le fil de discussion et l'affichage
+     * gardent la forme brute saisie par l'utilisateur.
+     */
+    val defaultRegionIso: String? = null,
+)
+
+enum class MmsImageQuality { HIGH, BALANCED, ECONOMY }
+
+/**
+ * v1.28.3 (audit global D-01, D-03) — cinq champs retirés : `vibrate`, `vibratePattern`,
+ * `defaultSoundUri`, `ledColorArgb`, `bubbles`. Aucun code ne les lisait : sur Android 8+, le
+ * son, la vibration et la LED appartiennent au CANAL, figés à sa création, et l'utilisateur les
+ * règle dans les paramètres système. Le toggle « Vibrer » était le plus grave des cinq — exposé
+ * dans les Réglages, accepté, persisté, sans le moindre effet (le motif de F26). Les quatre
+ * autres n'avaient même pas d'écran. `ConversationSettings.groupArchived` et
+ * `AdvancedSettings.mmsRoamingAutoDownload` sont partis pour la même raison.
+ */
+data class NotificationSettings(
+    val enabled: Boolean = true,
+    val style: NotificationStyle = NotificationStyle.HEADS_UP,
+    val previewMode: PreviewMode = PreviewMode.ALWAYS,
+    val inlineReply: Boolean = true,
+)
+
+enum class NotificationStyle { BANNER, HEADS_UP, SILENT }
+enum class PreviewMode { ALWAYS, WHEN_UNLOCKED, NEVER }
+
+data class SecuritySettings(
+    val lockMode: LockMode = LockMode.OFF,
+    val autoLockDelay: AutoLockDelay = AutoLockDelay.ONE_MINUTE,
+    val flagSecure: Boolean = false,
+    // Feedback round 4 (2026-11-07) — FLAG_SECURE ("Hide preview in Recents") is
+    // OFF by default at Kristin's request, so fresh installs can take screenshots
+    // out of the box. The toggle stays in Settings for anyone who wants it on.
+    // Existing installs keep their stored value; only the default changed.
+    val lockVaultOnLeave: Boolean = true,
+    val panicCodeEnabled: Boolean = false,
+    /**
+     * v1.9.0 — config du Safety call (opt-in, désactivé par défaut).
+     * Voir [com.relay.sms.domain.safetycall.SafetyCallConfig] pour le
+     * détail des champs et de la sémantique. Stocké dans DataStore via 5
+     * clés indépendantes (cf. K.safetyCall*) plutôt qu'un blob JSON sérialisé,
+     * pour rester lisible/debugable et permettre des migrations partielles
+     * sans schéma. La liste [SafetyCallContact] est stockée en format
+     * pipe-separated via `SafetyCallContactCodec` (dans `:data`) (seule structure complexe).
+     */
+    val safetyCall: com.relay.sms.domain.safetycall.SafetyCallConfig =
+        com.relay.sms.domain.safetycall.SafetyCallConfig(),
+    /**
+     * v1.10.0 — config du Mode urgence (opt-in, désactivé par défaut).
+     * Voir [com.relay.sms.domain.emergency.EmergencyConfig]. Réutilise
+     * les contacts de [safetyCall] (pas de liste séparée). Stocké dans
+     * DataStore via 4 clés flat (cf. K.emergency*).
+     */
+    val emergency: com.relay.sms.domain.emergency.EmergencyConfig =
+        com.relay.sms.domain.emergency.EmergencyConfig(),
+    /**
+     * v1.12.0 — Raccourci urgence en notification persistante. Quand `true`,
+     * Relay pose une notif `IMPORTANCE_LOW` (silencieuse, persistante)
+     * visible sur l'écran verrouillé avec 2 actions :
+     *  - "URGENCE" → déclenche [TriggerEmergencyUseCase] directement
+     *  - "112" → ouvre le composeur téléphone pré-rempli (ACTION_DIAL)
+     *
+     * Désactivé par défaut. Opt-in via Settings → Mode urgence. Nécessite
+     * `emergency.enabled = true` pour avoir un sens (sinon le bouton URGENCE
+     * tape dans le vide). Le canal `CHANNEL_EMERGENCY_SHORTCUT` est posé
+     * avec `VISIBILITY_PUBLIC` pour l'affichage lock-screen.
+     */
+    val emergencyShortcutEnabled: Boolean = false,
+    /**
+     * v1.12.0 — action "police" dans la notification raccourci lock-screen.
+     * Désactivée par défaut : le 112 couvre déjà police + secours + pompiers
+     * dans toute l'UE, et une action de plus sur l'écran verrouillé se paie.
+     * v1.28.12 — le numéro n'est plus le 17 français mais celui du pays où le
+     * téléphone est enregistré ([EmergencyNumbers]), et ce réglage ne gouverne
+     * PLUS la tuile police de l'écran Urgence, qui suit le pays quoi qu'il arrive.
+     */
+    val emergencyCallPoliceEnabled: Boolean = false,
+    /**
+     * v1.13.0 — PIN distinct pour le coffre (second-factor). Quand ON, l'entrée
+     * dans `VaultScreen` est gated derrière la saisie d'un PIN dédié (hash
+     * séparé du PIN d'app), même si l'app principale est déjà déverrouillée.
+     * Pratique pour ceux qui partagent leur PIN d'app à un proche mais veulent
+     * garder le coffre privé.
+     *
+     * Default `false` : opt-in pour ne pas changer la UX existante. Le hash
+     * vit dans [com.relay.sms.data.local.datastore.SecurityStore], cette
+     * clé n'est que le flag déclaratif "feature active oui/non".
+     */
+    val vaultPinEnabled: Boolean = false,
+    /**
+     * v1.14.0 — comportement des boutons 112 / 17 (EmergencyScreen + notif
+     * lock-screen raccourci). Deux niveaux :
+     *   - [EmergencyCallBehavior.DIALER_ONLY] (DEFAULT) : ACTION_DIAL ouvre le
+     *     composeur pré-rempli, l'user confirme l'appel manuellement.
+     *     Aucune permission, zéro risque de pocket-dial.
+     *   - [EmergencyCallBehavior.HOLD_3S_DIRECT_CALL] : maintenir le bouton
+     *     3 secondes déclenche un appel direct via CALL_PHONE permission.
+     *     Pour situations vraiment critiques où chaque seconde compte.
+     *     Anneau de progression visible (anti-déclenchement accidentel).
+     *
+     * Niveau 2 (tap unique → call direct) volontairement non implémenté
+     * v1.14.0 : risque pocket-dial trop élevé pour gain marginal.
+     */
+    val emergencyCallBehavior: EmergencyCallBehavior = EmergencyCallBehavior.DIALER_ONLY,
+    /**
+     * v1.14.0 — opt-in du SMS "Je vais bien" envoyé aux contacts SafetyCall
+     * quand l'user appuie sur le bouton kill-switch. Default `true` (assume
+     * que l'user veut rassurer ses contacts), désactivable.
+     */
+    val sendIAmOkSmsOnReset: Boolean = true,
+    /**
+     * v1.11.0 — Sujet 3 anti-smishing : active la détection locale d'arnaque
+     * (URL raccourcies, mots d'urgence, numéros premium, typosquatting) et
+     * l'affichage d'un bandeau rouge "⚠️ Possiblement frauduleux" sous les
+     * messages reçus suspects. Opt-in par défaut (valeur ajoutée significative
+     * face à la vague de smishing FR 2024-2025), désactivable dans Settings →
+     * Sécurité si l'user trouve les faux positifs gênants.
+     */
+    val smishingDetectionEnabled: Boolean = true,
+    /**
+     * Profondeur de l'auto-nettoyage : NULL ou 0 = désactivé, sinon nombre de jours
+     * au-delà duquel les messages sont effacés. L'auto-nettoyage tourne au plus une fois
+     * par mois (voir [lastAutoPurgeAt]) ; le bouton "Effacer maintenant" du dialog
+     * applique la même profondeur sans toucher au cycle auto.
+     */
+    val autoDeleteOlderThanDays: Int? = null,
+    /**
+     * Timestamp epoch ms du dernier passage de l'auto-nettoyage (manuel ou auto). NULL =
+     * jamais. Le worker compare `now - lastAutoPurgeAt >= AUTO_PURGE_INTERVAL_MS`
+     * (30 jours) avant de re-purger, pour éviter le spam toutes les 12 h.
+     */
+    val lastAutoPurgeAt: Long? = null,
+    /**
+     * v1.28.2 — une purge du coffre lancée par la porte « PIN oublié » a déjà échoué.
+     *
+     * # Pourquoi cet état existe, et pourquoi il est PERSISTANT
+     *
+     * Depuis la v1.28.1, le PIN n'est retiré que sur un coffre démontrablement vide, et la
+     * conversation dont la copie système a résisté est CONSERVÉE. C'est la bonne règle tant que
+     * l'échec est passager. Il ne l'est pas toujours : une sauvegarde restaurée d'avant la
+     * v1.27.10 recopiait les `telephony_uri` du téléphone SOURCE, si bien qu'un message peut
+     * porter durablement une liaison qui désigne, ici, un AUTRE message. Le garde d'identité
+     * refuse alors d'y toucher — correctement — et chaque nouvel essai reproduit le même refus.
+     * L'utilisateur qui a oublié son PIN n'a plus aucune issue : une porte de sortie qui ne
+     * s'ouvre jamais n'en est pas une.
+     *
+     * Ce drapeau ouvre, **au second échec seulement**, une sortie assumée : vider quand même et
+     * retirer le PIN, en disant ce qui subsistera. Le premier échec ne la propose pas, pour ne
+     * pas offrir l'option dégradée sur une panne passagère — rôle SMS momentanément perdu, par
+     * exemple — qu'un simple nouvel essai suffirait à lever.
+     *
+     * Il est **en base et non en mémoire** : sans cela, fermer l'application entre deux essais
+     * ramènerait l'impasse, exactement comme la v1.28.1 a montré qu'un compteur en mémoire ne
+     * survit pas à ce qu'on lui demande de survivre.
+     */
+    val vaultPurgeFailedOnce: Boolean = false,
+)
+
+/**
+ * Round 40 — end-to-end encryption discovery (Relay-to-Relay).
+ */
+data class EncryptionSettings(
+    /**
+     * Automatic Relay discovery (outbound probing only), ON by
+     * default. When ON, opening a 1:1 thread or sending a 1:1
+     * message sends a probe — a short invisible data SMS carrying
+     * our identity keys — so the session is usually live before
+     * the user hits send. When OFF, this phone stops SENDING
+     * probes; inbound handshakes stay fully active (answering
+     * probes, receiving bundles, decrypting), so encryption still
+     * starts when the other side initiates. Toggled on the
+     * Encryption settings screen; read by [com.relay.sms.e2e.E2eProbeManager].
+     */
+    val autoDiscoverRelayContacts: Boolean = true,
+)
+
+enum class LockMode { OFF, PIN, PATTERN, BIOMETRIC }
+enum class AutoLockDelay { IMMEDIATE, FIFTEEN_SECONDS, ONE_MINUTE, FIVE_MINUTES, NEXT_LAUNCH }
+
+/**
+ * v1.14.0 — comportement des boutons 112 / 17 dans EmergencyScreen.
+ * Voir [SecuritySettings.emergencyCallBehavior] pour le KDoc.
+ */
+enum class EmergencyCallBehavior { DIALER_ONLY, HOLD_3S_DIRECT_CALL }
+
+data class BlockingSettings(
+    val blockUnknown: Boolean = false,
+    // v1.3.5 G6 audit fix — `blockShortCodes` retiré (champ fantôme : aucun caller
+    // ne le lisait pour filtrer les short codes côté SmsDeliverReceiver, et l'UI
+    // ne l'exposait pas. Si la feature est re-demandée plus tard, ré-implémenter
+    // proprement via une colonne `BlockedNumberEntity.scope` plutôt qu'un boolean
+    // global. La clé DataStore reste lue pour migration (sera supprimée v1.3.6+).
+)
+
+/**
+ * v1.26.1 (audit F5) — la sauvegarde AUTOMATIQUE a été retirée, sur décision explicite.
+ *
+ * Elle était morte à trois niveaux indépendants : `BackupWorker` n'était jamais mis en file,
+ * aucun écran ne réglait la fréquence ni le dossier de destination, et `runScheduledBackup`
+ * refusait de toute façon le format `.smsbk` — le format par défaut — faute de phrase secrète
+ * disponible pour un travail de fond. La rendre réelle aurait exigé de persister un secret de
+ * chiffrement sur l'appareil ; l'alternative, sauvegarder en XML non chiffré, aurait été une
+ * régression de confidentialité. La fonctionnalité part donc entièrement, plutôt que de rester
+ * une promesse latente.
+ *
+ * Sont supprimés avec elle : `autoBackup` + l'enum `AutoBackupFrequency`, `destinationUri`,
+ * `keepLast`, `format` + l'enum `BackupFormat` (dont l'unique consommateur était le chemin
+ * planifié), `runScheduledBackup`, `writeXmlCompat` et `BackupWorker`.
+ *
+ * **La sauvegarde MANUELLE, elle, est intacte** : `writeSmsbk` / `readSmsbk` depuis l'écran
+ * Sauvegarde, restauration comprise.
+ */
+data class BackupSettings(
+    val encrypt: Boolean = true,
+)
+
+data class AdvancedSettings(
+    // v1.28.12 (audit B2) — `isDefaultSmsApp` a été SUPPRIMÉ. Il était écrit et relu par
+    // `SettingsRepository`, et par personne d'autre : RIEN ne l'a jamais mis à jour, il valait
+    // donc `false` à vie, y compris sur un téléphone où l'application TIENT le rôle. Le rôle se
+    // demande au système, au moment où la question se pose — `DefaultSmsAppManager.isDefault()`,
+    // qui est ce que l'écran des conversations utilise déjà.
+    /**
+     * Highest `Telephony.Sms._ID` we have already mirrored into our Room DB. Maintained by the
+     * [com.relay.sms.data.sync.TelephonySyncManager] — it queries `content://sms` with
+     * `_ID > lastSyncedSmsId` to read only new rows, which keeps every open instant (no full
+     * scan after the first run). `0L` means "never synced yet", so the first sync after a
+     * fresh install copies everything.
+     */
+    val lastSyncedSmsId: Long = 0L,
+    /**
+     * v1.27.2 (audit Codex du 2026-08-05, P-10) — `true` une fois qu'un import MMS a été mené
+     * **jusqu'à sa dernière page**.
+     *
+     * # Le défaut que ce marqueur ferme
+     *
+     * L'import MMS se déclenchait sur `isFirstRun || !hasAnyMms`, c'est-à-dire sur une preuve
+     * indirecte : « la base contient au moins un MMS ». Or il écrit **page par page**. Une
+     * exception après la première page laissait donc :
+     *  - `hasAnyMms = true` — grâce à cette seule page ;
+     *  - `isFirstRun = false` dès que le curseur SMS avançait, ce qui suit immédiatement.
+     *
+     * `needsMmsImport` devenait faux et **les pages restantes n'étaient jamais relues**.
+     * L'historique MMS restait durablement amputé : les messages sont toujours dans le
+     * fournisseur Android, mais l'application ne les réimportait plus sans remise à zéro externe.
+     *
+     * Le marqueur est posé **après** la dernière page, jamais avant. Une interruption — annulation
+     * comprise — le laisse à `false`, et la passe suivante rejoue l'import en entier. C'est sans
+     * risque : l'insertion est idempotente (`telephony_uri` UNIQUE + `IGNORE`).
+     *
+     * ⚠️ Les installations existantes n'ont pas ce marqueur : elles rejouent donc **une** passe
+     * complète de validation au prochain démarrage. C'est exactement le rattrapage voulu pour
+     * celles dont l'import s'était interrompu sans que rien ne le signale.
+     */
+    val mmsImportCompleted: Boolean = false,
+    /**
+     * v1.3.7 — `true` une fois que le splash de présentation a été vu (à la première
+     * ouverture après install). Tant que `false`, l'ouverture de l'app passe par
+     * [com.relay.sms.ui.screens.splash.SplashScreen] (logo scale+fade + tagline,
+     * 3 s ou tap-to-skip), puis le flag est persisté et l'utilisateur n'est plus jamais
+     * redirigé vers ce splash, y compris après une mise à jour. `Effacer données` depuis
+     * les paramètres système ré-affiche le splash (comportement attendu : nouvelle "1ère
+     * ouverture" du point de vue de l'utilisateur).
+     */
+    val splashShown: Boolean = false,
+    /**
+     * v1.8.0 (post-audit fix unread badges) — migration one-shot pour purger
+     * l'état legacy v1.7.1 : au 1er cold-start v1.8.0, on RESET tous les
+     * `conversations.unread_count` à 0 ET on marque tous les `messages.read`
+     * INCOMING à 1 (pour aligner Room sur la réalité — le user a très
+     * probablement déjà lu ces messages dans une autre app ou les considère
+     * comme lus). Sans cette purge, les badges hérités de v1.7.1 (compteurs
+     * inflated + flag `read=0` désynchronisé du système) persistent
+     * indéfiniment et ne se cleanent jamais — le simple recompute SQL ne
+     * suffit pas car il s'appuie sur `messages.read` qui est lui-même
+     * désynchronisé.
+     *
+     * `true` une fois la migration faite. Les futurs SMS live arrivent
+     * ensuite via `SmsDeliverReceiver` avec `read=false` + `unread_count++`
+     * normalement — comportement préservé pour la vraie nouveauté.
+     */
+    val unreadResetV180: Boolean = false,
+    /**
+     * v1.22.x — flag de complétion de la dédup des conversations du même numéro
+     * ([com.relay.sms.data.repository.ConversationMirror.dedupeSameNumberConversations]).
+     * Posé à `true` une fois la base propre (aucun doublon restant) pour ne plus re-scanner à
+     * chaque cold-start. Même pattern que `unreadResetV180`.
+     */
+    val dedupSameNumberV1230: Boolean = false,
+    /**
+     * v1.14.7 — flag de migration one-shot pour rapatrier les attachments MMS reçus
+     * de `cacheDir/mms_incoming/` (volatile, peut être purgé par Android Storage
+     * Manager ou par "Effacer le cache" Réglages → Apps) vers
+     * `filesDir/mms_attachments/` (persistant, ne disparaît qu'avec un wipe app).
+     * Avant ce fix, les MMS audio/image/vidéo reçus disparaissaient silencieusement
+     * quand Android nettoyait le cache, laissant des `AttachmentEntity.localUri`
+     * Room pointant vers des fichiers absents → bulle audio cassée affichant le
+     * nom de fichier en fallback. Migration cold-start idempotente.
+     */
+    val attachmentsMovedToFilesDirV147: Boolean = false,
+    /**
+     * v1.24.0 — court-circuit global des migrations one-shot qui ouvrent la base
+     * ([com.relay.sms.system.startup.StartupMigrations]).
+     *
+     * Chaque migration garde son propre flag comme **source de vérité** ([unreadResetV180],
+     * [attachmentsMovedToFilesDirV147], [dedupSameNumberV1230]). Ce flag n'est qu'une optimisation :
+     * il est posé UNIQUEMENT lorsque les trois sont déjà à `true`, et il permet alors au cold-start
+     * suivant de sortir sans ouvrir SQLCipher du tout — le vrai gain, puisqu'une install à jour ne
+     * fait plus aucun travail de migration. Sûr par construction : il ne peut jamais sauter une
+     * migration dont le flag individuel n'est pas encore posé.
+     */
+    val startupDbMigrationsDone: Boolean = false,
+    /**
+     * Feedback round 7 — version of the retroactive reaction reparse
+     * ([com.relay.sms.data.repository.ConversationMirror
+     * .reparseStoredReactions]) this install has run, so it never re-scans
+     * on later cold starts. A versioned gate rather than a boolean: when a
+     * later version folds a new shape (v2 added our OWN outgoing tapbacks,
+     * imported from the sent box), installs that already ran v1 run once
+     * more instead of keeping the old rows as text forever. Compare
+     * against [REACTION_REPARSE_CURRENT_VERSION]; the stored value is
+     * migrated from the legacy `advanced.reactionReparseDone` boolean
+     * (`true` → 1) by `SettingsRepository`.
+     */
+    val reactionReparseVersion: Int = 0,
+    /**
+     * v1.24.0 — réparation one-shot des aperçus de conversation périmés par des suppressions de
+     * message sous les versions ≤ 1.23.4 (qui ne recalculaient pas la ligne `conversations`).
+     * `true` une fois la passe [com.relay.sms.data.local.db.dao.MessageDao.repairStaleConversationPreviews]
+     * exécutée. Indépendant de [startupDbMigrationsDone] : doit tourner même sur une install déjà
+     * migrée qui passe à 1.24.0.
+     */
+    val staleConversationPreviewsRepairedV1240: Boolean = false,
+    /**
+     * v1.28.12 — le format de réaction du PARC EXISTANT a été ramené une fois au défaut
+     * déclaré par la v1.14.4.
+     *
+     * `SettingsRepository` écrit `send.reactionFormat` à CHAQUE enregistrement de réglages,
+     * sans condition. Toute installation ayant modifié un réglage — n'importe lequel — entre
+     * la v1.8.0 et la v1.14.4 a donc gravé `READABLE_FR`, et la valeur stockée l'emporte sur
+     * le défaut déclaré. Ces installations envoyaient encore leurs réactions en français, y
+     * compris à des correspondants allemands, italiens, espagnols ou anglais.
+     *
+     * ⚠️ Rien ne distingue « a choisi la forme française » de « en a hérité » : la migration
+     * écrase donc un choix délibéré s'il existe. Arbitré par Patrice le 2026-09-17, en
+     * connaissance de ce coût — le réglage se remet en deux tapes, et le changelog le dit.
+     * Indépendant de [startupDbMigrationsDone] : le parc visé l'a déjà à `true`.
+     */
+    val reactionFormatMigreV12812: Boolean = false,
+    /**
+     * One-shot : ramène UNE FOIS le format `EMOJI_WITH_QUOTE` au défaut
+     * [ReactionFormat.IOS_TAPBACK]. Les `«»` de l'ancien format arrivaient
+     * déformés en `<<>>` côté correspondant (`👍<<Hi>>`) : le format ne
+     * remplissait plus sa promesse d'être compris hors Relay. Seul
+     * `EMOJI_WITH_QUOTE` est migré — les choix explicites (`READABLE_FR`,
+     * `TAPBACK_EN`, `EMOJI_ONLY`) sont conservés, comme pour la migration
+     * v1.28.12. Voir [com.relay.sms.data.local.datastore.SettingsRepository
+     * .migrerFormatVersIosTapback].
+     */
+    val reactionFormatMigreIosTapback: Boolean = false,
+    /**
+     * 🔴 v1.27.2 (audit Codex du 2026-08-05, LP-05) — REJOUE la deduplication avec l identite
+     * region-aware corrigee.
+     *
+     * `dedupSameNumberV1230` ne peut pas servir : une installation VICTIME du defaut l a
+     * precisement deja a `true` — c est meme la signature du probleme. Elle avait fusionne (ou
+     * refuse de fusionner) sous une region fausse, declare la base propre, et pose le drapeau. Le
+     * correctif d identite ne rejouait donc jamais sur les bases qu il cherche a reparer.
+     *
+     * Nouveau drapeau, nouvelle version : c est la seule facon de rattraper un parc deja marque.
+     * Pose UNIQUEMENT quand la passe rend `false`, c est-a-dire quand la base est reellement
+     * propre — tant qu elle fusionne encore, on rejoue au demarrage suivant.
+     */
+    val identityDedupRepairedV1272: Boolean = false,
+    /**
+     * 🔴 v1.27.2 (audit Codex du 2026-08-05, LP-07) — retire les conversations **coquilles** deja
+     * creees avant le correctif.
+     *
+     * Le nettoyage introduit le meme soir ne s applique qu aux conversations dont un message vient
+     * d etre supprime. Une coquille deja vide n a plus de message, donc n est jamais candidate :
+     * elle restait affichee indefiniment, datee du 1er janvier 1970.
+     */
+    val emptyConversationsPurgedV1272: Boolean = false,
+    /**
+     * Round 35 (schema v20) — the one-shot sticky-category backfill has
+     * run: every 1:1 stranger conversation was filed from the full bodies
+     * of its recent incoming messages, so conversations the spammers
+     * already reached move to their tab without waiting for another
+     * message. Independent of [startupDbMigrationsDone]: the fleet it
+     * targets already has that flag set.
+     */
+    val stickyCategoryBackfilledV20: Boolean = false,
+    /**
+     * Spam follow-up (schema v22) — the second one-shot sticky-category
+     * backfill has run. The classifier gained new signals after the
+     * round-35 pass, so conversations the first pass filed as all-plain
+     * (or that a plain follow-up later filed Personal) are re-examined
+     * once, so already-received spam moves to its tab without waiting
+     * for another message. Same placement and semantics as
+     * [stickyCategoryBackfilledV20]: independent of
+     * [startupDbMigrationsDone], set only after a complete pass.
+     */
+    val stickyCategoryBackfilledV22: Boolean = false,
+    /**
+     * v1.3.10 — **opt-in** : démarre [com.relay.sms.system.service.KeepAliveService]
+     * qui maintient le processus Relay vivant via une notification persistante
+     * discrète (canal `IMPORTANCE_MIN`, ne fait ni son ni vibration). Indispensable pour
+     * que Relay reçoive correctement les SMS / MMS / notifications sur :
+     *
+     *   - **Xiaomi MIUI / HyperOS 2024+** (Redmi 9A Android 10 Go, Poco F5 HyperOS,
+     *     Redmi Note 14 Pro 5G `2410FPCC5G`…)
+     *   - **Huawei EMUI / HarmonyOS** (sans Google Mobile Services)
+     *   - **Honor MagicOS** (descendant EMUI)
+     *   - Certains **OnePlus** anciens (OxygenOS < 12) et **realme realmeUI**
+     *
+     * Ces ROMs whitelistent uniquement les apps SMS du constructeur ; toute app SMS
+     * tierce (Relay, QKSMS, Silence, etc.) est silencieusement killée en
+     * background, ce qui empêche la réception MMS et l'affichage des notifications.
+     *
+     * Sur ROMs non-agressives (Pixel Android stock, Samsung One UI, Sony Xperia,
+     * Fairphone, Nothing OS, OnePlus récent OxygenOS, Motorola), ce mode est INUTILE
+     * — la notification persistante encombre le shade pour rien. Laisser `false` par
+     * défaut respecte les utilisateurs sur des ROMs propres.
+     *
+     * **Trade-off** : ~5-10 Mo RAM permanents (processus gardé en heap), batterie
+     * négligeable (service idle). La notif persistante est masquable depuis les
+     * réglages OS si l'utilisateur la trouve gênante.
+     */
+    val keepAliveService: Boolean = false,
+    // Round 18 fix (2026-11-12) — the temporary Klipy API key field
+    // (`klipyApiKey`, pasted in Settings → Advanced) was removed: CI builds
+    // now bake the key in from the repository secret, so no device-side key
+    // entry is needed. A value stored on an existing install under
+    // `advanced.klipyApiKey` is simply never read again.
+) {
+    companion object {
+        /**
+         * Current reparse version (see [reactionReparseVersion]): 1 folded
+         * incoming reaction texts; 2 also folds our own outgoing tapbacks;
+         * 3 also normalizes stored multi-emoji reactions (a legacy
+         * multi-react value like "👍😂😅") down to their first emoji.
+         * Bump when the reparse learns a new shape, so existing installs
+         * re-run it exactly once.
+         */
+        const val REACTION_REPARSE_CURRENT_VERSION = 3
+    }
+}

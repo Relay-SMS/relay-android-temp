@@ -1,0 +1,84 @@
+/*
+ * Copyright 2026 Relay Messaging. All rights reserved.
+ *
+ * This file is proprietary to Relay Messaging and is not licensed under the
+ * Apache License 2.0. See LICENSE-RELAY for the terms.
+ */
+
+package com.relay.sms.data.local.db.dao
+
+import androidx.room.Dao
+import androidx.room.Insert
+import androidx.room.Query
+import com.relay.sms.data.local.db.entity.E2eNoticeEntity
+import com.relay.sms.data.local.db.entity.E2eNoticeKind
+import kotlinx.coroutines.flow.Flow
+
+/**
+ * DAO for [E2eNoticeEntity] — the in-thread encryption notices (system rows, not
+ * bubbles).
+ *
+ * All access goes through [com.relay.sms.e2e.E2eNoticeStore]. The thread
+ * ViewModel merges [noticesForConversation] into the message window by date
+ * (notices are rare, so the merge is cheap).
+ */
+@Dao
+interface E2eNoticeDao {
+
+    @Insert
+    suspend fun insert(notice: E2eNoticeEntity): Long
+
+    /** Every notice in a conversation, oldest first (the thread merge order). */
+    @Query("SELECT * FROM e2e_notices WHERE conversation_id = :conversationId ORDER BY date ASC")
+    suspend fun noticesForConversation(conversationId: Long): List<E2eNoticeEntity>
+
+    /**
+     * The conversation's latest notice (newest date; the highest id
+     * breaks a date tie, so the most recently recorded row wins).
+     * Null when the conversation has no notices. Round 48 — the
+     * thread-open ACTIVATED backfill reads this one row instead of
+     * the whole notice list.
+     */
+    @Query(
+        "SELECT * FROM e2e_notices WHERE conversation_id = :conversationId " +
+            "ORDER BY date DESC, id DESC LIMIT 1",
+    )
+    suspend fun latestNotice(conversationId: Long): E2eNoticeEntity?
+
+    /**
+     * Live view of a conversation's notices, oldest first (the thread
+     * merge order). The thread UI collects it: a notice recorded while
+     * the thread is open (a bundle landing, a key change) appears
+     * without reopening the thread.
+     */
+    @Query("SELECT * FROM e2e_notices WHERE conversation_id = :conversationId ORDER BY date ASC")
+    fun observeForConversation(conversationId: Long): Flow<List<E2eNoticeEntity>>
+
+    /** How many notices of this kind a conversation already has (the once-per-identity guard). */
+    @Query(
+        "SELECT COUNT(*) FROM e2e_notices WHERE conversation_id = :conversationId AND kind = :kind",
+    )
+    suspend fun countByKind(conversationId: Long, kind: E2eNoticeKind): Int
+
+    /**
+     * E2E sync (round 42) — every notice, oldest first: the
+     * device-link snapshot source (the in-thread notice set). A
+     * stable order keeps the frame stable.
+     */
+    @Query("SELECT * FROM e2e_notices ORDER BY date ASC")
+    suspend fun allNotices(): List<E2eNoticeEntity>
+
+    /**
+     * E2E sync (round 42) — the live version of [allNotices]:
+     * re-emits whenever any `e2e_notices` row changes, so a
+     * notice recorded while a desktop is linked re-sends the full
+     * set. Room invalidates on any write to the table — the
+     * collector dedupes the no-change emissions.
+     */
+    @Query("SELECT * FROM e2e_notices ORDER BY date ASC")
+    fun observeAll(): Flow<List<E2eNoticeEntity>>
+
+    /** Deletes a conversation's notices (conversation deleted). */
+    @Query("DELETE FROM e2e_notices WHERE conversation_id = :conversationId")
+    suspend fun deleteForConversation(conversationId: Long): Int
+}

@@ -1,0 +1,47 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.data.local.datastore
+
+import com.google.common.truth.Truth.assertThat
+import com.relay.sms.domain.settings.AppSettings
+import org.junit.jupiter.api.Test
+
+class AppSettingsTest {
+
+    @Test fun `defaults are conservative and privacy friendly`() {
+        val s = AppSettings()
+        // Notifications enabled by default but content preview can be capped
+        assertThat(s.notifications.enabled).isTrue()
+        // Security: lock disabled out-of-the-box (user has to enable) and FLAG_SECURE
+        // off — feedback round 4 (2026-11-07), Kristin's request: fresh installs can
+        // take screenshots out of the box; the toggle in Settings turns it back on.
+        assertThat(s.security.flagSecure).isFalse()
+        // Vault locks on leave by default
+        assertThat(s.security.lockVaultOnLeave).isTrue()
+        // Sending: delivery reports on by default; no confirm-before-send dialog
+        // by default — messages send straight away.
+        assertThat(s.sending.deliveryReports).isTrue()
+        assertThat(s.sending.confirmBeforeBroadcast).isFalse()
+        // Backups: encrypted by default
+        assertThat(s.backup.encrypt).isTrue()
+        // Auto-delete OFF — no surprise data loss
+        assertThat(s.security.autoDeleteOlderThanDays).isNull()
+    }
+
+    @Test fun `v1_3_1 reaction send defaults are explicit`() {
+        val s = AppSettings()
+        // ON by default: the user wants the recipient to see the reaction.
+        // Feedback round 5 — the first send is NOT guarded by a confirm
+        // dialog any more: reactions dispatch immediately, no confirmation
+        // step, so there is no dismissed flag to assert here.
+        assertThat(s.sending.sendReactionsToRecipient).isTrue()
+        // Cleanup anchor null at install: prevents the worker from auto-purging immediately
+        // after the user enables retention (anchor is set on first worker tick, real purge
+        // in 30 days). This guards against the v1.3.0 regression where `null` was read as 0.
+        assertThat(s.security.lastAutoPurgeAt).isNull()
+    }
+}

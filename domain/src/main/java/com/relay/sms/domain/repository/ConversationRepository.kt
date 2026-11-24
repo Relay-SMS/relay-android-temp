@@ -1,0 +1,309 @@
+/*
+ * Copyright 2026 Relay Messaging (modifications). The original work is
+ * copyright its respective holders and is licensed under the Apache
+ * License 2.0. See LICENSE.
+ */
+
+package com.relay.sms.domain.repository
+
+import com.relay.sms.core.result.Outcome
+import com.relay.sms.domain.model.Attachment
+import com.relay.sms.domain.model.Conversation
+import com.relay.sms.domain.model.Message
+import com.relay.sms.domain.model.MessageSearchHit
+import com.relay.sms.domain.model.MessageState
+import com.relay.sms.domain.model.MessageWindow
+import com.relay.sms.domain.model.MessageWindowSpec
+import com.relay.sms.domain.model.PhoneAddress
+import kotlinx.coroutines.flow.Flow
+
+interface ConversationRepository {
+    fun observeAll(includeArchived: Boolean = false): Flow<List<Conversation>>
+    fun observeVault(): Flow<List<Conversation>>
+    fun observeOne(id: Long): Flow<Conversation?>
+
+    /**
+     * v1.26.1 — `true` quand la conversation existe mais que son contenu est masqué parce que
+     * le Coffre s'est refermé pour cette session. Permet à l'écran de fil de distinguer « masqué
+     * par le Coffre » de « conversation inexistante » et de ressortir au lieu d'afficher un fil
+     * vide dont l'envoi échoue en silence. Toujours `false` en session leurre — voir
+     * l'implémentation.
+     */
+    fun observeVaultHidden(id: Long): Flow<Boolean>
+
+    /**
+     * The **entire** thread. Kept unbounded for consumers that need the full history, such as the
+     * PDF export. The thread UI uses [observeMessagesWindow] instead.
+     */
+    fun observeMessages(conversationId: Long): Flow<List<Message>>
+
+    /**
+     * A bounded, growable view of the thread: the most recent messages first paint, older ones on
+     * demand.
+     *
+     * @param window emits the current window spec; a new spec re-runs the query in place.
+     */
+    fun observeMessagesWindow(
+        conversationId: Long,
+        window: Flow<MessageWindowSpec>,
+    ): Flow<MessageWindow>
+
+    /**
+     * Feedback round 5 — full-history thread search: ids of the messages in
+     * [conversationId] whose body contains [query] (literal, case-insensitive
+     * substring), oldest first, over the WHOLE thread — not just the loaded
+     * window. Empty when the query is blank; empty when the vault hides the
+     * conversation, under the same rule as [observeMessagesWindow]. The match
+     * count the thread shows is the size of this list.
+     *
+     * A `Flow`: Room re-emits on table invalidation, so the count stays fresh if
+     * a matching message arrives mid-search.
+     */
+    fun observeSearchInConversation(conversationId: Long, query: String): Flow<List<Long>>
+
+    /**
+     * Issue #59 — the photos and videos of a conversation, most recent first. Empty when the vault
+     * hides the conversation, under the same rule as [observeMessages].
+     */
+    fun observeMedia(conversationId: Long): Flow<List<Attachment>>
+
+    /**
+     * Details panel — Files tab: the attachments that are neither photos nor videos, most recent
+     * first. Same vault rule as [observeMedia].
+     */
+    fun observeFiles(conversationId: Long): Flow<List<Attachment>>
+
+    fun observeUnreadConversationCount(): Flow<Int>
+
+    suspend fun findOrCreate(addresses: List<PhoneAddress>): Outcome<Conversation>
+    suspend fun setPinned(id: Long, pinned: Boolean)
+    suspend fun setArchived(id: Long, archived: Boolean)
+    suspend fun setMuted(id: Long, muted: Boolean)
+
+    /**
+     * Feedback round 5 — épingle (ou retire) le message d'un fil. Un seul
+     * message épinglé par conversation : épingler un autre message remplace
+     * l'épingle courante. `messageId = null` (avec `pinnedAt = null`) retire
+     * l'épingle. `pinnedAt` est la date de l'épinglage (epoch ms), affichée
+     * par la bannière du fil.
+     */
+    suspend fun setPinnedMessage(id: Long, messageId: Long?, pinnedAt: Long?)
+
+    /**
+     * v1.28.3 (audit global, X-01) — lecture DIRECTE d'une conversation par son id, sans le
+     * masquage du coffre qu'applique [observeOne] : c'est ce qu'il faut à qui décide d'y entrer
+     * ou d'en sortir. `null` si elle n'existe pas.
+     */
+    suspend fun findById(id: Long): Conversation?
+
+    /**
+     * v1.14.8 audit R8 — Move bulk atomique : N conversations vers/depuis le coffre dans une
+     * SEULE transaction Room. Avant : la VM bouclait `for (id in ids) moveToVault(id, ...)` et
+     * un process-kill au milieu laissait l'état partiellement migré sans feedback. Maintenant
+     * `withTransaction { ... }` garantit : soit tout passe, soit rien — pas d'état hybride.
+     * Retourne le nombre de rows effectivement mises à jour.
+     */
+    suspend fun bulkMoveToVault(ids: List<Long>, inVault: Boolean): Int
+    suspend fun setDraft(id: Long, draft: String?)
+    /**
+     * v1.11.0 — apparence personnalisée par conversation (Sujet 5). `null` sur
+     * un argument = reset à la valeur par défaut (bleu marque pour la bulle,
+     * avatar contact natif). Voir [com.relay.sms.data.local.db.dao.ConversationDao.setAppearance].
+     */
+    suspend fun setAppearance(id: Long, bubbleColorArgb: Int?, avatarUri: String?)
+
+    /** v1.28.3 — nom choisi d'un groupe, déjà normalisé par [com.relay.sms.domain.model.GroupName]. */
+    suspend fun setCustomName(id: Long, name: String?)
+
+    /**
+     * Round 44 — self-heal for a stale cached display name on a
+     * 1:1 thread: clears the conversation's `displayName` (so the
+     * title falls back to the formatted number) when a live lookup
+     * definitively says [address] is not a contact. Clears ONLY
+     * when the lookup could actually answer (READ_CONTACTS
+     * granted) and came back empty; a denied permission, a contact
+     * found, and client mode (where the name came from the hub and
+     * the local cache is not authoritative) all leave the name
+     * untouched. 1:1 only — the caller guarantees it: a group's
+     * display name is its joined member names, never one lookup.
+     */
+    suspend fun clearStaleDisplayName(conversationId: Long, address: String)
+
+    suspend fun markRead(id: Long)
+
+    /**
+     * Long-press "Mark unread" (desktop parity): re-opens the
+     * conversation as unread. Unread is derived — `unread_count`
+     * is recomputed from incoming `read = 0` rows — so the mark
+     * flips the latest incoming message back to unread and
+     * recomputes (badge shows 1). Client mode: local only, no
+     * frame exists for mark-unread, so the hub never learns of
+     * it and a re-sync may reset it. Room-only, never the system
+     * store, and silent — no notification is (re-)posted.
+     */
+    suspend fun markUnread(id: Long)
+
+    /**
+     * v1.14.8 audit H4 — "Tout marquer comme lu" centralisé. Avant : la
+     * [com.relay.sms.ui.screens.conversations.ConversationsViewModel] injectait
+     * `MessageDao` + `ConversationDao` + `TelephonyReader` et orchestrait elle-même
+     * la propagation Room + content://sms+mms. Couche presentation court-circuitée.
+     * Maintenant la logique vit dans le repository (qui sait déjà tout ce qu'il faut).
+     */
+    suspend fun markAllRead()
+
+    /**
+     * v1.28.9 (septième note d'Andrew, point 5) — rend ce qu'il est advenu de la conversation : une
+     * conversation du coffre est CONSERVÉE sur tout échec, cf. [ConversationDeleteResult].
+     */
+    suspend fun delete(id: Long): ConversationDeleteResult
+
+    /**
+     * v1.27.10 (revue externe GitLab !38458) — supprime TOUTES les conversations du coffre,
+     * messages compris, et propage au fournisseur SMS/MMS du systeme comme [delete].
+     *
+     * Seul appelant legitime : la porte de sortie « PIN du coffre oublie » des Reglages, qui
+     * echange l'acces contre la destruction. Cf. `VaultPinManager.forgetVaultPin`.
+     *
+     * v1.27.11 (meme revue, constat 2) — renvoie un [VaultPurgeResult] et non plus un simple
+     * compte. Voir ce type pour la raison : un nombre de succes ne dit pas si le coffre est vide.
+     *
+     * v1.28.5 (sixieme note d'Andrew, point 2) — [apresPurge] s'execute avec le resultat, AVANT
+     * que la barriere d'entree au coffre ne retombe. C'est la que l'appelant decide du PIN : le
+     * decider apres le retour laissait une fenetre ou une conversation entrait au coffre entre la
+     * relecture de `remaining` et le retrait du PIN. L'appelant choisit ; l'implementation garantit
+     * seulement que personne n'entre pendant qu'il choisit.
+     */
+    suspend fun deleteAllInVault(
+        force: Boolean = false,
+        apresPurge: suspend (VaultPurgeResult) -> Unit = {},
+    ): VaultPurgeResult
+    suspend fun deleteMessage(messageId: Long)
+
+    /**
+     * v1.26.1 (audit F2) — marque ou démarque un message comme favori.
+     *
+     * `MessageDao.setStarred` existait sans aucun appelant, alors que la purge automatique
+     * épargne déjà les favoris (`DELETE … AND starred = 0`) et que l'interface le promet à
+     * l'utilisateur. Sans ce chemin d'écriture, la promesse ne protégeait rien.
+     */
+    suspend fun setMessageStarred(messageId: Long, starred: Boolean)
+
+    /**
+     * v1.28.8 (issue #17) — recherche dans le TEXTE des messages, par l'index plein texte.
+     *
+     * Jamais dans le coffre : c'est aussi ce que voit une session leurre. [archivedOnly] limite aux
+     * conversations archivées (écran des archives). Le flux se réémet quand un message arrive ou
+     * disparaît : un message supprimé quitte les résultats. Moins de
+     * [MessageSearchHit.MIN_QUERY_LENGTH] caractères : liste vide.
+     */
+    fun observeMessageSearch(query: String, archivedOnly: Boolean): Flow<List<MessageSearchHit>>
+
+    /**
+     * v1.3.1 — lookup ponctuel d'un message par id. Retourne `null` si purgé ou supprimé
+     * entre-temps. Suspend + indexé sur PRIMARY KEY (négligeable). Utilisé par
+     * [com.relay.sms.domain.usecase.SendReactionUseCase] pour cibler le bon
+     * expéditeur (anti-bug groupe : on n'envoie qu'à `message.address`, pas à toute la
+     * conversation) et pour bloquer les réactions sur messages sortants.
+     */
+    suspend fun findMessageById(id: Long): Message?
+
+    /**
+     * Lookup PRIMARY KEY d'un message pour un **re-dispatch** (retry d'envoi), SANS la garde
+     * `inVault` de [findMessageById]. Renvoyer ici un message d'une conversation coffre est
+     * légitime : l'appelant ([com.relay.sms.domain.usecase.RetrySendUseCase]) ré-émet vers
+     * le destinataire d'origine et n'expose jamais le corps à l'UI. **Ne pas utiliser pour un
+     * affichage** — utiliser [findMessageById] (gardé) pour tout chemin visible par l'utilisateur.
+     */
+    suspend fun findMessageForResend(id: Long): Message?
+
+    /**
+     * Slice 3 — lookup d'un message par sa **clé d'idempotence** (l'UUID qu'un appareil lié
+     * a généré pour cet envoi). `null` si aucune ligne ne porte la clé — envoi jamais vu,
+     * ou message purgé depuis. La garde `inVault` est INCONDITIONNELLE, comme les autres
+     * lectures de synchronisation : le contenu du coffre ne quitte jamais le téléphone, et
+     * une conversation déplacée au coffre après l'envoi ne doit plus répondre à sa clé.
+     */
+    suspend fun findMessageByClientMessageId(key: String): Message?
+
+    /**
+     * Slice 4 — lookup ponctuel d'une pièce jointe par id, pour le
+     * téléchargement vers un appareil lié. Aucune garde coffre ici :
+     * la colle vérifie l'appartenance (message + conversation
+     * non-coffre) avant d'ouvrir les octets.
+     */
+    suspend fun findAttachmentById(id: Long): Attachment?
+
+    /**
+     * v1.3.1 — pose / change / retire la réaction emoji locale sur [messageId] et retourne
+     * le type de transition pour permettre au caller (ViewModel) de décider d'un éventuel
+     * envoi SMS en aval. Sémantique :
+     *
+     *   - [SetReactionResult.Noop]    : la valeur stockée était déjà égale à [emoji]
+     *                                   (incluant null → null ou même emoji), ou le message
+     *                                   n'existe plus (purgé / supprimé concurrently).
+     *   - [SetReactionResult.First]   : transition null → emoji non-null. Premier tap.
+     *                                   Le caller envoie un SMS de réaction.
+     *   - [SetReactionResult.Changed] : transition emoji A → emoji B (deux non-null distincts).
+     *                                   Le caller envoie un SMS avec le nouvel emoji (v1.4.1).
+     *   - [SetReactionResult.Removed] : transition emoji → null. Le caller envoie
+     *                                   un SMS de retrait (`Removed a like from "…"`, forme Apple).
+     *
+     * Le mapping est strictement déterministe : un seul update Room par appel, jamais d'écho
+     * réseau côté repo. L'envoi SMS éventuel est orchestré par le caller via
+     * [com.relay.sms.domain.usecase.SendReactionUseCase].
+     */
+    suspend fun setReaction(messageId: Long, emoji: String?): SetReactionResult
+
+    /**
+     * v1.3.0 — compte combien de messages seraient effacés par un nettoyage manuel à la
+     * profondeur [olderThanDays] (jours). Utilisé par le dialog réglages avant confirmation.
+     * Ne touche jamais aux favoris ni aux 5 derniers jours (filet interne).
+     */
+    suspend fun countMessagesToPurge(olderThanDays: Int): Int
+
+    /**
+     * v1.3.0 — efface MAINTENANT les messages plus vieux que [olderThanDays] jours, en
+     * appliquant le filet interne 5 jours et en épargnant les favoris. Ne touche pas au
+     * cycle auto-mensuel (le `lastAutoPurgeAt` n'est pas mis à jour). Retourne le nombre
+     * de rows effacées pour feedback UI.
+     *
+     * v1.28.1 — **la copie systeme part aussi**, ce qui n'etait pas le cas et n'etait ecrit
+     * nulle part. La retention est un reglage de confidentialite : laisser les messages dans
+     * `content://sms` les gardait lisibles par toute application ayant `READ_SMS`, et le bouton
+     * « Resynchroniser » les ramenait tous. La ligne locale part meme si la propagation echoue —
+     * voir `ConversationEraser.purgeHistory` pour la regle qui separe ce cas de celui du coffre.
+     */
+    suspend fun purgeHistoryNow(olderThanDays: Int): Int
+
+    /**
+     * Slice 2 — one page of one conversation, newest first: ids
+     * strictly below [beforeId] (0 = newest), at most [limit] rows.
+     * Reaction sentinels (`hidden = 1`) never appear; a vault
+     * conversation yields nothing. Attachments are joined.
+     */
+    suspend fun messagesBefore(conversationId: Long, beforeId: Long, limit: Int): List<Message>
+
+    /**
+     * Slice 2 — messages with id strictly above [afterId], oldest
+     * first: the live path and the reconnect delta. Same filters as
+     * [messagesBefore].
+     */
+    suspend fun messagesAfter(conversationId: Long, afterId: Long): List<Message>
+
+    /** Slice 2 — total message count over all non-vault conversations (sentinels excluded). */
+    suspend fun totalMessageCount(): Long
+
+    /** Slice 2 — per-conversation message counts, same scope as [totalMessageCount]. */
+    suspend fun messageCountsByConversation(): Map<Long, Int>
+
+    /** Slice 2 — current max message id (0 when the mirror is empty). */
+    suspend fun maxMessageId(): Long
+
+    /**
+     * Slice 2 — live states for a bounded id set, re-emitted on
+     * change. Empty [ids] yields one empty emission (never an invalid
+     * `IN ()` query).
+     */
+    fun observeMessageStates(ids: List<Long>): Flow<List<MessageState>>
+}
