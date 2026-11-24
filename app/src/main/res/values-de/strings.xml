@@ -862,6 +862,8 @@
     <string name="about_website">Webseite</string>
     <string name="about_contact_support">Support kontaktieren</string>
     <string name="about_license">Lizenz</string>
+    <string name="about_support">Das Projekt unterstützen</string>
+    <string name="about_support_desc">Eine Spende hilft, die App kostenlos zu halten, ohne Werbung und ohne Tracker</string>
     <string name="license_notice_heading">© 2026 Relay. All rights reserved.</string>
     <string name="license_notice_body">The original application interface, user experience design, visual assets, branding, and original design implementations are the intellectual property of Relay and its respective copyright holder.\n\nThese original works may not be copied, reproduced, redistributed, or used in another product without prior written permission, except where otherwise permitted by applicable law.\n\nThis application incorporates portions of SMS Tech, Copyright © Patrice Haltaya, licensed under the Apache License, Version 2.0.\n\nSee the accompanying license and third-party notices for additional information.</string>
     <string name="twemoji_attribution">Emoji and sticker artwork: Twemoji (jdecked/twemoji fork), Copyright Twitter, Inc. and contributors, licensed under CC-BY 4.0. Source: https://github.com/jdecked/twemoji</string>

@@ -44,6 +44,7 @@ import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material.icons.outlined.Translate
+import androidx.compose.material.icons.outlined.VolunteerActivism
 import androidx.compose.material.icons.outlined.Warning
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -288,6 +289,20 @@ fun AboutScreen(
                         )
                     }
                 }
+                // Donate row: opens the Relay website in the browser, like the
+                // other links (the Internet permission is only used for GIF
+                // search, cf. KlipyClient).
+                // Visible also in a decoy session: a public donations page reveals nothing.
+                item(onClick = {
+                    safeStartActivity(context, Intent(Intent.ACTION_VIEW, Uri.parse(DONATE_URL)))
+                }) {
+                    RelaySettingRow(
+                        icon = Icons.Outlined.VolunteerActivism,
+                        title = stringResource(R.string.about_support),
+                        subtitle = stringResource(R.string.about_support_desc),
+                        chevron = true,
+                    )
+                }
             }
 
             // Feedback round 9 — the bottom credits line is gone too: the
@@ -417,6 +432,11 @@ private const val RELEASES_URL = "https://github.com/relay-sms/relay-android/rel
 
 // Round 36 — Relay has its own website now.
 private const val WEBSITE_URL = "https://getrelaysms.com"
+
+// Donate row (restored 2026-11-24): no donations page exists yet, so the row
+// points at the website for now — one URL for every language. Update this
+// const when there's a real donations page.
+internal const val DONATE_URL = "https://getrelaysms.com"
 private const val LEGAL_BASE_URL = "https://github.com/relay-sms/relay-android/blob/main/"
 
 /** Round 36 — the support email, shown on the About screen. */
