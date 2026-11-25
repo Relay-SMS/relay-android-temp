@@ -25,8 +25,9 @@ import org.junit.jupiter.api.Test
 
 /**
  * The platform hangup: `endCall()` ends the current call through
- * `TelecomManager.endCall` — the API-28 floor first, then the
- * permission, then the in-call check, then the end itself. The context and the telecom service
+ * `TelecomManager.endCall` — permission first, then the API-28
+ * floor (folded into the telecom fetch), then the in-call check,
+ * then the end itself. The context and the telecom service
  * are MockK mocks, and the permission check is statically mocked
  * (`mockkStatic` on `ContextCompat`, like the `SmsManager` mock
  * in `E2eDataSmsSenderTest`) — the real service never runs here.

@@ -116,32 +116,41 @@ class AndroidCallDialer @Inject constructor(
     }
 
     /**
-     * Ends the current call. The API-28 floor is checked first:
-     * below P there is nothing to end with, and
-     * ANSWER_PHONE_CALLS can't be granted there either, so
-     * PermissionDenied would be a misleading answer. Lint can't
-     * see the floor through the injected [sdkInt], hence the
-     * NewApi suppression — the guard IS the check.
+     * Ends the current call. `TelecomManager.endCall` exists only
+     * since API 28 (Android 9) — minSdk is 26, so below P there
+     * is nothing to end with and the answer is Failed (the
+     * desktop shows its generic note). The floor folds into the
+     * telecom fetch: both answer Failed.
+     *
+     * The permission check stays inline (not a helper): lint's
+     * MissingPermission check only recognizes a check in the
+     * same method, before the `isInCall` call — extracting it
+     * into a helper failed CI. Same for the NewApi
+     * suppression: lint can't see the floor through the
+     * injected [sdkInt], so the guard IS the check.
      */
     @SuppressLint("NewApi")
     // endCall is deprecated upstream; still the only end-call API for a non-dialer app.
     @Suppress("DEPRECATION")
     override suspend fun endCall(): EndCallOutcome {
-        val early = when {
-            sdkInt < Build.VERSION_CODES.P -> {
-                Timber.w("AndroidCallDialer: endCall needs API 28 (device API $sdkInt)")
-                EndCallOutcome.Failed
-            }
-            !isEndCallPermitted() -> {
-                Timber.w("AndroidCallDialer: ANSWER_PHONE_CALLS not granted — end refused")
-                EndCallOutcome.PermissionDenied
-            }
-            else -> null
+        val granted = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ANSWER_PHONE_CALLS,
+        ) == PackageManager.PERMISSION_GRANTED
+        if (!granted) {
+            Timber.w("AndroidCallDialer: ANSWER_PHONE_CALLS not granted — end refused")
+            return EndCallOutcome.PermissionDenied
         }
-        if (early != null) return early
-        // No telephony on this device, no call to end.
-        val telecom = context.getSystemService(TelecomManager::class.java)
-            ?: return EndCallOutcome.Failed
+        // `endCall` exists only since API 28 (Android 9) — minSdk
+        // is 26, so below P there is nothing to end with. Folded
+        // into the no-telecom return: both answer Failed (the
+        // desktop shows its generic note).
+        val telecom = if (sdkInt < Build.VERSION_CODES.P) {
+            Timber.w("AndroidCallDialer: endCall needs API 28 (device API $sdkInt)")
+            null
+        } else {
+            context.getSystemService(TelecomManager::class.java)
+        } ?: return EndCallOutcome.Failed
         if (!telecom.isInCall) return EndCallOutcome.NoCall
         return try {
             if (telecom.endCall()) {
@@ -162,12 +171,6 @@ class AndroidCallDialer @Inject constructor(
             EndCallOutcome.Failed
         }
     }
-
-    private fun isEndCallPermitted(): Boolean =
-        ContextCompat.checkSelfPermission(
-            context,
-            Manifest.permission.ANSWER_PHONE_CALLS,
-        ) == PackageManager.PERMISSION_GRANTED
 
     private fun dialViaIntent(uri: Uri): DialOutcome {
         val intent = Intent(Intent.ACTION_CALL).apply {
