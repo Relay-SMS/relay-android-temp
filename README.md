@@ -1,7 +1,5 @@
 # Relay
 
-English · 🇫🇷 [Version française](README.fr.md)
-
 A modern, private SMS & MMS app for Android — built with Kotlin, Jetpack Compose and Material 3.
 No ads, no trackers, no analytics, no Google services. Internet is used only for GIF search (Klipy) and link previews. Desktop linking runs over your local network only — no cloud, no account. The SMS Tech engine is Apache-2.0; Relay's own code and brand are reserved — see License & Copyright.
 
@@ -157,9 +155,11 @@ project, including, where independently authored:
 
 Files carrying the Relay proprietary header are the exclusive property of Relay Messaging and are
 not licensed under the Apache License 2.0 — see [LICENSE-RELAY](LICENSE-RELAY) for the terms.
-Files modified from the original carry a modification notice and remain under the Apache License,
-Version 2.0. The underlying SMS Tech code and all other third-party components remain subject to
-their respective licenses.
+Files modified from the original carry a modification notice: the original SMS Tech code in
+them remains under the Apache License, Version 2.0, while Relay's modifications to those files
+are proprietary to Relay Messaging — see [LICENSE-RELAY](LICENSE-RELAY) for the terms. The
+underlying SMS Tech code and all other third-party components remain subject to their
+respective licenses.
 
 ### Trademark
 

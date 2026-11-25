@@ -1,7 +1,9 @@
 /*
- * Copyright 2026 Relay Messaging (modifications). The original work is
- * copyright its respective holders and is licensed under the Apache
- * License 2.0. See LICENSE.
+ * Copyright 2026 Relay Messaging (modifications). Relay's modifications
+ * to this file are proprietary to Relay Messaging and are not licensed
+ * under the Apache License 2.0. See LICENSE-RELAY for the terms. The
+ * original work is copyright its respective holders and is licensed
+ * under the Apache License 2.0. See LICENSE.
  */
 
 package com.relay.sms.system.notifications
