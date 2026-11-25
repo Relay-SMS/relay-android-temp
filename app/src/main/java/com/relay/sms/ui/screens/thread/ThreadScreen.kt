@@ -894,22 +894,23 @@ fun ThreadScreen(
     // user retrying a dial that cannot succeed until it is fixed).
     // A dial that went through needs no snackbar: the status row
     // below the header shows it instead.
+    // Hoisted (not `context.getString` in the effect): `LocalContext.current`
+    // reads are not configuration-aware, and lint fails the build on them
+    // inside a `LaunchedEffect` (LocalContextGetResourceValueCall).
+    val dialOfflineLabel = stringResource(R.string.client_call_dial_offline)
+    val dialNoPermissionLabel = stringResource(R.string.client_call_dial_no_permission)
+    val dialFailedLabel = stringResource(R.string.client_call_dial_failed)
     LaunchedEffect(clientCallViewModel) {
         clientCallViewModel.events.collect { event ->
             val failed = event as? ClientCallViewModel.Event.DialFailed ?: return@collect
             snackbarHost.showSnackbar(
-                context.getString(
-                    when (failed.reason) {
-                        ClientCallViewModel.DialFailure.Offline ->
-                            R.string.client_call_dial_offline
+                when (failed.reason) {
+                    ClientCallViewModel.DialFailure.Offline -> dialOfflineLabel
 
-                        ClientCallViewModel.DialFailure.NoPermission ->
-                            R.string.client_call_dial_no_permission
+                    ClientCallViewModel.DialFailure.NoPermission -> dialNoPermissionLabel
 
-                        ClientCallViewModel.DialFailure.Failed ->
-                            R.string.client_call_dial_failed
-                    },
-                ),
+                    ClientCallViewModel.DialFailure.Failed -> dialFailedLabel
+                },
             )
         }
     }
