@@ -25,7 +25,11 @@ import com.relay.sms.e2e.E2eNoticeStore
 import com.relay.sms.e2e.E2ePeerRepository
 import com.relay.sms.e2e.E2eProbeManager
 import com.relay.sms.e2e.E2eSafetyNumber
+import com.relay.sms.e2e.HandshakeChannel
 import com.relay.sms.e2e.IdentityKeys
+import com.relay.sms.e2e.ProbeGate
+import com.relay.sms.e2e.ProbeResult
+import com.relay.sms.sync.ActionResult
 import com.relay.sms.sync.SyncProtocol
 import io.mockk.coEvery
 import io.mockk.coVerify
@@ -422,12 +426,17 @@ class RepositoryE2eSyncSourceTest {
         val harness = Harness()
         coEvery { harness.conversations.findByAddressesCsv(ALICE) } returns
             conversation(CONVERSATION_ID, ALICE)
-        coEvery { harness.probes.probeConversation(CONVERSATION_ID, any(), true) } returns true
+        coEvery {
+            harness.probes.retryProbeDetailed(CONVERSATION_ID, HandshakeChannel.DATA_SMS)
+        } returns ProbeResult.Sent()
 
-        val result = harness.source.retryProbe(ALICE)
+        val result = harness.source.retryProbe(ALICE, null)
 
         assertThat(result.ok).isTrue()
-        coVerify(exactly = 1) { harness.probes.probeConversation(CONVERSATION_ID, any(), true) }
+        assertThat(result.budgetExhausted).isFalse()
+        coVerify(exactly = 1) {
+            harness.probes.retryProbeDetailed(CONVERSATION_ID, HandshakeChannel.DATA_SMS)
+        }
         // The exact match wins — the identity fallback never runs.
         coVerify(exactly = 0) { harness.phoneIdentity.snapshot() }
     }
@@ -441,12 +450,16 @@ class RepositoryE2eSyncSourceTest {
         val snapshot = mockk<PhoneIdentity.Snapshot>()
         every { snapshot.matches("0612345678", ALICE) } returns true
         coEvery { harness.phoneIdentity.snapshot() } returns snapshot
-        coEvery { harness.probes.probeConversation(CONVERSATION_ID, any(), true) } returns true
+        coEvery {
+            harness.probes.retryProbeDetailed(CONVERSATION_ID, HandshakeChannel.DATA_SMS)
+        } returns ProbeResult.Sent()
 
-        val result = harness.source.retryProbe(ALICE)
+        val result = harness.source.retryProbe(ALICE, null)
 
         assertThat(result.ok).isTrue()
-        coVerify(exactly = 1) { harness.probes.probeConversation(CONVERSATION_ID, any(), true) }
+        coVerify(exactly = 1) {
+            harness.probes.retryProbeDetailed(CONVERSATION_ID, HandshakeChannel.DATA_SMS)
+        }
     }
 
     @Test fun `retryProbe answers unknown_conversation when no conversation exists`() = runTest {
@@ -456,23 +469,157 @@ class RepositoryE2eSyncSourceTest {
         val snapshot = mockk<PhoneIdentity.Snapshot>()
         coEvery { harness.phoneIdentity.snapshot() } returns snapshot
 
-        val result = harness.source.retryProbe(ALICE)
+        val result = harness.source.retryProbe(ALICE, null)
 
         assertThat(result.ok).isFalse()
         assertThat(result.code).isEqualTo(SyncProtocol.MessageFailed.UNKNOWN_CONVERSATION)
-        coVerify(exactly = 0) { harness.probes.probeConversation(any(), any(), any()) }
+        coVerify(exactly = 0) { harness.probes.retryProbeDetailed(any(), any()) }
     }
 
     @Test fun `retryProbe answers send_failed when the probe could not go out`() = runTest {
         val harness = Harness()
         coEvery { harness.conversations.findByAddressesCsv(ALICE) } returns
             conversation(CONVERSATION_ID, ALICE)
-        coEvery { harness.probes.probeConversation(CONVERSATION_ID, any(), true) } returns false
+        coEvery {
+            harness.probes.retryProbeDetailed(CONVERSATION_ID, HandshakeChannel.DATA_SMS)
+        } returns ProbeResult.SendFailed
 
-        val result = harness.source.retryProbe(ALICE)
+        val result = harness.source.retryProbe(ALICE, null)
 
         assertThat(result.ok).isFalse()
         assertThat(result.code).isEqualTo(SyncProtocol.MessageFailed.SEND_FAILED)
+    }
+
+    // ---- Desktop encryption-box update — method routing + result codes ----
+
+    @Test fun `retryProbe with the alternate method sends the probe as a text SMS`() = runTest {
+        val harness = Harness()
+        coEvery { harness.conversations.findByAddressesCsv(ALICE) } returns
+            conversation(CONVERSATION_ID, ALICE)
+        coEvery {
+            harness.probes.retryProbeDetailed(CONVERSATION_ID, HandshakeChannel.TEXT_SMS)
+        } returns ProbeResult.Sent()
+
+        val result = harness.source.retryProbe(ALICE, "alternate")
+
+        assertThat(result.ok).isTrue()
+        coVerify(exactly = 1) {
+            harness.probes.retryProbeDetailed(CONVERSATION_ID, HandshakeChannel.TEXT_SMS)
+        }
+        coVerify(exactly = 0) {
+            harness.probes.retryProbeDetailed(CONVERSATION_ID, HandshakeChannel.DATA_SMS)
+        }
+    }
+
+    @Test fun `retryProbe with the standard method sends the probe as a data SMS`() = runTest {
+        val harness = Harness()
+        coEvery { harness.conversations.findByAddressesCsv(ALICE) } returns
+            conversation(CONVERSATION_ID, ALICE)
+        coEvery {
+            harness.probes.retryProbeDetailed(CONVERSATION_ID, HandshakeChannel.DATA_SMS)
+        } returns ProbeResult.Sent()
+
+        val result = harness.source.retryProbe(ALICE, "standard")
+
+        assertThat(result.ok).isTrue()
+        coVerify(exactly = 1) {
+            harness.probes.retryProbeDetailed(CONVERSATION_ID, HandshakeChannel.DATA_SMS)
+        }
+    }
+
+    @Test fun `retryProbe with an unknown method falls back to the data SMS`() = runTest {
+        val harness = Harness()
+        coEvery { harness.conversations.findByAddressesCsv(ALICE) } returns
+            conversation(CONVERSATION_ID, ALICE)
+        coEvery {
+            harness.probes.retryProbeDetailed(CONVERSATION_ID, HandshakeChannel.DATA_SMS)
+        } returns ProbeResult.Sent()
+
+        val result = harness.source.retryProbe(ALICE, "smoke-signal")
+
+        assertThat(result.ok).isTrue()
+        coVerify(exactly = 1) {
+            harness.probes.retryProbeDetailed(CONVERSATION_ID, HandshakeChannel.DATA_SMS)
+        }
+    }
+
+    @Test fun `retryProbe carries the budget flag when the send spent the last slot`() = runTest {
+        val harness = Harness()
+        coEvery { harness.conversations.findByAddressesCsv(ALICE) } returns
+            conversation(CONVERSATION_ID, ALICE)
+        coEvery {
+            harness.probes.retryProbeDetailed(CONVERSATION_ID, HandshakeChannel.DATA_SMS)
+        } returns ProbeResult.Sent(budgetExhausted = true)
+
+        val result = harness.source.retryProbe(ALICE, null)
+
+        assertThat(result.ok).isTrue()
+        assertThat(result.budgetExhausted).isTrue()
+    }
+
+    @Test fun `retryProbe maps a missing conversation to unknown_conversation`() = runTest {
+        val result = retryProbeResultFor(ProbeResult.Gated(ProbeGate.NoConversation))
+
+        assertThat(result.ok).isFalse()
+        assertThat(result.code).isEqualTo(SyncProtocol.MessageFailed.UNKNOWN_CONVERSATION)
+        assertThat(result.message).isEqualTo("Conversation not found.")
+    }
+
+    @Test fun `retryProbe maps a group conversation to not_one_to_one`() = runTest {
+        val result = retryProbeResultFor(ProbeResult.Gated(ProbeGate.NotOneToOne))
+
+        assertThat(result.ok).isFalse()
+        assertThat(result.code).isEqualTo(SyncProtocol.MessageFailed.NOT_ONE_TO_ONE)
+    }
+
+    @Test fun `retryProbe maps an unprobeable address to invalid_address`() = runTest {
+        val result = retryProbeResultFor(ProbeResult.Gated(ProbeGate.InvalidAddress))
+
+        assertThat(result.ok).isFalse()
+        assertThat(result.code).isEqualTo(SyncProtocol.MessageFailed.INVALID_ADDRESS)
+    }
+
+    @Test fun `retryProbe maps a blocked number to blocked`() = runTest {
+        val result = retryProbeResultFor(ProbeResult.Gated(ProbeGate.Blocked))
+
+        assertThat(result.ok).isFalse()
+        assertThat(result.code).isEqualTo(SyncProtocol.MessageFailed.BLOCKED)
+    }
+
+    @Test fun `retryProbe maps an encrypted peer to already_encrypted`() = runTest {
+        val result = retryProbeResultFor(ProbeResult.Gated(ProbeGate.AlreadyEncrypted))
+
+        assertThat(result.ok).isFalse()
+        assertThat(result.code).isEqualTo(SyncProtocol.MessageFailed.ALREADY_ENCRYPTED)
+    }
+
+    @Test fun `retryProbe maps an exhausted budget to rate_limited`() = runTest {
+        // Unreachable from a manual retry (the budget is lifted
+        // there) — the mapping is total anyway.
+        val result = retryProbeResultFor(ProbeResult.Gated(ProbeGate.BudgetExhausted))
+
+        assertThat(result.ok).isFalse()
+        assertThat(result.code).isEqualTo(SyncProtocol.MessageFailed.RATE_LIMITED)
+    }
+
+    @Test fun `retryProbe maps a switched-off discovery to discovery_off`() = runTest {
+        // Unreachable from a manual retry (the toggle is lifted
+        // there) — the mapping is total anyway.
+        val result = retryProbeResultFor(ProbeResult.Gated(ProbeGate.DiscoveryOff))
+
+        assertThat(result.ok).isFalse()
+        assertThat(result.code).isEqualTo(SyncProtocol.MessageFailed.DISCOVERY_OFF)
+    }
+
+    /** One retry's answer when the probe manager reports [probeResult]. */
+    private suspend fun retryProbeResultFor(probeResult: ProbeResult): ActionResult {
+        val harness = Harness()
+        coEvery { harness.conversations.findByAddressesCsv(ALICE) } returns
+            conversation(CONVERSATION_ID, ALICE)
+        coEvery {
+            harness.probes.retryProbeDetailed(CONVERSATION_ID, HandshakeChannel.DATA_SMS)
+        } returns probeResult
+        return harness.source.retryProbe(ALICE, null)
     }
 
     // ---- Round 48 — media-key arrivals ----

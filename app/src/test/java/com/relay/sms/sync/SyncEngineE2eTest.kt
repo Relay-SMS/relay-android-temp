@@ -87,11 +87,11 @@ class SyncEngineE2eTest {
             return verifiedResult
         }
 
-        val probeRetries = mutableListOf<String>()
+        val probeRetries = mutableListOf<Pair<String, String?>>()
         var probeResult: ActionResult = ActionResult(ok = true)
 
-        override suspend fun retryProbe(address: String): ActionResult {
-            probeRetries += address
+        override suspend fun retryProbe(address: String, method: String?): ActionResult {
+            probeRetries += address to method
             return probeResult
         }
 
@@ -349,11 +349,46 @@ class SyncEngineE2eTest {
 
             engine.onRetryE2eProbe(SyncProtocol.RetryE2eProbe(address = ALICE))
             advanceUntilIdle()
-            assertThat(e2e.probeRetries).containsExactly(ALICE)
+            assertThat(e2e.probeRetries).containsExactly(ALICE to null)
             val result = sent.first { it.frameType() == "action_result" }.asObject()
             assertThat(result["action"]?.jsonPrimitive?.content).isEqualTo("retry_e2e_probe")
             assertThat(result["address"]?.jsonPrimitive?.content).isEqualTo(ALICE)
             assertThat(result["ok"]?.jsonPrimitive?.content).isEqualTo("true")
+            // No budget spent on the last slot: the field is absent.
+            assertThat(result["budget_exhausted"]).isNull()
+        }
+    }
+
+    @Test fun `retry_e2e_probe passes the method through to the source`() = runTest {
+        val source = FakeSyncMessageSource()
+        val e2e = FakeE2eSyncSource()
+        runEngineWithE2e(source, e2e) { engine, sent ->
+            engine.start()
+            advanceUntilIdle()
+
+            engine.onRetryE2eProbe(
+                SyncProtocol.RetryE2eProbe(address = ALICE, method = "alternate"),
+            )
+            advanceUntilIdle()
+            assertThat(e2e.probeRetries).containsExactly(ALICE to "alternate")
+            val result = sent.first { it.frameType() == "action_result" }.asObject()
+            assertThat(result["ok"]?.jsonPrimitive?.content).isEqualTo("true")
+        }
+    }
+
+    @Test fun `a retry that spent the last budget slot answers budget_exhausted`() = runTest {
+        val source = FakeSyncMessageSource()
+        val e2e = FakeE2eSyncSource()
+        e2e.probeResult = ActionResult(ok = true, budgetExhausted = true)
+        runEngineWithE2e(source, e2e) { engine, sent ->
+            engine.start()
+            advanceUntilIdle()
+
+            engine.onRetryE2eProbe(SyncProtocol.RetryE2eProbe(address = ALICE))
+            advanceUntilIdle()
+            val result = sent.first { it.frameType() == "action_result" }.asObject()
+            assertThat(result["ok"]?.jsonPrimitive?.content).isEqualTo("true")
+            assertThat(result["budget_exhausted"]?.jsonPrimitive?.content).isEqualTo("true")
         }
     }
 
