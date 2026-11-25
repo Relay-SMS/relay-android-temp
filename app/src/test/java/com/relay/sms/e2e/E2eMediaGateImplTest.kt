@@ -148,7 +148,11 @@ class E2eMediaGateImplTest {
         // send itself re-declares OUR capability, so the peer's
         // announce-back makes the NEXT media send encrypt.
         assertThat(result).isEqualTo(E2eMediaGate.PrepareResult.Plain)
-        coVerify(exactly = 1) { harness.mediaCapability.announceIfNeeded(BOB, SUB_ID) }
+        // `now` is defaulted on both sides of the call, so it must
+        // be matched with `any()` — the gate fills it at send time
+        // and this verify would fill it again at verify time, and
+        // the two millisecond values never agree.
+        coVerify(exactly = 1) { harness.mediaCapability.announceIfNeeded(BOB, SUB_ID, any()) }
         assertThat(harness.keyJsons).isEmpty()
     }
 
@@ -167,7 +171,7 @@ class E2eMediaGateImplTest {
         )
 
         assertThat(result).isInstanceOf(E2eMediaGate.PrepareResult.Encrypted::class.java)
-        coVerify(exactly = 0) { harness.mediaCapability.announceIfNeeded(any(), any()) }
+        coVerify(exactly = 0) { harness.mediaCapability.announceIfNeeded(any(), any(), any()) }
     }
 
     @Test
