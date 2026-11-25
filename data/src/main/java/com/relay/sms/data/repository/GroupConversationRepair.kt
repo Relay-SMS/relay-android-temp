@@ -52,6 +52,18 @@ import javax.inject.Singleton
  * untouched (only `addresses_csv`, `display_name` and the sticky
  * category change).
  *
+ * Member-ID fix — a second arm for groups the round-52 import filed
+ * with recipient IDS as members ("23", "59"): `readThreadRecipients`
+ * read column 0 of the `canonical-addresses` cursor, which AOSP
+ * fills with `_id` (the provider ignores the caller's projection
+ * for the plural URI). Those groups are filed as groups, so the
+ * refile arm never sees them — the CorrectMembers arm re-reads
+ * their recipient set with the fixed lookup and corrects
+ * `addresses_csv` + the group title in place. A group whose members
+ * already match is left exactly alone; a corrected set that would
+ * collide with another existing group is left alone too (never
+ * create a duplicate group).
+ *
  * Safety rules (each is load-bearing):
  *   - only a conversation whose thread's recipient set has MORE THAN
  *     ONE member is touched: a legit 1:1 keeps its row exactly. The
@@ -100,6 +112,8 @@ class GroupConversationRepair @Inject constructor(
         val merged: Int,
         /** `false` when a provider read failed — the pass must re-run. */
         val complete: Boolean,
+        /** Groups whose member list was corrected in place (member-ID fix). */
+        val corrected: Int = 0,
     )
 
     private sealed interface Plan {
@@ -113,6 +127,13 @@ class GroupConversationRepair @Inject constructor(
             val threadId: Long,
             /** Group title for the survivor, when it has no display name yet. */
             val survivorTitle: String?,
+        ) : Plan
+
+        /** Correct a group's member list in place to [csv] / [title]. */
+        data class CorrectMembers(
+            val victim: ConversationEntity,
+            val csv: String,
+            val title: String?,
         ) : Plan
     }
 
@@ -179,30 +200,84 @@ class GroupConversationRepair @Inject constructor(
         }
     }
 
-    suspend fun repair(): Result = withContext(io) {
-        val candidates = conversationDao.snapshotOneToOneConversations()
-            .filter { !it.inVault && (it.threadId ?: 0L) > 0L }
-        if (candidates.isEmpty()) return@withContext Result(0, 0, complete = true)
-        val ident = phoneIdentity.snapshot()
-        val matches = repairMatches(ident::matches)
-        val groups = conversationDao.snapshotGroupConversations()
-        var complete = true
-        val plans = ArrayList<Plan>(candidates.size)
-        // Phase 1 — plan (provider + contacts reads, NO transaction).
-        for (conv in candidates) {
-            when (val outcome = planFor(conv, groups, matches)) {
-                is PlanOutcome.Planned -> plans += outcome.plan
-                // Provider read failed: fail-soft, retry next cold start.
-                PlanOutcome.ProviderFailed -> complete = false
-                PlanOutcome.Skipped -> Unit
+    /**
+     * Plans the correction for one group candidate whose stored
+     * members may be recipient ids (member-ID fix): re-reads the
+     * thread's recipient set with the fixed lookup and compares it
+     * with the stored member set (canonical comparison — the same
+     * matcher the refile arm uses). A healthy group is left exactly
+     * alone; a corrected set that would collide with ANOTHER
+     * existing group is left alone too (never create a duplicate
+     * group — the dedupe pass owns duplicates).
+     */
+    private suspend fun planCorrection(
+        conv: ConversationEntity,
+        groups: List<ConversationEntity>,
+        matches: (String, String) -> Boolean,
+    ): PlanOutcome {
+        val threadId = conv.threadId
+        val recipients = threadId?.let {
+            runCatching { telephonyReader.readThreadRecipients(it) }.getOrNull()
+        }
+        return when {
+            threadId == null -> PlanOutcome.Skipped
+            recipients == null -> PlanOutcome.ProviderFailed
+            recipients.size < 2 -> PlanOutcome.Skipped
+            else -> {
+                val members = recipients.map { PhoneAddress.of(it) }
+                val csv = members.sortedBy { it.normalized }.toCsv()
+                val alreadyCorrect =
+                    ConversationRepositoryImpl.matchGroupByIdentity(listOf(conv), members, matches) != null
+                val collision = if (alreadyCorrect) {
+                    null
+                } else {
+                    conversationDao.findByAddressesCsv(csv)
+                        ?: ConversationRepositoryImpl.matchGroupByIdentity(
+                            groups.filter { it.id != conv.id },
+                            members,
+                            matches,
+                        )
+                }
+                when {
+                    alreadyCorrect -> PlanOutcome.Skipped
+                    collision != null -> {
+                        Timber.i(
+                            "GroupConversationRepair: group %d would collide with group %d — left alone",
+                            conv.id,
+                            collision.id,
+                        )
+                        PlanOutcome.Skipped
+                    }
+                    else -> PlanOutcome.Planned(
+                        Plan.CorrectMembers(victim = conv, csv = csv, title = groupTitle(members)),
+                    )
+                }
             }
         }
+    }
+
+    suspend fun repair(): Result = withContext(io) {
+        val groups = conversationDao.snapshotGroupConversations()
+        val candidates = conversationDao.snapshotOneToOneConversations()
+            .filter { !it.inVault && (it.threadId ?: 0L) > 0L }
+        // Member-ID fix — groups filed with recipient ids as members
+        // are group rows already, so the refile arm never sees them;
+        // they get their own candidate list (same filters).
+        val groupCandidates = groups.filter { !it.inVault && (it.threadId ?: 0L) > 0L }
+        if (candidates.isEmpty() && groupCandidates.isEmpty()) {
+            return@withContext Result(0, 0, complete = true)
+        }
+        val ident = phoneIdentity.snapshot()
+        val matches = repairMatches(ident::matches)
+        // Phase 1 — plan (provider + contacts reads, NO transaction).
+        val (plans, complete) = planAll(candidates, groupCandidates, groups, matches)
         if (plans.isEmpty()) return@withContext Result(0, 0, complete)
         // Phase 2 — apply (one transaction; rows are re-read — a live
         // receive may have changed them since the snapshot).
         val deletedVictims = mutableListOf<Long>()
         var repaired = 0
         var merged = 0
+        var corrected = 0
         database.withTransaction {
             for (plan in plans) {
                 when (plan) {
@@ -238,6 +313,18 @@ class GroupConversationRepair @Inject constructor(
                             }
                         }
                     }
+                    is Plan.CorrectMembers -> {
+                        val current = conversationDao.findById(plan.victim.id)
+                        if (current != null) {
+                            conversationDao.update(
+                                current.copy(
+                                    addressesCsv = plan.csv,
+                                    displayName = plan.title,
+                                ),
+                            )
+                            corrected++
+                        }
+                    }
                 }
             }
             if (merged > 0) conversationDao.recomputeAllUnreadCounts()
@@ -249,12 +336,44 @@ class GroupConversationRepair @Inject constructor(
             notifications.cancelAllForConversation(victimId)
         }
         Timber.i(
-            "GroupConversationRepair: done — repaired=%d merged=%d complete=%b",
+            "GroupConversationRepair: done — repaired=%d merged=%d corrected=%d complete=%b",
             repaired,
             merged,
+            corrected,
             complete,
         )
-        Result(repaired, merged, complete)
+        Result(repaired, merged, complete, corrected)
+    }
+
+    /**
+     * Phase 1 — plans both arms (provider + contacts reads, NO
+     * transaction). Returns the plans plus whether every provider
+     * read succeeded (`false` = the pass must re-run next start).
+     */
+    private suspend fun planAll(
+        candidates: List<ConversationEntity>,
+        groupCandidates: List<ConversationEntity>,
+        groups: List<ConversationEntity>,
+        matches: (String, String) -> Boolean,
+    ): Pair<List<Plan>, Boolean> {
+        var complete = true
+        val plans = ArrayList<Plan>(candidates.size + groupCandidates.size)
+        for (conv in candidates) {
+            when (val outcome = planFor(conv, groups, matches)) {
+                is PlanOutcome.Planned -> plans += outcome.plan
+                // Provider read failed: fail-soft, retry next cold start.
+                PlanOutcome.ProviderFailed -> complete = false
+                PlanOutcome.Skipped -> Unit
+            }
+        }
+        for (conv in groupCandidates) {
+            when (val outcome = planCorrection(conv, groups, matches)) {
+                is PlanOutcome.Planned -> plans += outcome.plan
+                PlanOutcome.ProviderFailed -> complete = false
+                PlanOutcome.Skipped -> Unit
+            }
+        }
+        return plans to complete
     }
 
     /**

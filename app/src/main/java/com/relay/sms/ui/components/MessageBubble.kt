@@ -298,10 +298,11 @@ fun MessageBubble(
                 } else {
                     com.relay.sms.ui.theme.bubbleIncomingColor(cs)
                 },
-                // Round 21 — badge tap removes the reaction. The callback
-                // rides [BubbleMenuToggles]: the bubble is at the Detekt
-                // 20-parameter limit, so it has no slot of its own.
-                onRemoveReaction = toggles?.onRemoveReaction ?: {},
+                // Round 52 emoji fix — badge tap opens the reaction picker
+                // (never removes). The callback rides [BubbleMenuToggles]:
+                // the bubble is at the Detekt 20-parameter limit, so it has
+                // no slot of its own.
+                onReactionBadgeTap = toggles?.onReactionBadgeTap ?: {},
             ) {
                 Box(
                     modifier = Modifier

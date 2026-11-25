@@ -35,6 +35,9 @@ import java.util.concurrent.Executor
  * Round 50 — the one-shot repair for group threads the pre-round-50
  * import filed as 1:1s.
  *
+ * Member-ID fix — a second arm corrects groups the round-52 import
+ * filed with recipient ids as members ("23", "59").
+ *
  * Strict MockK doubles (no Room) + the Room 2.8 `withTransaction`
  * stubs (see [ConversationMirrorE2eImportTest]).
  */
@@ -48,6 +51,7 @@ class GroupConversationRepairTest {
         const val THREAD_ID = 7L
         const val VICTIM_ID = 11L
         const val GROUP_ID = 20L
+        const val OTHER_GROUP_ID = 21L
     }
 
     private val database = mockk<AppDatabase>()
@@ -95,10 +99,15 @@ class GroupConversationRepairTest {
         stickyCategory = stickyCategory,
     )
 
-    private fun group(inVault: Boolean = false, csv: String = "$ALICE_NATIONAL;$BOB_NATIONAL") =
+    private fun group(
+        inVault: Boolean = false,
+        csv: String = "$ALICE_NATIONAL;$BOB_NATIONAL",
+        threadId: Long? = null,
+        id: Long = GROUP_ID,
+    ) =
         ConversationEntity(
-            id = GROUP_ID,
-            threadId = null,
+            id = id,
+            threadId = threadId,
             addressesCsv = csv,
             displayName = null,
             lastMessageAt = 3000L,
@@ -246,11 +255,114 @@ class GroupConversationRepairTest {
     @Test
     fun `no candidates means a complete no-op without touching identity`() = runTest {
         coEvery { conversationDao.snapshotOneToOneConversations() } returns emptyList()
+        coEvery { conversationDao.snapshotGroupConversations() } returns emptyList()
 
         val result = repair().repair()
 
         assertThat(result).isEqualTo(GroupConversationRepair.Result(0, 0, true))
         coVerify(exactly = 0) { phoneIdentity.snapshot() }
         verify(exactly = 0) { telephonyReader.readThreadRecipients(any()) }
+    }
+
+    // ──────── Member-ID fix — CorrectMembers arm ────────
+
+    @Test
+    fun `group with id-members is corrected in place`() = runTest {
+        stubIdentity()
+        val idGroup = group(csv = "23;59", threadId = THREAD_ID)
+        coEvery { conversationDao.snapshotOneToOneConversations() } returns emptyList()
+        coEvery { conversationDao.snapshotGroupConversations() } returns listOf(idGroup)
+        every { telephonyReader.readThreadRecipients(THREAD_ID) } returns
+            setOf(ALICE_E164, BOB_E164)
+        coEvery { conversationDao.findByAddressesCsv(any()) } returns null
+        coEvery { conversationDao.findById(GROUP_ID) } returns idGroup
+        val updated = slot<ConversationEntity>()
+        coEvery { conversationDao.update(capture(updated)) } just Runs
+
+        val result = repair().repair()
+
+        assertThat(result).isEqualTo(GroupConversationRepair.Result(0, 0, true, 1))
+        assertThat(updated.captured.addressesCsv).isEqualTo("$ALICE_E164;$BOB_E164")
+        assertThat(updated.captured.displayName).isNull()
+        assertThat(updated.captured.threadId).isEqualTo(THREAD_ID)
+        coVerify(exactly = 0) { conversationDao.delete(any()) }
+        coVerify(exactly = 0) { messageDao.reparentMessages(any(), any()) }
+    }
+
+    @Test
+    fun `a healthy group is left exactly alone`() = runTest {
+        stubIdentity()
+        // Stored nationally, the provider spells E.164 — the
+        // canonical comparison must still see the same members.
+        val healthy = group(csv = "$ALICE_NATIONAL;$BOB_NATIONAL", threadId = THREAD_ID)
+        coEvery { conversationDao.snapshotOneToOneConversations() } returns emptyList()
+        coEvery { conversationDao.snapshotGroupConversations() } returns listOf(healthy)
+        every { telephonyReader.readThreadRecipients(THREAD_ID) } returns
+            setOf(ALICE_E164, BOB_E164)
+
+        val result = repair().repair()
+
+        assertThat(result).isEqualTo(GroupConversationRepair.Result(0, 0, true))
+        coVerify(exactly = 0) { conversationDao.update(any()) }
+    }
+
+    @Test
+    fun `correction skipped when another group already holds the members`() = runTest {
+        stubIdentity()
+        val idGroup = group(csv = "23;59", threadId = THREAD_ID)
+        val healthy = group(csv = "$ALICE_NATIONAL;$BOB_NATIONAL", id = OTHER_GROUP_ID)
+        coEvery { conversationDao.snapshotOneToOneConversations() } returns emptyList()
+        coEvery { conversationDao.snapshotGroupConversations() } returns listOf(idGroup, healthy)
+        every { telephonyReader.readThreadRecipients(THREAD_ID) } returns
+            setOf(ALICE_E164, BOB_E164)
+        coEvery { conversationDao.findByAddressesCsv(any()) } returns null
+
+        val result = repair().repair()
+
+        assertThat(result).isEqualTo(GroupConversationRepair.Result(0, 0, true))
+        coVerify(exactly = 0) { conversationDao.update(any()) }
+        coVerify(exactly = 0) { conversationDao.delete(any()) }
+    }
+
+    @Test
+    fun `failed provider read on a group candidate makes the pass incomplete`() = runTest {
+        stubIdentity()
+        coEvery { conversationDao.snapshotOneToOneConversations() } returns emptyList()
+        coEvery { conversationDao.snapshotGroupConversations() } returns
+            listOf(group(csv = "23;59", threadId = THREAD_ID))
+        every { telephonyReader.readThreadRecipients(THREAD_ID) } returns null
+
+        val result = repair().repair()
+
+        assertThat(result.complete).isFalse()
+        coVerify(exactly = 0) { conversationDao.update(any()) }
+    }
+
+    @Test
+    fun `a vault group is never corrected and never even read from the provider`() = runTest {
+        stubIdentity()
+        coEvery { conversationDao.snapshotOneToOneConversations() } returns emptyList()
+        coEvery { conversationDao.snapshotGroupConversations() } returns
+            listOf(group(inVault = true, csv = "23;59", threadId = THREAD_ID))
+
+        val result = repair().repair()
+
+        assertThat(result).isEqualTo(GroupConversationRepair.Result(0, 0, true))
+        verify(exactly = 0) { telephonyReader.readThreadRecipients(any()) }
+        coVerify(exactly = 0) { conversationDao.update(any()) }
+    }
+
+    @Test
+    fun `a group without a thread id is never corrected`() = runTest {
+        stubIdentity()
+        coEvery { conversationDao.snapshotOneToOneConversations() } returns emptyList()
+        coEvery { conversationDao.snapshotGroupConversations() } returns
+            listOf(group(csv = "23;59"))
+
+        val result = repair().repair()
+
+        assertThat(result).isEqualTo(GroupConversationRepair.Result(0, 0, true))
+        verify(exactly = 0) { telephonyReader.readThreadRecipients(any()) }
+        coVerify(exactly = 0) { conversationDao.update(any()) }
     }
 }

@@ -461,6 +461,22 @@ class TelephonyReader @Inject constructor(
      * swallowed and every group silently filed as a 1:1. Do not
      * "simplify" this URI back.
      *
+     * The `canonical-addresses` read below is positional-free by
+     * design: AOSP's provider IGNORES the caller's projection for
+     * the plural `canonical-addresses` URI (the
+     * `URI_CANONICAL_ADDRESSES` case always queries with the
+     * hardcoded `CANONICAL_ADDRESSES_COLUMNS_2 = { _ID, ADDRESS }`),
+     * so column 0 is the recipient id and the address sits at
+     * column 1. Reading `getString(0)` returned the ids ("23",
+     * "59") as if they were addresses — the round-52 member bug
+     * (device-proven 2026-11-24). Only the SINGULAR
+     * `canonical-address/{id}` URI returns `{ ADDRESS }` alone
+     * (which is why AOSP's own MmsUtils reads `getString(0)`
+     * there). Always resolve the address column BY NAME here;
+     * never by position. The round-52 tests missed it because
+     * their mock copied the code's wrong assumption instead of
+     * the provider's real projection.
+     *
      * `null` = the provider could not be read (query failed or threw) —
      * distinct from "thread has no recipients" (empty set: the thread
      * is gone or degenerate, nothing to repair). Callers treat `null`
@@ -523,8 +539,15 @@ class TelephonyReader @Inject constructor(
         }.getOrNull() ?: return null
         val out = HashSet<String>()
         addrCursor.use { c ->
+            // By NAME, never by position: the provider ignores our
+            // `["address"]` projection for this URI and always
+            // returns { _id, address } — column 0 is the id (see
+            // the KDoc above).
+            val addressIdx = c.getColumnIndexOrThrow(
+                Telephony.CanonicalAddressesColumns.ADDRESS,
+            )
             while (c.moveToNext()) {
-                val addr = c.getString(0)
+                val addr = c.getString(addressIdx)
                 if (!addr.isNullOrBlank() && addr != "insert-address-token") out += addr
             }
         }

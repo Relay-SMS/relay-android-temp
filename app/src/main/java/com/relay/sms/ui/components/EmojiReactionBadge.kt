@@ -13,7 +13,6 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
@@ -31,6 +30,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.relay.sms.R
+import com.relay.sms.domain.reaction.IncomingReactionDecoder
 
 /**
  * v1.3.0 — Petit cercle 28 dp affichant l'emoji de réaction posé sur un message.
@@ -40,11 +40,14 @@ import com.relay.sms.R
  * bleu sortant, dans les deux thèmes. (Avant : fond blanc fixe, qui rendait une
  * pastille claire sur les bulles sombres du thème sombre.)
  *
- * Round 21 — tap = [onClick] (typically: removes the reaction, via
- * `setReaction(id, null)`). The badge lost its tap handler in the UI
- * refresh and a sent reaction could no longer be removed at all; this
- * restores the original single-tap removal. TalkBack announces it as a
- * button (« Réaction ❤️, double-tap pour retirer »).
+ * Round 52 emoji fix — tap = [onClick] opens the reaction picker (the
+ * same picker the bubble menu's React entry opens). It NEVER removes
+ * the reaction: a single-emoji badge carries no author, so a tap cannot
+ * tell your reaction from the other side's — and a stray tap used to
+ * clear a reaction you did not make. Removing your own reaction stays
+ * possible through the picker / quick bar, which only clears on an
+ * explicit tap of the already-applied emoji ([toggleReaction]).
+ * TalkBack announces it as a button (« Réaction ❤️, double-tap pour réagir »).
  */
 @Composable
 fun EmojiReactionBadge(
@@ -69,7 +72,7 @@ fun EmojiReactionBadge(
     // v1.6.0 (audit U2) — a11y : TalkBack annonce "Réaction <emoji>, double-tap
     // pour retirer" au lieu d'un Box muet. `Role.Button` cible explicitement
     // les services d'a11y, `onClickLabel` qualifie l'action.
-    val removeLabel = stringResource(R.string.reaction_badge_remove_action)
+    val reactLabel = stringResource(R.string.action_react)
     val badgeContentDescription = stringResource(R.string.reaction_badge_content_description, emoji)
     Box(
         modifier = modifier
@@ -82,7 +85,7 @@ fun EmojiReactionBadge(
                 contentDescription = badgeContentDescription
                 role = Role.Button
             }
-            .clickable(onClickLabel = removeLabel, onClick = onClick)
+            .clickable(onClickLabel = reactLabel, onClick = onClick)
             .padding(horizontal = 6.dp, vertical = 2.dp),
         contentAlignment = Alignment.Center,
     ) {
@@ -96,25 +99,32 @@ fun EmojiReactionBadge(
  * [AudioMessageBubble] — pas de duplication de la logique d'alignement.
  *
  * Le early-return quand `reactionEmoji == null` garantit zéro overhead de composition pour
- * les bulles sans réaction (= 99 % des cas).
+ * les bulles sans réaction (= 99 % des cas). Round 52 emoji fix — the same
+ * early-return applies to a blank or invisible-only stored emoji (lone VS16 /
+ * skin tone / ZWJ): [Text] of an invisible string inside the min-24dp pill
+ * renders as an empty oval, so such a value must never reach [EmojiReactionBadge].
+ * ([IncomingReactionDecoder.isVisibleEmoji] is the pure-Kotlin decision; the
+ * decoder also refuses to store invisible-only emojis going forward.)
  *
  * Relay UI refresh : le badge reprend la couleur de fond de la bulle qu'il décore
  * (grise entrante, bleue sortante, dans les deux thèmes) et descend de quelques px
  * pour ne plus couvrir l'horodatage en bas de bulle.
  *
- * Round 21 — [onRemoveReaction] restores the badge tap: tapping the badge
- * removes the reaction (single tap, no confirmation), as it did before
- * the UI refresh dropped the handler.
+ * Round 52 emoji fix — [onReactionBadgeTap] opens the reaction picker:
+ * tapping the badge never removes the reaction (see the [EmojiReactionBadge]
+ * KDoc above — the badge carries no author, so a tap must not clear it).
  */
 @Composable
 fun BubbleReactionOverlay(
     reactionEmoji: String?,
     isOutgoing: Boolean,
     bubbleColor: Color,
-    onRemoveReaction: () -> Unit,
+    onReactionBadgeTap: () -> Unit,
     content: @Composable () -> Unit,
 ) {
-    if (reactionEmoji == null) {
+    // Round 52 emoji fix — a blank or invisible-only stored emoji must
+    // not paint a pill (see the KDoc above): render the bare content.
+    if (reactionEmoji == null || !IncomingReactionDecoder.isVisibleEmoji(reactionEmoji)) {
         content()
         return
     }
@@ -131,7 +141,7 @@ fun BubbleReactionOverlay(
         EmojiReactionBadge(
             emoji = reactionEmoji,
             bubbleColor = bubbleColor,
-            onClick = onRemoveReaction,
+            onClick = onReactionBadgeTap,
             modifier = Modifier
                 .align(if (isOutgoing) Alignment.BottomStart else Alignment.BottomEnd)
                 // Feedback round 5 — the badge hung 12dp below the edge, so it

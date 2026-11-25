@@ -640,7 +640,7 @@ class E2eProbeManagerTest {
             channel = HandshakeChannel.TEXT_SMS,
         )
 
-        assertThat(result).isEqualTo(ProbeResult.Sent)
+        assertThat(result).isEqualTo(ProbeResult.Sent(budgetExhausted = false))
         assertThat(harness.sender.sentTexts).hasSize(1)
         assertThat(harness.sender.sent).isEmpty()
         assertThat(harness.peerDao.peers[ALICE]?.probeAttempts).isEqualTo(1)
@@ -665,13 +665,58 @@ class E2eProbeManagerTest {
             channel = HandshakeChannel.TEXT_SMS,
         )
 
-        assertThat(result).isEqualTo(ProbeResult.Sent)
+        assertThat(result).isEqualTo(ProbeResult.Sent(budgetExhausted = true))
         assertThat(harness.peerDao.peers[ALICE]?.probeAttempts).isEqualTo(3)
         // The round-44 rule applies on the SMS channel too: the
         // NOT_RELAY flip is automatic probes only.
         assertThat(harness.peerDao.peers[ALICE]?.state).isEqualTo(E2ePeerState.PROBING)
         assertThat(harness.sender.sentTexts).hasSize(1)
         assertThat(harness.sender.sent).isEmpty()
+    }
+
+    @Test
+    fun `a second manual attempt does not set the budget flag`() = runTest {
+        val harness = Harness(scope = this)
+        harness.seedPeer(
+            state = E2ePeerState.PROBING,
+            attempts = 1,
+            windowStartedAt = NOW - 2 * MS_PER_DAY,
+            lastProbeAt = NOW - 2 * MS_PER_DAY,
+        )
+
+        val result = harness.manager.probeAddressDetailed(
+            ALICE,
+            null,
+            manual = true,
+            now = NOW,
+        )
+
+        assertThat(result).isEqualTo(ProbeResult.Sent(budgetExhausted = false))
+        assertThat(harness.peerDao.peers[ALICE]?.probeAttempts).isEqualTo(2)
+        assertThat(harness.sender.sent).hasSize(1)
+    }
+
+    @Test
+    fun `a third manual data-SMS attempt sets the budget flag`() = runTest {
+        val harness = Harness(scope = this)
+        harness.seedPeer(
+            state = E2ePeerState.PROBING,
+            attempts = 2,
+            windowStartedAt = NOW - 2 * MS_PER_DAY,
+            lastProbeAt = NOW - 2 * MS_PER_DAY,
+        )
+
+        val result = harness.manager.probeAddressDetailed(
+            ALICE,
+            null,
+            manual = true,
+            now = NOW,
+        )
+
+        assertThat(result).isEqualTo(ProbeResult.Sent(budgetExhausted = true))
+        assertThat(harness.peerDao.peers[ALICE]?.probeAttempts).isEqualTo(3)
+        assertThat(harness.sender.sent).hasSize(1)
+        assertThat(harness.sender.sentTexts).isEmpty()
     }
 
     @Test
@@ -743,6 +788,45 @@ class E2eProbeManagerTest {
             )
         }
         verify(exactly = 0) { harness.recorder.record(any(), any()) }
+    }
+
+    @Test
+    fun `retryProbeDetailed returns the outcome and records a gated retry`() = runTest {
+        val harness = Harness(scope = this, blocked = FakeBlockedRepo(setOf(ALICE)))
+        coEvery { harness.conversationDao.findById(11L) } returns
+            harness.conversationWith(ALICE)
+
+        val result = harness.manager.retryProbeDetailed(11L, HandshakeChannel.TEXT_SMS)
+
+        assertThat(result).isEqualTo(ProbeResult.Gated(ProbeGate.Blocked))
+        assertThat(harness.sender.sentTexts).isEmpty()
+        assertThat(harness.sender.sent).isEmpty()
+        verify(exactly = 1) {
+            harness.recorder.recordEvent(
+                "e2e-manual-retry",
+                "Manual retry refused: number is blocked.",
+            )
+        }
+    }
+
+    @Test
+    fun `retryProbeDetailed returns the sent outcome with the budget flag`() = runTest {
+        val harness = Harness(scope = this)
+        coEvery { harness.conversationDao.findById(11L) } returns
+            harness.conversationWith(ALICE)
+        harness.seedPeer(
+            state = E2ePeerState.PROBING,
+            attempts = 2,
+            windowStartedAt = NOW - 2 * MS_PER_DAY,
+            lastProbeAt = NOW - 2 * MS_PER_DAY,
+        )
+
+        val result = harness.manager.retryProbeDetailed(11L)
+
+        assertThat(result).isEqualTo(ProbeResult.Sent(budgetExhausted = true))
+        assertThat(harness.sender.sent).hasSize(1)
+        // Success records nothing — the state flip is the signal.
+        verify(exactly = 0) { harness.recorder.recordEvent(any(), any()) }
     }
 
     // ──────────────────── Peer-left re-probe (round 41) ────────────────────

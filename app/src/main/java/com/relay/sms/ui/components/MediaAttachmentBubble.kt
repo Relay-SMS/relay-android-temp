@@ -293,10 +293,10 @@ fun MediaAttachmentBubble(
                         reactionEmoji = message.reactionEmoji,
                         isOutgoing = isOut,
                         bubbleColor = bgColor,
-                        // Round 21 — badge tap removes the reaction; the
-                        // callback rides [BubbleMenuToggles] (see
-                        // [MessageBubble]).
-                        onRemoveReaction = toggles?.onRemoveReaction ?: {},
+                        // Round 52 emoji fix — badge tap opens the reaction
+                        // picker (never removes); the callback rides
+                        // [BubbleMenuToggles] (see [MessageBubble]).
+                        onReactionBadgeTap = toggles?.onReactionBadgeTap ?: {},
                     ) {
                         MediaPreview(
                             attachment,

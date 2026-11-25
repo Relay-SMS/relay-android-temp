@@ -401,4 +401,179 @@ class IncomingReactionDecoderTest {
     @Test fun `first cluster of an empty string is empty`() {
         assertThat(IncomingReactionDecoder.firstGraphemeCluster("")).isEqualTo("")
     }
+
+    @Test fun `first cluster skips a leading BOM`() {
+        // A stored "‹BOM›👍" (folded before the decoder stripped format
+        // chars) normalizes to the visible thumbs-up, not to the BOM.
+        assertThat(IncomingReactionDecoder.firstGraphemeCluster("\uFEFF👍")).isEqualTo("👍")
+        assertThat(IncomingReactionDecoder.firstGraphemeCluster("\u200B👍")).isEqualTo("👍")
+        assertThat(IncomingReactionDecoder.firstGraphemeCluster("\u200C👍")).isEqualTo("👍")
+    }
+
+    @Test fun `first cluster of only format chars is empty`() {
+        assertThat(IncomingReactionDecoder.firstGraphemeCluster("\uFEFF")).isEqualTo("")
+        assertThat(IncomingReactionDecoder.firstGraphemeCluster("\u200B\u200C")).isEqualTo("")
+    }
+
+    // ──────────────── Round 52 emoji fix — invisible-only tokens never decode ────────────────
+
+    @Test fun `lone VS16 token is NOT decoded as a reaction`() {
+        // A lone variation selector is invisible: storing it would paint an empty pill.
+        assertThat(IncomingReactionDecoder.decode("\uFE0F to \u201CHello\u201D")).isNull()
+        assertThat(IncomingReactionDecoder.decode("Reacted \uFE0F to \u201CHello\u201D")).isNull()
+        assertThat(IncomingReactionDecoder.decode("Reacted \uFE0F")).isNull()
+        assertThat(IncomingReactionDecoder.decode("\uFE0F")).isNull()
+    }
+
+    @Test fun `lone skin-tone token is NOT decoded as a reaction`() {
+        assertThat(IncomingReactionDecoder.decode("\uD83C\uDFFB to \u201CHello\u201D")).isNull()
+        assertThat(IncomingReactionDecoder.decode("Reacted \uD83C\uDFFB to \u201CHello\u201D")).isNull()
+        assertThat(IncomingReactionDecoder.decode("Reacted \uD83C\uDFFB")).isNull()
+        assertThat(IncomingReactionDecoder.decode("\uD83C\uDFFB")).isNull()
+    }
+
+    @Test fun `lone ZWJ token is NOT decoded as a reaction`() {
+        assertThat(IncomingReactionDecoder.decode("\u200D to \u201CHello\u201D")).isNull()
+        assertThat(IncomingReactionDecoder.decode("\u200D")).isNull()
+    }
+
+    @Test fun `leading format char on the emoji token decodes to the clean emoji`() {
+        // Root cause of the empty pills: a BOM / ZWSP / ZWNJ prepended
+        // to the token used to be stored with the emoji, and the reparse
+        // normalize then reduced it to the invisible char alone. The
+        // token is stripped, so the fold stores a clean thumbs-up.
+        assertDecodesTo("\uFEFF👍 to \u201CHello\u201D", "👍")
+        assertDecodesTo("\u200B👍 to \u201CHello\u201D", "👍")
+        assertDecodesTo("\u200C👍 to \u201CHello\u201D", "👍")
+        assertDecodesTo("Reacted \uFEFF👍 to \u201CHello\u201D", "👍")
+        assertDecodesTo("👍\uFEFF to \u201CHello\u201D", "👍")
+        val google = IncomingReactionDecoder.decodeGoogleFormat(googleBody("\uFEFF👍", "Hello"))
+        assertThat(google).isNotNull()
+        assertThat(google!!.emoji).isEqualTo("👍")
+    }
+
+    @Test fun `lone format char token is NOT decoded as a reaction`() {
+        assertThat(IncomingReactionDecoder.decode("\uFEFF to \u201CHello\u201D")).isNull()
+        assertThat(IncomingReactionDecoder.decode("\uFEFF")).isNull()
+        assertThat(IncomingReactionDecoder.decode("\u200B")).isNull()
+    }
+
+    @Test fun `Google format with invisible-only emoji is NOT decoded`() {
+        assertThat(
+            IncomingReactionDecoder.decodeGoogleFormat(googleBody("\uFE0F", "Hello")),
+        ).isNull()
+        assertThat(
+            IncomingReactionDecoder.decodeGoogleFormat(googleBody("\uD83C\uDFFB", "Hello")),
+        ).isNull()
+    }
+
+    @Test fun `isVisibleEmoji rejects blank and invisible-only strings`() {
+        assertThat(IncomingReactionDecoder.isVisibleEmoji("")).isFalse()
+        assertThat(IncomingReactionDecoder.isVisibleEmoji("   ")).isFalse()
+        assertThat(IncomingReactionDecoder.isVisibleEmoji("\uFE0F")).isFalse()
+        assertThat(IncomingReactionDecoder.isVisibleEmoji("\uD83C\uDFFB")).isFalse()
+        assertThat(IncomingReactionDecoder.isVisibleEmoji("\u200D")).isFalse()
+        assertThat(IncomingReactionDecoder.isVisibleEmoji("\uFE0F\uD83C\uDFFB\u200D")).isFalse()
+    }
+
+    @Test fun `isVisibleEmoji accepts real emojis with modifiers`() {
+        assertThat(IncomingReactionDecoder.isVisibleEmoji("👍")).isTrue()
+        assertThat(IncomingReactionDecoder.isVisibleEmoji("👍\uFE0F")).isTrue()
+        assertThat(IncomingReactionDecoder.isVisibleEmoji("👍\uD83C\uDFFB")).isTrue()
+        assertThat(IncomingReactionDecoder.isVisibleEmoji("❤️‍🔥")).isTrue()
+        assertThat(IncomingReactionDecoder.isVisibleEmoji("🇫🇷")).isTrue()
+        assertThat(IncomingReactionDecoder.isVisibleEmoji("‼️")).isTrue()
+        // BMP emoji bases below U+2300 (must not be excluded with the modifiers).
+        assertThat(IncomingReactionDecoder.isVisibleEmoji("⭐")).isTrue()
+        assertThat(IncomingReactionDecoder.isVisibleEmoji("©️")).isTrue()
+        assertThat(IncomingReactionDecoder.isVisibleEmoji("⁉️")).isTrue()
+        assertThat(IncomingReactionDecoder.isVisibleEmoji("™️")).isTrue()
+    }
+
+    @Test fun `decodes BMP emoji bases below U+2300 in emoji-quote form`() {
+        assertDecodesTo("‼️ to \u201CHello\u201D", "‼️")
+        assertDecodesTo("⭐ to \u201CHello\u201D", "⭐")
+        assertDecodesTo("©️ to \u201CHello\u201D", "©️")
+    }
+
+    // ──────────────── Round 52 emoji fix — Reacted … to … with curly quotes ────────────────
+
+    @Test fun `decodes Relay Tapback with curly quotes`() {
+        // Pre-existing gap: TAPBACK_WITH_PREVIEW_REGEX only knew «» and ".
+        val result = IncomingReactionDecoder.decode("Reacted 👍 to \u201CHello\u201D")
+        assertThat(result).isNotNull()
+        assertThat(result!!.emoji).isEqualTo("👍")
+        assertThat(result.previewPrefix).isEqualTo("Hello")
+        assertThat(result.kind).isEqualTo(IncomingReactionDecoder.DecodedReaction.Kind.Tapback)
+    }
+
+    @Test fun `decodes Relay Tapback with straight quotes`() {
+        val result = IncomingReactionDecoder.decode("Reacted 👍 to \"Hello\"")
+        assertThat(result).isNotNull()
+        assertThat(result!!.emoji).isEqualTo("👍")
+        assertThat(result.previewPrefix).isEqualTo("Hello")
+    }
+
+    // ──────────────── Round 52 emoji fix — Curt regression (16 wire forms) ────────────────
+
+    // Kristin's exact message: Curt's 👍 on it rendered as an empty oval in
+    // the round-52 build (it rendered fine in round 50). The decoder is
+    // proven correct for every form below — this locks the behaviour in so
+    // the hardening above can never regress it.
+    private val curtMessage = "Sounds good, cyah then! Oh no worries :)"
+
+    private fun assertDecodesTo(body: String, expectedEmoji: String) {
+        val result = IncomingReactionDecoder.decode(body)
+        assertThat(result).isNotNull()
+        assertThat(result!!.emoji).isEqualTo(expectedEmoji)
+    }
+
+    @Test fun `Curt thumbs-up decodes in every word and emoji-quote form`() {
+        assertDecodesTo("Liked \"$curtMessage\"", "👍")
+        assertDecodesTo("Liked \u201C$curtMessage\u201D", "👍")
+        assertDecodesTo("👍 to \"$curtMessage\"", "👍")
+        assertDecodesTo("👍 to \u201C$curtMessage\u201D", "👍")
+        assertDecodesTo("👍 \u201C$curtMessage\u201D", "👍")
+        assertDecodesTo("👍 to \u201C $curtMessage\u201D", "👍")
+        assertDecodesTo("👍 to \" $curtMessage\"", "👍")
+        assertDecodesTo("👍 to \u201C$curtMessage\u201D ", "👍")
+    }
+
+    @Test fun `Curt thumbs-up decodes in Relay Reacted form with curly and straight quotes`() {
+        assertDecodesTo("Reacted 👍 to \u201C$curtMessage\u201D", "👍")
+        assertDecodesTo("Reacted 👍 to \"$curtMessage\"", "👍")
+    }
+
+    @Test fun `Curt thumbs-up decodes with VS16 and skin tone`() {
+        assertDecodesTo("👍\uFE0F to \u201C$curtMessage\u201D", "👍\uFE0F")
+        assertDecodesTo("👍\uD83C\uDFFB to \u201C$curtMessage\u201D", "👍\uD83C\uDFFB")
+    }
+
+    @Test fun `Curt thumbs-up removals decode`() {
+        val word = IncomingReactionDecoder.decode(
+            "Removed a like from \u201C$curtMessage\u201D",
+        )
+        assertThat(word).isNotNull()
+        assertThat(word!!.emoji).isEqualTo("👍")
+        assertThat(word.isRemoval).isTrue()
+        val generic = IncomingReactionDecoder.decode(
+            "Removed 👍 from \u201C$curtMessage\u201D",
+        )
+        assertThat(generic).isNotNull()
+        assertThat(generic!!.emoji).isEqualTo("👍")
+        assertThat(generic.isRemoval).isTrue()
+    }
+
+    @Test fun `bare thumbs-up decodes as EmojiOnly and the YouTube control still decodes`() {
+        val bare = IncomingReactionDecoder.decode("👍")
+        assertThat(bare).isNotNull()
+        assertThat(bare!!.emoji).isEqualTo("👍")
+        assertThat(bare.kind).isEqualTo(IncomingReactionDecoder.DecodedReaction.Kind.EmojiOnly)
+        val control = IncomingReactionDecoder.decode(
+            "👍 to \u201C Hey Curt, this is the video I was talking about:\n" +
+                "https://www.youtube.com/watch?v=8v2 \u201D",
+        )
+        assertThat(control).isNotNull()
+        assertThat(control!!.emoji).isEqualTo("👍")
+    }
 }

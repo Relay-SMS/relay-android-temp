@@ -61,4 +61,17 @@ class QuickReactionRowTest {
         // a multi-emoji reaction replaces it instead.
         assertThat(toggleReaction("❤️👍", "❤️")).isEqualTo("❤️")
     }
+
+    @Test fun `tapping any other emoji never clears the stored reaction`() {
+        // Round 52 emoji fix — the badge tap opens the picker and never
+        // clears: removal happens ONLY through this toggle, and only on
+        // an explicit tap of the already-applied emoji. A tap on any
+        // other emoji must store that emoji, never null — so a stray tap
+        // on someone else's reaction can never wipe the badge.
+        for (emoji in DEFAULT_QUICK_REACTIONS) {
+            if (emoji != "👍") {
+                assertThat(toggleReaction("👍", emoji)).isEqualTo(emoji)
+            }
+        }
+    }
 }

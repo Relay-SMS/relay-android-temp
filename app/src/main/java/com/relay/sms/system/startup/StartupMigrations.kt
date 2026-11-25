@@ -275,20 +275,27 @@ class StartupMigrations @Inject constructor(
      * provider lookup (wrong URI — it read the thread's messages,
      * not the thread row), so every install re-runs the pass once
      * with the fixed lookup.
+     *
+     * Member-ID fix — the flag is V26: the V25 pass ran with a
+     * broken `canonical-addresses` read (column 0 is the recipient
+     * `_id`, not the address), so groups came back with ids as
+     * members. V26 re-runs the pass with the fixed lookup, plus
+     * the CorrectMembers arm that heals those groups in place.
      */
     private suspend fun repairGroupConversations(advanced: AdvancedSettings) {
-        if (advanced.groupConversationsRepairedV25) return
+        if (advanced.groupConversationsRepairedV26) return
         val result = groupRepair.get().repair()
         if (result.complete) {
             settings.update { s ->
-                s.copy(advanced = s.advanced.copy(groupConversationsRepairedV25 = true))
+                s.copy(advanced = s.advanced.copy(groupConversationsRepairedV26 = true))
             }
         }
-        if (result.repaired > 0 || result.merged > 0) {
+        if (result.repaired > 0 || result.merged > 0 || result.corrected > 0) {
             Timber.i(
-                "group conversation repair: %d re-filed, %d merged (complete=%b)",
+                "group conversation repair: %d re-filed, %d merged, %d corrected (complete=%b)",
                 result.repaired,
                 result.merged,
+                result.corrected,
                 result.complete,
             )
         }

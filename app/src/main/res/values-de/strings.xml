@@ -742,7 +742,6 @@
     <!-- v1.5.0 — multi-emoji picker validate button -->
     <!-- v1.6.0 — a11y reaction badge (TalkBack) -->
     <string name="reaction_badge_content_description">Reaktion %1$s</string>
-    <string name="reaction_badge_remove_action">Reaktion entfernen</string>
     <!-- v1.6.1 — body of the system notification fired when someone reacts to our message -->
     <string name="reaction_notif_body_with_preview">Hat mit %1$s reagiert auf: %2$s</string>
     <string name="reaction_notif_body_no_preview">Hat mit %1$s auf Ihre Nachricht reagiert</string>

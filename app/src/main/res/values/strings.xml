@@ -740,7 +740,6 @@
     <!-- v1.6.0 — a11y reaction badge (TalkBack) -->
     <string name="reaction_badge_content_description">Reaction %1$s</string>
     <!-- Round 21 — badge tap removes the reaction again (also the picker sheet's empty-selection button) -->
-    <string name="reaction_badge_remove_action">Remove reaction</string>
     <!-- v1.6.1 — body of the system notification fired when someone reacts to our message -->
     <string name="reaction_notif_body_with_preview">Reacted %1$s to: %2$s</string>
     <string name="reaction_notif_body_no_preview">Reacted %1$s to your message</string>

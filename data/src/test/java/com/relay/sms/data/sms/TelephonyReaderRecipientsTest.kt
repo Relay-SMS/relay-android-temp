@@ -11,6 +11,7 @@ import android.content.ContentResolver
 import android.content.Context
 import android.database.Cursor
 import android.net.Uri
+import android.provider.Telephony
 import com.google.common.truth.Truth.assertThat
 import io.mockk.Runs
 import io.mockk.every
@@ -44,6 +45,13 @@ import org.junit.jupiter.api.Test
  * pass vacuously). The mock returns a distinct [Uri] per string so
  * the two provider queries (thread row, then canonical-addresses)
  * can be stubbed independently.
+ *
+ * Member-ID fix — the `canonical-addresses` mock models the
+ * provider's REAL projection (`{ _id, address }`, address at 1):
+ * AOSP ignores the caller's projection for the plural URI. The
+ * round-52 mock put the address at 0, which is why the column-0
+ * read passed every test while returning recipient ids ("23",
+ * "59") on device. A mock must model the provider, not the code.
  */
 class TelephonyReaderRecipientsTest {
 
@@ -91,12 +99,22 @@ class TelephonyReaderRecipientsTest {
         return cursor
     }
 
-    /** A cursor over one `address` row per entry (nulls model NULL cells). */
-    private fun addressesCursor(vararg rows: String?): Cursor {
+    /**
+     * A cursor over the provider's REAL `canonical-addresses`
+     * projection — two columns, `_id` at 0 and `address` at 1
+     * (AOSP ignores the caller's projection for the plural URI).
+     * Each row is an (id, address) pair; a null address models a
+     * NULL cell. A mock that puts the address at 0 copies the
+     * round-52 bug instead of catching it.
+     */
+    private fun addressesCursor(vararg rows: Pair<Long, String?>): Cursor {
         val cursor = mockk<Cursor>()
         var index = -1
         every { cursor.moveToNext() } answers { ++index < rows.size }
-        every { cursor.getString(0) } answers { rows[index] }
+        every { cursor.getColumnIndex(Telephony.CanonicalAddressesColumns.ADDRESS) } returns 1
+        every { cursor.getColumnIndexOrThrow(Telephony.CanonicalAddressesColumns.ADDRESS) } returns 1
+        every { cursor.getString(0) } answers { rows[index].first.toString() }
+        every { cursor.getString(1) } answers { rows[index].second }
         every { cursor.close() } just Runs
         return cursor
     }
@@ -105,7 +123,7 @@ class TelephonyReaderRecipientsTest {
         every { resolver.query(idsUri, any(), any(), any(), any()) } returns idsCursor(raw)
     }
 
-    private fun stubAddresses(vararg rows: String?) {
+    private fun stubAddresses(vararg rows: Pair<Long, String?>) {
         every { resolver.query(addressesUri, any(), any(), any(), any()) } returns
             addressesCursor(*rows)
     }
@@ -113,7 +131,7 @@ class TelephonyReaderRecipientsTest {
     @Test
     fun `queries the recipients URI, not the bare conversations URI`() {
         stubIds("3 7")
-        stubAddresses("+16100000001", "+16100000002")
+        stubAddresses(3L to "+16100000001", 7L to "+16100000002")
 
         val result = reader.readThreadRecipients(THREAD_ID)
 
@@ -126,7 +144,7 @@ class TelephonyReaderRecipientsTest {
     @Test
     fun `resolves recipient ids to addresses`() {
         stubIds("3 7 9")
-        stubAddresses("+16100000001", "+16100000002", "+16100000003")
+        stubAddresses(3L to "+16100000001", 7L to "+16100000002", 9L to "+16100000003")
 
         val result = reader.readThreadRecipients(THREAD_ID)
 
@@ -162,7 +180,7 @@ class TelephonyReaderRecipientsTest {
         val argsSlot = slot<Array<String>>()
         stubIds("3 abc 7")
         every { resolver.query(addressesUri, any(), any(), capture(argsSlot), any()) } returns
-            addressesCursor("+16100000001", "+16100000002")
+            addressesCursor(3L to "+16100000001", 7L to "+16100000002")
 
         val result = reader.readThreadRecipients(THREAD_ID)
 
@@ -175,7 +193,7 @@ class TelephonyReaderRecipientsTest {
         val argsSlot = slot<Array<String>>()
         stubIds("3 3 7 3")
         every { resolver.query(addressesUri, any(), any(), capture(argsSlot), any()) } returns
-            addressesCursor("+16100000001", "+16100000002")
+            addressesCursor(3L to "+16100000001", 7L to "+16100000002")
 
         reader.readThreadRecipients(THREAD_ID)
 
@@ -185,11 +203,32 @@ class TelephonyReaderRecipientsTest {
     @Test
     fun `insert-address-token blank and null addresses are filtered`() {
         stubIds("3 7 9 11 13")
-        stubAddresses("+16100000001", "insert-address-token", "", "  ", null)
+        stubAddresses(
+            3L to "+16100000001",
+            7L to "insert-address-token",
+            9L to "",
+            11L to "  ",
+            13L to null,
+        )
 
         val result = reader.readThreadRecipients(THREAD_ID)
 
         assertThat(result).containsExactly("+16100000001")
+    }
+
+    @Test
+    fun `canonical-address ids at column 0 are never returned as addresses`() {
+        // Device-proven 2026-11-24: group members showed as "23,
+        // 59" — the provider returns { _id, address } and the code
+        // read column 0. The ids here are the device's own.
+        stubIds("23 59")
+        stubAddresses(23L to "+16100000001", 59L to "+16100000002")
+
+        val result = reader.readThreadRecipients(THREAD_ID)
+
+        assertThat(result).containsExactly("+16100000001", "+16100000002")
+        assertThat(result).doesNotContain("23")
+        assertThat(result).doesNotContain("59")
     }
 
     @Test

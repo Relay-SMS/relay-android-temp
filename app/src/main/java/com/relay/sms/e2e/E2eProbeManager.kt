@@ -115,6 +115,20 @@ import com.relay.sms.data.local.db.entity.E2ePeerState as StoredPeerState
  * never announce (the tap is about the key exchange, and the
  * panel only offers it for non-ENCRYPTED peers).
  *
+ * Desktop encryption-box update — the manual retry is now
+ * result-aware on both surfaces: [retryProbeDetailed] runs the
+ * detailed core and returns the outcome (the fire-and-forget
+ * buttons and the desktop `retry_e2e_probe` command share it),
+ * and [ProbeResult.Sent] carries whether the send consumed the
+ * last probe-budget slot ([ProbeResult.Sent.budgetExhausted]).
+ * A manual retry BYPASSES the budget ([gateFor] returns before
+ * the budget check), so a manual retry can never be REFUSED for
+ * budget reasons — but it still CONSUMES budget, and the send
+ * that spends the last slot is the moment the user should hear
+ * about the reset (Settings → Advanced → "Reset encryption
+ * timing"): automatic checks for that contact are paused until
+ * the window elapses.
+ *
  * All entry points are fire-and-forget (non-suspend, own scope): a
  * probe must never delay opening a thread or sending a message. The
  * suspend cores ([probeConversation], [probeAddress]) are the testable
@@ -135,8 +149,17 @@ import com.relay.sms.data.local.db.entity.E2ePeerState as StoredPeerState
  * a tap that does nothing leaves a trace in the error log.
  */
 sealed interface ProbeResult {
-    /** The probe data SMS went out. */
-    data object Sent : ProbeResult
+    /**
+     * The probe went out. [budgetExhausted] is true when this
+     * send consumed the last probe-budget slot (attempts reached
+     * [E2ePeerRepository.MAX_PROBE_ATTEMPTS] — automatic checks
+     * for the contact are paused until the window elapses). A
+     * manual retry can never be REFUSED for budget reasons
+     * (the gate lifts the budget for manual retries), but it
+     * still consumes budget, so the flag is what tells the
+     * user the reset exists.
+     */
+    data class Sent(val budgetExhausted: Boolean = false) : ProbeResult
 
     /** No probe went out: the attempt was refused before sending. */
     data class Gated(val reason: ProbeGate) : ProbeResult
@@ -271,20 +294,38 @@ class E2eProbeManager @Inject constructor(
 
     /**
      * Shared fire-and-forget core of the two manual retries: runs
-     * the detailed core on the chosen [channel] and records every
-     * non-[ProbeResult.Sent] outcome in the error log (round 42).
+     * the detailed retry ([retryProbeDetailed]) and lets it record
+     * every non-[ProbeResult.Sent] outcome in the error log (round
+     * 42). A thrown error is recorded too, like before.
      */
     private fun manualRetry(conversationId: Long, channel: HandshakeChannel) {
         scope.launch {
-            runCatching {
-                probeConversationDetailed(conversationId, manual = true, channel = channel)
-            }
-                .onSuccess { result -> recordManualResult(result) }
+            runCatching { retryProbeDetailed(conversationId, channel) }
                 .onFailure { error ->
                     recorder.record(MANUAL_RETRY_TAG, error)
                     Timber.w(error, "E2E: manual probe retry failed")
                 }
         }
+    }
+
+    /**
+     * Suspend manual retry (desktop encryption-box update): the
+     * same one-probe-now core as [manualRetry] — detailed core on
+     * the chosen [channel], `e2e-manual-retry` recording on every
+     * non-[ProbeResult.Sent] outcome — but the outcome is
+     * RETURNED, so the caller can tell the user what happened:
+     * the thread ViewModel shows a snackbar, and the desktop
+     * `retry_e2e_probe` command answers `action_result` with the
+     * mapped code. The fire-and-forget buttons route through here
+     * too, so the recording lives in exactly one place.
+     */
+    suspend fun retryProbeDetailed(
+        conversationId: Long,
+        channel: HandshakeChannel = HandshakeChannel.DATA_SMS,
+    ): ProbeResult {
+        val result = probeConversationDetailed(conversationId, manual = true, channel = channel)
+        recordManualResult(result)
+        return result
     }
 
     /**
@@ -297,7 +338,7 @@ class E2eProbeManager @Inject constructor(
      */
     private fun recordManualResult(result: ProbeResult) {
         when (result) {
-            ProbeResult.Sent -> Unit
+            is ProbeResult.Sent -> Unit
             is ProbeResult.Gated -> recorder.recordEvent(
                 MANUAL_RETRY_TAG,
                 "Manual retry refused: ${result.reason.label}.",
@@ -320,7 +361,7 @@ class E2eProbeManager @Inject constructor(
         now: Long = System.currentTimeMillis(),
         manual: Boolean = false,
     ): Boolean =
-        probeConversationDetailed(conversationId, now, manual) == ProbeResult.Sent
+        probeConversationDetailed(conversationId, now, manual) is ProbeResult.Sent
 
     /**
      * Detailed core of [probeConversation]: resolves the conversation
@@ -363,7 +404,7 @@ class E2eProbeManager @Inject constructor(
         manual: Boolean = false,
         now: Long = System.currentTimeMillis(),
     ): Boolean =
-        probeAddressDetailed(address, subId, allowEncrypted, manual, now) == ProbeResult.Sent
+        probeAddressDetailed(address, subId, allowEncrypted, manual, now) is ProbeResult.Sent
 
     /**
      * Detailed core of [probeAddress]: the same probe, with the
@@ -437,11 +478,18 @@ class E2eProbeManager @Inject constructor(
         // above); only the immediate state flip is skipped, and the
         // NOT_RELAY conclusion still applies to automatic probes.
         val attempts = peers.getPeer(address)?.probeAttempts ?: 0
-        if (!manual && attempts >= E2ePeerRepository.MAX_PROBE_ATTEMPTS) {
+        // Desktop encryption-box update — the send that spends
+        // the last budget slot: automatic checks for this contact
+        // are paused until the window elapses, and the caller
+        // (phone snackbar, desktop dialog) tells the user about
+        // the reset. The flag rides on the result for manual AND
+        // automatic sends; automatic callers ignore it.
+        val budgetExhausted = attempts >= E2ePeerRepository.MAX_PROBE_ATTEMPTS
+        if (!manual && budgetExhausted) {
             peers.setState(address, StoredPeerState.NOT_RELAY, now)
         }
         Timber.i("E2E: probe sent (state=%s, attempts=%d)", state, attempts)
-        ProbeResult.Sent
+        ProbeResult.Sent(budgetExhausted = budgetExhausted)
     }
 
     /**

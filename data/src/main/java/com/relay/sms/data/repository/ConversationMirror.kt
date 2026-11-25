@@ -672,11 +672,18 @@ class ConversationMirror @Inject constructor(
         // one emoji per message, so keep the first cluster and drop the
         // rest. Idempotent: single-emoji values are untouched, so a
         // re-run (or a v3 install that already ran it) changes nothing.
+        // Round 52 emoji fix — never write an invisible-only (or empty)
+        // value back: a stored "‹invisible›👍" used to normalize to the
+        // invisible char alone, painting an empty pill on every reparse.
+        // [firstGraphemeCluster] now skips leading format chars, so a
+        // contaminated row normalizes to its visible emoji; anything
+        // still invisible is left alone (the render guard hides it)
+        // rather than rewritten.
         var normalized = 0
         for (row in messageDao.findMessagesWithReactions()) {
             val emoji = row.reactionEmoji ?: continue
             val first = IncomingReactionDecoder.firstGraphemeCluster(emoji)
-            if (first != emoji) {
+            if (first != emoji && IncomingReactionDecoder.isVisibleEmoji(first)) {
                 messageDao.setReaction(row.id, first)
                 normalized++
             }

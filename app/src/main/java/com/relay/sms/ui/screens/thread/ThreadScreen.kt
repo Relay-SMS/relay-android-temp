@@ -1361,9 +1361,6 @@ fun ThreadScreen(
                 // the ViewModel's setReaction. Round 21 — `null` removes the
                 // reaction (the bar toggles the applied emoji off).
                 onQuickReact = { msgId, emoji -> viewModel.setReaction(msgId, emoji) },
-                // Round 21 — badge tap removes the reaction, single tap, no
-                // confirmation (restores the pre-refresh behaviour).
-                onRemoveReaction = { msgId -> viewModel.setReaction(msgId, null) },
                 onForward = { msg -> forwardingMessage = msg },
                 onTranslate = { msg -> translateMessageExternal(msg) },
                 onCopy = { msg -> copyMessageBody(msg) },
@@ -3963,8 +3960,6 @@ private class ThreadMessageItemActions(
     val onReact: (Long) -> Unit,
     /** Round 12 — quick-reaction bar: sends [String] emoji for [Long] message id at once. */
     val onQuickReact: (Long, String?) -> Unit,
-    /** Round 21 — badge tap: removes the reaction (`setReaction(id, null)`). */
-    val onRemoveReaction: (Long) -> Unit,
     val onForward: (Message) -> Unit,
     val onTranslate: (Message) -> Unit,
     val onCopy: (Message) -> Unit,
@@ -4177,11 +4172,13 @@ private fun ThreadMessageItem(
             BubbleMenuToggles(
                 isPinned = isPinnedMessage,
                 onTogglePin = { actions.onTogglePin(msg) },
-                // Round 21 — badge tap removes the reaction. A badge can
-                // sit on an outgoing message too (the other side's
-                // Tapback, or your own reaction), and tapping it clears
-                // the local badge — same as the original wiring.
-                onRemoveReaction = { actions.onRemoveReaction(msg.id) },
+                // Round 52 emoji fix — badge tap opens the reaction picker
+                // (same as the bubble menu's React entry). A badge can sit
+                // on an outgoing message too (the other side's Tapback, or
+                // your own reaction), and tapping it must never clear it:
+                // the badge carries no author. Removing your own reaction
+                // stays on the picker / quick bar toggle ([toggleReaction]).
+                onReactionBadgeTap = { actions.onReact(msg.id) },
                 // Round 53 — smart-action tap, same bundle (the text
                 // bubble is at the parameter limit). Not gated in
                 // client mode: it never writes, like the phone tap.
@@ -4191,7 +4188,7 @@ private fun ThreadMessageItem(
         // Client mode C3 — the gated actions, one decision for the
         // three bubble types below: `null` hides the menu item (or
         // the quick bar). Only Delete stays gated (no delete frame);
-        // Reply, React, Forward and the pin/remove-reaction toggles
+        // Reply, React, Forward and the pin/reaction-badge toggles
         // are wired on a linked device. Copy, Translate, playback
         // and phone-click are not gated — they never write.
         val gatedOnDelete = if (isClientMode) null else onDelete

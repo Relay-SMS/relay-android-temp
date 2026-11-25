@@ -224,7 +224,7 @@ object IncomingReactionDecoder {
      */
     fun decode(body: String): DecodedReaction? {
         if (body.length > MAX_DECODE_INPUT_LENGTH) return null
-        val trimmed = body.trim()
+        val trimmed = stripFormatChars(body.trim())
         if (trimmed.isEmpty()) return null
         return resolveAttempts(trimmed)
     }
@@ -286,11 +286,15 @@ object IncomingReactionDecoder {
         previewGroup: Int,
     ): DecodeAttempt =
         regex.matchEntire(trimmed)?.let { m ->
-            val emoji = m.groupValues[emojiGroup].trim()
+            val emoji = stripFormatChars(m.groupValues[emojiGroup].trim())
             val rawPreview = m.groupValues[previewGroup]
             val preview = rawPreview.removeSuffix(TRUNCATION_MARKER).trim()
             when {
-                emoji.isEmpty() || preview.isEmpty() -> DecodeAttempt.Invalid
+                // Round 52 emoji fix — an invisible-only token (lone
+                // VS16 / skin tone / ZWJ) must not decode: it would be
+                // stored as a reaction and paint an empty pill.
+                emoji.isEmpty() || preview.isEmpty() || !hasBaseEmoji(emoji) ->
+                    DecodeAttempt.Invalid
                 else -> DecodeAttempt.Found(
                     DecodedReaction(
                         emoji = emoji,
@@ -314,9 +318,12 @@ object IncomingReactionDecoder {
         emojiGroup: Int,
     ): DecodeAttempt =
         regex.matchEntire(trimmed)?.let { m ->
-            val emoji = m.groupValues[emojiGroup]
+            val emoji = stripFormatChars(m.groupValues[emojiGroup])
             when {
-                emoji.isEmpty() || emoji.all { it.code < 128 } -> DecodeAttempt.Invalid
+                // Round 52 emoji fix — see [decodeWithPreview]: an
+                // invisible-only token must not decode.
+                emoji.isEmpty() || emoji.all { it.code < 128 } || !hasBaseEmoji(emoji) ->
+                    DecodeAttempt.Invalid
                 else -> DecodeAttempt.Found(
                     DecodedReaction(
                         emoji = emoji,
@@ -363,11 +370,14 @@ object IncomingReactionDecoder {
      */
     private fun decodeGenericRemoval(trimmed: String): DecodeAttempt =
         GENERIC_REMOVED_REGEX.matchEntire(trimmed)?.let { m ->
-            val emoji = m.groupValues[1]
+            val emoji = stripFormatChars(m.groupValues[1])
             val rawPreview = m.groupValues[2]
             val preview = rawPreview.removeSuffix(TRUNCATION_MARKER).trim()
             when {
-                emoji.isEmpty() || emoji.all { it.code < 128 } -> DecodeAttempt.NotMatched
+                // Round 52 emoji fix — see [decodeWithPreview]: an
+                // invisible-only token must not decode.
+                emoji.isEmpty() || emoji.all { it.code < 128 } || !hasBaseEmoji(emoji) ->
+                    DecodeAttempt.NotMatched
                 preview.isEmpty() -> DecodeAttempt.NotMatched
                 else -> DecodeAttempt.Found(
                     DecodedReaction(
@@ -383,8 +393,10 @@ object IncomingReactionDecoder {
 
     /**
      * v1.9.0 — Emoji + quote compact format: `<emoji> «<preview>»`. The
-     * emoji must contain a real emoji char ([isLikelyEmojiChar]) — the old
-     * ASCII guard wrongly accepted an accented French word (`été «aperçu»`).
+     * emoji must contain a real BASE emoji codepoint ([hasBaseEmoji]) —
+     * the old ASCII guard wrongly accepted an accented French word
+     * (`été «aperçu»`), and the [isLikelyEmojiChar] guard wrongly
+     * accepted an invisible-only token (lone VS16 / skin tone / ZWJ).
      * Fast-path: skip the regex when there is no closing guillemet (the
      * non-greedy pattern backtracks on pathological input).
      */
@@ -401,7 +413,7 @@ object IncomingReactionDecoder {
             return DecodeAttempt.NotMatched
         }
         return EMOJI_WITH_QUOTE_REGEX.matchEntire(trimmed)?.let { m ->
-            val emoji = m.groupValues[1]
+            val emoji = stripFormatChars(m.groupValues[1])
             val rawPreview = m.groupValues[2]
             val preview = rawPreview.removeSuffix(TRUNCATION_MARKER).trim()
             // Feedback round 9 — the closing quote may be absent when the
@@ -410,7 +422,12 @@ object IncomingReactionDecoder {
             val hasClosingQuote = trimmed.endsWith('»') || trimmed.endsWith('"') ||
                 trimmed.endsWith('”')
             when {
-                emoji.isEmpty() || emoji.none { isLikelyEmojiChar(it) } ->
+                // Round 52 emoji fix — the token must contain a BASE
+                // emoji codepoint, not only modifiers / VS16 / ZWJ:
+                // [isLikelyEmojiChar] accepts those as emoji chars, so
+                // a lone U+FE0F / U+1F3FB / U+200D used to pass this
+                // guard and be stored as an invisible reaction.
+                emoji.isEmpty() || !hasBaseEmoji(emoji) ->
                     DecodeAttempt.NotMatched
                 preview.isEmpty() -> DecodeAttempt.NotMatched
                 else -> DecodeAttempt.Found(
@@ -478,10 +495,11 @@ object IncomingReactionDecoder {
         isRemoval: Boolean,
     ): DecodedReaction? =
         googleQuotePositions(body, separator)?.let { positions ->
-            val emoji = body.substring(positions.firstSep + 1, positions.secondSep)
+            val emoji = stripFormatChars(body.substring(positions.firstSep + 1, positions.secondSep))
             val rawPreview = body.substring(positions.openQuote + 1, positions.closeQuote)
             val preview = rawPreview.removeSuffix(TRUNCATION_MARKER).trim()
-            val emojiInvalid = emoji.isEmpty() || emoji.none { isLikelyEmojiChar(it) }
+            val emojiInvalid = emoji.isEmpty() || emoji.none { isLikelyEmojiChar(it) } ||
+                !hasBaseEmoji(emoji)
             val framingInvalid = emoji.any { it == GOOGLE_FRAME } || preview.isEmpty()
             if (emojiInvalid || framingInvalid) {
                 null
@@ -608,13 +626,25 @@ object IncomingReactionDecoder {
      * A stored reaction holds exactly one emoji in Relay's model, but
      * older builds could store several ("👍😂😅"); the v3 reparse keeps
      * the first and drops the rest. Returns "" for an empty input.
+     *
+     * Round 52 emoji fix — leading zero-width format chars (BOM /
+     * ZWSP / ZWNJ / word joiner, see [stripFormatChars]) are not a
+     * grapheme cluster: a stored "‹invisible›👍" (folded before the
+     * decoder stripped them) normalizes to "👍", not to the invisible
+     * char alone. Returns "" when nothing but format chars remains.
      */
     fun firstGraphemeCluster(text: String): String {
-        if (text.isEmpty()) return ""
         var index = 0
+        while (index < text.length && text.codePointAt(index) in FORMAT_CHARS) {
+            index += Character.charCount(text.codePointAt(index))
+        }
+        // Covers the empty input too: the skip loop never runs, so
+        // index (0) is already past the end.
+        if (index >= text.length) return ""
+        val start = index
         var joinNext = false
         var pendingRegional = false
-        var clusterEnd = 0
+        var clusterEnd = start
         while (index < text.length) {
             val codePoint = text.codePointAt(index)
             index += Character.charCount(codePoint)
@@ -634,7 +664,7 @@ object IncomingReactionDecoder {
                     if (pendingRegional) {
                         pendingRegional = false
                     } else {
-                        if (clusterEnd != 0) return text.substring(0, clusterEnd)
+                        if (clusterEnd != start) return text.substring(start, clusterEnd)
                         pendingRegional = true
                     }
                     joinNext = false
@@ -646,12 +676,12 @@ object IncomingReactionDecoder {
                 // A plain code point starts a new cluster — unless this
                 // is the very first one.
                 else -> {
-                    if (clusterEnd != 0) return text.substring(0, clusterEnd)
+                    if (clusterEnd != start) return text.substring(start, clusterEnd)
                 }
             }
             clusterEnd = index
         }
-        return text.substring(0, clusterEnd)
+        return text.substring(start, clusterEnd)
     }
 
     /** Lone Unicode horizontal ellipsis Relay appends when the preview was truncated. */
@@ -728,13 +758,15 @@ object IncomingReactionDecoder {
      * Matches `Reacted <emoji> to «<preview>»` with both standard Unicode guillemets
      * `«»` (what Relay always emits) and a defensive ASCII fallback using the plain
      * double-quote `"..."` — covers carriers / OEMs that occasionally strip non-ASCII
-     * punctuation from SMS bodies. The emoji group is non-greedy and the preview group
+     * punctuation from SMS bodies. Round 52 emoji fix — the curly quotes `“”`
+     * join both classes: Relay's own `Reacted <emoji> to “…”` shape (an iPhone
+     * rendering) used to decode to `null`. The emoji group is non-greedy and the preview group
      * accepts any char (including new lines, defensively) because Relay sanitises
      * but a third-party SMS app on the other end might inject CRLF that the parser
      * should still survive.
      */
     private val TAPBACK_WITH_PREVIEW_REGEX = Regex(
-        """^Reacted\s+(.+?)\s+to\s+[«"](.+?)[»"]$""",
+        """^Reacted\s+(.+?)\s+to\s+[«"“](.+?)[»"”]$""",
         RegexOption.DOT_MATCHES_ALL,
     )
 
@@ -857,6 +889,89 @@ object IncomingReactionDecoder {
      * (encoder utilise le picker système qui produit du plane supplémentaire
      * pour la quasi-totalité des emojis usuels).
      */
+    /**
+     * Round 52 emoji fix — `true` when [emoji] would render as a visible
+     * emoji: not blank, and containing at least one BASE emoji codepoint.
+     * A string of only modifiers (skin tones), variation selectors,
+     * ZWJ or keycap marks is invisible — a lone U+FE0F / U+1F3FB /
+     * U+200D renders as nothing — and must never be stored as a reaction
+     * (it paints an empty pill) nor drawn as one. Used by the decode
+     * guards below and by the UI ([BubbleReactionOverlay]) so a bad
+     * stored value can never paint an empty pill again.
+     */
+    fun isVisibleEmoji(emoji: String): Boolean =
+        emoji.isNotBlank() && hasBaseEmoji(emoji)
+
+    /**
+     * Round 52 emoji fix — zero-width FORMAT chars that are not emoji
+     * and never part of an emoji sequence: BOM (U+FEFF), zero width
+     * space (U+200B), zero width non-joiner (U+200C), word joiner
+     * (U+2060). A carrier / gateway / system store can prepend one to
+     * a reaction's emoji token (or the sender's app can emit one) and
+     * the regexes capture it into the token (`\S+` matches them), so
+     * without stripping, the fold stores e.g. "‹U+FEFF›👍" — which
+     * renders fine, but the reparse's [firstGraphemeCluster] then
+     * takes the invisible char as the "first cluster" and writes it
+     * back as the reaction: an empty pill, on every fresh import.
+     * Stripping them here (token and body ends) keeps the stored value
+     * clean. Deliberately NOT stripped: ZWJ (U+200D), VS16 (U+FE0F),
+     * skin tones and keycap — those ARE emoji sequence parts.
+     */
+    private fun stripFormatChars(raw: String): String =
+        raw.trim { it.code in FORMAT_CHARS }
+
+    private val FORMAT_CHARS: Set<Int> = setOf(0xFEFF, 0x200B, 0x200C, 0x2060)
+
+    /**
+     * Round 52 emoji fix — `true` when [emoji] contains at least one
+     * base emoji codepoint, i.e. a codepoint that renders something on
+     * its own. Modifiers (skin tones), variation selectors, ZWJ and
+     * keycap marks only make sense attached to a base emoji.
+     */
+    private fun hasBaseEmoji(emoji: String): Boolean {
+        var index = 0
+        while (index < emoji.length) {
+            val codePoint = emoji.codePointAt(index)
+            index += Character.charCount(codePoint)
+            if (isBaseEmojiCodePoint(codePoint)) return true
+        }
+        return false
+    }
+
+    /**
+     * Round 52 emoji fix — one codepoint's contribution to [hasBaseEmoji].
+     * Supplementary-plane codepoints (U+10000+, reached via a high
+     * surrogate) are emoji bases; BMP bases are the single-codepoint
+     * emoji of the Unicode Emoji property — the Misc Technical /
+     * Symbols / Dingbats block U+2300..U+27BF (same range as
+     * [isLikelyEmojiChar]) PLUS the emoji punctuation and symbols
+     * below it (© ® ‼ ⁉ ™ ℹ arrows ⭐ ⭕ 〰 〽 ㊗ ㊙) that the
+     * U+2300 floor would wrongly exclude (‼️ is the iOS "Emphasized"
+     * tapback emoji — it must stay visible). Everything that only
+     * combines with a base — skin tones, ZWJ, variation selectors,
+     * keycap marks — is not a base. Order matters: the exclusions
+     * come first, since skin tones and VS-supplement codepoints are
+     * themselves supplementary-plane values.
+     */
+    private fun isBaseEmojiCodePoint(codePoint: Int): Boolean = when {
+        codePoint in 0x1F3FB..0x1F3FF -> false // skin-tone modifier
+        codePoint == 0x200D -> false // ZWJ
+        codePoint in 0xFE00..0xFE0F -> false // variation selectors, incl. VS16
+        codePoint in 0xE0100..0xE01EF -> false // variation selectors supplement
+        codePoint == 0x20E3 -> false // keycap mark
+        codePoint > 0xFFFF -> true // supplementary plane (high surrogate)
+        codePoint == 0x00A9 || codePoint == 0x00AE -> true // © ®
+        codePoint == 0x203C || codePoint == 0x2049 -> true // ‼ ⁉
+        codePoint == 0x2122 || codePoint == 0x2139 -> true // ™ ℹ
+        codePoint in 0x2194..0x2199 || codePoint in 0x21A9..0x21AA -> true // arrows
+        codePoint in 0x2300..0x27BF -> true // Misc Technical, Symbols, Dingbats
+        codePoint in 0x2B05..0x2B07 || codePoint in 0x2B1B..0x2B1C -> true // ⬅⬆⬇ ⬛⬜
+        codePoint == 0x2B50 || codePoint == 0x2B55 -> true // ⭐ ⭕
+        codePoint == 0x3030 || codePoint == 0x303D -> true // 〰 〽
+        codePoint == 0x3297 || codePoint == 0x3299 -> true // ㊗ ㊙
+        else -> false
+    }
+
     private fun isLikelyEmojiChar(c: Char): Boolean {
         if (c.isHighSurrogate()) return true
         val code = c.code
