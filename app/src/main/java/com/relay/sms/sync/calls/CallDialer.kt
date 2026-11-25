@@ -30,6 +30,8 @@ interface CallDialer {
     /**
      * Ends the current call on the phone, if there is one. Never
      * throws: every failure mode is an [EndCallOutcome].
+     * `TelecomManager.endCall` exists only since API 28, so
+     * below that the answer is [EndCallOutcome.Failed].
      */
     suspend fun endCall(): EndCallOutcome
 }
@@ -60,6 +62,6 @@ sealed interface EndCallOutcome {
     /** No call is in progress, so there is nothing to end. */
     data object NoCall : EndCallOutcome
 
-    /** Anything else: no telephony on the device, or the OS refused. */
+    /** Anything else: no telephony on the device, the OS refused, or the device is below API 28. */
     data object Failed : EndCallOutcome
 }

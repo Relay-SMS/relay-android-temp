@@ -9,6 +9,7 @@ package com.relay.sms.sync.calls
 
 import android.content.Context
 import android.content.pm.PackageManager
+import android.os.Build
 import android.telecom.TelecomManager
 import androidx.core.content.ContextCompat
 import com.google.common.truth.Truth.assertThat
@@ -24,11 +25,13 @@ import org.junit.jupiter.api.Test
 
 /**
  * The platform hangup: `endCall()` ends the current call through
- * `TelecomManager.endCall` — permission first, then the in-call
- * check, then the end itself. The context and the telecom service
+ * `TelecomManager.endCall` — the API-28 floor first, then the
+ * permission, then the in-call check, then the end itself. The context and the telecom service
  * are MockK mocks, and the permission check is statically mocked
  * (`mockkStatic` on `ContextCompat`, like the `SmsManager` mock
  * in `E2eDataSmsSenderTest`) — the real service never runs here.
+ * The API level is an injected constructor value, so the floor
+ * is drivable here (plain JVM always reads SDK_INT 0).
  *
  * The dial path has no unit test of its own (it ends in
  * `placeCall` / an intent, both unobservable on the JVM); the
@@ -50,7 +53,7 @@ class AndroidCallDialerTest {
         every { context.getSystemService(TelecomManager::class.java) } returns telecom
         every { telecom.isInCall } returns true
         every { telecom.endCall() } returns true
-        dialer = AndroidCallDialer(context)
+        dialer = AndroidCallDialer(context, Build.VERSION_CODES.P)
     }
 
     @AfterEach
@@ -102,6 +105,17 @@ class AndroidCallDialerTest {
             every { telecom.endCall() } throws SecurityException("permission revoked")
 
             assertThat(dialer.endCall()).isEqualTo(EndCallOutcome.PermissionDenied)
+        }
+    }
+
+    @Test
+    fun `below API 28 answers Failed without touching telecom`() {
+        runTest {
+            val oldApiDialer = AndroidCallDialer(context, Build.VERSION_CODES.P - 1)
+
+            assertThat(oldApiDialer.endCall()).isEqualTo(EndCallOutcome.Failed)
+            verify(exactly = 0) { context.getSystemService(TelecomManager::class.java) }
+            verify(exactly = 0) { telecom.endCall() }
         }
     }
 

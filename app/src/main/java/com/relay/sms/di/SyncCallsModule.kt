@@ -7,6 +7,7 @@
 
 package com.relay.sms.di
 
+import android.os.Build
 import com.relay.sms.sync.calls.AndroidCallDialer
 import com.relay.sms.sync.calls.CallDialer
 import com.relay.sms.sync.calls.CallStateObserver
@@ -15,7 +16,17 @@ import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
 import dagger.hilt.components.SingletonComponent
+import javax.inject.Qualifier
 import javax.inject.Singleton
+
+/**
+ * The device's API level ([Build.VERSION.SDK_INT]), for the
+ * end-call API-28 floor in [AndroidCallDialer]. A qualifier so
+ * the binding never collides with another plain `Int`.
+ */
+@Qualifier
+@Retention(AnnotationRetention.BINARY)
+annotation class SdkInt
 
 /**
  * Live calls — the Hilt bindings for the hub phone's call
@@ -42,4 +53,9 @@ object SyncCallsModule {
     @Provides
     @Singleton
     fun provideCallDialer(impl: AndroidCallDialer): CallDialer = impl
+
+    /** The device's API level, for the end-call API-28 floor. */
+    @Provides
+    @SdkInt
+    fun provideSdkInt(): Int = Build.VERSION.SDK_INT
 }

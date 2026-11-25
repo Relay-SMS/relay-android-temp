@@ -8,13 +8,16 @@
 package com.relay.sms.sync.calls
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.telecom.TelecomManager
 import androidx.core.content.ContextCompat
+import com.relay.sms.di.SdkInt
 import dagger.hilt.android.qualifiers.ApplicationContext
 import timber.log.Timber
 import javax.inject.Inject
@@ -49,6 +52,12 @@ import javax.inject.Inject
  * refusal (or the call ending in the race), not a crash. Only
  * ANSWERING a call still goes over Bluetooth HFP.
  *
+ * `endCall` exists only since API 28 (Android 9) and minSdk is
+ * 26, so on API 26–27 ending answers Failed — there is no API
+ * to end with. The level is injected ([sdkInt], provided by
+ * `SyncCallsModule`) so the floor is testable on the JVM (plain
+ * JVM always reads SDK_INT 0).
+ *
  * `ACTION_CALL` stays as a fallback if `placeCall` throws: a
  * throw means the call was NOT placed, so the fallback cannot
  * double-dial, and it covers the case where the app happens to
@@ -70,6 +79,7 @@ import javax.inject.Inject
  */
 class AndroidCallDialer @Inject constructor(
     @ApplicationContext private val context: Context,
+    @SdkInt private val sdkInt: Int,
 ) : CallDialer {
 
     override suspend fun dial(number: String): DialOutcome {
@@ -105,15 +115,30 @@ class AndroidCallDialer @Inject constructor(
         }
     }
 
+    /**
+     * Ends the current call. The API-28 floor is checked first:
+     * below P there is nothing to end with, and
+     * ANSWER_PHONE_CALLS can't be granted there either, so
+     * PermissionDenied would be a misleading answer. Lint can't
+     * see the floor through the injected [sdkInt], hence the
+     * NewApi suppression — the guard IS the check.
+     */
+    @SuppressLint("NewApi")
+    // endCall is deprecated upstream; still the only end-call API for a non-dialer app.
+    @Suppress("DEPRECATION")
     override suspend fun endCall(): EndCallOutcome {
-        val granted = ContextCompat.checkSelfPermission(
-            context,
-            Manifest.permission.ANSWER_PHONE_CALLS,
-        ) == PackageManager.PERMISSION_GRANTED
-        if (!granted) {
-            Timber.w("AndroidCallDialer: ANSWER_PHONE_CALLS not granted — end refused")
-            return EndCallOutcome.PermissionDenied
+        val early = when {
+            sdkInt < Build.VERSION_CODES.P -> {
+                Timber.w("AndroidCallDialer: endCall needs API 28 (device API $sdkInt)")
+                EndCallOutcome.Failed
+            }
+            !isEndCallPermitted() -> {
+                Timber.w("AndroidCallDialer: ANSWER_PHONE_CALLS not granted — end refused")
+                EndCallOutcome.PermissionDenied
+            }
+            else -> null
         }
+        if (early != null) return early
         // No telephony on this device, no call to end.
         val telecom = context.getSystemService(TelecomManager::class.java)
             ?: return EndCallOutcome.Failed
@@ -137,6 +162,12 @@ class AndroidCallDialer @Inject constructor(
             EndCallOutcome.Failed
         }
     }
+
+    private fun isEndCallPermitted(): Boolean =
+        ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ANSWER_PHONE_CALLS,
+        ) == PackageManager.PERMISSION_GRANTED
 
     private fun dialViaIntent(uri: Uri): DialOutcome {
         val intent = Intent(Intent.ACTION_CALL).apply {
