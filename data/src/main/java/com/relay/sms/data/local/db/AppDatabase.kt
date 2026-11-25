@@ -234,6 +234,16 @@ abstract class AppDatabase : RoomDatabase() {
         //   naissent vides et les lignes existantes projettent les
         //   défauts (pair non capable de groupes, déclaration non
         //   envoyée — la prochaine annonce emporte les deux bits).
-        const val SCHEMA_VERSION = 24
+        // v25 (2026-11-25, round 54 ownership-aware reactions): deux
+        //   colonnes sur `messages` — `reaction_by_address` (TEXT
+        //   nullable, l'adresse brute de l'auteur du tapback replié)
+        //   et `reaction_is_own` (`INTEGER NOT NULL DEFAULT 0`, vrai
+        //   seulement pour une réaction posée par l'utilisateur, sur
+        //   ce téléphone ou depuis un appareil lié). Strictement
+        //   additive : les lignes existantes projettent NULL / 0 =
+        //   auteur inconnu, et l'inconnu se lit comme « pas la
+        //   mienne » (une réaction d'avant cette version se remplace
+        //   mais ne se retire pas d'un tap sur le même emoji).
+        const val SCHEMA_VERSION = 26
     }
 }

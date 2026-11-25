@@ -12,26 +12,32 @@ import com.relay.sms.domain.smartactions.MapCoordinates
 import org.junit.jupiter.api.Test
 
 /**
- * The pure parts of [MapPreviewFetcher]: the static-map URL, the
+ * The pure parts of [MapPreviewFetcher]: the Apple Maps preview URL, the
  * Nominatim answer parsing and the cache-key normalisation. No network
  * tests — the fetcher's network path is fail-soft and covered by the
  * same shape as the link preview fetcher.
  */
 class MapPreviewFetcherTest {
 
-    @Test fun `static map url`() {
-        assertThat(staticMapUrl(37.422, -122.084)).isEqualTo(
-            "https://staticmap.openstreetmap.de/staticmap.php" +
-                "?center=37.422000,-122.084000&zoom=15&size=640x360" +
-                "&maptype=mapnik&markers=37.422000,-122.084000,red-pushpin",
-        )
+    @Test fun `apple maps preview url`() {
+        assertThat(appleMapsPreviewUrl("1600 Amphitheatre Parkway", 37.422, -122.084))
+            .isEqualTo(
+                "https://maps.apple.com/?q=1600%20Amphitheatre%20Parkway" +
+                    "&ll=37.422000,-122.084000",
+            )
     }
 
-    @Test fun `static map url rounds to six decimals`() {
-        assertThat(staticMapUrl(37.422123456, -122.084987654)).isEqualTo(
-            "https://staticmap.openstreetmap.de/staticmap.php" +
-                "?center=37.422123,-122.084988&zoom=15&size=640x360" +
-                "&maptype=mapnik&markers=37.422123,-122.084988,red-pushpin",
+    @Test fun `apple maps preview url rounds coordinates to six decimals`() {
+        assertThat(appleMapsPreviewUrl("1600 Amphitheatre Parkway", 37.422123456, -122.084987654))
+            .isEqualTo(
+                "https://maps.apple.com/?q=1600%20Amphitheatre%20Parkway" +
+                    "&ll=37.422123,-122.084988",
+            )
+    }
+
+    @Test fun `apple maps preview url encodes the address`() {
+        assertThat(appleMapsPreviewUrl("123 Main St, Springfield", 1.0, 2.0)).isEqualTo(
+            "https://maps.apple.com/?q=123%20Main%20St%2C%20Springfield&ll=1.000000,2.000000",
         )
     }
 

@@ -173,6 +173,19 @@ internal class FakeE2ePeerDao : E2ePeerDao {
         }
     }
 
+    // Round 54 — group-media capability columns.
+    override suspend fun setGroupMediaCapable(address: String, groupMediaCapable: Boolean, updatedAt: Long) {
+        peers[address]?.let {
+            peers[address] = it.copy(groupMediaCapable = groupMediaCapable, updatedAt = updatedAt)
+        }
+    }
+
+    override suspend fun setGroupMediaAnnounced(address: String, groupMediaAnnounced: Boolean, updatedAt: Long) {
+        peers[address]?.let {
+            peers[address] = it.copy(groupMediaAnnounced = groupMediaAnnounced, updatedAt = updatedAt)
+        }
+    }
+
     override suspend fun setHandshakeChannel(address: String, channel: String?, updatedAt: Long) {
         peers[address]?.let {
             peers[address] = it.copy(handshakeChannel = channel, updatedAt = updatedAt)

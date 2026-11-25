@@ -167,6 +167,9 @@
     <string name="conversations_importing_title">Importation de vos messages</string>
     <string name="conversations_importing_body">Lecture de vos SMS existants — opération unique.</string>
     <string name="conversations_importing_count">%1$d messages importés…</string>
+    <string name="conversations_importing_patient">Merci de patienter, cela peut prendre un moment</string>
+    <string name="conversations_importing_phase_mms">Importation des photos, vidéos et messages vocaux…</string>
+    <string name="conversations_importing_phase_sms">Importation des messages texte…</string>
     <string name="conversations_delete_confirm_title">Supprimer cette conversation ?</string>
     <string name="conversations_delete_confirm_body">Tous les messages de cette conversation seront définitivement supprimés de cet appareil. Les autres conversations ne sont pas affectées.</string>
     <!-- v1.28.9 — une conversation du coffre n'est plus supprimee si sa copie systeme resiste : elle reviendrait hors du coffre. -->
@@ -226,7 +229,7 @@
     <string name="e2e_verify_verified">Vérifié</string>
     <string name="e2e_verify_copy">Copier</string>
     <string name="e2e_verify_load_failed">Impossible de charger le numéro de sécurité.</string>
-    <string name="e2e_settings_explainer">De Relay à Relay, le chiffrement est automatique. Quand les deux personnes utilisent Relay, vos messages 1:1 sont chiffrés de bout en bout automatiquement — aucune configuration nécessaire. Les messages aux personnes sans Relay, ainsi que les photos et les fichiers dans les groupes, sont envoyés en SMS/MMS ordinaires. Un groupe ne chiffre que lorsque tous ses membres utilisent Relay. Les messages chiffrés utilisent quelques segments de texte de plus que les messages ordinaires.</string>
+    <string name="e2e_settings_explainer">De Relay à Relay, le chiffrement est automatique. Quand les deux personnes utilisent Relay, vos messages 1:1 sont chiffrés de bout en bout automatiquement — aucune configuration nécessaire. Les messages aux personnes sans Relay sont envoyés en SMS/MMS ordinaires. Un groupe ne chiffre que lorsque tous ses membres utilisent Relay — alors ses messages, photos, vidéos, messages vocaux et fichiers sont chiffrés aussi. Les légendes de texte sur les médias chiffrés restent en clair. Les messages chiffrés utilisent quelques segments de texte de plus que les messages ordinaires.</string>
     <string name="e2e_settings_status_subtitle">Automatique quand les deux personnes utilisent Relay</string>
     <string name="e2e_settings_fingerprint">Ton empreinte</string>
     <string name="e2e_settings_unavailable">Chiffrement indisponible</string>
@@ -732,6 +735,10 @@
     <string name="action_star">Mettre en favori</string>
     <string name="action_unstar">Retirer des favoris</string>
     <string name="reaction_picker_other">Autre emoji</string>
+    <!-- Round 54 — the picker sheet's header line, naming who set the
+         reaction on the message. The name is the contact name when known,
+         else the number. -->
+    <string name="reaction_picker_reacted_by">%1$s par %2$s</string>
     <!-- v1.5.0 — bouton valider du picker multi-emoji -->
     <!-- v1.6.0 — a11y badge réaction (TalkBack) -->
     <string name="reaction_badge_content_description">Réaction %1$s</string>
@@ -799,10 +806,9 @@
     <string name="settings_maps_app_apple_hint">Apple Maps sur le web — il n\'existe pas d\'application Apple Maps pour Android.</string>
     <string name="settings_maps_app_osm">OpenStreetMap</string>
     <string name="settings_maps_app_osm_hint">Une application OpenStreetMap si elle est installée, sinon openstreetmap.org.</string>
-    <string name="map_preview_load">Charger l\'aperçu de la carte</string>
-    <string name="map_preview_load_hint">Charge une carte depuis OpenStreetMap.</string>
-    <string name="map_preview_unavailable">Aperçu de la carte indisponible — toucher pour réessayer</string>
-    <string name="map_preview_attribution">© les contributeurs d\'OpenStreetMap</string>
+    <string name="map_show_map">Afficher la carte</string>
+    <string name="map_get_directions">Itinéraire</string>
+    <string name="map_directions_unavailable">Impossible d\'ouvrir Plans.</string>
     <string name="smart_action_no_app">Aucune application ne peut ouvrir ceci</string>
 
     <string name="settings_section_security">Sécurité &amp; confidentialité</string>

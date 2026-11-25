@@ -73,14 +73,26 @@ open class LinkPreviewFetcher @Inject constructor(
     /** Manual construction (Compose bubbles, tests): the same fetcher on [Dispatchers.IO]. */
     constructor() : this(Dispatchers.IO)
 
-    override suspend fun preview(url: String): LinkPreview? = withContext(io) {
+    /**
+     * The preview for [url], or `null` when the page yields none. The
+     * [userAgent] is the browser the page is fetched as — the default
+     * mobile Chrome UA, except the Apple Maps preview
+     * ([com.relay.sms.data.smartactions.MapPreviewFetcher]), which Apple
+     * only serves Open Graph tags to under a Safari UA (see that
+     * fetcher's KDoc). The cache key stays the URL: a maps.apple.com URL
+     * is only ever fetched this one way.
+     */
+    override suspend fun preview(url: String): LinkPreview? = preview(url, USER_AGENT)
+
+    /** [preview] as a [LinkPreviewRepository] fetch, under [userAgent]. */
+    suspend fun preview(url: String, userAgent: String): LinkPreview? = withContext(io) {
         val clean = url.trim()
         val scheme = clean.substringBefore("://", missingDelimiterValue = "").lowercase()
         if (scheme != "http" && scheme != "https") return@withContext null
         synchronized(cacheLock) {
             if (cache.containsKey(clean)) return@withContext cache[clean]
         }
-        val preview = runCatching { resolvePreview(clean) }
+        val preview = runCatching { resolvePreview(clean, userAgent) }
             .onFailure { Timber.d(it, "Link preview fetch failed") }
             .getOrNull()
         synchronized(cacheLock) { cache[clean] = preview }
@@ -108,20 +120,20 @@ open class LinkPreviewFetcher @Inject constructor(
      * reshaped to the post, TikTok suppresses its generic shell, and
      * everything else takes the plain Open Graph fetch.
      */
-    private fun resolvePreview(url: String): LinkPreview? {
+    private fun resolvePreview(url: String, userAgent: String): LinkPreview? {
         val host = hostOf(url)
         return when {
             isYouTubeHost(host) -> fetchOEmbed(url, YOUTUBE_OEMBED_URL) ?: fetchOpenGraph(url)
             isXHost(host) && url.contains("/status/") ->
                 fetchOpenGraph(url)?.let(::shapeXPost)
             isTikTokHost(host) -> fetchOpenGraph(url)?.takeUnless { it.imageUrl == null }
-            else -> fetchOpenGraph(url)
+            else -> fetchOpenGraph(url, userAgent)
         }
     }
 
     /** The page's Open Graph preview, or `null` when the page yields none. */
-    private fun fetchOpenGraph(url: String): LinkPreview? =
-        fetchHtml(url)?.let { parseOpenGraph(it, url) }
+    private fun fetchOpenGraph(url: String, userAgent: String = USER_AGENT): LinkPreview? =
+        fetchHtml(url, userAgent)?.let { parseOpenGraph(it, url) }
 
     /** The oEmbed preview for [pageUrl] (`title` + author + thumbnail), or `null`. */
     private fun fetchOEmbed(pageUrl: String, endpoint: String): LinkPreview? {
@@ -152,14 +164,14 @@ open class LinkPreviewFetcher @Inject constructor(
     }
 
     /** A GET connection with the fetcher's timeouts, UA and redirect following. */
-    private fun openGetConnection(pageUrl: String): HttpURLConnection? {
+    private fun openGetConnection(pageUrl: String, userAgent: String = USER_AGENT): HttpURLConnection? {
         val connection = runCatching { URL(pageUrl).openConnection() as HttpURLConnection }
             .getOrNull() ?: return null
         connection.apply {
             requestMethod = "GET"
             connectTimeout = CONNECT_TIMEOUT_MS
             readTimeout = READ_TIMEOUT_MS
-            setRequestProperty("User-Agent", USER_AGENT)
+            setRequestProperty("User-Agent", userAgent)
             setRequestProperty("Accept", "text/html,application/xhtml+xml")
             instanceFollowRedirects = true
         }
@@ -172,8 +184,8 @@ open class LinkPreviewFetcher @Inject constructor(
      * `</head>` (Open Graph tags live there) or at [MAX_HTML_CHARS] — a
      * page body is never needed.
      */
-    private fun fetchHtml(pageUrl: String): String? {
-        val connection = openGetConnection(pageUrl) ?: return null
+    private fun fetchHtml(pageUrl: String, userAgent: String = USER_AGENT): String? {
+        val connection = openGetConnection(pageUrl, userAgent) ?: return null
         try {
             return if (isFetchableHtml(connection)) readHead(connection) else null
         } catch (_: Exception) {

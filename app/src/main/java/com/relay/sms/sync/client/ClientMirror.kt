@@ -159,6 +159,22 @@ class ConversationMirrorAdapter @Inject constructor(
                     update.reaction != null -> update.reaction
                     else -> existing.reactionEmoji
                 },
+                // Round 54 — the author rides with the reaction: a set
+                // carries the hub's author (absent = the hub user's
+                // own or unknown — both read as the hub's fields say),
+                // a removal clears the author with the emoji. An
+                // author-only frame (no reaction change) leaves the
+                // stored author alone.
+                reactionByAddress = when {
+                    update.reactionRemoved -> null
+                    update.reaction != null -> update.reactionBy
+                    else -> existing.reactionByAddress
+                },
+                reactionIsOwn = when {
+                    update.reactionRemoved -> false
+                    update.reaction != null -> update.reactionIsOwn ?: false
+                    else -> existing.reactionIsOwn
+                },
                 read = update.read ?: existing.read,
                 starred = update.starred ?: existing.starred,
             ),

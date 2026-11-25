@@ -433,6 +433,8 @@ class RepositorySyncMessageSource @Inject constructor(
         errorCode = errorCode,
         replyToMessageId = replyToMessageId?.toString(),
         reaction = reactionEmoji,
+        reactionBy = reactionByAddress,
+        reactionIsOwn = reactionIsOwn,
         attachments = attachments.map { it.toSyncedWithKey() },
         clientMessageId = clientMessageId,
         // E2E (§9.1): the stored flags, not the bytes — the `ciphertext`
@@ -1664,6 +1666,8 @@ private fun DomainMessageState.toSynced(): MessageState = MessageState(
     conversationId = conversationId,
     status = status.name.lowercase(),
     reaction = reactionEmoji,
+    reactionBy = reactionByAddress,
+    reactionIsOwn = reactionIsOwn,
     read = read,
     starred = starred,
 )

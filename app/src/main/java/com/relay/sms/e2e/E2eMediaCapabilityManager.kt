@@ -32,6 +32,12 @@ import javax.inject.Singleton
  * gets the round-49 declaration: the unset group flag re-fires
  * the thread-open trigger.
  *
+ * Round 54 — a third announced flag ([E2ePeerRepository.groupMediaCapability])
+ * for the group-media bit (bit 2): a peer announced in round 49
+ * (media + groups) still gets the round-54 declaration, since the
+ * unset group-media flag re-fires the thread-open trigger. The
+ * same three-flag rule gates the announce-back.
+ *
  * Three send triggers, all best-effort and idempotent (a duplicate
  * declaration is a no-op on receipt — the flag just sets again):
  *
@@ -94,7 +100,10 @@ class E2eMediaCapabilityManager @Inject constructor(
      * are only set after an accepted send. Round 49: the
      * declaration re-fires when EITHER capability flag is unset —
      * a peer announced in round 48 (media only) still needs the
-     * round-49 declaration, which carries the group bit.
+     * round-49 declaration, which carries the group bit. Round
+     * 54: the same rule with THREE flags — a peer announced in
+     * round 49 (media + groups) still needs the round-54
+     * declaration, which carries the group-media bit.
      */
     suspend fun announceIfNeeded(
         address: String,
@@ -103,7 +112,9 @@ class E2eMediaCapabilityManager @Inject constructor(
     ): Boolean {
         return runCatching {
             if (peers.state(address) != E2ePeerState.ENCRYPTED) return@runCatching false
-            if (peers.isMediaAnnounced(address) && peers.isGroupAnnounced(address)) {
+            if (peers.isMediaAnnounced(address) && peers.isGroupAnnounced(address) &&
+                peers.groupMediaCapability(address).announced
+            ) {
                 return@runCatching false
             }
             announce(address, subId, now)
@@ -148,7 +159,8 @@ class E2eMediaCapabilityManager @Inject constructor(
      * fires its own announce (see the class KDoc), so a peer
      * that is PROBING now still declares once it is ENCRYPTED.
      * Round 49: the announce-back fires when EITHER announced
-     * flag is unset. Never throws.
+     * flag is unset. Round 54: the same rule with THREE flags.
+     * Never throws.
      */
     suspend fun onDeclarationReceived(
         address: String,
@@ -156,12 +168,18 @@ class E2eMediaCapabilityManager @Inject constructor(
         now: Long = System.currentTimeMillis(),
         mediaCapable: Boolean = true,
         groupCapable: Boolean = false,
+        groupMediaCapable: Boolean = false,
     ) {
         runCatching {
             peers.setMediaCapable(address, mediaCapable, now)
             peers.setGroupCapable(address, groupCapable, now)
-            Timber.i("E2E: peer declared capabilities (media=$mediaCapable, groups=$groupCapable)")
-            val announced = peers.isMediaAnnounced(address) && peers.isGroupAnnounced(address)
+            peers.setGroupMediaCapability(address, capable = groupMediaCapable, now = now)
+            Timber.i(
+                "E2E: peer declared capabilities (media=$mediaCapable, groups=$groupCapable, " +
+                    "groupMedia=$groupMediaCapable)",
+            )
+            val announced = peers.isMediaAnnounced(address) && peers.isGroupAnnounced(address) &&
+                peers.groupMediaCapability(address).announced
             if (peers.state(address) == E2ePeerState.ENCRYPTED && !announced) {
                 announce(address, subId, now)
             }
@@ -171,8 +189,8 @@ class E2eMediaCapabilityManager @Inject constructor(
     /**
      * Sends one declaration on the peer's proven channel (or both
      * channels when none is recorded — see the class KDoc) and
-     * marks the peer announced (BOTH capability flags — one
-     * packet announces both) when at least one send was accepted.
+     * marks the peer announced (ALL THREE capability flags — one
+     * packet announces all three) when at least one send was accepted.
      * Returns `true` when at least one send went out. Blocked
      * peers get nothing.
      */
@@ -196,6 +214,7 @@ class E2eMediaCapabilityManager @Inject constructor(
         if (sent) {
             peers.setMediaAnnounced(address, true, now)
             peers.setGroupAnnounced(address, true, now)
+            peers.setGroupMediaCapability(address, announced = true, now = now)
             Timber.i("E2E: capability declaration sent")
         }
         return sent

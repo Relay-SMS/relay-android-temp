@@ -381,23 +381,35 @@ private fun PickerDragHandle(dragModifier: Modifier) {
 }
 
 /**
- * Search bar: back arrow on the left (closes the panel), an editable search
- * field whose placeholder changes with the tab, and the three tab icons on the
- * right. Typing edits the local text and, on the GIF tab, searches live once
- * the user pauses ([GifLiveSearchEffect]); enter submits immediately. The
- * emoji and sticker grids filter locally on the same text. The field never
- * requests focus by itself, so opening the panel never summons the keyboard
+ * Round 54 — the SHARED picker search bar: the composer's search field,
+ * extracted so the "+" reaction picker ([ReactionEmojiPickerSheet]) uses
+ * the exact same bar instead of its own ([RelaySearchField], 36dp high
+ * with 10dp corners, a magnifier and a clear button — visibly different
+ * from this 48dp pill). Same pill, same text, same behaviour in both
+ * places: 48dp high, `surfaceVariant` fill, 24dp corners, `bodyLarge`
+ * text in `onSurface` with an `onSurface` cursor, `onSurfaceVariant`
+ * placeholder, `ImeAction.Search`, live filtering on every keystroke
+ * (the emoji/sticker grids filter locally; GIF searches live, debounced
+ * — [GifLiveSearchEffect]); enter submits. The field never requests
+ * focus by itself, so opening either picker never summons the keyboard
  * — only an explicit tap on the field does.
+ *
+ * The ends are slots because the two pickers differ there and only
+ * there: the composer puts its close button on the left and the three
+ * tab icons on the right; the reaction picker (emoji-only, no tabs)
+ * puts the same close button on the left and a clear button on the
+ * right, shown only while the query is non-empty. The shared middle —
+ * the pill and the text field — is identical.
  */
 @Composable
-private fun PickerSearchBar(
-    selectedTab: EmojiPickerTab,
+fun EmojiPickerSearchBar(
     query: String,
     onQueryChange: (String) -> Unit,
+    placeholder: String,
     onSearchSubmit: () -> Unit,
-    onTabSelected: (EmojiPickerTab) -> Unit,
-    onCloseClick: () -> Unit,
     modifier: Modifier = Modifier,
+    leadingContent: (@Composable () -> Unit)? = null,
+    trailingContent: (@Composable () -> Unit)? = null,
 ) {
     val cs = MaterialTheme.colorScheme
     Row(
@@ -410,20 +422,7 @@ private fun PickerSearchBar(
             .padding(horizontal = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Box(
-            modifier = Modifier
-                .size(40.dp)
-                .clip(CircleShape)
-                .clickable(onClick = onCloseClick),
-            contentAlignment = Alignment.Center,
-        ) {
-            Icon(
-                painter = painterResource(R.drawable.ic_close_drawer),
-                contentDescription = stringResource(R.string.action_close),
-                tint = cs.onSurfaceVariant,
-                modifier = Modifier.size(24.dp),
-            )
-        }
+        leadingContent?.invoke()
         BasicTextField(
             value = query,
             onValueChange = onQueryChange,
@@ -439,7 +438,7 @@ private fun PickerSearchBar(
                 Box {
                     if (query.isEmpty()) {
                         Text(
-                            text = stringResource(selectedTab.labelRes),
+                            text = placeholder,
                             color = cs.onSurfaceVariant,
                             style = MaterialTheme.typography.bodyLarge,
                             maxLines = 1,
@@ -449,11 +448,71 @@ private fun PickerSearchBar(
                 }
             },
         )
-        PickerTabs(
-            selectedTab = selectedTab,
-            onTabSelected = onTabSelected,
+        trailingContent?.invoke()
+    }
+}
+
+/**
+ * Round 54 — the close button at the left end of the picker search bar,
+ * shared by the composer panel and the "+" reaction picker: a 40dp
+ * circle with the drawer-close icon, so both bars close their picker
+ * from the same spot in the same way.
+ */
+@Composable
+fun PickerSearchCloseButton(
+    onClick: () -> Unit,
+) {
+    val cs = MaterialTheme.colorScheme
+    Box(
+        modifier = Modifier
+            .size(40.dp)
+            .clip(CircleShape)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            painter = painterResource(R.drawable.ic_close_drawer),
+            contentDescription = stringResource(R.string.action_close),
+            tint = cs.onSurfaceVariant,
+            modifier = Modifier.size(24.dp),
         )
     }
+}
+
+/**
+ * Search bar: back arrow on the left (closes the panel), an editable search
+ * field whose placeholder changes with the tab, and the three tab icons on the
+ * right. Typing edits the local text and, on the GIF tab, searches live once
+ * the user pauses ([GifLiveSearchEffect]); enter submits immediately. The
+ * emoji and sticker grids filter locally on the same text. The field never
+ * requests focus by itself, so opening the panel never summons the keyboard
+ * — only an explicit tap on the field does. The pill itself is the shared
+ * [EmojiPickerSearchBar] — the reaction picker renders the same bar.
+ */
+@Composable
+private fun PickerSearchBar(
+    selectedTab: EmojiPickerTab,
+    query: String,
+    onQueryChange: (String) -> Unit,
+    onSearchSubmit: () -> Unit,
+    onTabSelected: (EmojiPickerTab) -> Unit,
+    onCloseClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    EmojiPickerSearchBar(
+        query = query,
+        onQueryChange = onQueryChange,
+        placeholder = stringResource(selectedTab.labelRes),
+        onSearchSubmit = onSearchSubmit,
+        modifier = modifier,
+        leadingContent = { PickerSearchCloseButton(onClick = onCloseClick) },
+        trailingContent = {
+            PickerTabs(
+                selectedTab = selectedTab,
+                onTabSelected = onTabSelected,
+            )
+        },
+    )
 }
 
 /**

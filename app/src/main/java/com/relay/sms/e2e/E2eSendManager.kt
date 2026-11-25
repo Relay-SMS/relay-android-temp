@@ -239,6 +239,45 @@ class E2eSendManager @Inject constructor(
     )
 
     /**
+     * Round 54 — sends one PRE-BUILT group media key fragment set
+     * ([E2eWireFormat.PayloadType.GROUP_MEDIA_KEY], built by the
+     * group session manager under the sender's sender key) to one
+     * group member. The SAME fragment set goes to every member —
+     * the caller fans it out, one call per member — so this method
+     * takes fragments, not a body: it never re-encrypts (a second
+     * encryption would produce a different set per member and
+     * break the one-ciphertext shape). Dispatch mirrors
+     * [sendControlMessage] (system sent box + diagnostic-only
+     * sent intent, no message row): a fragment the radio refuses
+     * fails the send, and the group gate fails the whole MMS
+     * visibly instead of going out plain.
+     */
+    suspend fun sendGroupMediaKey(
+        address: String,
+        fragments: List<String>,
+        date: Long,
+        subId: Int?,
+    ): Outcome<Unit> {
+        for (fragment in fragments) {
+            recorder.insertSentSms(address, fragment, date, subId = subId)
+            val sent = dataSmsSender.sendTextMessage(
+                address = address,
+                subId = subId,
+                text = fragment,
+                kind = DataSmsKind.GROUP_MEDIA_KEY,
+            )
+            if (!sent) {
+                Timber.w("E2E: group media key fragment refused by the radio")
+                return Outcome.Failure(
+                    AppError.Telephony("group media key message could not be sent"),
+                )
+            }
+        }
+        Timber.i("E2E: group media key sent (%d fragment(s))", fragments.size)
+        return Outcome.Success(Unit)
+    }
+
+    /**
      * One row-less control message (a media key, a sender-key
      * distribution, a key request): encrypt under the pairwise
      * session, fragment, store the fragments in the system sent

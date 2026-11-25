@@ -290,6 +290,54 @@ class E2ePeerRepository @Inject constructor(
     }
 
     /**
+     * Round 54 — this peer's group-media capability as one read:
+     * whether they declared they handle encrypted media in groups
+     * (the 0x03 capability packet's group-media flag, bit 2) and
+     * whether WE already sent our declaration to them. False/false
+     * when no row exists or no declaration ever arrived: a
+     * round-49 build never declares it, so group media with it
+     * stays plain even though group text encrypts. The group-media
+     * send gate reads [capable] before a group MMS may encrypt;
+     * the capability manager reads [announced] before re-declaring.
+     * One read (not two flag reads) because the two flags always
+     * travel together — one packet carries both, and the announce
+     * rule checks all three announced flags at once.
+     */
+    data class GroupMediaCapability(val capable: Boolean, val announced: Boolean)
+
+    suspend fun groupMediaCapability(address: String): GroupMediaCapability {
+        val row = peerDao.findByAddress(canonicalAddress(address))
+        return GroupMediaCapability(
+            capable = row?.groupMediaCapable == true,
+            announced = row?.groupMediaAnnounced == true,
+        )
+    }
+
+    /**
+     * Round 54 — records one side of this peer's group-media
+     * capability: [capable] is the peer's own declaration about
+     * itself (called only by the declaration receive path —
+     * [E2eMediaCapabilityManager.onDeclarationReceived] — never a
+     * sender-side guess); [announced] records that OUR declaration
+     * went out to this peer (call AFTER the radio accepted the
+     * send — a failed send must not consume the one-shot). A null
+     * side is left untouched, so each caller sets only its own
+     * flag. One setter (not a pair) keeps this repository under
+     * Detekt's function-count threshold.
+     */
+    suspend fun setGroupMediaCapability(
+        address: String,
+        capable: Boolean? = null,
+        announced: Boolean? = null,
+        now: Long = System.currentTimeMillis(),
+    ) {
+        val key = canonicalAddress(address)
+        getOrCreateUnknown(key, now)
+        capable?.let { peerDao.setGroupMediaCapable(key, it, now) }
+        announced?.let { peerDao.setGroupMediaAnnounced(key, it, now) }
+    }
+
+    /**
      * Round 48 — the channel our outbound handshake packets
      * provably used for this peer, or null when the handshake
      * predates round 48 and no channel was ever recorded. The

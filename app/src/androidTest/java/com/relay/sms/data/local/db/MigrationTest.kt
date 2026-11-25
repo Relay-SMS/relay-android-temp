@@ -1414,4 +1414,103 @@ class MigrationTest {
             assertThat(c.isNull(1)).isTrue()
         }
     }
+
+    /**
+     * Round 54 — v25 adds the reaction author columns to `messages`:
+     * `reaction_by_address` (nullable — the reactor's raw address)
+     * and `reaction_is_own` (0 by default). Existing rows project
+     * unknown ownership — the safe default, read as not-mine.
+     *
+     * Nécessite `25.json` dans les assets (émis par Room à la compilation).
+     */
+    @Test
+    fun migrate24To25_addsReactionAuthorColumns_unknownOwnerByDefault() {
+        helper.createDatabase(TEST_DB, 24).use { db ->
+            db.execSQL(
+                "INSERT INTO conversations (id, addresses_csv, last_message_at, unread_count, " +
+                    "pinned, archived, muted, in_vault) " +
+                    "VALUES (9, '+33600000001', 1000, 0, 0, 0, 0, 0)",
+            )
+            db.execSQL(
+                "INSERT INTO messages (id, conversation_id, address, body, type, direction, " +
+                    "date, read, starred, status, attachments_count, reaction_emoji) " +
+                    "VALUES (42, 9, '+33600000001', 'salut', 0, 1, 1000, 1, 0, 4, 0, '👍')",
+            )
+        }
+
+        val db = helper.runMigrationsAndValidate(TEST_DB, 25, true, Migrations.MIGRATION_24_25)
+
+        // La réaction existante survit ; ses colonnes d'auteur projettent
+        // l'inconnu (adresse NULL, pas la mienne).
+        db.query(
+            "SELECT reaction_emoji, reaction_by_address, reaction_is_own FROM messages WHERE id = 42",
+        ).use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getString(0)).isEqualTo("👍")
+            assertThat(c.isNull(1)).isTrue()
+            assertThat(c.getInt(2)).isEqualTo(0)
+        }
+
+        // Les nouvelles colonnes s'écrivent et se relisent.
+        db.execSQL(
+            "UPDATE messages SET reaction_by_address = '+33600000001', reaction_is_own = 0 " +
+                "WHERE id = 42",
+        )
+        db.query(
+            "SELECT reaction_by_address, reaction_is_own FROM messages WHERE id = 42",
+        ).use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getString(0)).isEqualTo("+33600000001")
+            assertThat(c.getInt(1)).isEqualTo(0)
+        }
+    }
+
+    /**
+     * Round 54 — v26 adds the group-media capability columns to
+     * `e2e_peers`: `group_media_capable` (0 by default — a
+     * round-49 build never declared it) and
+     * `group_media_announced` (0 by default). Existing rows
+     * project the defaults, and the next announce trigger
+     * re-sends the combined 0x03 packet, all three bits set.
+     *
+     * Nécessite `26.json` dans les assets (émis par Room à la compilation).
+     */
+    @Test
+    fun migrate25To26_addsGroupMediaCapabilityColumns_withDefaults() {
+        helper.createDatabase(TEST_DB, 25).use { db ->
+            db.execSQL(
+                "INSERT INTO e2e_peers (address, state, group_capable, group_announced, updated_at) " +
+                    "VALUES ('6108423232', 'ENCRYPTED', 1, 1, 1000)",
+            )
+        }
+
+        val db = helper.runMigrationsAndValidate(TEST_DB, 26, true, Migrations.MIGRATION_25_26)
+
+        // La ligne existante survit ; ses colonnes group-media
+        // projettent les défauts (pas de capacité déclarée, pas
+        // d'annonce envoyée).
+        db.query(
+            "SELECT group_capable, group_media_capable, group_media_announced " +
+                "FROM e2e_peers WHERE address = '6108423232'",
+        ).use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getInt(0)).isEqualTo(1)
+            assertThat(c.getInt(1)).isEqualTo(0)
+            assertThat(c.getInt(2)).isEqualTo(0)
+        }
+
+        // Les nouvelles colonnes s'écrivent et se relisent.
+        db.execSQL(
+            "UPDATE e2e_peers SET group_media_capable = 1, group_media_announced = 1 " +
+                "WHERE address = '6108423232'",
+        )
+        db.query(
+            "SELECT group_media_capable, group_media_announced FROM e2e_peers " +
+                "WHERE address = '6108423232'",
+        ).use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getInt(0)).isEqualTo(1)
+            assertThat(c.getInt(1)).isEqualTo(1)
+        }
+    }
 }

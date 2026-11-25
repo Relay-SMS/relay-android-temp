@@ -17,11 +17,15 @@ import com.relay.sms.data.repository.ConversationMirror
 import com.relay.sms.data.sms.SimSelfNumber
 import com.relay.sms.domain.e2e.E2eGroupSendGate
 import com.relay.sms.domain.e2e.E2ePayloadType
+import com.relay.sms.domain.e2e.MediaFileInput
+import com.relay.sms.domain.mms.MmsAttachment
 import com.relay.sms.domain.model.PhoneAddress
 import com.relay.sms.domain.settings.AppSettingsSource
 import com.relay.sms.e2e.E2eGroupSenderKeyMessage.SenderKeyDistribution
 import com.relay.sms.e2e.E2eGroupSenderKeyStore.StoreResult
+import kotlinx.coroutines.CancellationException
 import timber.log.Timber
+import java.io.File
 import java.nio.charset.StandardCharsets
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -100,6 +104,7 @@ class E2eGroupSessionManager @Inject constructor(
     private val simSelfNumber: SimSelfNumber,
     private val stateProvider: E2eGroupStateProvider,
     private val mirror: ConversationMirror,
+    private val preparer: E2eMediaFilePreparer,
 ) : E2eGroupSendGate {
 
     // In-memory key-request clock: (group id, sender) → last
@@ -280,8 +285,9 @@ class E2eGroupSessionManager @Inject constructor(
      * user can retry, and the plaintext NEVER goes out instead.
      * [AppError.OwnNumberMissing] means our own number is unknown
      * and no stored distribution could supply the member list.
-     * MEDIA_KEY is refused: encrypted media in groups is a
-     * follow-up (design §13.7).
+     * MEDIA_KEY is refused by the payload-type mapping below:
+     * encrypted media in groups goes through
+     * [encryptGroupMediaKey], not this method (design §13.7).
      */
     override suspend fun encryptGroupMessage(
         memberAddresses: List<String>,
@@ -290,25 +296,11 @@ class E2eGroupSessionManager @Inject constructor(
         date: Long,
         payloadType: E2ePayloadType,
     ): Outcome<E2eGroupSendGate.EncryptedGroupMessage> {
-        if (payloadType == E2ePayloadType.MEDIA_KEY) {
-            return Outcome.Failure(
-                AppError.Validation("encrypted media in groups is not supported yet"),
-            )
-        }
         val members = resolveMemberList(memberAddresses)
             ?: return Outcome.Failure(AppError.OwnNumberMissing)
         val key = ensureOwnKey(members, date)
             ?: return Outcome.Failure(AppError.OwnNumberMissing)
         distributeKeyToMembers(key, members, subId, date)
-        return encryptWithKey(key, body, payloadType)
-    }
-
-    /** The encrypt + fragment half of [encryptGroupMessage]. */
-    private fun encryptWithKey(
-        key: SenderKey,
-        body: String,
-        payloadType: E2ePayloadType,
-    ): Outcome<E2eGroupSendGate.EncryptedGroupMessage> {
         val groupPayloadType = when (payloadType) {
             E2ePayloadType.TEXT -> E2eWireFormat.PayloadType.GROUP_TEXT
             E2ePayloadType.REACTION -> E2eWireFormat.PayloadType.GROUP_REACTION
@@ -319,9 +311,213 @@ class E2eGroupSessionManager @Inject constructor(
                 AppError.Validation("this payload type cannot be a group message"),
             )
         }
+        return encryptWithKey(key, body.toByteArray(UTF_8), groupPayloadType)
+    }
+
+    /**
+     * Round 54 — wraps one file's media-key JSON in our sender key
+     * for the group (design §13.7): the same envelope + AAD as a
+     * group text, payload type `GROUP_MEDIA_KEY (0x08)`, fanned
+     * out as ONE identical fragment set to every member. Resolves
+     * the member list, ensures our sender key, distributes it to
+     * the members missing it (best-effort, as for text), then
+     * encrypts. A failure anywhere returns [Outcome.Failure] —
+     * the caller fails the send visibly, never plain. This method
+     * only BUILDS the fragment set; the caller fans it out (via
+     * [E2eSendManager.sendGroupMediaKey]) — the group-media gate
+     * ([prepareGroupMediaSend]) does that before returning the
+     * ciphertext parts.
+     */
+    suspend fun encryptGroupMediaKey(
+        memberAddresses: List<String>,
+        keyJson: String,
+        subId: Int?,
+        date: Long,
+    ): Outcome<E2eGroupSendGate.EncryptedGroupMessage> {
+        val members = resolveMemberList(memberAddresses)
+            ?: return Outcome.Failure(AppError.OwnNumberMissing)
+        val key = ensureOwnKey(members, date)
+            ?: return Outcome.Failure(AppError.OwnNumberMissing)
+        distributeKeyToMembers(key, members, subId, date)
+        return encryptWithKey(key, keyJson.toByteArray(UTF_8), E2eWireFormat.PayloadType.GROUP_MEDIA_KEY)
+    }
+
+    /**
+     * Round 54 — the group-media decision: Encrypted only when
+     * the group state is [GroupEncryptionState.Encrypted] (every
+     * member ENCRYPTED + group-capable) AND every member declared
+     * group-media capability (flags bit 2). A state-read failure
+     * fails OPEN to [E2eGroupSendGate.Decision.Plain], like the
+     * text gate. The group bit alone is NOT enough: a round-49
+     * build is group-capable but never group-media-capable, and
+     * a `GROUP_MEDIA_KEY` to it would become a placeholder.
+     */
+    override suspend fun decideGroupMediaSend(
+        memberAddresses: List<String>,
+    ): E2eGroupSendGate.Decision {
+        val state = runCatching { stateProvider.groupState(memberAddresses) }.getOrNull()
+            ?: return E2eGroupSendGate.Decision.Plain
+        if (state != GroupEncryptionState.Encrypted) return E2eGroupSendGate.Decision.Plain
+        val allMediaCapable = memberAddresses.all { address ->
+            runCatching { peers.groupMediaCapability(address).capable }.getOrDefault(false)
+        }
+        return if (allMediaCapable) {
+            E2eGroupSendGate.Decision.Encrypted
+        } else {
+            E2eGroupSendGate.Decision.Plain
+        }
+    }
+
+    /**
+     * Round 54 — prepares one group MMS (design §13.7): decides,
+     * encrypts each file with a fresh per-file key (the shared
+     * [E2eMediaFilePreparer] — the same pipeline as 1:1, so
+     * images, video and voice ride it), cap-checks the ciphertext
+     * total, then sends every `GROUP_MEDIA_KEY` fragment set
+     * (one identical set per file, fanned out to every member)
+     * BEFORE returning the ciphertext parts. Any failure —
+     * undecryptable group, over-cap ciphertext, a key-send the
+     * radio refuses — returns [E2eGroupSendGate.GroupMediaPrepareResult.Refuse]:
+     * the caller fails the send visibly. There is NO plain
+     * fallback on this path (the group discipline), and a Refuse
+     * happens before any mirror row exists. Temp files are
+     * deleted on every failure path; the caller deletes the
+     * returned parts after dispatch.
+     */
+    override suspend fun prepareGroupMediaSend(
+        memberAddresses: List<String>,
+        files: List<MediaFileInput>,
+        maxTotalBytes: Long,
+        date: Long,
+        subId: Int?,
+    ): E2eGroupSendGate.GroupMediaPrepareResult {
+        if (files.isEmpty()) return E2eGroupSendGate.GroupMediaPrepareResult.Plain
+        if (decideGroupMediaSend(memberAddresses) != E2eGroupSendGate.Decision.Encrypted) {
+            return E2eGroupSendGate.GroupMediaPrepareResult.Plain
+        }
+        preparer.pruneStaleCiphertext()
+        val dir = preparer.cipherDir()
+        val prepared = mutableListOf<PreparedMediaFile>()
+        return try {
+            val failure = prepareAndSendKeys(
+                files,
+                dir,
+                prepared,
+                memberAddresses,
+                maxTotalBytes,
+                date,
+                subId,
+            )
+            if (failure != null) {
+                preparer.deleteAll(prepared)
+                failure
+            } else {
+                E2eGroupSendGate.GroupMediaPrepareResult.Encrypted(
+                    prepared.map {
+                        MmsAttachment(
+                            file = it.file,
+                            mimeType = E2eMediaKeyMessage.MEDIA_PART_MIME,
+                            kind = MmsAttachment.Kind.OTHER,
+                        )
+                    },
+                )
+            }
+        } catch (ce: CancellationException) {
+            preparer.deleteAll(prepared)
+            throw ce
+        } catch (t: Throwable) {
+            Timber.w(t, "E2E: unexpected group media encryption failure")
+            preparer.deleteAll(prepared)
+            E2eGroupSendGate.GroupMediaPrepareResult.Refuse("unexpected group media encryption failure")
+        }
+    }
+
+    /**
+     * Encrypts every file, cap-checks the ciphertext total, then
+     * fans every key out — `null` on success, the [Refuse] to
+     * return on failure (the caller deletes the temp files).
+     * Split out of [prepareGroupMediaSend] so neither function
+     * trips Detekt's return-count limit.
+     */
+    private suspend fun prepareAndSendKeys(
+        files: List<MediaFileInput>,
+        dir: File,
+        prepared: MutableList<PreparedMediaFile>,
+        memberAddresses: List<String>,
+        maxTotalBytes: Long,
+        date: Long,
+        subId: Int?,
+    ): E2eGroupSendGate.GroupMediaPrepareResult.Refuse? {
+        for (input in files) {
+            when (val one = preparer.prepareOne(input, dir)) {
+                is E2eMediaFilePreparer.PrepareOneResult.Ok -> prepared += one.file
+                is E2eMediaFilePreparer.PrepareOneResult.Failed -> {
+                    return E2eGroupSendGate.GroupMediaPrepareResult.Refuse(
+                        "encrypted group media failed (${one.reason})",
+                    )
+                }
+            }
+        }
+        val total = prepared.sumOf { it.file.length() }
+        if (total > maxTotalBytes) {
+            return E2eGroupSendGate.GroupMediaPrepareResult.Refuse(
+                "encrypted attachments exceed the MMS size cap ($total bytes)",
+            )
+        }
+        return fanOutMediaKeys(prepared, memberAddresses, date, subId)
+    }
+
+    /**
+     * Sends every file's `GROUP_MEDIA_KEY` fragment set (one
+     * identical set per file, fanned out to every member) — `null`
+     * when every radio accepted, the [Refuse] to return otherwise.
+     * Keys go FIRST: every key message accepted by every member's
+     * radio before the caller dispatches any part.
+     */
+    private suspend fun fanOutMediaKeys(
+        prepared: List<PreparedMediaFile>,
+        memberAddresses: List<String>,
+        date: Long,
+        subId: Int?,
+    ): E2eGroupSendGate.GroupMediaPrepareResult.Refuse? {
+        val threadMembers = memberAddresses.map { it.canonicalPhone() }.distinct()
+        for (item in prepared) {
+            val encrypted = encryptGroupMediaKey(memberAddresses, item.keyJson, subId, date)
+            val fragments = when (encrypted) {
+                is Outcome.Success -> encrypted.value.fragments
+                is Outcome.Failure -> return refuseFor(encrypted.error)
+            }
+            for (member in threadMembers) {
+                val sent = sendManager.sendGroupMediaKey(member, fragments, date, subId)
+                if (sent is Outcome.Failure) {
+                    return E2eGroupSendGate.GroupMediaPrepareResult.Refuse(
+                        "the group media key could not be sent",
+                    )
+                }
+            }
+        }
+        return null
+    }
+
+    /** Maps an [AppError] from the key wrap onto a visible Refuse (own-number stays named). */
+    private fun refuseFor(error: AppError): E2eGroupSendGate.GroupMediaPrepareResult.Refuse {
+        val message = if (error == AppError.OwnNumberMissing) {
+            "own number unknown — group media cannot be encrypted"
+        } else {
+            "the group media key could not be encrypted"
+        }
+        return E2eGroupSendGate.GroupMediaPrepareResult.Refuse(message)
+    }
+
+    /** The encrypt + fragment half of [encryptGroupMessage] and [encryptGroupMediaKey]. */
+    private fun encryptWithKey(
+        key: SenderKey,
+        plaintext: ByteArray,
+        groupPayloadType: E2eWireFormat.PayloadType,
+    ): Outcome<E2eGroupSendGate.EncryptedGroupMessage> {
         val aad = E2eGroupWireFormat.aadFor(key.groupId, key.senderAddress, key.keyId)
         val ciphertext = when (
-            val encrypted = aead.encryptRaw(key.key, body.toByteArray(UTF_8), aad)
+            val encrypted = aead.encryptRaw(key.key, plaintext, aad)
         ) {
             is Outcome.Success -> encrypted.value
             is Outcome.Failure -> return Outcome.Failure(encrypted.error)

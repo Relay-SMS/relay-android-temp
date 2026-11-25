@@ -13,6 +13,7 @@ import com.relay.sms.core.result.Outcome
 import com.relay.sms.core.result.map
 import com.relay.sms.domain.clientmode.ClientActionGateway
 import com.relay.sms.domain.clientmode.NoOpClientActionGateway
+import com.relay.sms.domain.e2e.E2eGroupSendGate
 import com.relay.sms.domain.e2e.E2ePayloadType
 import com.relay.sms.domain.model.PhoneAddress
 import com.relay.sms.domain.model.ReactionFormat
@@ -77,12 +78,16 @@ import javax.inject.Inject
  * would have contained) is encrypted with payload type REACTION, and
  * the receiver decrypts and folds it onto its target exactly like a
  * plain tapback. Only single-target reactions in a 1:1 conversation
- * qualify: a group reaction, and a reaction to one member's message in
- * a group (F2 — one target, but a group conversation), stay plain
- * byte-identically, as does any reaction to a peer that is not
- * ENCRYPTED. The local mirror is unchanged (`localMirrorBody = ""` —
- * no bubble; the local badge is applied by the caller via
- * `setReaction`). Client mode keeps its early return.
+ * qualified at first; since round 54 (group reactions, design
+ * §13.7 follow-up) a reaction in an ENCRYPTED GROUP encrypts too —
+ * one GROUP_REACTION fragment set fanned out to every member, via
+ * [E2eGroupSendGate] + [SendSmsUseCase]. A reaction to a peer that is
+ * not ENCRYPTED, or in a group that is not fully encrypted, stays
+ * plain (F2 single-target for an incoming group message, all members
+ * for an own group message) — and a background probe fires so the
+ * next exchange can flip the group. The local mirror is unchanged
+ * (`localMirrorBody = ""` — no bubble; the local badge is applied by
+ * the caller via `setReaction`). Client mode keeps its early return.
  */
 class SendReactionUseCase @Inject constructor(
     private val sendSms: SendSmsUseCase,
@@ -96,6 +101,14 @@ class SendReactionUseCase @Inject constructor(
      * hub tests compiling untouched; Hilt always provides the real one.
      */
     private val clientActions: ClientActionGateway = NoOpClientActionGateway,
+    /**
+     * Round 54 (group reactions) — the encrypted-group send gate.
+     * Default [E2eGroupSendGate.NoOp] keeps the existing `:domain`
+     * tests compiling untouched (every group reaction sends plain,
+     * exactly as before); Hilt always provides the real gate (bound
+     * in `E2eModule`).
+     */
+    private val groupGate: E2eGroupSendGate = E2eGroupSendGate.NoOp,
 ) {
     /** Message reacted to + validated recipients, resolved before any send. */
     private data class ReactionRecipient(
@@ -105,9 +118,19 @@ class SendReactionUseCase @Inject constructor(
          * E2E — `true` when the message's conversation is 1:1 (exactly
          * one address). Decided here, not from [targets]: an incoming
          * group message has ONE target (F2 — its sender) but is still a
-         * group conversation, and group reactions never encrypt.
+         * group conversation, and group reactions encrypt only when the
+         * whole group is encrypted (see [groupMembers]).
          */
         val isOneToOne: Boolean,
+        /**
+         * Round 54 (group reactions) — ALL validated member addresses
+         * of a group conversation, for the encrypted attempt only.
+         * Empty for a 1:1 conversation (the encrypted 1:1 attempt
+         * uses [targets]) and empty when the member list could not be
+         * resolved or validated — the reaction then fails OPEN to the
+         * plain F2 path, exactly like a missing conversation.
+         */
+        val groupMembers: List<PhoneAddress> = emptyList(),
     )
 
     /**
@@ -128,10 +151,22 @@ class SendReactionUseCase @Inject constructor(
             // itself must be 1:1. A missing conversation fails OPEN to
             // plain (the reaction still sends); it cannot fail the send,
             // which never needed the conversation before.
-            val isOneToOne = conversationRepo.findById(message.conversationId)
-                ?.let { it.addresses.size == 1 } ?: false
+            // Round 54 (group reactions) — a group conversation also
+            // resolves ALL its members (validated) for the encrypted
+            // attempt; an unresolvable member list fails open to plain
+            // the same way (groupMembers stays empty).
+            val conversation = conversationRepo.findById(message.conversationId)
+            val isOneToOne = conversation?.let { it.addresses.size == 1 } ?: false
+            val groupMembers = if (isOneToOne || conversation == null) {
+                emptyList()
+            } else {
+                when (val validated = validateAddresses(conversation.addresses)) {
+                    is Outcome.Success -> validated.value
+                    is Outcome.Failure -> emptyList()
+                }
+            }
             return validateSenderAddress(message.address.trim())
-                .map { target -> ReactionRecipient(message, listOf(target), isOneToOne) }
+                .map { target -> ReactionRecipient(message, listOf(target), isOneToOne, groupMembers) }
         }
         return resolveOutgoingRecipients(message)
     }
@@ -157,16 +192,38 @@ class SendReactionUseCase @Inject constructor(
         if (conversation.addresses.isEmpty()) {
             return Outcome.Failure(AppError.Validation("conversation has no recipients"))
         }
+        val targets = when (val validated = validateAddresses(conversation.addresses)) {
+            is Outcome.Success -> validated.value
+            is Outcome.Failure -> return validated
+        }
+        return Outcome.Success(
+            ReactionRecipient(
+                message,
+                targets,
+                isOneToOne = conversation.addresses.size == 1,
+                groupMembers = targets,
+            ),
+        )
+    }
+
+    /**
+     * Validates every address of a conversation (X1, same rule as
+     * [validateSenderAddress]). One invalid recipient fails the whole
+     * send (fail-closed: a silently skipped member would be worse
+     * than a visible failure) — except for the incoming-group member
+     * list, where the caller fails open to the plain F2 path instead.
+     */
+    private fun validateAddresses(
+        addresses: List<PhoneAddress>,
+    ): Outcome<List<PhoneAddress>> {
         val targets = mutableListOf<PhoneAddress>()
-        for (address in conversation.addresses) {
+        for (address in addresses) {
             when (val validated = validateSenderAddress(address.raw.trim())) {
                 is Outcome.Success -> targets += validated.value
                 is Outcome.Failure -> return validated
             }
         }
-        return Outcome.Success(
-            ReactionRecipient(message, targets, isOneToOne = conversation.addresses.size == 1),
-        )
+        return Outcome.Success(targets)
     }
 
     /**
@@ -246,7 +303,8 @@ class SendReactionUseCase @Inject constructor(
 
         val resolved = resolveRecipient(messageId)
         if (resolved is Outcome.Failure) return resolved
-        val (message, targets, isOneToOne) = (resolved as Outcome.Success).value
+        val recipient = (resolved as Outcome.Success).value
+        val message = recipient.message
 
         // Own-message reactions always carry context: a bare emoji
         // (`EMOJI_ONLY`) would land on the recipient's phone with no
@@ -260,42 +318,96 @@ class SendReactionUseCase @Inject constructor(
             format
         }
 
-        // E2E (design §3.2) — a single target in a 1:1 conversation
-        // encrypts as a reaction payload when the peer is ENCRYPTED
-        // (the gate decides; a non-encrypted peer gets the plain send
-        // and a background probe, exactly as before). Anything else —
-        // group, multi-target — keeps TEXT and stays plain.
-        val e2ePayloadType = if (targets.size == 1 && isOneToOne) {
+        // The formatted tapback body, built once: the group gate
+        // decides on it below, and both the encrypted and the plain
+        // send carry the identical string.
+        val tapbackBody = if (isRemoval) {
+            buildIosTapbackBody(emoji, message.body, isRemoval = true)
+        } else {
+            when (effectiveFormat) {
+                ReactionFormat.EMOJI_ONLY -> emoji
+                ReactionFormat.TAPBACK_EN -> buildTapbackBody(emoji, message.body)
+                ReactionFormat.READABLE_FR -> buildReadableFrBody(
+                    emoji,
+                    message.body,
+                    // v1.8.1 — résolu à l'envoi (Settings override > Profile
+                    // Android > null). Lecture rapide (~1-5 ms), faite à
+                    // chaque envoi pour refléter immédiatement un changement
+                    // de nom dans Settings sans avoir à redémarrer l'app.
+                    senderName = senderNameProvider.resolveDisplayName(),
+                )
+                // v1.9.0 — format compact + contexte : "❤️ «aperçu»".
+                ReactionFormat.EMOJI_WITH_QUOTE -> buildEmojiWithQuoteBody(emoji, message.body)
+                // Forme textuelle Apple : `Liked "aperçu"`, défaut actuel.
+                ReactionFormat.IOS_TAPBACK -> buildIosTapbackBody(emoji, message.body)
+            }
+        }
+
+        return dispatchReaction(recipient, tapbackBody)
+    }
+
+    /**
+     * The actual send, once the tapback body is built.
+     *
+     * Round 54 (group reactions) — a group conversation asks the
+     * group gate FIRST, before the F2 plain send below. Encrypted
+     * (every member ENCRYPTED + group-capable) → the reaction goes
+     * out as ONE GROUP_REACTION fragment set to EVERY member
+     * (echoInGroup + REACTION — [SendSmsUseCase.groupSendPlan]
+     * admits it); a member who never exchanged keys would leave
+     * the rest stale if only the sender got it. RefuseOverCap →
+     * visible failure, never plain. Plain → fall through to
+     * today's F2 call (incoming: sender only; own message: all
+     * members), byte-identical to before.
+     *
+     * E2E (design §3.2) — a single target in a 1:1 conversation
+     * encrypts as a reaction payload when the peer is ENCRYPTED
+     * (the gate decides; a non-encrypted peer gets the plain send
+     * and a background probe, exactly as before). Anything else —
+     * a group the gate left Plain, multi-target — keeps TEXT and
+     * stays plain.
+     */
+    private suspend fun dispatchReaction(
+        recipient: ReactionRecipient,
+        tapbackBody: String,
+    ): Outcome<SendReport> {
+        if (!recipient.isOneToOne && recipient.groupMembers.size > 1) {
+            when (
+                groupGate.decideGroupSend(
+                    recipient.groupMembers.map { it.raw },
+                    tapbackBody,
+                )
+            ) {
+                E2eGroupSendGate.Decision.Encrypted -> {
+                    return sendSms(
+                        recipients = recipient.groupMembers,
+                        body = tapbackBody,
+                        appendSignature = false,
+                        replyToMessageId = null,
+                        localMirrorBody = "",
+                        e2ePayloadType = E2ePayloadType.REACTION,
+                        echoInGroup = true,
+                    )
+                }
+                E2eGroupSendGate.Decision.RefuseOverCap -> {
+                    return Outcome.Failure(
+                        AppError.Validation("message too long to send encrypted"),
+                    )
+                }
+                E2eGroupSendGate.Decision.Plain -> Unit
+            }
+        }
+        val e2ePayloadType = if (recipient.targets.size == 1 && recipient.isOneToOne) {
             E2ePayloadType.REACTION
         } else {
             E2ePayloadType.TEXT
         }
         return sendSms(
-            recipients = targets,
+            recipients = recipient.targets,
             // v1.8.0 (bug 5 fix) — switch sur les formats de réaction. Le retrait
             // ignore [format] : seule la forme iPhone sait exprimer un retrait
             // sur le fil (voir KDoc de [invoke]).
-            body = if (isRemoval) {
-                buildIosTapbackBody(emoji, message.body, isRemoval = true)
-            } else {
-                when (effectiveFormat) {
-                    ReactionFormat.EMOJI_ONLY -> emoji
-                    ReactionFormat.TAPBACK_EN -> buildTapbackBody(emoji, message.body)
-                    ReactionFormat.READABLE_FR -> buildReadableFrBody(
-                        emoji,
-                        message.body,
-                        // v1.8.1 — résolu à l'envoi (Settings override > Profile
-                        // Android > null). Lecture rapide (~1-5 ms), faite à
-                        // chaque envoi pour refléter immédiatement un changement
-                        // de nom dans Settings sans avoir à redémarrer l'app.
-                        senderName = senderNameProvider.resolveDisplayName(),
-                    )
-                    // v1.9.0 — format compact + contexte : "❤️ «aperçu»".
-                    ReactionFormat.EMOJI_WITH_QUOTE -> buildEmojiWithQuoteBody(emoji, message.body)
-                    // Forme textuelle Apple : `Liked "aperçu"`, défaut actuel.
-                    ReactionFormat.IOS_TAPBACK -> buildIosTapbackBody(emoji, message.body)
-                }
-            },
+            body = tapbackBody,
             // F3 — pas de signature pour une réaction.
             appendSignature = false,
             // Pas de réponse contextuelle (la réaction est ponctuelle, ajouter un
@@ -314,7 +426,6 @@ class SendReactionUseCase @Inject constructor(
             e2ePayloadType = e2ePayloadType,
         )
     }
-
 
     /**
      * X1 — vrai numéro téléphonique dialable. Refuse :
@@ -359,7 +470,6 @@ class SendReactionUseCase @Inject constructor(
         // tape le message. C'est l'automatisme qui pose problème ici, pas la destination.
         return count { it.isDigit() } >= REACTION_MIN_DIGITS
     }
-
 }
 
 /**

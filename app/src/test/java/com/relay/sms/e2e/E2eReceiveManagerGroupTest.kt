@@ -392,6 +392,93 @@ class E2eReceiveManagerGroupTest {
         }
     }
 
+    // ──────────────────────────── GROUP_MEDIA_KEY (round 54) ────────────────────────────
+
+    private fun mediaKeyJson(): String = E2eMediaKeyMessage.encode(
+        E2eMediaKeyMessage.MediaKey(
+            id = "0123456789abcdef",
+            key = ByteArray(32) { 4 },
+            mime = "image/jpeg",
+            sizeBytes = 100L,
+            sha256Hex = "c".repeat(64),
+            fileName = "photo.jpg",
+        ),
+    )
+
+    @Test
+    fun `a group media key decrypts and is stored, with no message row`() = runTest {
+        val harness = Harness()
+        val json = mediaKeyJson()
+        coEvery {
+            harness.groupSessions.decryptGroupMessage(any(), any())
+        } returns GroupDecrypted(json, GROUP_ID, MEMBERS, KEY_ID)
+
+        harness.feed(
+            harness.groupFragments(harness.envelope(), E2eWireFormat.PayloadType.GROUP_MEDIA_KEY),
+        )
+
+        val stored = io.mockk.slot<E2eMediaKeyMessage.MediaKey>()
+        coVerify(exactly = 1) { harness.mediaKeys.store(capture(stored), NOW) }
+        assertThat(stored.captured.id).isEqualTo("0123456789abcdef")
+        assertThat(stored.captured.mime).isEqualTo("image/jpeg")
+        // Nothing else: no message, no notification, no notice —
+        // exactly like the 1:1 MEDIA_KEY branch.
+        coVerify(exactly = 0) {
+            harness.mirror.upsertIncomingGroupSms(any(), any(), any(), any(), any(), any(), any())
+        }
+        coVerify(exactly = 0) {
+            harness.mirror.upsertIncomingSms(any(), any(), any(), any(), any(), any())
+        }
+        coVerify(exactly = 0) { harness.notifier.notifyIncoming(any(), any(), any(), any()) }
+    }
+
+    @Test
+    fun `a malformed group media key is dropped silently`() = runTest {
+        val harness = Harness()
+        coEvery {
+            harness.groupSessions.decryptGroupMessage(any(), any())
+        } returns GroupDecrypted("not json", GROUP_ID, MEMBERS, KEY_ID)
+
+        harness.feed(
+            harness.groupFragments(harness.envelope(), E2eWireFormat.PayloadType.GROUP_MEDIA_KEY),
+        )
+
+        coVerify(exactly = 0) { harness.mediaKeys.store(any(), any()) }
+        coVerify(exactly = 0) {
+            harness.mirror.upsertIncomingGroupSms(any(), any(), any(), any(), any(), any(), any())
+        }
+        coVerify(exactly = 0) { harness.notifier.notifyIncoming(any(), any(), any(), any()) }
+    }
+
+    @Test
+    fun `an undecryptable group media key requests the key but inserts no placeholder`() = runTest {
+        val harness = Harness()
+        coEvery {
+            harness.groupSessions.decryptGroupMessage(any(), any())
+        } returns null
+        coEvery {
+            harness.groupSessions.conversationIdForGroup(GROUP_ID, null)
+        } returns CONV_ID
+        coEvery { harness.groupSessions.requestSenderKey(any(), any(), any(), any()) } just Runs
+
+        harness.feed(
+            harness.groupFragments(harness.envelope(), E2eWireFormat.PayloadType.GROUP_MEDIA_KEY),
+        )
+
+        // The key request goes out (the sender key may still
+        // arrive for future messages), but there is no message
+        // to show — the MMS part itself carries the visible
+        // state — so no placeholder, no failure mark, no
+        // notification. A GROUP_TEXT under the same unknown key
+        // still inserts one (see the placeholder test above).
+        coVerify(exactly = 1) { harness.groupSessions.requestSenderKey(GROUP_ID, BOB, 3, NOW) }
+        coVerify(exactly = 0) {
+            harness.mirror.upsertIncomingGroupSms(any(), any(), any(), any(), any(), any(), any())
+        }
+        coVerify(exactly = 0) { harness.messageDao.markDecryptFailed(any(), any()) }
+        coVerify(exactly = 0) { harness.notifier.notifyIncoming(any(), any(), any(), any()) }
+    }
+
     // ──────────────────────────── Control payloads ────────────────────────────
 
     @Test

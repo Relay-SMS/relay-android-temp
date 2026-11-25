@@ -107,6 +107,11 @@ fun MessageEntity.toDomain(attachments: List<Attachment> = emptyList()): Message
     attachments = attachments,
     replyToMessageId = replyToMessageId,
     reactionEmoji = reactionEmoji,
+    // Round 54 — the reaction's author rides the same mapping as the
+    // emoji: the thread renders from the domain model, so the toggle
+    // and the picker header must see both.
+    reactionByAddress = reactionByAddress,
+    reactionIsOwn = reactionIsOwn,
     clientMessageId = clientMessageId,
     // E2E (schema v22) — the lock on the timestamp line and the undecryptable
     // placeholder both render from the domain model. `ciphertext` stays on the
@@ -147,6 +152,8 @@ fun MessageStateRow.toDomain(): MessageState = MessageState(
     conversationId = conversationId,
     status = mapStatus(status),
     reactionEmoji = reactionEmoji,
+    reactionByAddress = reactionByAddress,
+    reactionIsOwn = reactionIsOwn,
     read = read,
     starred = starred,
 )

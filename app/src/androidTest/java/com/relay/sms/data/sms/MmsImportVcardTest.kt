@@ -77,6 +77,36 @@ class MmsImportVcardTest {
         assertThat(ligne.attachments.map { it.contentType }).containsExactly(VCARD)
     }
 
+    /**
+     * Round 54, item 3 — **un MMS qui ne porte qu'un message vocal est importé.**
+     *
+     * Même forme que le test vCard ci-dessus : un MMS sans texte dont la seule partie est
+     * un enregistrement audio doit revenir avec sa pièce jointe, pas être sauté par
+     * `flushPendingWithBatchedParts` (qui n'écarte que les lignes sans texte NI pièce).
+     * L'import ne décode jamais les octets audio — seuls les métadonnées (`ct`, `name`)
+     * comptent ici, comme pour une image ou une vidéo.
+     */
+    @Test
+    fun unMmsNePortantQuUnMessageVocalEstImporteAvecSaPieceAudio() {
+        val id = insererMmsOuIgnorer()
+        val partie = insererPartie(
+            id,
+            ContentValues().apply {
+                put("ct", AUDIO_3GPP)
+                put("cl", "voice.3gp")
+                put("name", "voice.3gp")
+            },
+        )
+        resolver.openOutputStream(partie)!!.use { it.write(byteArrayOf(0, 1, 2, 3)) }
+
+        val ligne = importer(id)
+
+        assertThat(ligne).isNotNull()
+        assertThat(ligne!!.textBody).isEmpty()
+        assertThat(ligne.attachments.map { it.contentType }).containsExactly(AUDIO_3GPP)
+        assertThat(ligne.attachments.single().filename).isEqualTo("voice.3gp")
+    }
+
     private fun importer(id: Long): TelephonyReader.MmsImportRow? {
         val lues = mutableListOf<TelephonyReader.MmsImportRow>()
         runBlocking { TelephonyReader(context).readMmsBatched(pageSize = 200) { lues += it } }
@@ -125,6 +155,7 @@ class MmsImportVcardTest {
     private companion object {
         const val EXPEDITEUR = "+33600000044"
         const val VCARD = "text/x-vcard"
+        const val AUDIO_3GPP = "audio/3gpp"
         const val LEGENDE = "Voici le contact"
         const val CARTE = "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Test Import\r\nTEL:+33600000045\r\nEND:VCARD\r\n"
 

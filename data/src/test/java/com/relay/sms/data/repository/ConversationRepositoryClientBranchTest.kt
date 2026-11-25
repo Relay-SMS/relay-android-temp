@@ -115,6 +115,8 @@ class ConversationRepositoryClientBranchTest {
         id: Long = 11L,
         conversationId: Long = 7L,
         reaction: String? = null,
+        reactionBy: String? = null,
+        reactionIsOwn: Boolean = false,
     ) = MessageEntity(
         id = id,
         conversationId = conversationId,
@@ -127,6 +129,8 @@ class ConversationRepositoryClientBranchTest {
         dateSent = null,
         read = false,
         reactionEmoji = reaction,
+        reactionByAddress = reactionBy,
+        reactionIsOwn = reactionIsOwn,
     )
 
     private class Harness(
@@ -313,7 +317,8 @@ class ConversationRepositoryClientBranchTest {
 
         assertThat(res).isEqualTo(SetReactionResult.First(11L, "❤️"))
         assertThat(h.gateway.actions).containsExactly(ClientAction.SetReaction(7L, 11L, "❤️"))
-        coVerify { h.messageDao.setReaction(11L, "❤️") }
+        // Round 54 — a user-initiated set is recorded as ours.
+        coVerify { h.messageDao.setReactionWithAuthor(11L, "❤️", null, true) }
     }
 
     @Test
@@ -325,8 +330,8 @@ class ConversationRepositoryClientBranchTest {
 
         assertThat(res).isEqualTo(SetReactionResult.Noop)
         // The badge went on, then the revert took it back off.
-        coVerify { h.messageDao.setReaction(11L, "❤️") }
-        coVerify { h.messageDao.setReaction(11L, null) }
+        coVerify { h.messageDao.setReactionWithAuthor(11L, "❤️", null, true) }
+        coVerify { h.messageDao.setReactionWithAuthor(11L, null, null, false) }
     }
 
     @Test
@@ -338,7 +343,69 @@ class ConversationRepositoryClientBranchTest {
         assertThat(res).isEqualTo(SetReactionResult.Changed("👍", "❤️"))
 
         h.gateway.revertLast()
-        coVerify { h.messageDao.setReaction(11L, "👍") }
+        // Round 54 — the revert restores the previous emoji WITH its
+        // author (here unknown: the fixture row predates the columns).
+        coVerify { h.messageDao.setReactionWithAuthor(11L, "👍", null, false) }
+    }
+
+    // Round 54 — hub-mode ownership guard: the repository is the
+    // choke point for every caller (phone UI, desktop `set_reaction`
+    // frame), so a removal of someone else's — or unknown-owner —
+    // badge is refused here even if a caller forgets the toggle check.
+
+    @Test
+    fun `hub setReaction refuses to remove someone else's reaction`() = runTest {
+        val h = harness(clientMode = false)
+        coEvery { h.messageDao.findById(11L) } returns msgRow(
+            reaction = "❤️",
+            reactionBy = "+33600000001",
+            reactionIsOwn = false,
+        )
+
+        val res = h.repo.setReaction(11L, null)
+
+        assertThat(res).isEqualTo(SetReactionResult.Noop)
+        coVerify(exactly = 0) { h.messageDao.setReactionWithAuthor(any(), any(), any(), any()) }
+    }
+
+    @Test
+    fun `hub setReaction removes our own reaction`() = runTest {
+        val h = harness(clientMode = false)
+        coEvery { h.messageDao.findById(11L) } returns msgRow(
+            reaction = "❤️",
+            reactionIsOwn = true,
+        )
+
+        val res = h.repo.setReaction(11L, null)
+
+        assertThat(res).isEqualTo(SetReactionResult.Removed)
+        coVerify { h.messageDao.setReactionWithAuthor(11L, null, null, false) }
+    }
+
+    @Test
+    fun `hub setReaction replaces someone else's reaction with ours`() = runTest {
+        val h = harness(clientMode = false)
+        coEvery { h.messageDao.findById(11L) } returns msgRow(
+            reaction = "❤️",
+            reactionBy = "+33600000001",
+            reactionIsOwn = false,
+        )
+
+        val res = h.repo.setReaction(11L, "👍")
+
+        assertThat(res).isEqualTo(SetReactionResult.Changed("❤️", "👍"))
+        coVerify { h.messageDao.setReactionWithAuthor(11L, "👍", null, true) }
+    }
+
+    @Test
+    fun `hub setReaction refuses to remove an unknown-ownership reaction`() = runTest {
+        val h = harness(clientMode = false)
+        coEvery { h.messageDao.findById(11L) } returns msgRow(reaction = "❤️")
+
+        val res = h.repo.setReaction(11L, null)
+
+        assertThat(res).isEqualTo(SetReactionResult.Noop)
+        coVerify(exactly = 0) { h.messageDao.setReactionWithAuthor(any(), any(), any(), any()) }
     }
 
     @Test

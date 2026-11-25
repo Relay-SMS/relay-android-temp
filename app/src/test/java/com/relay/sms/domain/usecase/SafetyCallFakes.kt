@@ -227,6 +227,7 @@ internal class NoopMirror(
         date: Long,
         subId: Int?,
         clientMessageId: String?,
+        encrypted: Boolean,
     ): Long = 0L
 
     override suspend fun upsertGroupEcho(

@@ -344,6 +344,15 @@ class ConversationsViewModel @Inject constructor(
         /** First-run import total, when the system store could be counted up front (null = unknown). */
         val importTotalCount: Int? = null,
         /**
+         * Round 54 — which half of the first-run import is running
+         * ([TelephonySyncManager.ImportPhase.MMS] while the MMS table
+         * is walked, SMS once the text-message loop starts). The MMS
+         * phase reports no count, so without this the screen sat at
+         * "0 of N" for the whole of it.
+         */
+        val importPhase: TelephonySyncManager.ImportPhase =
+            TelephonySyncManager.ImportPhase.SMS,
+        /**
          * `true` when the session was unlocked via the panic code. The host screen uses this to
          * hide all vault entry points (top-bar icon, deep-link buttons). Combined with the
          * navigation gate in [com.relay.sms.ui.AppRoot] and the data-layer filter in
@@ -544,6 +553,8 @@ class ConversationsViewModel @Inject constructor(
             isImporting = syncState is TelephonySyncManager.State.Running && syncState.isFirstRun,
             importedCount = (syncState as? TelephonySyncManager.State.Running)?.importedSoFar ?: 0,
             importTotalCount = (syncState as? TelephonySyncManager.State.Running)?.totalMessages,
+            importPhase = (syncState as? TelephonySyncManager.State.Running)?.phase
+                ?: TelephonySyncManager.ImportPhase.SMS,
             isPanicDecoy = isPanic,
             showIAmOkChip = showChip,
             selectedIds = effectiveSelection,

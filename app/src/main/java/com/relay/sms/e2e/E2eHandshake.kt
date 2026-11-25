@@ -65,6 +65,13 @@ package com.relay.sms.e2e
  * before round 49 reads only bit 0, ignoring bit 1 exactly as its
  * decoder was written to (reserved bits ignored).
  *
+ * Round 54 — flags bit 2 declares encrypted group media ("I can
+ * send and receive encrypted media in groups", design §13.7):
+ * the group bit alone no longer implies it. A round-49 build
+ * reads bits 0–1 and ignores bit 2, so it still declares (and is
+ * read as) group-capable while never claiming group media — the
+ * gate is what keeps a group-media key from reaching it.
+ *
  * The declaration is deliberately PROBE-SIZED (70 bytes, flags in
  * the first payload byte, the rest zeroes) — not the 6-byte header
  * alone. An old build drops an unknown packet type silently on the
@@ -119,9 +126,10 @@ object E2eHandshake {
      * payload byte, right after the 6-byte header. Bit 0
      * ([MEDIA_FLAG]) says the sender handles encrypted media;
      * bit 1 ([GROUP_FLAG], round 49) says the sender handles
-     * encrypted groups. Bits 2–7 are reserved (zero today) so a
-     * future capability can ride the same packet without a new
-     * type.
+     * encrypted groups; bit 2 ([GROUP_MEDIA_FLAG], round 54)
+     * says the sender handles encrypted media in groups.
+     * Bits 3–7 are reserved (zero today) so a future capability
+     * can ride the same packet without a new type.
      */
     private const val CAPABILITY_FLAGS_OFFSET: Int = HEADER_SIZE
 
@@ -130,6 +138,9 @@ object E2eHandshake {
 
     /** Flags bit 1 (round 49): the sender can send and receive encrypted groups. */
     private const val GROUP_FLAG: Int = 0x02
+
+    /** Flags bit 2 (round 54): the sender can send and receive encrypted media in groups. */
+    private const val GROUP_MEDIA_FLAG: Int = 0x04
 
     /**
      * Bit 7 of the type byte: set on a probe the user sent by tapping
@@ -224,17 +235,18 @@ object E2eHandshake {
         }
 
         /**
-         * A capability declaration (round 48, extended round 49):
-         * "I can send and receive encrypted media" (flags bit 0)
-         * and / or "I can send and receive encrypted groups"
-         * (flags bit 1, round 49). Sent after the session is
-         * established, on the handshake channel — the receiver
-         * records the sender's capabilities and needs no reply
-         * beyond its own declaration (see
-         * [E2eMediaCapabilityManager]). Carries no keys: the
-         * sender's address identifies the peer, and the session
-         * already exists. A data class is safe here — the fields
-         * are Booleans, no [ByteArray] equality trap.
+         * A capability declaration (round 48, extended round 49,
+         * round 54): "I can send and receive encrypted media"
+         * (flags bit 0), "I can send and receive encrypted
+         * groups" (flags bit 1, round 49), and "I can send and
+         * receive encrypted media in groups" (flags bit 2, round
+         * 54). Sent after the session is established, on the
+         * handshake channel — the receiver records the sender's
+         * capabilities and needs no reply beyond its own
+         * declaration (see [E2eMediaCapabilityManager]). Carries
+         * no keys: the sender's address identifies the peer, and
+         * the session already exists. A data class is safe here —
+         * the fields are Booleans, no [ByteArray] equality trap.
          */
         data class Capability(
             /** True when the sender handles encrypted media (flags bit 0). */
@@ -245,6 +257,14 @@ object E2eHandshake {
              * declaration built before round 49 still decodes.
              */
             val groupCapable: Boolean = false,
+            /**
+             * True when the sender handles encrypted media in
+             * groups (flags bit 2, round 54). Defaults to false
+             * so a declaration built before round 54 still
+             * decodes — a round-49 build never claims it, so a
+             * group with one stays plain for media.
+             */
+            val groupMediaCapable: Boolean = false,
         ) : HandshakePacket
     }
 
@@ -273,18 +293,18 @@ object E2eHandshake {
     /**
      * Encode a capability declaration packet (round 48, 70 bytes
      * — probe-sized, see the class KDoc): the header, the flags
-     * byte with bits 0 (media) and 1 (groups, round 49) set, and
-     * zeroes. Sent after the session is established, never
-     * before — a declaration from a peer with no session is
-     * meaningless, and the receiver only trusts it alongside an
-     * ENCRYPTED state.
+     * byte with bits 0 (media), 1 (groups, round 49) and 2
+     * (group media, round 54) set, and zeroes. Sent after the
+     * session is established, never before — a declaration from
+     * a peer with no session is meaningless, and the receiver
+     * only trusts it alongside an ENCRYPTED state.
      */
     fun encodeCapabilityDeclaration(): ByteArray {
         return ByteArray(CAPABILITY_SIZE).apply {
             MAGIC.copyInto(this, 0)
             this[4] = VERSION
             this[5] = TYPE_CAPABILITY
-            this[CAPABILITY_FLAGS_OFFSET] = (MEDIA_FLAG or GROUP_FLAG).toByte()
+            this[CAPABILITY_FLAGS_OFFSET] = (MEDIA_FLAG or GROUP_FLAG or GROUP_MEDIA_FLAG).toByte()
         }
     }
 
@@ -355,9 +375,10 @@ object E2eHandshake {
 
     /**
      * Decode a capability declaration: exactly [CAPABILITY_SIZE]
-     * bytes, flags bits 0 (media) and 1 (groups, round 49) read
-     * leniently — bits 2–7 are reserved for future capabilities
-     * and must not break decoding when a newer build sets them.
+     * bytes, flags bits 0 (media), 1 (groups, round 49) and 2
+     * (group media, round 54) read leniently — bits 3–7 are
+     * reserved for future capabilities and must not break
+     * decoding when a newer build sets them.
      */
     private fun decodeCapability(bytes: ByteArray): HandshakePacket.Capability? =
         if (bytes.size != CAPABILITY_SIZE) {
@@ -366,6 +387,7 @@ object E2eHandshake {
             HandshakePacket.Capability(
                 mediaCapable = (bytes[CAPABILITY_FLAGS_OFFSET].toInt() and MEDIA_FLAG) != 0,
                 groupCapable = (bytes[CAPABILITY_FLAGS_OFFSET].toInt() and GROUP_FLAG) != 0,
+                groupMediaCapable = (bytes[CAPABILITY_FLAGS_OFFSET].toInt() and GROUP_MEDIA_FLAG) != 0,
             )
         }
 }

@@ -105,6 +105,16 @@ class TelephonySyncManager @Inject constructor(
     @IoDispatcher private val io: CoroutineDispatcher,
 ) {
 
+    /**
+     * Round 54 — which half of the first-run import is running. The
+     * MMS import runs BEFORE the SMS loop and never reported progress
+     * (see [runSync]), so the screen sat at "0 of N" for the whole
+     * MMS phase while conversations were already landing. The phase
+     * rides the same [State] the UI already observes, so the
+     * placeholder can name the phase instead of looking dead.
+     */
+    enum class ImportPhase { MMS, SMS }
+
     sealed interface State {
         data object Idle : State
         data class Running(
@@ -120,6 +130,8 @@ class TelephonySyncManager @Inject constructor(
              * has its own counter and never reports here.
              */
             val totalMessages: Int? = null,
+            /** Round 54 — which import phase is running; SMS by default. */
+            val phase: ImportPhase = ImportPhase.SMS,
         ) : State
     }
 
@@ -247,13 +259,6 @@ class TelephonySyncManager @Inject constructor(
             val current = advanced.lastSyncedSmsId
             val isFirstRun = current == 0L
             val totalMessages = firstRunTotal(isFirstRun)
-            _state.value = State.Running(
-                isFirstRun = isFirstRun,
-                importedSoFar = 0,
-                totalMessages = totalMessages,
-            )
-            Timber.i("runSync(%s) starting; cursor=%d firstRun=%b", reason, current, isFirstRun)
-
             // MMS import : the SMS-cursor delta (below) doesn't catch `content://mms` rows
             // and re-reading the entire MMS table on every sync would be wasteful. We trigger
             // it when EITHER the cursor is still zero (first install) OR Room currently has
@@ -271,8 +276,22 @@ class TelephonySyncManager @Inject constructor(
             //
             // Le marqueur ci-dessous est la seule preuve de complétion, et il n'est posé qu'après
             // la DERNIÈRE page. Tant qu'il manque, on rejoue — l'insertion est idempotente.
+            //
+            // Round 54 — computed BEFORE the first `Running` emission (not
+            // down at the MMS block): the initial phase is MMS exactly
+            // when this import will run one, so the screen names the
+            // phase from the first frame instead of sitting at "0 of N"
+            // through the whole MMS walk.
             val hasAnyMms = runCatching { messageDao.hasAnyMms() }.getOrDefault(false)
             val needsMmsImport = !advanced.mmsImportCompleted || isFirstRun || !hasAnyMms
+            _state.value = State.Running(
+                isFirstRun = isFirstRun,
+                importedSoFar = 0,
+                totalMessages = totalMessages,
+                phase = if (needsMmsImport) ImportPhase.MMS else ImportPhase.SMS,
+            )
+            Timber.i("runSync(%s) starting; cursor=%d firstRun=%b", reason, current, isFirstRun)
+
             if (needsMmsImport) {
                 runCatching {
                     // v1.2.4 audit P3: paged read + per-chunk insert. The previous
@@ -362,6 +381,17 @@ class TelephonySyncManager @Inject constructor(
 
             var imported = 0
             var skipped = 0
+            // Round 54 — the MMS phase is over (or never ran): flip the
+            // phase BEFORE the first SMS page is read, so the screen
+            // stops saying "media messages" while the first 500-row SMS
+            // page is still being bulk-imported. `imported` is 0 here —
+            // only the phase changes.
+            _state.value = State.Running(
+                isFirstRun = isFirstRun,
+                importedSoFar = imported,
+                totalMessages = totalMessages,
+                phase = ImportPhase.SMS,
+            )
             val newCursor = try {
                 telephonyReader.readSmsSince(sinceId = current, pageSize = 500) { page ->
                     val filtered = page.filterNot { isBlockedAddress(it.entity.address) }
@@ -388,6 +418,7 @@ class TelephonySyncManager @Inject constructor(
                         isFirstRun = isFirstRun,
                         importedSoFar = imported,
                         totalMessages = totalMessages,
+                        phase = ImportPhase.SMS,
                     )
                 }
             } catch (t: Throwable) {

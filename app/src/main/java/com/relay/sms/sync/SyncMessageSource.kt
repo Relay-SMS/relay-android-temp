@@ -389,8 +389,19 @@ sealed interface SendResult {
     data class Failed(val code: String, val message: String) : SendResult
 }
 
-/** Slice 3 — what an action did: the `action_result` payload. */
-data class ActionResult(val ok: Boolean, val code: String? = null, val message: String? = null)
+/**
+ * Slice 3 — what an action did: the `action_result` payload.
+ * [budgetExhausted] (desktop encryption-box update) is true only
+ * on a successful `retry_e2e_probe` whose probe consumed the last
+ * probe-budget slot; the engine encodes it as the wire field
+ * `budget_exhausted` (omitted when false).
+ */
+data class ActionResult(
+    val ok: Boolean,
+    val code: String? = null,
+    val message: String? = null,
+    val budgetExhausted: Boolean = false,
+)
 
 /**
  * Phase 2 — what a schedule did: the `message_scheduled` /
@@ -582,6 +593,16 @@ data class SyncedMessage(
     @SerialName("error_code") val errorCode: Int?,
     @SerialName("reply_to_message_id") val replyToMessageId: String?,
     @SerialName("reaction") val reaction: String?,
+    /**
+     * Round 54 — who set [reaction]: the reactor's raw address for a
+     * peer's tapback, absent when the reaction is the hub user's own
+     * or its owner is unknown (a row stored before the author
+     * columns). An older hub omits both fields — the desktop reads
+     * absent as not-mine (safe default).
+     */
+    @SerialName("reaction_by") val reactionBy: String? = null,
+    /** Round 54 — `true` only when the reaction is the hub user's own. */
+    @SerialName("reaction_is_own") val reactionIsOwn: Boolean = false,
     @SerialName("attachments") val attachments: List<SyncedAttachment>,
     @SerialName("client_message_id") val clientMessageId: String? = null,
     @SerialName("encrypted") val encrypted: Boolean = false,
@@ -656,6 +677,10 @@ data class MessageState(
     val conversationId: Long,
     val status: String,
     val reaction: String?,
+    /** Round 54 — the reactor's raw address (`null` = own or unknown). */
+    val reactionBy: String? = null,
+    /** Round 54 — `true` only when the reaction is ours. */
+    val reactionIsOwn: Boolean = false,
     val read: Boolean,
     val starred: Boolean,
 )

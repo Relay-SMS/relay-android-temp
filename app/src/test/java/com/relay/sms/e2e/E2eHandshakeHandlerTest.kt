@@ -705,7 +705,7 @@ class E2eHandshakeHandlerTest {
         val handled = harness.handler.handleDataSms(BOB, E2eHandshake.encodeCapabilityDeclaration(), 3, NOW)
 
         assertThat(handled).isTrue()
-        coVerify { harness.mediaCapability.onDeclarationReceived(BOB, 3, NOW, true, true) }
+        coVerify { harness.mediaCapability.onDeclarationReceived(BOB, 3, NOW, true, true, true) }
         // A declaration earns no bundle reply — it is not a probe.
         assertThat(harness.sender.sent).isEmpty()
         assertThat(harness.sender.sentTexts).isEmpty()
@@ -719,7 +719,7 @@ class E2eHandshakeHandlerTest {
         val handled = harness.handler.handleSms(BOB, text, null, NOW)
 
         assertThat(handled).isTrue()
-        coVerify { harness.mediaCapability.onDeclarationReceived(BOB, null, NOW, true, true) }
+        coVerify { harness.mediaCapability.onDeclarationReceived(BOB, null, NOW, true, true, true) }
         assertThat(harness.sender.sent).isEmpty()
         assertThat(harness.sender.sentTexts).isEmpty()
     }

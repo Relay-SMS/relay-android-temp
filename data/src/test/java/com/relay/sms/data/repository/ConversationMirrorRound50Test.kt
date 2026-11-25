@@ -13,6 +13,7 @@ import com.relay.sms.data.local.db.dao.AttachmentDao
 import com.relay.sms.data.local.db.dao.ConversationDao
 import com.relay.sms.data.local.db.dao.MessageDao
 import com.relay.sms.data.local.db.dao.ScheduledMessageDao
+import com.relay.sms.data.local.db.entity.AttachmentEntity
 import com.relay.sms.data.local.db.entity.ConversationEntity
 import com.relay.sms.data.local.db.entity.MessageEntity
 import com.relay.sms.data.sms.PhoneIdentity
@@ -66,6 +67,7 @@ class ConversationMirrorRound50Test {
     private val database = mockk<AppDatabase>()
     private val conversationDao = mockk<ConversationDao>()
     private val messageDao = mockk<MessageDao>()
+    private val attachmentDao = mockk<AttachmentDao>()
     private val contacts = mockk<ContactRepository>()
     private val phoneIdentity = mockk<PhoneIdentity>()
 
@@ -74,7 +76,7 @@ class ConversationMirrorRound50Test {
         conversationDao = conversationDao,
         messageDao = messageDao,
         scheduledMessageDao = mockk<ScheduledMessageDao>(),
-        attachmentDao = mockk<AttachmentDao>(),
+        attachmentDao = attachmentDao,
         contacts = contacts,
         phoneIdentity = phoneIdentity,
         notifications = mockk<ConversationNotificationCanceller>(),
@@ -110,6 +112,7 @@ class ConversationMirrorRound50Test {
         date: Long,
         direction: MessageDirection = MessageDirection.INCOMING,
         recipients: List<String> = emptyList(),
+        attachments: List<TelephonyReader.MmsPartImport> = emptyList(),
     ) = TelephonyReader.MmsImportRow(
         telephonyId = telephonyId,
         threadId = THREAD_ID,
@@ -120,7 +123,7 @@ class ConversationMirrorRound50Test {
         address = address,
         subId = null,
         textBody = body,
-        attachments = emptyList(),
+        attachments = attachments,
         threadRecipients = recipients,
     )
 
@@ -197,6 +200,123 @@ class ConversationMirrorRound50Test {
         assertThat(created.captured.addressesCsv).isEqualTo(ALICE)
     }
 
+    // ──────────────────── Round 54 — encrypted group media import ────────────────────
+
+    /**
+     * Round 54, group media — a group MMS carrying a `relay-media-`
+     * part imports flagged encrypted, pending its group media key
+     * (same as the 1:1 import since round 48); an OUTGOING one is
+     * failed outright, because the sender keeps no copy of the
+     * per-file keys and the plaintext original is gone with the
+     * reinstall that triggered this import.
+     */
+    @Test
+    fun `mms import flags a group relay-media part encrypted, outgoing failed`() = runTest {
+        stubNewConversation()
+        coEvery { conversationDao.insert(any()) } returns CONV_ID
+        coEvery { conversationDao.findById(CONV_ID) } returns convEntity(csv = GROUP_CSV)
+        coEvery { attachmentDao.insertAll(any()) } just Runs
+        val inserted = mutableListOf<MessageEntity>()
+        coEvery { messageDao.insert(capture(inserted)) } returns 55L
+        val relayPart = TelephonyReader.MmsPartImport(
+            partId = 1L,
+            contentType = "application/octet-stream",
+            filename = "relay-media-0123456789abcdef.bin",
+        )
+
+        mirror().bulkImportMmsFromTelephony(
+            listOf(
+                mmsRow(
+                    101L,
+                    ALICE,
+                    "photo",
+                    1000L,
+                    recipients = listOf(ALICE, BOB, CAROL),
+                    attachments = listOf(relayPart),
+                ),
+                mmsRow(
+                    102L,
+                    BOB,
+                    "photo",
+                    2000L,
+                    direction = MessageDirection.OUTGOING,
+                    recipients = listOf(ALICE, BOB, CAROL),
+                    attachments = listOf(relayPart),
+                ),
+            ),
+        )
+
+        assertThat(inserted).hasSize(2)
+        assertThat(inserted[0].encrypted).isTrue()
+        assertThat(inserted[0].decryptFailed).isFalse()
+        assertThat(inserted[1].encrypted).isTrue()
+        assertThat(inserted[1].decryptFailed).isTrue()
+    }
+
+    // ──────────────────── Round 54 — voice-message import ────────────────────
+
+    /**
+     * Round 54, item 3 — a voice-only MMS (no text, one audio part)
+     * imports exactly like an image/video MMS: the message
+     * row carries `attachmentsCount = 1`, the part is stored as an
+     * [AttachmentEntity] pointing at `content://mms/part/…`, and
+     * the conversation preview is the 🎤 label — so the thread
+     * renders an audio bubble, not a missing message.
+     *
+     * Regression guard: the reader ([TelephonyReader]) and the
+     * mirror ([ConversationMirror.bulkImportMmsFromTelephony])
+     * treat every non-SMIL, non-inline-text part as an attachment,
+     * with no audio-specific filter — this test pins that, so a
+     * future "unsupported type" carve-out cannot silently drop
+     * voice notes again.
+     */
+    @Test
+    fun `mms import keeps a voice-only mms as an audio attachment`() = runTest {
+        stubNewConversation()
+        coEvery { conversationDao.findById(CONV_ID) } returns convEntity()
+        coEvery { messageDao.insert(any()) } returns 55L
+        coEvery { attachmentDao.insertAll(any()) } just Runs
+
+        mirror().bulkImportMmsFromTelephony(
+            listOf(
+                mmsRow(
+                    telephonyId = 101L,
+                    address = ALICE,
+                    body = "",
+                    date = 1000L,
+                    attachments = listOf(
+                        TelephonyReader.MmsPartImport(
+                            partId = 77L,
+                            contentType = "audio/3gpp",
+                            filename = "voice.3gp",
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        // The message row exists, with no text but one attachment…
+        val insertedMsg = slot<MessageEntity>()
+        coVerify { messageDao.insert(capture(insertedMsg)) }
+        assertThat(insertedMsg.captured.body).isEmpty()
+        assertThat(insertedMsg.captured.type).isEqualTo(MessageType.MMS)
+        assertThat(insertedMsg.captured.attachmentsCount).isEqualTo(1)
+        // …the audio part is stored, pointing at the system part URI…
+        val insertedAtts = slot<List<AttachmentEntity>>()
+        coVerify { attachmentDao.insertAll(capture(insertedAtts)) }
+        assertThat(insertedAtts.captured).hasSize(1)
+        assertThat(insertedAtts.captured.single().messageId).isEqualTo(55L)
+        assertThat(insertedAtts.captured.single().mimeType).isEqualTo("audio/3gpp")
+        assertThat(insertedAtts.captured.single().fileName).isEqualTo("voice.3gp")
+        assertThat(insertedAtts.captured.single().localUri)
+            .isEqualTo("content://mms/part/77")
+        // …and the conversation preview names the voice clip, so the
+        // thread list shows it instead of an empty row.
+        val touched = mutableListOf<ConversationEntity>()
+        coVerify(atLeast = 1) { conversationDao.update(capture(touched)) }
+        assertThat(touched.map { it.lastMessagePreview }).contains("🎤 voice.3gp")
+    }
+
     // ──────────────────── Part 1 — SMS group threads ────────────────────
 
     @Test
@@ -269,7 +389,7 @@ class ConversationMirrorRound50Test {
         coEvery { conversationDao.update(any()) } just Runs
         coEvery { messageDao.insert(any()) } returns 201L
         coEvery { messageDao.findRecentForConversation(any(), any()) } returns listOf(target)
-        coEvery { messageDao.setReaction(any(), any()) } just Runs
+        coEvery { messageDao.setReactionWithAuthor(any(), any(), any(), any()) } just Runs
 
         mirror().bulkImportMmsFromTelephony(
             listOf(
@@ -279,7 +399,7 @@ class ConversationMirrorRound50Test {
         )
 
         // The badge landed on the target…
-        coVerify { messageDao.setReaction(201L, "👍") }
+        coVerify { messageDao.setReactionWithAuthor(201L, "👍", BOB, false) }
         // …and the tapback text was never inserted as a bubble…
         coVerify(exactly = 0) { messageDao.insert(match { it.body == "👍 to \"hello\"" }) }
         // …nor surfaced as the conversation preview (any touch).

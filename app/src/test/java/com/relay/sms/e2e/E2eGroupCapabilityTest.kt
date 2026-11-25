@@ -146,7 +146,7 @@ class E2eGroupCapabilityTest {
     }
 
     @Test
-    fun `a successful announce sets both announced flags`() = runTest {
+    fun `a successful announce sets all three announced flags`() = runTest {
         val harness = Harness()
         harness.seedPeer()
 
@@ -155,10 +155,11 @@ class E2eGroupCapabilityTest {
         assertThat(sent).isTrue()
         assertThat(harness.peerDao.peers[BOB]!!.mediaAnnounced).isTrue()
         assertThat(harness.peerDao.peers[BOB]!!.groupAnnounced).isTrue()
+        assertThat(harness.peerDao.peers[BOB]!!.groupMediaAnnounced).isTrue()
     }
 
     @Test
-    fun `a radio refusal leaves both announced flags clear`() = runTest {
+    fun `a radio refusal leaves all three announced flags clear`() = runTest {
         val harness = Harness(sender = RecordingDataSmsSender(result = false))
         harness.seedPeer()
 
@@ -167,5 +168,6 @@ class E2eGroupCapabilityTest {
         assertThat(sent).isFalse()
         assertThat(harness.peerDao.peers[BOB]!!.mediaAnnounced).isFalse()
         assertThat(harness.peerDao.peers[BOB]!!.groupAnnounced).isFalse()
+        assertThat(harness.peerDao.peers[BOB]!!.groupMediaAnnounced).isFalse()
     }
 }

@@ -44,7 +44,7 @@ class E2eHandshakeMediaCapabilityTest {
     }
 
     @Test
-    fun `a capability packet decodes back with both flags set`() {
+    fun `a capability packet decodes back with all three flags set`() {
         val bytes = E2eHandshake.encodeCapabilityDeclaration()
 
         val decoded = E2eHandshake.decode(bytes)
@@ -52,6 +52,7 @@ class E2eHandshakeMediaCapabilityTest {
         assertThat(decoded).isInstanceOf(HandshakePacket.Capability::class.java)
         assertThat((decoded as HandshakePacket.Capability).mediaCapable).isTrue()
         assertThat((decoded as HandshakePacket.Capability).groupCapable).isTrue()
+        assertThat((decoded as HandshakePacket.Capability).groupMediaCapable).isTrue()
     }
 
     @Test
@@ -63,29 +64,33 @@ class E2eHandshakeMediaCapabilityTest {
 
         assertThat(decoded.mediaCapable).isFalse()
         assertThat(decoded.groupCapable).isFalse()
+        assertThat(decoded.groupMediaCapable).isFalse()
     }
 
     @Test
-    fun `reserved flag bits are ignored on decode, bit 1 is the group flag`() {
-        // Round 49 — bit 1 is meaningful now (group capable); bits
-        // 2–7 stay reserved and must not break decoding when a
-        // newer build sets them.
+    fun `reserved flag bits are ignored on decode, bit 2 is the group-media flag`() {
+        // Round 54 — bit 2 is meaningful now (group-media
+        // capable); bits 3–7 stay reserved and must not break
+        // decoding when a newer build sets them.
         val reservedOnly = E2eHandshake.encodeCapabilityDeclaration()
-        reservedOnly[FLAGS_OFFSET] = 0xFC.toByte() // bits 2-7, bits 0-1 clear
-        val groupOnly = E2eHandshake.encodeCapabilityDeclaration()
-        groupOnly[FLAGS_OFFSET] = 0xFE.toByte() // bit 1 + bits 2-7, bit 0 clear
+        reservedOnly[FLAGS_OFFSET] = 0xF8.toByte() // bits 3-7, bits 0-2 clear
+        val groupMediaOnly = E2eHandshake.encodeCapabilityDeclaration()
+        groupMediaOnly[FLAGS_OFFSET] = 0xFC.toByte() // bit 2 + bits 3-7, bits 0-1 clear
         val allSet = E2eHandshake.encodeCapabilityDeclaration()
-        allSet[FLAGS_OFFSET] = 0xFF.toByte() // both flags + every reserved bit
+        allSet[FLAGS_OFFSET] = 0xFF.toByte() // all flags + every reserved bit
 
         val reserved = E2eHandshake.decode(reservedOnly) as HandshakePacket.Capability
         assertThat(reserved.mediaCapable).isFalse()
         assertThat(reserved.groupCapable).isFalse()
-        val group = E2eHandshake.decode(groupOnly) as HandshakePacket.Capability
-        assertThat(group.mediaCapable).isFalse()
-        assertThat(group.groupCapable).isTrue()
+        assertThat(reserved.groupMediaCapable).isFalse()
+        val groupMedia = E2eHandshake.decode(groupMediaOnly) as HandshakePacket.Capability
+        assertThat(groupMedia.mediaCapable).isFalse()
+        assertThat(groupMedia.groupCapable).isFalse()
+        assertThat(groupMedia.groupMediaCapable).isTrue()
         val all = E2eHandshake.decode(allSet) as HandshakePacket.Capability
         assertThat(all.mediaCapable).isTrue()
         assertThat(all.groupCapable).isTrue()
+        assertThat(all.groupMediaCapable).isTrue()
     }
 
     @Test

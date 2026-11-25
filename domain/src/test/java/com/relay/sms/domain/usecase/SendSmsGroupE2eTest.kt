@@ -41,9 +41,14 @@ import org.junit.jupiter.api.Test
  *   as it did before encrypted groups existed.
  * - RefuseOverCap → the send is refused BEFORE any row is written.
  * - Encrypt failure → the group thread gets a FAILED echo, never
- *   a plain send, and nothing goes out on the radio.
- * - A multi-recipient send WITHOUT an echo (Safety call, emergency
- *   mode) and a group reaction never consult the group gate.
+ *   a plain send, and nothing goes out on the radio — except for a
+ *   group REACTION, which writes NO echo (the tapback text must
+ *   never paint as a failed bubble).
+ * - A group reaction (REACTION payload, empty local mirror body)
+ *   consults the group gate like a group text: Encrypted → the
+ *   same fragments to every member, per-member rows encrypted, no
+ *   group echo. A multi-recipient send WITHOUT an echo (Safety
+ *   call, emergency mode) never consults the group gate.
  */
 class SendSmsGroupE2eTest {
 
@@ -62,6 +67,7 @@ class SendSmsGroupE2eTest {
     ) : E2eGroupSendGate {
         val decidedFor = mutableListOf<List<String>>()
         val encryptedFor = mutableListOf<List<String>>()
+        val encryptedPayloadTypes = mutableListOf<E2ePayloadType>()
         val activatedFor = mutableListOf<List<String>>()
 
         override suspend fun decideGroupSend(
@@ -80,6 +86,7 @@ class SendSmsGroupE2eTest {
             payloadType: E2ePayloadType,
         ): Outcome<E2eGroupSendGate.EncryptedGroupMessage> {
             encryptedFor += memberAddresses
+            encryptedPayloadTypes += payloadType
             val error = encryptError
             return if (error != null) {
                 Outcome.Failure(error)
@@ -91,48 +98,19 @@ class SendSmsGroupE2eTest {
         override suspend fun recordGroupActivated(memberAddresses: List<String>, now: Long) {
             activatedFor += memberAddresses
         }
-    }
 
-    /** Records every fragment dispatch (and every plain send, which must not happen). */
-    private class RecordingFragmentSender(
-        var outcome: Outcome<Unit> = Outcome.Success(Unit),
-    ) : SmsSender {
-        data class FragmentCall(
-            val localMessageId: Long,
-            val destination: String,
-            val text: String,
-            val fragmentIndex: Int,
-            val fragmentTotal: Int,
-        )
+        override suspend fun decideGroupMediaSend(
+            memberAddresses: List<String>,
+        ): E2eGroupSendGate.Decision = E2eGroupSendGate.Decision.Plain
 
-        val fragments = mutableListOf<FragmentCall>()
-        val plainSends = mutableListOf<String>()
-
-        override fun send(
-            localMessageId: Long,
-            destination: String,
-            text: String,
+        override suspend fun prepareGroupMediaSend(
+            memberAddresses: List<String>,
+            files: List<com.relay.sms.domain.e2e.MediaFileInput>,
+            maxTotalBytes: Long,
+            date: Long,
             subId: Int?,
-            requestDeliveryReport: Boolean,
-            attempt: Int,
-        ): Outcome<Unit> {
-            plainSends += text
-            return outcome
-        }
-
-        override fun sendFragment(
-            localMessageId: Long,
-            destination: String,
-            text: String,
-            fragmentIndex: Int,
-            fragmentTotal: Int,
-            subId: Int?,
-            requestDeliveryReport: Boolean,
-            attempt: Int,
-        ): Outcome<Unit> {
-            fragments += FragmentCall(localMessageId, destination, text, fragmentIndex, fragmentTotal)
-            return outcome
-        }
+        ): E2eGroupSendGate.GroupMediaPrepareResult =
+            E2eGroupSendGate.GroupMediaPrepareResult.Plain
     }
 
     /** Records the background probes (the 1:1 gate's only role on the group path). */
@@ -168,6 +146,7 @@ class SendSmsGroupE2eTest {
         echoInGroup: Boolean = true,
         localMirrorBody: String? = null,
         e2eGate: E2eSendGate = E2eSendGate.NoOp,
+        e2ePayloadType: E2ePayloadType = E2ePayloadType.TEXT,
     ): Outcome<SendReport> = runBlocking {
         sendSmsUseCase(
             settings = DefaultSettingsSource(),
@@ -181,6 +160,7 @@ class SendSmsGroupE2eTest {
             body = body,
             echoInGroup = echoInGroup,
             localMirrorBody = localMirrorBody,
+            e2ePayloadType = e2ePayloadType,
         )
     }
 
@@ -421,28 +401,96 @@ class SendSmsGroupE2eTest {
     }
 
     @Test
-    fun `group reaction never consults the group gate`() {
+    fun `group reaction fans the same fragments to every member, with no group echo`() {
         val gate = FakeGroupGate(decision = E2eGroupSendGate.Decision.Encrypted)
         val sender = RecordingFragmentSender()
         val mirror = NoopMirror()
+        val recorder = RecordingRecorder()
 
-        // A group reaction (empty local mirror body, like
-        // SendReactionUseCase passes for groups) stays plain:
-        // group reactions encrypt in a follow-up.
+        // A group reaction (empty local mirror body, REACTION payload,
+        // as SendReactionUseCase passes for an encrypted group).
+        val outcome = sendGroup(
+            groupGate = gate,
+            sender = sender,
+            mirror = mirror,
+            recorder = recorder,
+            localMirrorBody = "",
+            e2ePayloadType = E2ePayloadType.REACTION,
+        )
+
+        assertThat(outcome).isInstanceOf(Outcome.Success::class.java)
+        assertThat(gate.decidedFor).containsExactly(listOf(ALICE, BOB))
+        assertThat(gate.encryptedFor).containsExactly(listOf(ALICE, BOB))
+        assertThat(gate.encryptedPayloadTypes)
+            .containsExactly(E2ePayloadType.REACTION)
+        // The SAME fragment set to each member; no plain send.
+        assertThat(sender.fragments).hasSize(4)
+        assertThat(sender.fragments.map { it.destination })
+            .containsExactly(ALICE, ALICE, BOB, BOB)
+        assertThat(sender.plainSends).isEmpty()
+        // Per-member rows carry the lock — but NO group echo: a
+        // reaction is not a bubble, and the tapback text must never
+        // paint in the group thread.
+        assertThat(mirror.lignes).hasSize(2)
+        assertThat(mirror.lignes.all { it.encrypted }).isTrue()
+        assertThat(mirror.echos).isEmpty()
+        assertThat(gate.activatedFor).containsExactly(listOf(ALICE, BOB))
+    }
+
+    @Test
+    fun `group reaction encrypt failure writes no failed echo and never sends plain`() {
+        val gate = FakeGroupGate(
+            decision = E2eGroupSendGate.Decision.Encrypted,
+            encryptError = AppError.Validation("no own number"),
+        )
+        val sender = RecordingFragmentSender()
+        val mirror = NoopMirror()
+        val recorder = RecordingRecorder()
+
+        val outcome = sendGroup(
+            groupGate = gate,
+            sender = sender,
+            mirror = mirror,
+            recorder = recorder,
+            localMirrorBody = "",
+            e2ePayloadType = E2ePayloadType.REACTION,
+        )
+
+        assertThat(outcome).isInstanceOf(Outcome.Failure::class.java)
+        assertThat(gate.encryptedFor).containsExactly(listOf(ALICE, BOB))
+        assertThat(sender.plainSends).isEmpty()
+        assertThat(sender.fragments).isEmpty()
+        assertThat(recorder.adressesEcrites).isEmpty()
+        assertThat(mirror.lignes).isEmpty()
+        assertThat(mirror.statuts).isEmpty()
+        // Unlike a group TEXT failure, a reaction failure writes NO
+        // FAILED echo — the tapback text must never paint as a failed
+        // bubble in the group thread.
+        assertThat(mirror.echos).isEmpty()
+        assertThat(gate.activatedFor).isEmpty()
+    }
+
+    @Test
+    fun `group reaction refused over cap fails with no echo`() {
+        val gate = FakeGroupGate(decision = E2eGroupSendGate.Decision.RefuseOverCap)
+        val sender = RecordingFragmentSender()
+        val mirror = NoopMirror()
+
         val outcome = sendGroup(
             groupGate = gate,
             sender = sender,
             mirror = mirror,
             localMirrorBody = "",
+            e2ePayloadType = E2ePayloadType.REACTION,
         )
 
-        assertThat(outcome).isInstanceOf(Outcome.Success::class.java)
-        assertThat(gate.decidedFor).isEmpty()
+        assertThat(outcome).isInstanceOf(Outcome.Failure::class.java)
         assertThat(gate.encryptedFor).isEmpty()
-        assertThat(sender.plainSends).containsExactly(BODY, BODY)
+        assertThat(sender.plainSends).isEmpty()
         assertThat(sender.fragments).isEmpty()
-        assertThat(mirror.lignes.all { !it.encrypted }).isTrue()
+        assertThat(mirror.lignes).isEmpty()
         assertThat(mirror.echos).isEmpty()
+        assertThat(gate.activatedFor).isEmpty()
     }
 
     @Test

@@ -30,6 +30,11 @@ import com.relay.sms.domain.smartactions.SmartAction
  * Round 53 — [onSmartAction] rides it too: a tap on a smart-action span
  * (email, address, date/time, tracking number) in the bubble's text, and
  * the map preview card's tap, both forward here.
+ *
+ * Round 54 — [mapsProvider] rides it as well: the map preview card
+ * follows the Settings maps-provider choice (Apple gets a tap-to-load
+ * preview, the rest get the "Get directions" button), and the text
+ * bubble has no parameter slot left for it either.
  */
 data class BubbleMenuToggles(
     val isPinned: Boolean,
@@ -43,4 +48,12 @@ data class BubbleMenuToggles(
      * phone callback.
      */
     val onSmartAction: ((SmartAction) -> Unit)? = null,
+    /**
+     * Round 54 — the maps provider for the map preview card (and for
+     * [onSmartAction] address taps, which the host resolves with the
+     * same value). Defaults to the system maps app where the thread
+     * does not wire a provider (previews, standalone bubbles, notes).
+     */
+    val mapsProvider: com.relay.sms.domain.settings.MapsProvider =
+        com.relay.sms.domain.settings.MapsProvider.SYSTEM_DEFAULT,
 )

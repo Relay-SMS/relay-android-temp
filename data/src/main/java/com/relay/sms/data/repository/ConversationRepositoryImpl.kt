@@ -1058,12 +1058,16 @@ class ConversationRepositoryImpl @Inject constructor(
             // no longer set.
             val current = messageDao.findById(messageId) ?: return@withContext SetReactionResult.Noop
             val previous = current.reactionEmoji
-            if (previous == emoji) return@withContext SetReactionResult.Noop
-            messageDao.setReaction(messageId, emoji)
+            // Round 54 — ownership choke point (see [maySetReaction]): a
+            // removal only clears the user's OWN reaction; someone else's
+            // (or unknown-owner) badge is never silently deleted.
+            // A set is always ours — on this phone or from a linked device.
+            if (!maySetReaction(previous, emoji, current.reactionIsOwn)) return@withContext SetReactionResult.Noop
+            messageDao.setReactionWithAuthor(messageId, emoji, null, emoji != null)
             if (clientActions.isClientMode()) {
                 val sent = clientActions.sendAction(
                     ClientAction.SetReaction(current.conversationId, messageId, emoji),
-                ) { messageDao.setReaction(messageId, previous) }
+                ) { messageDao.setReactionWithAuthor(messageId, previous, current.reactionByAddress, current.reactionIsOwn) }
                 return@withContext if (sent) {
                     reactionTransition(previous, emoji, messageId)
                 } else {
@@ -1254,3 +1258,12 @@ private data class WindowRows(
     val rows: List<MessageEntity>,
     val hasMoreOlder: Boolean?,
 )
+
+/**
+ * Round 54 — whether a reaction write may proceed. No change never writes;
+ * a removal writes only when the badge is the user's OWN (a peer's, or an
+ * unknown-owner, badge is never silently deleted); any set or replace
+ * writes. A set is always ours — on this phone or from a linked device.
+ */
+private fun maySetReaction(previous: String?, emoji: String?, reactionIsOwn: Boolean): Boolean =
+    previous != emoji && (emoji != null || previous == null || reactionIsOwn)

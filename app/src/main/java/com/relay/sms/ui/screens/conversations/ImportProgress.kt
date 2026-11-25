@@ -22,6 +22,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.relay.sms.R
+import com.relay.sms.data.sync.TelephonySyncManager
 import com.relay.sms.ui.theme.RelayText
 import com.relay.sms.ui.theme.brandBlue
 
@@ -43,9 +44,18 @@ import com.relay.sms.ui.theme.brandBlue
  * - Total unknown: the plain "N messages imported…" line while pages
  *   land, the "Reading your existing SMS…" line before the first one,
  *   and an indeterminate bar either way.
+ * - Round 54 — the phase line under the bar names what is running
+ *   (`MMS` while the media-message table is walked, `SMS` once the
+ *   text-message loop starts). The MMS phase reports no count, so
+ *   without it the screen sat at "0 of N" for the whole of it while
+ *   conversations were already landing behind the placeholder.
  */
 @Composable
-fun ImportProgressContent(imported: Int, total: Int?) {
+fun ImportProgressContent(
+    imported: Int,
+    total: Int?,
+    phase: TelephonySyncManager.ImportPhase = TelephonySyncManager.ImportPhase.SMS,
+) {
     Column(
         modifier = Modifier.fillMaxWidth(),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -79,5 +89,20 @@ fun ImportProgressContent(imported: Int, total: Int?) {
                 trackColor = MaterialTheme.colorScheme.surfaceVariant,
             )
         }
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            text = stringResource(
+                when (phase) {
+                    TelephonySyncManager.ImportPhase.MMS ->
+                        R.string.conversations_importing_phase_mms
+                    TelephonySyncManager.ImportPhase.SMS ->
+                        R.string.conversations_importing_phase_sms
+                },
+            ),
+            style = RelayText.Preview,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.fillMaxWidth(),
+        )
     }
 }

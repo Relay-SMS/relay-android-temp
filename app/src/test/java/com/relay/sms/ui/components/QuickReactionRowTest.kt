@@ -45,21 +45,21 @@ class QuickReactionRowTest {
     }
 
     @Test fun `tapping the applied emoji removes the reaction`() {
-        assertThat(toggleReaction("❤️", "❤️")).isNull()
+        assertThat(toggleReaction("❤️", "❤️", isOwnReaction = true)).isNull()
     }
 
     @Test fun `tapping a different emoji swaps the reaction`() {
-        assertThat(toggleReaction("❤️", "👍")).isEqualTo("👍")
+        assertThat(toggleReaction("❤️", "👍", isOwnReaction = true)).isEqualTo("👍")
     }
 
     @Test fun `tapping with no current reaction applies it`() {
-        assertThat(toggleReaction(null, "👍")).isEqualTo("👍")
+        assertThat(toggleReaction(null, "👍", isOwnReaction = true)).isEqualTo("👍")
     }
 
     @Test fun `tapping one emoji of a multi-emoji reaction swaps it`() {
         // Only the whole string matches for removal; a single emoji from
         // a multi-emoji reaction replaces it instead.
-        assertThat(toggleReaction("❤️👍", "❤️")).isEqualTo("❤️")
+        assertThat(toggleReaction("❤️👍", "❤️", isOwnReaction = true)).isEqualTo("❤️")
     }
 
     @Test fun `tapping any other emoji never clears the stored reaction`() {
@@ -70,8 +70,26 @@ class QuickReactionRowTest {
         // on someone else's reaction can never wipe the badge.
         for (emoji in DEFAULT_QUICK_REACTIONS) {
             if (emoji != "👍") {
-                assertThat(toggleReaction("👍", emoji)).isEqualTo(emoji)
+                assertThat(toggleReaction("👍", emoji, isOwnReaction = true)).isEqualTo(emoji)
             }
         }
+    }
+
+    // Round 54 — ownership: only the user's OWN reaction toggles off.
+    // Tapping someone else's (or unknown-owner) emoji must leave the
+    // badge exactly as it is — the repository refuses the removal too,
+    // but the toggle is the first line of defence.
+
+    @Test fun `tapping someone else's emoji does not remove it`() {
+        // Unknown ownership reads as not-mine at the call site (the
+        // stored row predates the author columns): same no-op.
+        assertThat(toggleReaction("❤️", "❤️", isOwnReaction = false)).isEqualTo("❤️")
+    }
+
+    @Test fun `tapping a different emoji replaces someone else's reaction`() {
+        // The single-emoji slot holds only the latest reactor, so
+        // reacting differently always replaces — the no-op is only for
+        // tapping the SAME emoji as someone else's reaction.
+        assertThat(toggleReaction("❤️", "👍", isOwnReaction = false)).isEqualTo("👍")
     }
 }

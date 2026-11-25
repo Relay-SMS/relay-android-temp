@@ -18,6 +18,10 @@ data class MessageState(
     val conversationId: Long,
     val status: Message.Status,
     val reactionEmoji: String?,
+    /** Round 54 — the reactor's raw address (`null` = own or unknown). */
+    val reactionByAddress: String? = null,
+    /** Round 54 — `true` only when the reaction is ours. */
+    val reactionIsOwn: Boolean = false,
     val read: Boolean,
     val starred: Boolean,
 )

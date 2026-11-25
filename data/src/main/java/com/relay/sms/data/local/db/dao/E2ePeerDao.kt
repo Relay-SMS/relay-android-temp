@@ -162,6 +162,18 @@ interface E2ePeerDao {
     suspend fun setGroupAnnounced(address: String, announced: Boolean, updatedAt: Long)
 
     /**
+     * Round 54 — records that this peer declared it handles
+     * encrypted media in groups (the 0x03 capability packet,
+     * flags bit 2). Targeted UPDATE, like the other peer writes.
+     */
+    @Query("UPDATE e2e_peers SET group_media_capable = :groupMediaCapable, updated_at = :updatedAt WHERE address = :address")
+    suspend fun setGroupMediaCapable(address: String, groupMediaCapable: Boolean, updatedAt: Long)
+
+    /** Round 54 — records that our capability declaration (all three bits) went out to this peer. */
+    @Query("UPDATE e2e_peers SET group_media_announced = :announced, updated_at = :updatedAt WHERE address = :address")
+    suspend fun setGroupMediaAnnounced(address: String, announced: Boolean, updatedAt: Long)
+
+    /**
      * Round 48 — records the channel our outbound handshake
      * packets provably used for this peer (`DATA_SMS` /
      * `TEXT_SMS`, the `HandshakeChannel` enum names stored raw).

@@ -238,4 +238,33 @@ class E2eWireFormatTest {
         assertThat(decodedNormal.message).isEqualTo(normal)
         assertThat(decodedNormal.payloadType).isEqualTo(PayloadType.REACTION)
     }
+
+    @Test
+    fun `GROUP pairs with GROUP_MEDIA_KEY and round-trips`() {
+        val group = EncryptedMessage(OlmMessageType.GROUP, byteArrayOf(5, 6, 7, 8))
+        val decoded = E2eWireFormat.parsePayload(
+            E2eWireFormat.encodePayload(group, PayloadType.GROUP_MEDIA_KEY),
+        )
+        assertThat(decoded.message).isEqualTo(group)
+        assertThat(decoded.payloadType).isEqualTo(PayloadType.GROUP_MEDIA_KEY)
+        assertThat(E2eWireFormat.isValidPairing(OlmMessageType.GROUP, PayloadType.GROUP_MEDIA_KEY)).isTrue()
+    }
+
+    @Test
+    fun `PRE_KEY and NORMAL never pair with GROUP_MEDIA_KEY`() {
+        assertThat(E2eWireFormat.isValidPairing(OlmMessageType.PRE_KEY, PayloadType.GROUP_MEDIA_KEY)).isFalse()
+        assertThat(E2eWireFormat.isValidPairing(OlmMessageType.NORMAL, PayloadType.GROUP_MEDIA_KEY)).isFalse()
+        assertThrows(IllegalArgumentException::class.java) {
+            E2eWireFormat.encodePayload(
+                EncryptedMessage(OlmMessageType.NORMAL, byteArrayOf(1, 2, 3, 4)),
+                PayloadType.GROUP_MEDIA_KEY,
+            )
+        }
+        // A crossed GROUP_MEDIA_KEY arriving as a 1:1 payload is
+        // rejected at parse time, so it can never reach the Olm
+        // decryptor.
+        assertThrows(IllegalArgumentException::class.java) {
+            E2eWireFormat.parsePayload(byteArrayOf(0x01, 0x02, 0x08, 0x00))
+        }
+    }
 }

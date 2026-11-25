@@ -498,6 +498,29 @@ interface MessageDao {
     suspend fun setReaction(id: Long, emoji: String?)
 
     /**
+     * Round 54 — set / clear the reaction WITH its author. The
+     * emoji-only [setReaction] above stays for the callers that must
+     * not touch authorship: the v3 multi-emoji normalize (a stored
+     * badge keeps its reactor) and the backup restore (a restored
+     * badge has an unknown owner). Every path that KNOWS the reactor
+     * uses this one instead:
+     *   - the tapback fold ([com.relay.sms.data.repository
+     *     .ConversationMirror.applyIncomingReaction]): the reaction
+     *     SMS's sender, or self for an own tapback;
+     *   - a user-initiated set ([com.relay.sms.data.repository
+     *     .ConversationRepositoryImpl.setReaction]): self, always —
+     *     including a `set_reaction` frame from a linked device (the
+     *     desktop user IS the phone user).
+     * Clearing (`emoji = null`) clears the author too — a badge with
+     * no emoji has no reactor.
+     */
+    @Query(
+        "UPDATE messages SET reaction_emoji = :emoji, " +
+            "reaction_by_address = :byAddress, reaction_is_own = :isOwn WHERE id = :id",
+    )
+    suspend fun setReactionWithAuthor(id: Long, emoji: String?, byAddress: String?, isOwn: Boolean)
+
+    /**
      * E2E (schema v22) — marks a row encrypted on the wire. The send/receive paths
      * usually insert the row with the flag already set; this is for rows whose crypto
      * outcome is known only after the insert (optimistic send, late decrypt).
@@ -1455,7 +1478,7 @@ interface MessageDao {
      */
     @Query(
         """
-        SELECT id, conversation_id, status, reaction_emoji, read, starred FROM messages
+        SELECT id, conversation_id, status, reaction_emoji, reaction_by_address, reaction_is_own, read, starred FROM messages
         WHERE id IN (:ids)
           AND conversation_id IN (SELECT id FROM conversations WHERE in_vault = 0)
         """,

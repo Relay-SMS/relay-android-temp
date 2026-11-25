@@ -110,24 +110,35 @@ class ReactionEmojiPickerTest {
     // the result (`null` = removal), then closes.
 
     @Test fun `tapping an emoji with no reaction applies it`() {
-        assertThat(toggleReaction(null, "🎉")).isEqualTo("🎉")
+        assertThat(toggleReaction(null, "🎉", isOwnReaction = true)).isEqualTo("🎉")
     }
 
     @Test fun `tapping the applied emoji again removes the reaction`() {
-        assertThat(toggleReaction("🎉", "🎉")).isNull()
+        assertThat(toggleReaction("🎉", "🎉", isOwnReaction = true)).isNull()
     }
 
     @Test fun `tapping a different emoji swaps the reaction`() {
-        assertThat(toggleReaction("🎉", "🔥")).isEqualTo("🔥")
+        assertThat(toggleReaction("🎉", "🔥", isOwnReaction = true)).isEqualTo("🔥")
     }
 
     @Test fun `a skin-tone variant from the long-press picker swaps the reaction`() {
         // The grid's tone picker hands the picker a toned variant; it is
         // a different emoji from the base, so it swaps rather than removes.
-        assertThat(toggleReaction("👍", "👍🏽")).isEqualTo("👍🏽")
+        assertThat(toggleReaction("👍", "👍🏽", isOwnReaction = true)).isEqualTo("👍🏽")
     }
 
     @Test fun `tapping the applied skin-tone variant again removes the reaction`() {
-        assertThat(toggleReaction("👍🏽", "👍🏽")).isNull()
+        assertThat(toggleReaction("👍🏽", "👍🏽", isOwnReaction = true)).isNull()
+    }
+
+    // Round 54 — ownership: the full picker shares the quick row's
+    // toggle, so someone else's emoji never toggles off here either.
+
+    @Test fun `tapping someone else's emoji in the picker does not remove it`() {
+        assertThat(toggleReaction("🎉", "🎉", isOwnReaction = false)).isEqualTo("🎉")
+    }
+
+    @Test fun `tapping a different emoji in the picker replaces someone else's reaction`() {
+        assertThat(toggleReaction("🎉", "🔥", isOwnReaction = false)).isEqualTo("🔥")
     }
 }

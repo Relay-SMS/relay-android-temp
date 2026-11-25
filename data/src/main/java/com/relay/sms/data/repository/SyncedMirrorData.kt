@@ -75,6 +75,19 @@ data class SyncedMessageData(
     val replyToHubMessageId: Long?,
     /** Emoji reaction on this message, or null. */
     val reaction: String?,
+    /**
+     * Round 54 — who set [reaction]: the reactor's raw address from
+     * the hub, or null when the reaction is the hub user's own (or
+     * the hub predates the author fields — unknown owner, read as
+     * not-mine). Stored on the client's mirror like the hub's rows.
+     */
+    val reactionByAddress: String? = null,
+    /**
+     * Round 54 — `true` only when the reaction is the hub user's
+     * own. A reaction the hub user set from a linked device counts
+     * as theirs too (the hub marks it own at the source).
+     */
+    val reactionIsOwn: Boolean = false,
     /** The linked device's UUID send key, when this device sent it (Slice 3). */
     val clientMessageId: String?,
     val attachments: List<SyncedAttachmentData>,

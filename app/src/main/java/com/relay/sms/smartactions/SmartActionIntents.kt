@@ -34,8 +34,13 @@ import timber.log.Timber
  * ([MapsProvider]). A `geo:` intent is offered to the chosen app only
  * when it is installed (checked with [Context.getLaunchIntentForPackage],
  * which needs the package in the manifest's `<queries>` block on API
- * 30+) — otherwise the provider's web version opens. The preview image
- * stays OSM whatever the choice (see `MapPreviewFetcher`).
+ * 30+) — otherwise the provider's web version opens. Round 54 — the map
+ * preview card's "Get directions" button ([directionsIntent] /
+ * [performDirections]) is a second maps path: Google, Apple and OSM go
+ * straight to their keyless directions web URL (the `geo:` URI has no
+ * directions mode), while SYSTEM_DEFAULT tries `geo:` first and falls
+ * back to OSM directions on the web when nothing handles it — the same
+ * rule as the desktop's `openMapsDirections`.
  */
 object SmartActionIntents {
 
@@ -162,6 +167,91 @@ object SmartActionIntents {
         context: Context,
     ): Intent = mapsIntent(address, provider) { packageName ->
         context.packageManager.getLaunchIntentForPackage(packageName) != null
+    }
+
+    /**
+     * Round 54 — the directions URL for [address] under [provider]: the
+     * "Get directions" button's target (see `mapPreview.ts` on desktop —
+     * the same provider matrix). Google uses the keyless Maps URLs
+     * directions form (`dir/?api=1&destination=`), Apple the `daddr`
+     * destination parameter (no `saddr`, so the route starts from the
+     * user's location), OpenStreetMap the `?to=` destination form; the
+     * `geo:` URI has no directions mode, so System default is the address
+     * search — the opener falls back to OSM directions on the web when
+     * nothing handles `geo:` (see [performDirections]).
+     *
+     * Pure on purpose (URL-encoded with [java.net.URLEncoder], `+` turned
+     * back into `%20` so the shape matches `encodeURIComponent`): the
+     * URL shaping is unit-tested on plain JVM, where `android.net.Uri`
+     * throws `Stub!` — the same reason [trackingUrl] is the tested shape
+     * for tracking. Only [mapsWebUrl] keeps `Uri.encode`, for the search
+     * URLs it already builds.
+     */
+    fun mapsDirectionsUrl(address: String, provider: MapsProvider): String {
+        val encoded = runCatching {
+            java.net.URLEncoder.encode(address, Charsets.UTF_8.name())
+        }.getOrNull()?.replace("+", "%20") ?: ""
+        return when (provider) {
+            MapsProvider.GOOGLE_MAPS ->
+                "https://www.google.com/maps/dir/?api=1&destination=$encoded"
+            MapsProvider.APPLE_MAPS -> "https://maps.apple.com/?daddr=$encoded"
+            MapsProvider.OPENSTREETMAP ->
+                "https://www.openstreetmap.org/directions?to=$encoded"
+            MapsProvider.SYSTEM_DEFAULT -> geoUriStringForDirections(address)
+        }
+    }
+
+    /**
+     * The `geo:` search URI for [address], as the System-default
+     * directions target (the `geo:` URI has no directions mode — see
+     * [mapsDirectionsUrl]). Kept separate from [geoUriString] so the
+     * directions path stays pure and unit-testable: [geoUriString] needs
+     * `android.net.Uri` and throws `Stub!` on plain JVM.
+     */
+    private fun geoUriStringForDirections(address: String): String =
+        "geo:0,0?q=" + runCatching {
+            java.net.URLEncoder.encode(address, Charsets.UTF_8.name())
+        }.getOrNull()?.replace("+", "%20") ?: ""
+
+    /**
+     * Round 54 — the "Get directions" intent for [address] under
+     * [provider]: the provider's directions web URL, except
+     * SYSTEM_DEFAULT, which is a plain `geo:` intent (Android resolves
+     * it to any maps app). No install check — every directions URL is a
+     * plain `ACTION_VIEW`, and the System-default fallback to OSM
+     * directions on the web lives in [performDirections], which is the
+     * only place that knows whether the `geo:` start failed.
+     */
+    fun directionsIntent(address: String, provider: MapsProvider): Intent =
+        Intent(Intent.ACTION_VIEW).apply {
+            data = Uri.parse(mapsDirectionsUrl(address, provider))
+        }
+
+    /** Starts [intent], `false` (with a log) when no app can take it. */
+    private fun tryStart(context: Context, intent: Intent): Boolean =
+        runCatching {
+            context.startActivity(intent)
+            true
+        }.onFailure { Timber.d(it, "Smart action had no handler") }.getOrDefault(false)
+
+    /**
+     * Round 54 — starts the directions intent for [address] under
+     * [provider]. SYSTEM_DEFAULT tries `geo:` first and falls back to
+     * OSM directions on the web when nothing handles it (the desktop's
+     * `openMapsDirections` rule); every other provider goes straight to
+     * its directions web URL. Returns `true` when an app took an intent,
+     * `false` (with a log) when none could — the caller shows the "no
+     * app" note.
+     */
+    fun performDirections(context: Context, address: String, provider: MapsProvider): Boolean {
+        if (provider == MapsProvider.SYSTEM_DEFAULT) {
+            if (tryStart(context, directionsIntent(address, provider))) return true
+            return tryStart(
+                context,
+                directionsIntent(address, MapsProvider.OPENSTREETMAP),
+            )
+        }
+        return tryStart(context, directionsIntent(address, provider))
     }
 
     /**

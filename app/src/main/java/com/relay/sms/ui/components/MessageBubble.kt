@@ -397,10 +397,15 @@ fun MessageBubble(
                             // Round 53 — map preview: the first address in
                             // the body gets its tap-to-load map card, right
                             // after the link preview. Same FAILED skip.
+                            // Round 54 — the card follows the provider
+                            // (Apple: preview; the rest: directions button),
+                            // which rides the toggles bundle: the bubble is
+                            // at the parameter limit (see [BubbleMenuToggles]).
                             MapPreviewCard(
                                 body = message.body,
                                 messageId = message.id,
-                                onSmartAction = toggles?.onSmartAction ?: {},
+                                mapsProvider = toggles?.mapsProvider
+                                    ?: com.relay.sms.domain.settings.MapsProvider.SYSTEM_DEFAULT,
                             )
                         }
                         if (message.status == com.relay.sms.domain.model.Message.Status.FAILED) {
@@ -488,9 +493,12 @@ fun MessageBubble(
                 onReact = onReact,
                 // Round 23 — the menu's top row IS the quick-reaction row
                 // (same bundle as the tap bar below); the applied reaction
-                // highlights in it, like the desktop popup.
+                // highlights in it, like the desktop popup. Round 54 —
+                // only the USER'S OWN reaction highlights: someone
+                // else's (or unknown-owner) emoji is not a toggle
+                // target, so it must not read as selected.
                 quickReactions = quickReactions,
-                currentReaction = message.reactionEmoji,
+                currentReaction = message.reactionEmoji.takeIf { message.reactionIsOwn },
                 toggles = toggles,
                 onDelete = onDelete,
             )

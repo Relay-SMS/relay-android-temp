@@ -15,8 +15,8 @@ Releases: [GitHub Releases](https://github.com/relay-sms/relay-android/releases/
 - Single-Activity Compose UI, Material 3 with dynamic colors, AMOLED true-black and
   System / Light / Dark themes.
 - **End-to-end encryption between Relay users**: texts, reactions, photos, videos, voice messages
-  and files in 1:1 chats, and texts in groups where every member uses Relay — automatic, with no
-  server, no internet and no account (vodozemac). Encrypted conversations carry a lock, and safety
+  and files in 1:1 chats, and texts, reactions, photos, videos, voice messages and files in groups where
+  every member uses Relay — automatic, with no server, no internet and no account (vodozemac). Encrypted conversations carry a lock, and safety
   numbers let you verify a contact.
 - **Link your desktop, tablet, or a second phone** over your local network: read and send from any
   linked device, with calls through the phone. The phone stays the messaging device; pairing is a
@@ -69,8 +69,9 @@ there is no Relay server, no internet connection, and no account involved. Your 
 created on your phone and never leave it.
 
 In a 1:1 conversation, texts, reactions, photos, videos, voice messages and files are all encrypted
-once the session is established. In a group, texts are encrypted when every member uses Relay (group
-photos and files stay plain for now). A lock marks encrypted conversations and messages. The first
+once the session is established. In a group, texts, reactions, photos, videos, voice messages and files are
+encrypted when every member uses Relay. A text caption typed on an encrypted photo or video stays
+plain — only the media itself is encrypted. A lock marks encrypted conversations and messages. The first
 message to a new contact may go out plain while the key exchange runs in the background; from then
 on, everything encrypts automatically. Messages sent before the other person had Relay stay plain —
 they can't be retroactively encrypted.

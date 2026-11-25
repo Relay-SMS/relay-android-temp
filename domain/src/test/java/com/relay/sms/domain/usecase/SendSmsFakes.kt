@@ -199,8 +199,14 @@ internal class NoopMirror : OutgoingMessageMirror {
         date: Long,
         subId: Int?,
         clientMessageId: String?,
+        encrypted: Boolean,
     ): Long {
-        lignes += LigneEcrite(addresses.joinToString(";") { it.raw }, telephonyUri = null, statut = MessageStatus.PENDING)
+        lignes += LigneEcrite(
+            addresses.joinToString(";") { it.raw },
+            telephonyUri = null,
+            statut = MessageStatus.PENDING,
+            encrypted = encrypted,
+        )
         cles += clientMessageId
         return prochainId++
     }
@@ -354,5 +360,47 @@ internal class FakeOwnNumberEnsurer(
     override suspend fun ensureForGroupSend(): Boolean {
         calls++
         return result
+    }
+}
+
+/** Records every fragment dispatch (and every plain send, which must not happen). */
+internal class RecordingFragmentSender(
+    var outcome: Outcome<Unit> = Outcome.Success(Unit),
+) : SmsSender {
+    data class FragmentCall(
+        val localMessageId: Long,
+        val destination: String,
+        val text: String,
+        val fragmentIndex: Int,
+        val fragmentTotal: Int,
+    )
+
+    val fragments = mutableListOf<FragmentCall>()
+    val plainSends = mutableListOf<String>()
+
+    override fun send(
+        localMessageId: Long,
+        destination: String,
+        text: String,
+        subId: Int?,
+        requestDeliveryReport: Boolean,
+        attempt: Int,
+    ): Outcome<Unit> {
+        plainSends += text
+        return outcome
+    }
+
+    override fun sendFragment(
+        localMessageId: Long,
+        destination: String,
+        text: String,
+        fragmentIndex: Int,
+        fragmentTotal: Int,
+        subId: Int?,
+        requestDeliveryReport: Boolean,
+        attempt: Int,
+    ): Outcome<Unit> {
+        fragments += FragmentCall(localMessageId, destination, text, fragmentIndex, fragmentTotal)
+        return outcome
     }
 }

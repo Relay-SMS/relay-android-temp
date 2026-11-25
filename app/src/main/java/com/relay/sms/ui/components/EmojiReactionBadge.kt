@@ -44,11 +44,13 @@ import com.relay.sms.domain.reaction.IncomingReactionDecoder
  *
  * Round 52 emoji fix — tap = [onClick] opens the reaction picker (the
  * same picker the bubble menu's React entry opens). It NEVER removes
- * the reaction: a single-emoji badge carries no author, so a tap cannot
- * tell your reaction from the other side's — and a stray tap used to
- * clear a reaction you did not make. Removing your own reaction stays
- * possible through the picker / quick bar, which only clears on an
- * explicit tap of the already-applied emoji ([toggleReaction]).
+ * the reaction: a tap cannot tell your reaction from the other side's
+ * at the badge — and a stray tap used to clear a reaction you did not
+ * make. Removing your own reaction stays possible through the picker /
+ * quick bar, which only clears on an explicit tap of the already-applied
+ * emoji ([toggleReaction]). Round 54 — the picker now KNOWS the author
+ * (the model carries it), but the badge tap still only opens the picker:
+ * removal stays an explicit same-emoji tap inside it.
  * TalkBack announces it as a button (« Réaction ❤️, double-tap pour réagir »).
  */
 @Composable
@@ -114,7 +116,8 @@ fun EmojiReactionBadge(
  *
  * Round 52 emoji fix — [onReactionBadgeTap] opens the reaction picker:
  * tapping the badge never removes the reaction (see the [EmojiReactionBadge]
- * KDoc above — the badge carries no author, so a tap must not clear it).
+ * KDoc above — a tap must not clear a reaction that may not be yours).
+ * Round 54 — the picker now shows who reacted and only toggles off your own.
  */
 @Composable
 fun BubbleReactionOverlay(

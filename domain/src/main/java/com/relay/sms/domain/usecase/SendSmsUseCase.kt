@@ -58,7 +58,10 @@ import javax.inject.Inject
  * does too. A group that is not fully encrypted sends plain (its
  * members get a background probe); an over-cap or failed encryption
  * fails the send — the group thread gets a FAILED echo, never a plain
- * send. Group MMS, group media, and group reactions stay plain.
+ * send. Group MMS and group media stay plain; group reactions encrypt
+ * when the group is encrypted (round 54) — a reaction that fails to
+ * encrypt fails visibly with NO failed echo (the tapback text must
+ * never paint as a bubble).
  */
 class SendSmsUseCase @Inject constructor(
     private val defaultAppManager: DefaultSmsAppChecker,
@@ -145,13 +148,13 @@ class SendSmsUseCase @Inject constructor(
         /**
          * E2E (design §3.2) — the payload kind when this send goes out
          * encrypted. [E2ePayloadType.TEXT] (the default) is an ordinary
-         * message; [E2ePayloadType.REACTION] is a 1:1 reaction, passed
-         * only by [SendReactionUseCase] after it has established that
-         * the reaction is single-target in a 1:1 conversation. A
-         * reaction payload encrypts the formatted tapback body; the
-         * receiver folds it onto its target instead of showing a
-         * bubble. Any other reaction (group, multi-target) keeps
-         * [E2ePayloadType.TEXT] and stays plain, exactly as before.
+         * message; [E2ePayloadType.REACTION] is a reaction, passed only
+         * by [SendReactionUseCase] after it has established that the
+         * reaction is single-target in a 1:1 conversation — or that
+         * the reaction is in an encrypted group (all members, via
+         * [groupSendPlan]). A reaction payload encrypts the formatted
+         * tapback body; the receiver folds it onto its target instead
+         * of showing a bubble.
          */
         e2ePayloadType: E2ePayloadType = E2ePayloadType.TEXT,
     ): Outcome<SendReport> {
@@ -185,12 +188,13 @@ class SendSmsUseCase @Inject constructor(
         // which only SendReactionUseCase passes, and only once it has
         // established single-target + 1:1 conversation) consults the
         // gate; multi-recipient sends consult the GROUP gate instead
-        // (below — [groupSendPlan]), and any other reaction never
-        // encrypts, but a 1:1 reaction still triggers a probe (sending
-        // to the thread is intent to talk). A peer that is not
-        // ENCRYPTED gets a background probe and a plain send; an
-        // over-cap encrypted send is refused here, before any row is
-        // written — never silently sent plain.
+        // (below — [groupSendPlan], which also admits group
+        // reactions), and any other reaction never encrypts, but a
+        // 1:1 reaction still triggers a probe (sending to the thread
+        // is intent to talk). A peer that is not ENCRYPTED gets a
+        // background probe and a plain send; an over-cap encrypted
+        // send is refused here, before any row is written — never
+        // silently sent plain.
         val singleRecipient = recipients.singleOrNull()
         val e2eDecision =
             if (singleRecipient != null &&
@@ -394,11 +398,13 @@ class SendSmsUseCase @Inject constructor(
      *
      * Only a send FROM a group thread qualifies: `echoInGroup`
      * with at least two recipients and a real text body
-     * (`localMirrorBody == null`). A multi-recipient broadcast
-     * (Safety call, emergency mode) is not a group send — each
-     * recipient gets a private SMS, no echo — and a reaction
-     * (`localMirrorBody` is `""`) stays plain: group reactions
-     * encrypt in a follow-up owned by [SendReactionUseCase].
+     * (`localMirrorBody == null`) — or a group reaction
+     * (`localMirrorBody` is `""` with [E2ePayloadType.REACTION],
+     * admitted since round 54: [SendReactionUseCase] pre-decides
+     * the group gate and passes the encrypted attempt here). A
+     * multi-recipient broadcast (Safety call, emergency mode) is
+     * not a group send — each recipient gets a private SMS, no
+     * echo — and any other reaction stays plain.
      *
      * - [Outcome.Success] with a fragment list: the group is
      *   encrypted — the caller fans the SAME fragments out to
@@ -416,7 +422,11 @@ class SendSmsUseCase @Inject constructor(
      *   encrypt failure the group thread gets a FAILED echo row
      *   (written here, since the caller has not written any row
      *   yet) so the user sees the failure where they sent it.
-     *   The plaintext NEVER goes out instead.
+     *   The plaintext NEVER goes out instead. A REACTION failure
+     *   writes NO echo: the tapback text (`Liked "…"`) must never
+     *   paint as a failed bubble in the group thread — the caller
+     *   surfaces the failure (snack / SEND_FAILED) and the local
+     *   badge stays set.
      */
     private suspend fun groupSendPlan(
         recipients: List<PhoneAddress>,
@@ -429,7 +439,11 @@ class SendSmsUseCase @Inject constructor(
         replyToMessageId: Long?,
         payloadType: E2ePayloadType,
     ): Outcome<List<String>?> {
-        if (!echoInGroup || recipients.size < 2 || localMirrorBody != null) {
+        // A group reaction carries no mirror body (""), but its
+        // REACTION payload still qualifies it as a group send.
+        val qualifiesAsGroupSend = localMirrorBody == null ||
+            payloadType == E2ePayloadType.REACTION
+        if (!echoInGroup || recipients.size < 2 || !qualifiesAsGroupSend) {
             return Outcome.Success(null)
         }
         val memberAddresses = recipients.map { it.raw }
@@ -451,16 +465,23 @@ class SendSmsUseCase @Inject constructor(
                         // a plain send — and the caller reports the
                         // failure. No per-recipient rows: nothing went
                         // out to anyone, so there is nothing to track.
-                        mirror.upsertGroupEcho(
-                            addresses = recipients,
-                            body = finalBody,
-                            date = now,
-                            subId = effectiveSubId,
-                            status = MessageStatus.FAILED,
-                            replyToMessageId = replyToMessageId,
-                            clientMessageId = clientMessageId,
-                            encrypted = true,
-                        )
+                        // A REACTION failure writes NO echo: the
+                        // tapback text must never paint as a failed
+                        // bubble in the group thread (see the KDoc
+                        // above — the caller surfaces the failure and
+                        // the local badge stays set).
+                        if (payloadType != E2ePayloadType.REACTION) {
+                            mirror.upsertGroupEcho(
+                                addresses = recipients,
+                                body = finalBody,
+                                date = now,
+                                subId = effectiveSubId,
+                                status = MessageStatus.FAILED,
+                                replyToMessageId = replyToMessageId,
+                                clientMessageId = clientMessageId,
+                                encrypted = true,
+                            )
+                        }
                         Outcome.Failure(encrypted.error)
                     }
                 }

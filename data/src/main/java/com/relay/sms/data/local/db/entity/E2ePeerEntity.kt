@@ -46,6 +46,18 @@ import androidx.room.PrimaryKey
  * group flag stays false until the next declaration — the
  * announce triggers re-send the combined packet when either flag
  * is unset.
+ *
+ * Round 54 (schema v26) — group-media capability (design §13.7):
+ * the same packet carries a third flags bit (bit 2) for encrypted
+ * media in groups, so [groupMediaCapable] says the peer declared
+ * it handles encrypted group media and [groupMediaAnnounced] says
+ * WE already sent our declaration (all three bits) to this peer.
+ * A peer whose declaration predates round 54 announced groups
+ * without the media bit, so its group-media flag stays false
+ * until the next declaration — the announce triggers re-send the
+ * combined packet when any flag is unset. The group bit alone no
+ * longer implies group media: a round-49 build is group-capable
+ * but never group-media-capable.
  */
 @Entity(tableName = "e2e_peers")
 data class E2ePeerEntity(
@@ -119,6 +131,26 @@ data class E2ePeerEntity(
      * combined packet. Set only after a successful send.
      */
     @ColumnInfo(name = "group_announced", defaultValue = "0") val groupAnnounced: Boolean = false,
+    /**
+     * Round 54 — true once this peer's phone declared it handles
+     * encrypted media in groups (the 0x03 capability packet,
+     * flags bit 2). False by default: a round-49 build never
+     * declares it, so group media with it stays plain even
+     * though group text encrypts. Set only by the declaration
+     * receive path, never by the sender guessing.
+     */
+    @ColumnInfo(name = "group_media_capable", defaultValue = "0") val groupMediaCapable: Boolean = false,
+    /**
+     * Round 54 — true once WE sent our capability declaration
+     * (all three bits) to this peer (and the radio accepted it).
+     * The declaration is one packet carrying all bits, so one
+     * send sets this and [mediaAnnounced] and [groupAnnounced];
+     * a peer announced before round 54 has [groupAnnounced]
+     * true and this false, and the next announce trigger
+     * re-sends the combined packet. Set only after a successful
+     * send.
+     */
+    @ColumnInfo(name = "group_media_announced", defaultValue = "0") val groupMediaAnnounced: Boolean = false,
     /** Epoch ms of the last state/key update. */
     @ColumnInfo(name = "updated_at") val updatedAt: Long,
 )

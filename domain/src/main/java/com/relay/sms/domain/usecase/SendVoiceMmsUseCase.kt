@@ -10,6 +10,7 @@ package com.relay.sms.domain.usecase
 
 import com.relay.sms.core.result.AppError
 import com.relay.sms.core.result.Outcome
+import com.relay.sms.domain.e2e.E2eGroupSendGate
 import com.relay.sms.domain.e2e.E2eMediaGate
 import com.relay.sms.domain.e2e.MediaFileInput
 import com.relay.sms.domain.mms.MmsDispatcher
@@ -41,8 +42,8 @@ import javax.inject.Inject
  * still-blank number after detection fails fast with
  * [AppError.OwnNumberMissing], before any mirror row exists.
  *
- * Round 48 — media encryption (1:1 only, never for groups), same
- * shape as [SendMediaMmsUseCase]: the gate prepares (decide +
+ * Round 48 — media encryption (1:1 only in the per-recipient
+ * path), same shape as [SendMediaMmsUseCase]: the gate prepares (decide +
  * encrypt + key-send) before any mirror row exists, the mirror
  * row keeps the plaintext sender copy and carries the `encrypted`
  * flag, and an encrypted voice clip dispatches via
@@ -50,6 +51,14 @@ import javax.inject.Inject
  * the AUDIO kind in the SMIL while a ciphertext part is an
  * octet-stream OTHER. The voice path has no size cap today, so
  * the gate gets none here (a Refuse can never fire for voice).
+ *
+ * Round 54 — group voice (design §13.7): the group-MMS path
+ * ([envoiDeGroupe]) prepares through [E2eGroupSendGate.prepareGroupMediaSend]
+ * instead, same shape as [SendMediaMmsUseCase] — one per-file key
+ * wrapped in the sender's sender key, one group PDU, one mirror
+ * row with `encrypted = true`. The per-recipient loop NEVER
+ * consults the 1:1 gate for a multi-recipient send (the echo
+ * path): a group send must go through the group gate only.
  */
 class SendVoiceMmsUseCase @Inject constructor(
     private val defaultAppManager: DefaultSmsAppChecker,
@@ -60,6 +69,12 @@ class SendVoiceMmsUseCase @Inject constructor(
     private val attachmentStore: OutgoingAttachmentStore,
     private val ownNumberEnsurer: OwnNumberEnsurer,
     private val mediaGate: E2eMediaGate = E2eMediaGate.NoOp,
+    /**
+     * Round 54 — the encrypted-group media gate (cf.
+     * [SendMediaMmsUseCase]). Default [E2eGroupSendGate.NoOp]
+     * keeps the existing tests compiling untouched.
+     */
+    private val groupGate: E2eGroupSendGate = E2eGroupSendGate.NoOp,
 ) {
     private val envoi = EnvoiParDestinataire(blockedRepo, mirror)
 
@@ -118,24 +133,34 @@ class SendVoiceMmsUseCase @Inject constructor(
         // fichier, et pas de plafond — la voix n'en a pas
         // aujourd'hui, on n'en ajoute pas (un Refuse ne peut donc
         // jamais se produire ici, mais le gate reste le même).
+        //
+        // Round 54 — le gate 1:1 n'est consulté que pour un
+        // destinataire UNIQUE (cf. [SendMediaMmsUseCase]) : un
+        // envoi multi-destinataires ne passe jamais par le gate
+        // par paire.
         val prepared = mutableMapOf<String, E2eMediaGate.PrepareResult.Encrypted>()
         try {
-            for (r in recipients) {
-                if (blockedRepo.isBlocked(r.raw)) continue
-                when (
-                    val result = mediaGate.prepareMediaSend(
-                        address = r.raw,
-                        files = listOf(MediaFileInput(durableAudio, mimeType)),
-                        maxTotalBytes = Long.MAX_VALUE,
-                        date = now,
-                        subId = effectiveSubId,
-                    )
-                ) {
-                    is E2eMediaGate.PrepareResult.Encrypted -> prepared[r.raw] = result
-                    is E2eMediaGate.PrepareResult.Plain,
-                    E2eMediaGate.PrepareResult.FallbackToPlain -> Unit
-                    is E2eMediaGate.PrepareResult.Refuse ->
-                        return Outcome.Failure(AppError.Validation(result.message))
+            // Round 54 — the 1:1 gate is consulted only for a
+            // UNIQUE recipient (cf. [SendMediaMmsUseCase]).
+            if (recipients.size == 1) {
+                for (r in recipients) {
+                    if (blockedRepo.isBlocked(r.raw)) continue
+                    when (
+                        val result = mediaGate.prepareMediaSend(
+                            address = r.raw,
+                            files = listOf(MediaFileInput(durableAudio, mimeType)),
+                            maxTotalBytes = Long.MAX_VALUE,
+                            date = now,
+                            subId = effectiveSubId,
+                        )
+                    ) {
+                        is E2eMediaGate.PrepareResult.Encrypted -> prepared[r.raw] = result
+                        is E2eMediaGate.PrepareResult.Plain,
+                        E2eMediaGate.PrepareResult.FallbackToPlain,
+                        -> Unit
+                        is E2eMediaGate.PrepareResult.Refuse ->
+                            return Outcome.Failure(AppError.Validation(result.message))
+                    }
                 }
             }
             // v1.28.3 (F21, second passage) — troisième occurrence du même `continue` muet, sur la
@@ -225,6 +250,10 @@ class SendVoiceMmsUseCase @Inject constructor(
 
     /** v1.28.3 (F21, second passage) — cf. le jumeau de [SendMediaMmsUseCase]. */
     /** v1.28.4 — le MMS vocal de groupe : un seul PDU, une seule ligne dans le groupe. */
+    /** Round 54 — la préparation du chiffrement de groupe a lieu AVANT toute ligne miroir
+     * (cf. [SendMediaMmsUseCase.envoiDeGroupe]) : chiffré, la voix part via `sendMediaMms`
+     * (pas `sendVoiceMms` — la partie chiffrée est un octet-stream OTHER) et la ligne miroir
+     * porte `encrypted = true`. Un Refuse fait échouer l'envoi ENTIER avant toute ligne. */
     @Suppress("LongParameterList")
     private suspend fun envoiDeGroupe(
         recipients: List<PhoneAddress>,
@@ -233,32 +262,59 @@ class SendVoiceMmsUseCase @Inject constructor(
         durationMs: Long,
         subId: Int?,
         deliveryReports: Boolean,
-    ): Outcome<SendReport> = envoi.enGroupe(
-        recipients = recipients,
-        sansRemise = "no MMS dispatched",
-        // v1.28.5 — le miroir porte les CIBLES, pas la liste d'origine : cf. `EnvoiParDestinataire.enGroupe`.
-        miroir = { cibles ->
-            mirror.upsertOutgoingGroupMms(
-                addresses = cibles,
-                attachments = listOf(
-                    com.relay.sms.domain.mms.MediaAttachmentSpec(audio, mimeType, durationMs = durationMs),
-                ),
-                textBody = "",
-                date = System.currentTimeMillis(),
-                subId = subId,
-            )
-        },
-        envoi = { localId, cibles ->
-            sender.sendVoiceMms(
-                localMessageId = localId,
-                recipients = cibles.map { it.raw },
-                audioFile = audio,
-                mimeType = mimeType,
-                subId = subId,
-                requestDeliveryReport = deliveryReports,
-            )
-        },
-    )
+    ): Outcome<SendReport> {
+        val prepared = groupGate.prepareGroupMediaSend(
+            memberAddresses = recipients.map { it.raw },
+            files = listOf(MediaFileInput(audio, mimeType)),
+            maxTotalBytes = Long.MAX_VALUE,
+            date = System.currentTimeMillis(),
+            subId = subId,
+        )
+        if (prepared is E2eGroupSendGate.GroupMediaPrepareResult.Refuse) {
+            return Outcome.Failure(AppError.Validation(prepared.message))
+        }
+        val encrypted = prepared as? E2eGroupSendGate.GroupMediaPrepareResult.Encrypted
+        val result = envoi.enGroupe(
+            recipients = recipients,
+            sansRemise = "no MMS dispatched",
+            // v1.28.5 — le miroir porte les CIBLES, pas la liste d'origine : cf. `EnvoiParDestinataire.enGroupe`.
+            miroir = { cibles ->
+                mirror.upsertOutgoingGroupMms(
+                    addresses = cibles,
+                    attachments = listOf(
+                        com.relay.sms.domain.mms.MediaAttachmentSpec(audio, mimeType, durationMs = durationMs),
+                    ),
+                    textBody = "",
+                    date = System.currentTimeMillis(),
+                    subId = subId,
+                    encrypted = encrypted != null,
+                )
+            },
+            envoi = { localId, cibles ->
+                if (encrypted != null) {
+                    sender.sendMediaMms(
+                        localMessageId = localId,
+                        recipients = cibles.map { it.raw },
+                        attachments = encrypted.attachments,
+                        textBody = null,
+                        subId = subId,
+                        requestDeliveryReport = deliveryReports,
+                    )
+                } else {
+                    sender.sendVoiceMms(
+                        localMessageId = localId,
+                        recipients = cibles.map { it.raw },
+                        audioFile = audio,
+                        mimeType = mimeType,
+                        subId = subId,
+                        requestDeliveryReport = deliveryReports,
+                    )
+                }
+            },
+        )
+        encrypted?.attachments?.forEach { runCatching { it.file.delete() } }
+        return result
+    }
 
     private fun refusPrealable(recipients: List<PhoneAddress>, audioFile: File): AppError? = when {
         !defaultAppManager.isDefault() -> AppError.NotDefaultSmsApp

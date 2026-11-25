@@ -104,6 +104,8 @@ fun SyncedMessage.toData(): SyncedMessageData? {
         errorCode = errorCode,
         replyToHubMessageId = replyToMessageId?.let(::parseHubId),
         reaction = reaction,
+        reactionByAddress = reactionBy,
+        reactionIsOwn = reactionIsOwn,
         clientMessageId = clientMessageId,
         attachments = attachments.mapNotNull { it.toData() },
         encrypted = encrypted,

@@ -1257,15 +1257,12 @@ fun ThreadScreen(
         val daySeparatorLabels: List<String?> = remember(
             state.messages, todayLabel, yesterdayLabel,
         ) {
-            state.messages.mapIndexed { index, msg ->
-                val prev = state.messages.getOrNull(index - 1)
-                if (prev == null || !sameDay(prev.date, msg.date)) {
-                    formatters.daySeparatorLabel(
-                        timestampMillis = msg.date,
-                        todayLabel = todayLabel,
-                        yesterdayLabel = yesterdayLabel,
-                    )
-                } else null
+            computeDaySeparatorLabels(state.messages) { timestampMillis ->
+                formatters.daySeparatorLabel(
+                    timestampMillis = timestampMillis,
+                    todayLabel = todayLabel,
+                    yesterdayLabel = yesterdayLabel,
+                )
             }
         }
         // Feedback round 7 — sticky date header: the date of
@@ -1339,7 +1336,10 @@ fun ThreadScreen(
         // Client mode C2 — `state.isClientMode` is a key too: the retry
         // gate below must rebuild when the mode flips, or a mode
         // switch mid-thread would keep the old behaviour.
-        val itemActions = remember(viewModel, state.isClientMode) {
+        // Round 54 — `state.mapsProvider` is a key too: the map
+        // preview card reads the provider from this bundle, so a
+        // provider change must rebuild it.
+        val itemActions = remember(viewModel, state.isClientMode, state.mapsProvider) {
             ThreadMessageItemActions(
                 onTogglePlayback = { audio -> viewModel.togglePlayback(audio.localUri, audio.toPlaybackUri()) },
                 onSeekPlayback = viewModel::seekPlaybackTo,
@@ -1380,6 +1380,8 @@ fun ThreadScreen(
                 },
                 onPhoneClick = onPhoneClick,
                 onSmartAction = onSmartAction,
+                // Round 54 — the maps provider for the map preview card.
+                mapsProvider = state.mapsProvider,
                 // E2E — a key-change notice tap opens the safety-number
                 // sheet for this thread's peer.
                 onE2eNoticeVerify = { e2eVerificationOpen = true },
@@ -1896,11 +1898,35 @@ fun ThreadScreen(
     // validate step. Tap reacts immediately; tapping the applied emoji
     // again removes the reaction (the sheet applies [toggleReaction]
     // and passes `null` for a removal — same toggle as the
-    // quick-reaction row and the desktop picker).
+    // quick-reaction row and the desktop picker). Round 54 — only
+    // when the reaction is ours: tapping someone else's emoji is a
+    // no-op, and the sheet's header names the reactor.
     pickingReactionFor?.let { msgId ->
-        val existingReaction = state.messages.firstOrNull { it.id == msgId }?.reactionEmoji
+        val pickedMessage = state.messages.firstOrNull { it.id == msgId }
+        val existingReaction = pickedMessage?.reactionEmoji
+        // Round 54 — who reacted, for the sheet's header line: our own
+        // reaction reads "you"; a peer's reads their contact name when
+        // known (memberNames, else the 1:1 thread's display name), else
+        // the number. Unknown owner → no header line.
+        val reactedByLabel = pickedMessage?.reactionEmoji?.let { emoji ->
+            val name = when {
+                pickedMessage.reactionIsOwn -> stringResource(R.string.chat_you)
+                pickedMessage.reactionByAddress != null ->
+                    state.memberNames[pickedMessage.reactionByAddress]
+                        ?: if (state.conversation?.isGroup == false) {
+                            state.conversation?.displayName
+                        } else {
+                            null
+                        }
+                        ?: pickedMessage.reactionByAddress
+                else -> null
+            }
+            name?.let { stringResource(R.string.reaction_picker_reacted_by, emoji, it) }
+        }
         com.relay.sms.ui.components.ReactionEmojiPickerSheet(
             currentReaction = existingReaction,
+            isOwnReaction = pickedMessage?.reactionIsOwn == true,
+            reactedByLabel = reactedByLabel,
             onPicked = { emoji ->
                 viewModel.setReaction(msgId, emoji)
                 pickingReactionFor = null
@@ -3777,6 +3803,32 @@ private fun sameDay(a: Long, b: Long): Boolean {
 }
 
 /**
+ * Round 54 — day-separator labels, one per message (`null` = no separator):
+ * the label for a day is attached to the FIRST message of that day (the
+ * oldest message whose calendar day differs from its predecessor's), and the
+ * label text is computed from THAT message's own date — never the previous
+ * message's, which would have labelled a morning message "Yesterday".
+ *
+ * Pure Kotlin (no Android APIs beyond [java.util.Calendar], which the plain
+ * JVM provides): the label text itself comes from [labelFor] so the
+ * function stays testable on the plain JVM — [com.relay.sms.ui.util.ChatFormatters]
+ * cannot be constructed there (its init touches `android.text.format.DateFormat`).
+ * See [ThreadDaySeparatorTest]: 7:17 PM day N, 6:33 AM day N+1 → a separator
+ * on the 6:33 AM message, labelled from its own date.
+ *
+ * The placement of the pill relative to its bubble is NOT covered here — it
+ * is a layout property of [ThreadMessageItem] (round 54: its roots must sit
+ * in a [Column], see there), which no plain-JVM test can observe.
+ */
+internal fun computeDaySeparatorLabels(
+    messages: List<Message>,
+    labelFor: (timestampMillis: Long) -> String,
+): List<String?> = messages.mapIndexed { index, msg ->
+    val prev = messages.getOrNull(index - 1)
+    if (prev == null || !sameDay(prev.date, msg.date)) labelFor(msg.date) else null
+}
+
+/**
  * Feedback round 4 — one timestamp per same-sender run, on its LAST message.
  *
  * The time shows on message M when M is the last message of its same-sender
@@ -3972,6 +4024,16 @@ private class ThreadMessageItemActions(
     /** Round 53 — smart-action tap (email, address, date/time, tracking). */
     val onSmartAction: (SmartAction) -> Unit,
     /**
+     * Round 54 — the maps provider for the map preview card (Apple:
+     * tap-to-load preview; the rest: "Get directions" button). A VALUE,
+     * not a lambda: the provider is read fresh from `state` when the
+     * bundle is rebuilt, so `state.mapsProvider` joins the `remember`
+     * keys at the construction site and a provider change rebuilds the
+     * bundle (rare, user-initiated in Settings). `MapsProvider` is an
+     * enum, so it stays `@Stable`.
+     */
+    val mapsProvider: com.relay.sms.domain.settings.MapsProvider,
+    /**
      * E2E — a key-change notice tap: opens the safety-number
      * verification sheet for this thread's peer.
      */
@@ -4057,330 +4119,351 @@ private fun ThreadMessageItem(
 ) {
     // Taille du texte des messages : tout l'élément (séparateur, bulle, citation, horodatage).
     MessageTextSize {
-        // Date separator (calendar day boundary) — affiché au-dessus du 1er msg du jour.
-        daySeparatorLabel?.let { label ->
-            DateSeparator(label = label)
-        }
+        // Round 54 — the Column wrapper is load-bearing: this item emits the
+        // day separator, the E2E notices and the bubble as sibling roots, and
+        // in this reversed list those roots stack bottom-up, so without this
+        // Column the separator rendered BELOW its bubble (the "Today" pill sat
+        // under the first message of the day instead of above it). A plain
+        // Column stacks its children top-to-bottom whatever the list's
+        // direction, so the separator stays above the bubble it belongs to.
+        // Same pattern as NoteMessageItem.
+        Column(modifier = Modifier.fillMaxWidth()) {
+            // Date separator (calendar day boundary) — affiché au-dessus du 1er msg du jour.
+            daySeparatorLabel?.let { label ->
+                DateSeparator(label = label)
+            }
 
-        // E2E — the notices dated at or before this message
-        // (activation / key change), above the bubble like the day
-        // separator above them.
-        e2eNotices?.let { e2e ->
-            for (notice in e2e.notices) {
-                E2eNoticeRow(
-                    notice = notice,
-                    contactName = e2e.contactName,
-                    onVerify = actions.onE2eNoticeVerify,
-                    memberNames = e2e.memberNames,
-                )
+            // E2E — the notices dated at or before this message
+            // (activation / key change), above the bubble like the day
+            // separator above them.
+            e2eNotices?.let { e2e ->
+                for (notice in e2e.notices) {
+                    E2eNoticeRow(
+                        notice = notice,
+                        contactName = e2e.contactName,
+                        onVerify = actions.onE2eNoticeVerify,
+                        memberNames = e2e.memberNames,
+                    )
+                }
             }
-        }
 
-        // Feedback round 4 — one timestamp per same-sender run, on its LAST
-        // message: the time shows when the next message is from a different
-        // sender, or this is the last message in the thread. Waits between
-        // messages do NOT split a run — only a reply from the other side does
-        // (texting, waiting, texting again, all within a minute = one run, one
-        // timestamp, on the last message). Replaces the old 1-minute gap rule
-        // (`msg.date - prev.date > 60_000L`), which hid the time on every
-        // message sent within a minute of the previous one.
-        val showTimestamp = isLastOfSenderRun(msg, next)
-        // Feedback round 4 — delivery status, decoupled from the timestamp:
-        // it belongs on the last outgoing message of a run, so a delivered
-        // message can say "Delivered" even when its timestamp is suppressed.
-        // (Before, the status label only rendered where the timestamp did, so
-        // a burst hid every "Delivered" except on the timestamped message.)
-        val showStatus = isLastOutgoingOfRun(msg, next)
-        val burstPosition = computeBurstPosition(prev, msg, next)
-        val audio = msg.audioAttachment
-        // Feedback round 6 — per-message callbacks, remembered so the bubbles
-        // can skip when the parent recomposes. Fresh inline lambdas are new
-        // instances on every recomposition, which defeats Compose skipping one
-        // level down (the round-5 stable-callbacks fix stopped at
-        // [itemActions]). Keyed on the whole `msg` (data-class equals): a new
-        // instance with identical content keeps the lambdas, a real content
-        // change rebuilds them — so a callback reading `msg.reactionEmoji`
-        // never closes over a stale message. The calls stay unconditional (above
-        // the `when`), so every branch reuses the same instances.
-        val onTogglePlay = remember(msg, actions) {
-            {
-                // `audio` is non-null wherever this callback is invoked (the
-                // audio branch), but it is nullable at this hoisted spot —
-                // the `when` smart-cast does not reach here.
-                if (audio != null) actions.onTogglePlayback(audio)
+            // Feedback round 4 — one timestamp per same-sender run, on its LAST
+            // message: the time shows when the next message is from a different
+            // sender, or this is the last message in the thread. Waits between
+            // messages do NOT split a run — only a reply from the other side does
+            // (texting, waiting, texting again, all within a minute = one run, one
+            // timestamp, on the last message). Replaces the old 1-minute gap rule
+            // (`msg.date - prev.date > 60_000L`), which hid the time on every
+            // message sent within a minute of the previous one.
+            val showTimestamp = isLastOfSenderRun(msg, next)
+            // Feedback round 4 — delivery status, decoupled from the timestamp:
+            // it belongs on the last outgoing message of a run, so a delivered
+            // message can say "Delivered" even when its timestamp is suppressed.
+            // (Before, the status label only rendered where the timestamp did, so
+            // a burst hid every "Delivered" except on the timestamped message.)
+            val showStatus = isLastOutgoingOfRun(msg, next)
+            val burstPosition = computeBurstPosition(prev, msg, next)
+            val audio = msg.audioAttachment
+            // Feedback round 6 — per-message callbacks, remembered so the bubbles
+            // can skip when the parent recomposes. Fresh inline lambdas are new
+            // instances on every recomposition, which defeats Compose skipping one
+            // level down (the round-5 stable-callbacks fix stopped at
+            // [itemActions]). Keyed on the whole `msg` (data-class equals): a new
+            // instance with identical content keeps the lambdas, a real content
+            // change rebuilds them — so a callback reading `msg.reactionEmoji`
+            // never closes over a stale message. The calls stay unconditional (above
+            // the `when`), so every branch reuses the same instances.
+            val onTogglePlay = remember(msg, actions) {
+                {
+                    // `audio` is non-null wherever this callback is invoked (the
+                    // audio branch), but it is nullable at this hoisted spot —
+                    // the `when` smart-cast does not reach here.
+                    if (audio != null) actions.onTogglePlayback(audio)
+                }
             }
-        }
-        val onDelete = remember(msg, actions) {
-            {
-                actions.onDelete(msg)
+            val onDelete = remember(msg, actions) {
+                {
+                    actions.onDelete(msg)
+                }
             }
-        }
-        val onReply = remember(msg, actions) {
-            {
-                actions.onReply(msg)
+            val onReply = remember(msg, actions) {
+                {
+                    actions.onReply(msg)
+                }
             }
-        }
-        val onReact = remember(msg, actions) {
-            {
-                actions.onReact(msg.id)
+            val onReact = remember(msg, actions) {
+                {
+                    actions.onReact(msg.id)
+                }
             }
-        }
-        // Round 12 — quick-reaction bar on tap: recents + the send path,
-        // bundled in one parameter for [MessageBubble] (Detekt parameter
-        // limit). Round 23 — EVERY message, incoming or outgoing: the old
-        // `msg.isIncoming` gate is what made reactions vanish on the
-        // user's own messages — the "React" menu item AND the tap bar
-        // both disappeared, so it read as intermittent (it depended on
-        // which message was tapped). The local reaction is always
-        // allowed: the SMS dispatch to the recipient stays gated to
-        // incoming messages in the ViewModel (`setReaction` refuses
-        // outgoing targets, and `SendReactionUseCase` refuses them too),
-        // so reacting to your own message sets the local badge and sends
-        // nothing. Round 21 — tapping the emoji already applied removes
-        // the reaction (toggle): see [toggleReaction].
-        val quickReactions = remember(msg, actions, recentReactions) {
-            com.relay.sms.ui.components.QuickReactionConfig(
-                recentEmojis = recentReactions,
-                onSelect = { emoji ->
-                    actions.onQuickReact(msg.id, toggleReaction(msg.reactionEmoji, emoji))
-                },
-            )
-        }
-        val onForward = remember(msg, actions) {
-            {
-                actions.onForward(msg)
-            }
-        }
-        val onCopy = remember(msg, actions) {
-            {
-                actions.onCopy(msg)
-            }
-        }
-        val onTranslate = remember(msg, actions) {
-            {
-                actions.onTranslate(msg)
-            }
-        }
-        val onTapFailed = remember(msg, actions) {
-            {
-                if (msg.status == Message.Status.FAILED) actions.onTapFailed(msg)
-            }
-        }
-        // Feedback round 5 — menu toggles for this message, built once for
-        // the three bubble types below (one bundle parameter instead of
-        // two — the text bubble is at the Detekt 20-parameter limit).
-        // Round 23 — pin only: the star toggle is gone with the menu's
-        // "Star" entry.
-        val menuToggles = remember(msg, actions, isPinnedMessage) {
-            BubbleMenuToggles(
-                isPinned = isPinnedMessage,
-                onTogglePin = { actions.onTogglePin(msg) },
-                // Round 52 emoji fix — badge tap opens the reaction picker
-                // (same as the bubble menu's React entry). A badge can sit
-                // on an outgoing message too (the other side's Tapback, or
-                // your own reaction), and tapping it must never clear it:
-                // the badge carries no author. Removing your own reaction
-                // stays on the picker / quick bar toggle ([toggleReaction]).
-                onReactionBadgeTap = { actions.onReact(msg.id) },
-                // Round 53 — smart-action tap, same bundle (the text
-                // bubble is at the parameter limit). Not gated in
-                // client mode: it never writes, like the phone tap.
-                onSmartAction = actions.onSmartAction,
-            )
-        }
-        // Client mode C3 — the gated actions, one decision for the
-        // three bubble types below: `null` hides the menu item (or
-        // the quick bar). Only Delete stays gated (no delete frame);
-        // Reply, React, Forward and the pin/reaction-badge toggles
-        // are wired on a linked device. Copy, Translate, playback
-        // and phone-click are not gated — they never write.
-        val gatedOnDelete = if (isClientMode) null else onDelete
-        val gatedOnReply = onReply
-        val gatedOnReact = onReact
-        val gatedQuickReactions = quickReactions
-        val gatedOnForward = onForward
-        val gatedToggles = menuToggles
-        // v1.3.3 bug #2 — pour les pièces jointes NON-audio (image/video/file), on délègue à
-        // MediaAttachmentBubble qui ajoute le tap-to-view (ACTION_VIEW via FileProvider).
-        // v1.28.3 (audit global, X-04 — mesuré sur le S9) — TOUTES, pas la première : F16 gardait
-        // toutes les parties d'un MMS, l'écran n'en montrait qu'une.
-        // Feedback round 6 — the media filter ran on every composition,
-        // allocating a new list per bubble; remembered on the attachments
-        // (structural list equals: a re-mapped identical list keeps it).
-        val mediaAttachments = remember(msg.attachments) { msg.attachments.filter { !it.isAudio } }
-        val mediaAttachment = mediaAttachments.firstOrNull()
-        // v1.3.3 #7 — étiquette d'expéditeur uniquement sur la 1ʳᵉ bulle d'un burst (Solo ou First)
-        // pour ne pas surcharger visuellement les suites consécutives du même expéditeur.
-        // Relay — uniquement dans les groupes : en 1:1, l'expéditeur est évident et
-        // l'étiquette ne fait que du bruit. Le suffixe SIM (ci-dessous) est conservé : il ne
-        // s'applique que quand une étiquette existe, donc uniquement en groupe.
-        val baseSenderLabel: String? = if (
-            isGroup && (
-                burstPosition == BurstPosition.Solo ||
-                burstPosition == BurstPosition.First
-            )
-        ) {
-            if (msg.isOutgoing) {
-                stringResource(R.string.bubble_sender_self)
-            } else {
-                conversationDisplayName?.takeIf { it.isNotBlank() } ?: msg.address
-            }
-        } else null
-        // v1.22.0 (double SIM) — suffixe le libellé SIM au nom de l'expéditeur sur la 1ʳᵉ bulle du
-        // burst ("Marie · SIM 2"), ce qui distingue d'un coup d'œil les conversations reçues sur la
-        // puce locale vs étrangère. `simLabel` vaut déjà `null` hors multi-SIM (ou message sans
-        // `sub_id`), donc les cas mono-SIM et les messages historiques restent strictement inchangés.
-        val senderLabel: String? = when {
-            baseSenderLabel == null -> null
-            simLabel.isNullOrBlank() -> baseSenderLabel
-            else -> "$baseSenderLabel · $simLabel"
-        }
-
-        when {
-            // E2E — the undecryptable-message placeholder: a
-            // notice-style row, not a bubble — no lock, no menu,
-            // and tapping it does nothing in v1.
-            msg.decryptFailed -> {
-                E2eDecryptFailedRow()
-            }
-            // Round 48 — an incoming encrypted-media MMS: the
-            // wrapper renders the pending row while any part's
-            // key is missing, else the decrypted bubble. BEFORE
-            // the audio/media branches: the stored MIME is
-            // `application/octet-stream`, so the media branch
-            // would otherwise claim it as a generic file. INCOMING
-            // only — our own outgoing encrypted media renders
-            // from the plaintext original the sender kept.
-            msg.isIncoming && msg.type == Message.Type.MMS && msg.encrypted &&
-                msg.attachments.any {
-                    com.relay.sms.data.mms.RelayMediaFilename.isEncryptedPart(it.mimeType, it.fileName)
-                } -> {
-                EncryptedMediaBubble(
-                    message = msg,
-                    showTimestamp = showTimestamp,
-                    showStatus = showStatus,
-                    senderLabel = senderLabel,
-                    playbackProvider = playbackProvider,
-                    repliedToPreview = repliedToPreview,
-                    searchHighlight = searchHighlight,
-                    onDelete = gatedOnDelete,
-                    onReply = gatedOnReply,
-                    onReact = gatedOnReact,
-                    quickReactions = gatedQuickReactions,
-                    onForward = gatedOnForward,
-                    toggles = gatedToggles,
-                    onCopy = if (msg.body.isNotBlank()) onCopy else null,
-                    onPhoneClick = actions.onPhoneClick,
-                    onSeekPlayback = actions.onSeekPlayback,
-                    onTogglePlaybackAt = actions.onTogglePlaybackAt,
-                )
-            }
-            audio != null -> {
-                AudioMessageBubble(
-                    message = msg,
-                    audio = audio,
-                    playbackProvider = playbackProvider,
-                    onTogglePlay = onTogglePlay,
-                    onSeekTo = actions.onSeekPlayback,
-                    onDelete = gatedOnDelete,
-                    onReply = gatedOnReply,
-                    // Round 23 — "Réagir" on EVERY message: the v1.3.1
-                    // incoming-only gate is gone (it made reactions vanish
-                    // on outgoing messages — see [quickReactions] above).
-                    // The picker's "+" and the menu row both use it.
-                    onReact = gatedOnReact,
-                    // Round 23 — the menu's top row IS the quick-reaction
-                    // row (same bundle as the text bubble).
-                    quickReactions = gatedQuickReactions,
-                    onForward = gatedOnForward,
-                    // Feedback round 5 — bascule « épingler » sur les
-                    // trois types de bulle. Round 23 — pin only: the star
-                    // toggle is gone with the menu's "Star" entry.
-                    toggles = gatedToggles,
-                    repliedToPreview = repliedToPreview,
-                    showTimestamp = showTimestamp,
-                    showStatus = showStatus,
-                    senderLabel = senderLabel,
-                    // Feedback round 5 — voice messages carry no searchable text
-                    // body, so there is nothing to highlight on an audio bubble.
-                    // Client mode C5 — the bubble auto-requests its bytes
-                    // when they are missing (null in hub mode).
-                    onRequestDownload = if (isClientMode) {
-                        { onRequestDownload?.invoke(audio.id) }
-                    } else {
-                        null
+            // Round 12 — quick-reaction bar on tap: recents + the send path,
+            // bundled in one parameter for [MessageBubble] (Detekt parameter
+            // limit). Round 23 — EVERY message, incoming or outgoing: the old
+            // `msg.isIncoming` gate is what made reactions vanish on the
+            // user's own messages — the "React" menu item AND the tap bar
+            // both disappeared, so it read as intermittent (it depended on
+            // which message was tapped). The local reaction is always
+            // allowed: the SMS dispatch to the recipient stays gated to
+            // incoming messages in the ViewModel (`setReaction` refuses
+            // outgoing targets, and `SendReactionUseCase` refuses them too),
+            // so reacting to your own message sets the local badge and sends
+            // nothing. Round 21 — tapping the emoji already applied removes
+            // the reaction (toggle): see [toggleReaction]. Round 54 — only
+            // when the reaction is ours: tapping someone else's (or
+            // unknown-owner) emoji is a no-op there.
+            val quickReactions = remember(msg, actions, recentReactions) {
+                com.relay.sms.ui.components.QuickReactionConfig(
+                    recentEmojis = recentReactions,
+                    onSelect = { emoji ->
+                        actions.onQuickReact(msg.id, toggleReaction(msg.reactionEmoji, emoji, msg.reactionIsOwn))
                     },
                 )
             }
-            mediaAttachment != null -> {
-                com.relay.sms.ui.components.MediaAttachmentBubble(
-                    message = msg,
-                    attachment = mediaAttachment,
-                    autres = mediaAttachments.drop(1),
-                    showTimestamp = showTimestamp,
-                    showStatus = showStatus,
-                    onDelete = gatedOnDelete,
-                    onReply = gatedOnReply,
-                    // Round 23 — "Réagir" on EVERY message: the v1.3.1
-                    // incoming-only gate is gone (see [quickReactions]
-                    // above). The menu row's "+" uses it.
-                    onReact = gatedOnReact,
-                    // Round 23 — the menu's top row IS the quick-reaction
-                    // row: long-press opens the menu, tap still opens the
-                    // viewer. The round-22 long-press quick bar is gone,
-                    // replaced by the menu row.
-                    quickReactions = gatedQuickReactions,
-                    // v1.3.11 (F3) — copy exposed only when the bubble carries a user-typed caption.
-                    onCopy = if (msg.body.isNotBlank()) onCopy else null,
-                    onForward = gatedOnForward,
-                    // Feedback round 5 — bascule « épingler » sur les
-                    // trois types de bulle. Round 23 — pin only: the star
-                    // toggle is gone with the menu's "Star" entry.
-                    toggles = gatedToggles,
-                    onPhoneClick = actions.onPhoneClick,
-                    repliedToPreview = repliedToPreview,
-                    senderLabel = senderLabel,
-                    searchHighlight = searchHighlight,
-                    // Client mode C5 — the download states + the
-                    // tap-to-download callback (null in hub mode, so
-                    // the bubbles never ask).
-                    downloadStates = downloadStates,
-                    onRequestDownload = if (isClientMode) onRequestDownload else null,
+            val onForward = remember(msg, actions) {
+                {
+                    actions.onForward(msg)
+                }
+            }
+            val onCopy = remember(msg, actions) {
+                {
+                    actions.onCopy(msg)
+                }
+            }
+            val onTranslate = remember(msg, actions) {
+                {
+                    actions.onTranslate(msg)
+                }
+            }
+            val onTapFailed = remember(msg, actions) {
+                {
+                    if (msg.status == Message.Status.FAILED) actions.onTapFailed(msg)
+                }
+            }
+            // Feedback round 5 — menu toggles for this message, built once for
+            // the three bubble types below (one bundle parameter instead of
+            // two — the text bubble is at the Detekt 20-parameter limit).
+            // Round 23 — pin only: the star toggle is gone with the menu's
+            // "Star" entry.
+            val menuToggles = remember(msg, actions, isPinnedMessage, actions.mapsProvider) {
+                BubbleMenuToggles(
+                    isPinned = isPinnedMessage,
+                    onTogglePin = { actions.onTogglePin(msg) },
+                    // Round 52 emoji fix — badge tap opens the reaction picker
+                    // (same as the bubble menu's React entry). A badge can sit
+                    // on an outgoing message too (the other side's Tapback, or
+                    // your own reaction), and tapping it must never clear it.
+                    // Removing your own reaction stays on the picker / quick
+                    // bar toggle ([toggleReaction]) — round 54, which only
+                    // clears your own.
+                    onReactionBadgeTap = { actions.onReact(msg.id) },
+                    // Round 53 — smart-action tap, same bundle (the text
+                    // bubble is at the parameter limit). Not gated in
+                    // client mode: it never writes, like the phone tap.
+                    onSmartAction = actions.onSmartAction,
+                    // Round 54 — the maps provider for the map preview
+                    // card, same bundle, same reason. It rides the item
+                    // actions bundle from ThreadScreen (which rebuilds
+                    // when the provider changes), not a `rememberUpdatedState`
+                    // — this item is a separate composable from ThreadScreen.
+                    mapsProvider = actions.mapsProvider,
                 )
             }
-            else -> {
-                MessageBubble(
-                    message = msg,
-                    showTimestamp = showTimestamp,
-                    showStatus = showStatus,
-                    burstPosition = burstPosition,
-                    onTap = onTapFailed,
-                    onDelete = gatedOnDelete,
-                    onReply = gatedOnReply,
-                    // v1.7.1 — Translate via ACTION_PROCESS_TEXT system intent. Only wired when
-                    // the body is non-blank (nothing to translate on attachment-only messages).
-                    onTranslate = if (msg.body.isNotBlank()) onTranslate else null,
-                    // Round 23 — "Réagir" on EVERY message: the v1.3.1
-                    // incoming-only gate is gone (see [quickReactions]
-                    // above). The tap bar's "+" and the menu row's "+"
-                    // both use it.
-                    onReact = gatedOnReact,
-                    // Round 12 — quick-reaction bar on tap (round 23:
-                    // every message, not just incoming).
-                    quickReactions = gatedQuickReactions,
-                    onCopy = if (msg.body.isNotBlank()) onCopy else null,
-                    onForward = gatedOnForward,
-                    // Feedback round 5 — bascule « épingler » sur les
-                    // trois types de bulle. Round 23 — pin only: the star
-                    // toggle is gone with the menu's "Star" entry.
-                    toggles = gatedToggles,
-                    onPhoneClick = actions.onPhoneClick,
-                    repliedToPreview = repliedToPreview,
-                    senderLabel = senderLabel,
-                    customBubbleColorArgb = bubbleColorArgb,
-                    smishingReasons = smishingReasons,
-                    searchHighlight = searchHighlight,
+            // Client mode C3 — the gated actions, one decision for the
+            // three bubble types below: `null` hides the menu item (or
+            // the quick bar). Only Delete stays gated (no delete frame);
+            // Reply, React, Forward and the pin/reaction-badge toggles
+            // are wired on a linked device. Copy, Translate, playback
+            // and phone-click are not gated — they never write.
+            val gatedOnDelete = if (isClientMode) null else onDelete
+            val gatedOnReply = onReply
+            val gatedOnReact = onReact
+            val gatedQuickReactions = quickReactions
+            val gatedOnForward = onForward
+            val gatedToggles = menuToggles
+            // v1.3.3 bug #2 — pour les pièces jointes NON-audio (image/video/file), on délègue à
+            // MediaAttachmentBubble qui ajoute le tap-to-view (ACTION_VIEW via FileProvider).
+            // v1.28.3 (audit global, X-04 — mesuré sur le S9) — TOUTES, pas la première : F16 gardait
+            // toutes les parties d'un MMS, l'écran n'en montrait qu'une.
+            // Feedback round 6 — the media filter ran on every composition,
+            // allocating a new list per bubble; remembered on the attachments
+            // (structural list equals: a re-mapped identical list keeps it).
+            val mediaAttachments = remember(msg.attachments) { msg.attachments.filter { !it.isAudio } }
+            val mediaAttachment = mediaAttachments.firstOrNull()
+            // v1.3.3 #7 — étiquette d'expéditeur uniquement sur la 1ʳᵉ bulle d'un burst (Solo ou First)
+            // pour ne pas surcharger visuellement les suites consécutives du même expéditeur.
+            // Relay — uniquement dans les groupes : en 1:1, l'expéditeur est évident et
+            // l'étiquette ne fait que du bruit. Le suffixe SIM (ci-dessous) est conservé : il ne
+            // s'applique que quand une étiquette existe, donc uniquement en groupe.
+            val baseSenderLabel: String? = if (
+                isGroup && (
+                    burstPosition == BurstPosition.Solo ||
+                        burstPosition == BurstPosition.First
                 )
+            ) {
+                if (msg.isOutgoing) {
+                    stringResource(R.string.bubble_sender_self)
+                } else {
+                    conversationDisplayName?.takeIf { it.isNotBlank() } ?: msg.address
+                }
+            } else {
+                null
+            }
+            // v1.22.0 (double SIM) — suffixe le libellé SIM au nom de l'expéditeur sur la 1ʳᵉ bulle du
+            // burst ("Marie · SIM 2"), ce qui distingue d'un coup d'œil les conversations reçues sur la
+            // puce locale vs étrangère. `simLabel` vaut déjà `null` hors multi-SIM (ou message sans
+            // `sub_id`), donc les cas mono-SIM et les messages historiques restent strictement inchangés.
+            val senderLabel: String? = when {
+                baseSenderLabel == null -> null
+                simLabel.isNullOrBlank() -> baseSenderLabel
+                else -> "$baseSenderLabel · $simLabel"
+            }
+
+            when {
+                // E2E — the undecryptable-message placeholder: a
+                // notice-style row, not a bubble — no lock, no menu,
+                // and tapping it does nothing in v1.
+                msg.decryptFailed -> {
+                    E2eDecryptFailedRow()
+                }
+                // Round 48 — an incoming encrypted-media MMS: the
+                // wrapper renders the pending row while any part's
+                // key is missing, else the decrypted bubble. BEFORE
+                // the audio/media branches: the stored MIME is
+                // `application/octet-stream`, so the media branch
+                // would otherwise claim it as a generic file. INCOMING
+                // only — our own outgoing encrypted media renders
+                // from the plaintext original the sender kept.
+                msg.isIncoming && msg.type == Message.Type.MMS && msg.encrypted &&
+                    msg.attachments.any {
+                        com.relay.sms.data.mms.RelayMediaFilename.isEncryptedPart(it.mimeType, it.fileName)
+                    } -> {
+                    EncryptedMediaBubble(
+                        message = msg,
+                        showTimestamp = showTimestamp,
+                        showStatus = showStatus,
+                        senderLabel = senderLabel,
+                        playbackProvider = playbackProvider,
+                        repliedToPreview = repliedToPreview,
+                        searchHighlight = searchHighlight,
+                        onDelete = gatedOnDelete,
+                        onReply = gatedOnReply,
+                        onReact = gatedOnReact,
+                        quickReactions = gatedQuickReactions,
+                        onForward = gatedOnForward,
+                        toggles = gatedToggles,
+                        onCopy = if (msg.body.isNotBlank()) onCopy else null,
+                        onPhoneClick = actions.onPhoneClick,
+                        onSeekPlayback = actions.onSeekPlayback,
+                        onTogglePlaybackAt = actions.onTogglePlaybackAt,
+                    )
+                }
+                audio != null -> {
+                    AudioMessageBubble(
+                        message = msg,
+                        audio = audio,
+                        playbackProvider = playbackProvider,
+                        onTogglePlay = onTogglePlay,
+                        onSeekTo = actions.onSeekPlayback,
+                        onDelete = gatedOnDelete,
+                        onReply = gatedOnReply,
+                        // Round 23 — "Réagir" on EVERY message: the v1.3.1
+                        // incoming-only gate is gone (it made reactions vanish
+                        // on outgoing messages — see [quickReactions] above).
+                        // The picker's "+" and the menu row both use it.
+                        onReact = gatedOnReact,
+                        // Round 23 — the menu's top row IS the quick-reaction
+                        // row (same bundle as the text bubble).
+                        quickReactions = gatedQuickReactions,
+                        onForward = gatedOnForward,
+                        // Feedback round 5 — bascule « épingler » sur les
+                        // trois types de bulle. Round 23 — pin only: the star
+                        // toggle is gone with the menu's "Star" entry.
+                        toggles = gatedToggles,
+                        repliedToPreview = repliedToPreview,
+                        showTimestamp = showTimestamp,
+                        showStatus = showStatus,
+                        senderLabel = senderLabel,
+                        // Feedback round 5 — voice messages carry no searchable text
+                        // body, so there is nothing to highlight on an audio bubble.
+                        // Client mode C5 — the bubble auto-requests its bytes
+                        // when they are missing (null in hub mode).
+                        onRequestDownload = if (isClientMode) {
+                            { onRequestDownload?.invoke(audio.id) }
+                        } else {
+                            null
+                        },
+                    )
+                }
+                mediaAttachment != null -> {
+                    com.relay.sms.ui.components.MediaAttachmentBubble(
+                        message = msg,
+                        attachment = mediaAttachment,
+                        autres = mediaAttachments.drop(1),
+                        showTimestamp = showTimestamp,
+                        showStatus = showStatus,
+                        onDelete = gatedOnDelete,
+                        onReply = gatedOnReply,
+                        // Round 23 — "Réagir" on EVERY message: the v1.3.1
+                        // incoming-only gate is gone (see [quickReactions]
+                        // above). The menu row's "+" uses it.
+                        onReact = gatedOnReact,
+                        // Round 23 — the menu's top row IS the quick-reaction
+                        // row: long-press opens the menu, tap still opens the
+                        // viewer. The round-22 long-press quick bar is gone,
+                        // replaced by the menu row.
+                        quickReactions = gatedQuickReactions,
+                        // v1.3.11 (F3) — copy exposed only when the bubble carries a user-typed caption.
+                        onCopy = if (msg.body.isNotBlank()) onCopy else null,
+                        onForward = gatedOnForward,
+                        // Feedback round 5 — bascule « épingler » sur les
+                        // trois types de bulle. Round 23 — pin only: the star
+                        // toggle is gone with the menu's "Star" entry.
+                        toggles = gatedToggles,
+                        onPhoneClick = actions.onPhoneClick,
+                        repliedToPreview = repliedToPreview,
+                        senderLabel = senderLabel,
+                        searchHighlight = searchHighlight,
+                        // Client mode C5 — the download states + the
+                        // tap-to-download callback (null in hub mode, so
+                        // the bubbles never ask).
+                        downloadStates = downloadStates,
+                        onRequestDownload = if (isClientMode) onRequestDownload else null,
+                    )
+                }
+                else -> {
+                    MessageBubble(
+                        message = msg,
+                        showTimestamp = showTimestamp,
+                        showStatus = showStatus,
+                        burstPosition = burstPosition,
+                        onTap = onTapFailed,
+                        onDelete = gatedOnDelete,
+                        onReply = gatedOnReply,
+                        // v1.7.1 — Translate via ACTION_PROCESS_TEXT system intent. Only wired when
+                        // the body is non-blank (nothing to translate on attachment-only messages).
+                        onTranslate = if (msg.body.isNotBlank()) onTranslate else null,
+                        // Round 23 — "Réagir" on EVERY message: the v1.3.1
+                        // incoming-only gate is gone (see [quickReactions]
+                        // above). The tap bar's "+" and the menu row's "+"
+                        // both use it.
+                        onReact = gatedOnReact,
+                        // Round 12 — quick-reaction bar on tap (round 23:
+                        // every message, not just incoming).
+                        quickReactions = gatedQuickReactions,
+                        onCopy = if (msg.body.isNotBlank()) onCopy else null,
+                        onForward = gatedOnForward,
+                        // Feedback round 5 — bascule « épingler » sur les
+                        // trois types de bulle. Round 23 — pin only: the star
+                        // toggle is gone with the menu's "Star" entry.
+                        toggles = gatedToggles,
+                        onPhoneClick = actions.onPhoneClick,
+                        repliedToPreview = repliedToPreview,
+                        senderLabel = senderLabel,
+                        customBubbleColorArgb = bubbleColorArgb,
+                        smishingReasons = smishingReasons,
+                        searchHighlight = searchHighlight,
+                    )
+                }
             }
         }
     }

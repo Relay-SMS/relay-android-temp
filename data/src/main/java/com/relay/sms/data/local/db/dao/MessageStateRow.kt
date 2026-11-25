@@ -21,6 +21,8 @@ data class MessageStateRow(
     @ColumnInfo(name = "conversation_id") val conversationId: Long,
     val status: MessageStatus,
     @ColumnInfo(name = "reaction_emoji") val reactionEmoji: String?,
+    @ColumnInfo(name = "reaction_by_address") val reactionByAddress: String?,
+    @ColumnInfo(name = "reaction_is_own") val reactionIsOwn: Boolean,
     val read: Boolean,
     val starred: Boolean,
 )

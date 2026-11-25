@@ -170,6 +170,9 @@
     <string name="conversations_importing_title">Ihre Nachrichten werden importiert</string>
     <string name="conversations_importing_body">Ihre vorhandenen SMS werden gelesen — das geschieht nur einmal.</string>
     <string name="conversations_importing_count">%1$d Nachrichten importiert…</string>
+    <string name="conversations_importing_patient">Bitte haben Sie Geduld, dies kann eine Weile dauern</string>
+    <string name="conversations_importing_phase_mms">Fotos, Videos und Sprachnachrichten werden importiert…</string>
+    <string name="conversations_importing_phase_sms">Textnachrichten werden importiert…</string>
     <string name="conversations_delete_confirm_title">Diese Unterhaltung löschen?</string>
     <string name="conversations_delete_confirm_body">Alle Nachrichten dieser Unterhaltung werden endgültig von diesem Gerät entfernt. Andere Unterhaltungen sind nicht betroffen.</string>
     <!-- v1.28.9 — une conversation du coffre n'est plus supprimee si sa copie systeme resiste : elle reviendrait hors du coffre. -->
@@ -230,7 +233,7 @@
     <string name="e2e_verify_verified">Verifiziert</string>
     <string name="e2e_verify_copy">Kopieren</string>
     <string name="e2e_verify_load_failed">Die Sicherheitsnummer konnte nicht geladen werden.</string>
-    <string name="e2e_settings_explainer">Relay-zu-Relay verschlüsselt automatisch. Wenn beide Relay nutzen, sind eure 1:1-Nachrichten automatisch Ende-zu-Ende-verschlüsselt – ganz ohne Einrichtung. Nachrichten an Personen ohne Relay sowie Fotos und Dateien in Gruppen werden als normale SMS/MMS gesendet. Eine Gruppe verschlüsselt nur, wenn alle Mitglieder Relay nutzen. Verschlüsselte Nachrichten verbrauchen ein paar mehr Textsegmente als unverschlüsselte.</string>
+    <string name="e2e_settings_explainer">Relay-zu-Relay verschlüsselt automatisch. Wenn beide Relay nutzen, sind eure 1:1-Nachrichten automatisch Ende-zu-Ende-verschlüsselt – ganz ohne Einrichtung. Nachrichten an Personen ohne Relay werden als normale SMS/MMS gesendet. Eine Gruppe verschlüsselt nur, wenn alle Mitglieder Relay nutzen – dann sind auch ihre Texte, Fotos, Videos, Sprachnachrichten und Dateien verschlüsselt. Textunterschriften auf verschlüsselten Medien bleiben unverschlüsselt. Verschlüsselte Nachrichten verbrauchen ein paar mehr Textsegmente als unverschlüsselte.</string>
     <string name="e2e_settings_status_subtitle">Automatisch, wenn beide Relay nutzen</string>
     <string name="e2e_settings_fingerprint">Dein Fingerabdruck</string>
     <string name="e2e_settings_unavailable">Verschlüsselung nicht verfügbar</string>
@@ -739,6 +742,10 @@
     <string name="action_star">Markieren</string>
     <string name="action_unstar">Markierung entfernen</string>
     <string name="reaction_picker_other">Anderes Emoji</string>
+    <!-- Round 54 — the picker sheet's header line, naming who set the
+         reaction on the message. The name is the contact name when known,
+         else the number. -->
+    <string name="reaction_picker_reacted_by">%1$s von %2$s</string>
     <!-- v1.5.0 — multi-emoji picker validate button -->
     <!-- v1.6.0 — a11y reaction badge (TalkBack) -->
     <string name="reaction_badge_content_description">Reaktion %1$s</string>
@@ -806,10 +813,9 @@
     <string name="settings_maps_app_apple_hint">Apple Maps im Web – es gibt keine Apple-Maps-App für Android.</string>
     <string name="settings_maps_app_osm">OpenStreetMap</string>
     <string name="settings_maps_app_osm_hint">Eine OpenStreetMap-App, falls installiert, sonst openstreetmap.org.</string>
-    <string name="map_preview_load">Kartenvorschau laden</string>
-    <string name="map_preview_load_hint">Lädt eine Karte von OpenStreetMap.</string>
-    <string name="map_preview_unavailable">Kartenvorschau nicht verfügbar – zum Wiederholen tippen</string>
-    <string name="map_preview_attribution">© OpenStreetMap-Mitwirkende</string>
+    <string name="map_show_map">Karte anzeigen</string>
+    <string name="map_get_directions">Route anzeigen</string>
+    <string name="map_directions_unavailable">Karten konnten nicht geöffnet werden.</string>
     <string name="smart_action_no_app">Keine App kann dies öffnen</string>
 
     <string name="settings_section_security">Sicherheit &amp; Privatsphäre</string>

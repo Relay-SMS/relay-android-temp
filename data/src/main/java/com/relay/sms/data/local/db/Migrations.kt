@@ -952,6 +952,37 @@ object Migrations {
         }
     }
 
+    val MIGRATION_24_25: Migration = object : Migration(24, 25) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                "ALTER TABLE `messages` ADD COLUMN `reaction_by_address` TEXT",
+            )
+            db.execSQL(
+                "ALTER TABLE `messages` ADD COLUMN `reaction_is_own` INTEGER NOT NULL DEFAULT 0",
+            )
+        }
+    }
+
+    /**
+     * Round 54 — group-media capability (design §13.7): two
+     * columns on `e2e_peers` (`group_media_capable`,
+     * `group_media_announced`), mirroring the round-49 group
+     * columns. Strictly additive: existing peer rows project the
+     * defaults (not group-media-capable, declaration not sent —
+     * the next announce trigger re-sends the combined 0x03
+     * packet, all three bits set).
+     */
+    val MIGRATION_25_26: Migration = object : Migration(25, 26) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                "ALTER TABLE `e2e_peers` ADD COLUMN `group_media_capable` INTEGER NOT NULL DEFAULT 0",
+            )
+            db.execSQL(
+                "ALTER TABLE `e2e_peers` ADD COLUMN `group_media_announced` INTEGER NOT NULL DEFAULT 0",
+            )
+        }
+    }
+
     /** All migrations registered in [DatabaseFactory]. Append new ones here in version order. */
     val ALL: Array<Migration> = arrayOf(
         MIGRATION_1_2,
@@ -977,5 +1008,7 @@ object Migrations {
         MIGRATION_21_22,
         MIGRATION_22_23,
         MIGRATION_23_24,
+        MIGRATION_24_25,
+        MIGRATION_25_26,
     )
 }

@@ -171,6 +171,9 @@
     <string name="conversations_importing_title">Importazione dei suoi messaggi</string>
     <string name="conversations_importing_body">Lettura degli SMS già presenti — accade una sola volta.</string>
     <string name="conversations_importing_count">%1$d messaggi importati…</string>
+    <string name="conversations_importing_patient">Si prega di pazientare, potrebbe richiedere del tempo</string>
+    <string name="conversations_importing_phase_mms">Importazione di foto, video e messaggi vocali…</string>
+    <string name="conversations_importing_phase_sms">Importazione dei messaggi di testo…</string>
     <string name="conversations_delete_confirm_title">Eliminare questa conversazione?</string>
     <string name="conversations_delete_confirm_body">Tutti i messaggi di questa conversazione saranno rimossi definitivamente da questo dispositivo. Le altre conversazioni non sono toccate.</string>
     <!-- v1.28.9 — une conversation du coffre n'est plus supprimee si sa copie systeme resiste : elle reviendrait hors du coffre. -->
@@ -232,7 +235,7 @@
     <string name="e2e_verify_verified">Verificato</string>
     <string name="e2e_verify_copy">Copia</string>
     <string name="e2e_verify_load_failed">Impossibile caricare il numero di sicurezza.</string>
-    <string name="e2e_settings_explainer">Da Relay a Relay la crittografia è automatica. Quando entrambe le persone usano Relay, i messaggi 1:1 sono crittografati end-to-end automaticamente, senza configurare nulla. I messaggi a chi non ha Relay, e le foto e i file nei gruppi, vengono inviati come normali SMS/MMS. Un gruppo si crittografa solo quando tutti i suoi membri usano Relay. I messaggi crittografati usano qualche segmento di testo in più rispetto ai messaggi normali.</string>
+    <string name="e2e_settings_explainer">Da Relay a Relay la crittografia è automatica. Quando entrambe le persone usano Relay, i messaggi 1:1 sono crittografati end-to-end automaticamente, senza configurare nulla. I messaggi a chi non ha Relay vengono inviati come normali SMS/MMS. Un gruppo si crittografa solo quando tutti i suoi membri usano Relay: allora anche i suoi testi, le foto, i video, i messaggi vocali e i file sono crittografati. Le didascalie di testo sui media crittografati restano in chiaro. I messaggi crittografati usano qualche segmento di testo in più rispetto ai messaggi normali.</string>
     <string name="e2e_settings_status_subtitle">Automatico quando entrambe le persone usano Relay</string>
     <string name="e2e_settings_fingerprint">La tua impronta</string>
     <string name="e2e_settings_unavailable">Crittografia non disponibile</string>
@@ -742,6 +745,10 @@
     <string name="action_star">Aggiungi ai preferiti</string>
     <string name="action_unstar">Togli dai preferiti</string>
     <string name="reaction_picker_other">Altra emoji</string>
+    <!-- Round 54 — the picker sheet's header line, naming who set the
+         reaction on the message. The name is the contact name when known,
+         else the number. -->
+    <string name="reaction_picker_reacted_by">%1$s di %2$s</string>
     <!-- v1.5.0 — multi-emoji picker validate button -->
     <!-- v1.6.0 — a11y reaction badge (TalkBack) -->
     <string name="reaction_badge_content_description">Reazione %1$s</string>
@@ -809,10 +816,9 @@
     <string name="settings_maps_app_apple_hint">Apple Maps sul web: non esiste un\'app Apple Maps per Android.</string>
     <string name="settings_maps_app_osm">OpenStreetMap</string>
     <string name="settings_maps_app_osm_hint">Un\'app OpenStreetMap se installata, altrimenti openstreetmap.org.</string>
-    <string name="map_preview_load">Carica anteprima mappa</string>
-    <string name="map_preview_load_hint">Carica una mappa da OpenStreetMap.</string>
-    <string name="map_preview_unavailable">Anteprima mappa non disponibile: tocca per riprovare</string>
-    <string name="map_preview_attribution">© Collaboratori di OpenStreetMap</string>
+    <string name="map_show_map">Mostra mappa</string>
+    <string name="map_get_directions">Indicazioni stradali</string>
+    <string name="map_directions_unavailable">Impossibile aprire Mappe.</string>
     <string name="smart_action_no_app">Nessuna app può aprire questo elemento</string>
 
     <string name="settings_section_security">Sicurezza e privacy</string>

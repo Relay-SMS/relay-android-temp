@@ -278,6 +278,60 @@ class ConversationMirrorAdapterTest {
         assertThat(slot.captured.body).isEqualTo("hello")
     }
 
+    // Round 54 — the reaction's author rides `message_updated` with
+    // the reaction: a set carries it, a removal clears it with the
+    // emoji, and an author-only frame never arrives (the hub only
+    // sends the author when the reaction changes).
+
+    @Test fun `applyMessageUpdated stores the reaction author on a set`() = runTest {
+        val f = Fixture()
+        val existing = sampleMessageEntity().copy(
+            id = 5,
+            status = MessageStatus.SENT,
+            hubMessageId = 50,
+        )
+        coEvery { f.messageDao.findByHubMessageId(50L) } returns existing
+        val slot = slot<MessageEntity>()
+        f.adapter.applyMessageUpdated(
+            SyncProtocol.MessageUpdated(
+                messageId = "50",
+                conversationId = "7",
+                reaction = "👍",
+                reactionBy = "+33612345678",
+                reactionIsOwn = false,
+            ),
+        )
+        coVerify { f.messageDao.update(capture(slot)) }
+        assertThat(slot.captured.reactionEmoji).isEqualTo("👍")
+        assertThat(slot.captured.reactionByAddress).isEqualTo("+33612345678")
+        assertThat(slot.captured.reactionIsOwn).isFalse()
+    }
+
+    @Test fun `applyMessageUpdated clears the author on a removal`() = runTest {
+        val f = Fixture()
+        val existing = sampleMessageEntity().copy(
+            id = 5,
+            status = MessageStatus.SENT,
+            reactionEmoji = "👍",
+            reactionByAddress = "+33612345678",
+            reactionIsOwn = false,
+            hubMessageId = 50,
+        )
+        coEvery { f.messageDao.findByHubMessageId(50L) } returns existing
+        val slot = slot<MessageEntity>()
+        f.adapter.applyMessageUpdated(
+            SyncProtocol.MessageUpdated(
+                messageId = "50",
+                conversationId = "7",
+                reactionRemoved = true,
+            ),
+        )
+        coVerify { f.messageDao.update(capture(slot)) }
+        assertThat(slot.captured.reactionEmoji).isNull()
+        assertThat(slot.captured.reactionByAddress).isNull()
+        assertThat(slot.captured.reactionIsOwn).isFalse()
+    }
+
     @Test fun `applyMessageUpdated is a no-op for an unknown message`() = runTest {
         val f = Fixture()
         coEvery { f.messageDao.findByHubMessageId(50L) } returns null

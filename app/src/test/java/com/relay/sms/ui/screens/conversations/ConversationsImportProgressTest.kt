@@ -79,6 +79,53 @@ class ConversationsImportProgressTest {
     }
 
     @Test
+    fun `first run in the MMS phase surfaces the MMS phase`() {
+        runTest(dispatcher) {
+            val syncState = MutableStateFlow<TelephonySyncManager.State>(
+                TelephonySyncManager.State.Running(
+                    isFirstRun = true,
+                    importedSoFar = 0,
+                    totalMessages = 5000,
+                    phase = TelephonySyncManager.ImportPhase.MMS,
+                ),
+            )
+            val vm = viewModel(syncState, backgroundScope)
+
+            val loaded = vm.state.first { !it.isLoading }
+            advanceUntilIdle()
+
+            // Round 54 — the counter sits at 0 through the whole MMS
+            // phase (it counts SMS only), so the phase is what tells
+            // the user the import is alive.
+            assertThat(loaded.isImporting).isTrue()
+            assertThat(loaded.importedCount).isEqualTo(0)
+            assertThat(loaded.importPhase).isEqualTo(TelephonySyncManager.ImportPhase.MMS)
+        }
+    }
+
+    @Test
+    fun `first run in the SMS phase surfaces the SMS phase`() {
+        runTest(dispatcher) {
+            val syncState = MutableStateFlow<TelephonySyncManager.State>(
+                TelephonySyncManager.State.Running(
+                    isFirstRun = true,
+                    importedSoFar = 250,
+                    totalMessages = 5000,
+                    phase = TelephonySyncManager.ImportPhase.SMS,
+                ),
+            )
+            val vm = viewModel(syncState, backgroundScope)
+
+            val loaded = vm.state.first { !it.isLoading }
+            advanceUntilIdle()
+
+            assertThat(loaded.isImporting).isTrue()
+            assertThat(loaded.importedCount).isEqualTo(250)
+            assertThat(loaded.importPhase).isEqualTo(TelephonySyncManager.ImportPhase.SMS)
+        }
+    }
+
+    @Test
     fun `first run with an unknown total surfaces a null total`() {
         runTest(dispatcher) {
             val syncState = MutableStateFlow<TelephonySyncManager.State>(

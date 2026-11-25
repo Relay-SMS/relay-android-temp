@@ -351,6 +351,12 @@ object SyncProtocol {
      * read, starred). Partial — only changed fields are present. A
      * removed reaction cannot ride as a null `reaction` (nulls are
      * omitted on encode), so it has its own flag: [reactionRemoved].
+     * Round 54 — the reaction's author rides with it: [reactionBy]
+     * is the reactor's raw address (absent when the reaction is the
+     * hub user's own or its owner is unknown) and [reactionIsOwn] is
+     * true only for the hub user's own reaction. Both are nullable
+     * so "unchanged" stays omissible; a removal clears the author's
+     * fields on the client via [reactionRemoved].
      */
     @Serializable
     data class MessageUpdated(
@@ -358,6 +364,8 @@ object SyncProtocol {
         @SerialName("conversation_id") val conversationId: String,
         @SerialName("status") val status: String? = null,
         @SerialName("reaction") val reaction: String? = null,
+        @SerialName("reaction_by") val reactionBy: String? = null,
+        @SerialName("reaction_is_own") val reactionIsOwn: Boolean? = null,
         @SerialName("reaction_removed") val reactionRemoved: Boolean = false,
         @SerialName("read") val read: Boolean? = null,
         @SerialName("starred") val starred: Boolean? = null,
@@ -581,6 +589,53 @@ object SyncProtocol {
 
             /** Round 3 — `set_contact_photo`: the photo exceeds [MAX_CONTACT_PHOTO_BYTES]. */
             const val PHOTO_TOO_LARGE = "photo_too_large"
+
+            /**
+             * Desktop encryption-box update — `retry_e2e_probe`:
+             * the conversation for the address is not 1:1 (a group,
+             * or no address at all).
+             */
+            const val NOT_ONE_TO_ONE = "not_one_to_one"
+
+            /**
+             * Desktop encryption-box update — `retry_e2e_probe`:
+             * the address is not a phone number (short code,
+             * service, empty).
+             */
+            const val INVALID_ADDRESS = "invalid_address"
+
+            /**
+             * Desktop encryption-box update — `retry_e2e_probe`:
+             * the number is blocked.
+             */
+            const val BLOCKED = "blocked"
+
+            /**
+             * Desktop encryption-box update — `retry_e2e_probe`:
+             * the peer is already ENCRYPTED — there is nothing to
+             * retry.
+             */
+            const val ALREADY_ENCRYPTED = "already_encrypted"
+
+            /**
+             * Desktop encryption-box update — `retry_e2e_probe`:
+             * the probe budget for this contact is exhausted. A
+             * manual retry can never hit this (manual retries
+             * bypass the budget) — the code exists so the mapping
+             * is total, and so the desktop can name the reset
+             * (Settings → Advanced → "Reset encryption timing")
+             * if a future path ever refuses on budget.
+             */
+            const val RATE_LIMITED = "rate_limited"
+
+            /**
+             * Desktop encryption-box update — `retry_e2e_probe`:
+             * the discovery toggle is off. Like [RATE_LIMITED],
+             * unreachable from a manual retry (the toggle is
+             * lifted there too) — the code exists so the mapping
+             * is total.
+             */
+            const val DISCOVERY_OFF = "discovery_off"
         }
     }
 
@@ -605,7 +660,14 @@ object SyncProtocol {
      * the [MessageFailed] set where they apply, plus `send_failed`
      * for a reaction whose SMS didn't go out (the local reaction
      * state stays set on the phone in that case, matching the
-     * phone's own behavior).
+     * phone's own behavior). [budgetExhausted] is present (and
+     * `true`) only on a successful `retry_e2e_probe` whose probe
+     * consumed the last probe-budget slot (desktop
+     * encryption-box update): automatic checks for that contact
+     * are paused until the window elapses, and the desktop tells
+     * the user about the reset (Settings → Advanced → "Reset
+     * encryption timing"). Absent everywhere else — the phone's
+     * JSON drops nulls (`encodeDefaults = false`).
      */
     @Serializable
     data class ActionResult(
@@ -621,6 +683,9 @@ object SyncProtocol {
         // rebind their arguments. (JSON key order is irrelevant
         // to the desktop — it reads by key.)
         @SerialName("category") val category: String? = null,
+        // After `category` for the same reason: positional
+        // constructors in the client tests must keep working.
+        @SerialName("budget_exhausted") val budgetExhausted: Boolean? = null,
     )
 
     // -- Slice 4: attachment bytes (SYNC_PROTOCOL.md, Slice 4) --------
@@ -1397,15 +1462,40 @@ object SyncProtocol {
      * same manual probe as the phone's Details panel "Retry
      * encryption" (one probe now, budget + discovery-toggle gates
      * lifted, address / blocked / ENCRYPTED gates still apply).
-     * The phone answers `action_result` (the address echoed):
-     * `ok: false` `unknown_conversation` when no 1:1 conversation
-     * exists for the address, `send_failed` when the probe could
-     * not go out.
+     * [method] picks the transport (desktop encryption-box
+     * update): `"standard"` sends the probe as a data SMS (the
+     * phone's "Retry encryption"), `"alternate"` as one `RLYH:`
+     * text (the phone's "Retry another way") — absent means
+     * `"standard"` (old desktops send no method), and an unknown
+     * value is treated as `"standard"` too. The phone answers
+     * `action_result` (the address echoed): `ok: true` when the
+     * probe went out, `ok: false` with a code per refusal —
+     * `unknown_conversation` (no 1:1 conversation for the
+     * address), `not_one_to_one`, `invalid_address`, `blocked`,
+     * `already_encrypted`, `rate_limited` / `discovery_off`
+     * (unreachable from a manual retry — the budget and the
+     * toggle are lifted there — the codes exist so the mapping is
+     * total), `send_failed` when the probe could not go out. A
+     * successful answer carries `budget_exhausted: true` when
+     * the probe consumed the last probe-budget slot: automatic
+     * checks for that contact are then paused until the window
+     * elapses (the reset lives in Settings → Advanced → "Reset
+     * encryption timing"). The `message` is user-facing — the
+     * desktop shows it verbatim in its dialog.
      */
     @Serializable
     data class RetryE2eProbe(
         @SerialName("address") val address: String,
-    )
+        @SerialName("method") val method: String? = null,
+    ) {
+        companion object {
+            /** The probe travels as a data SMS (the default). */
+            const val METHOD_STANDARD = "standard"
+
+            /** The probe travels as one `RLYH:` text SMS. */
+            const val METHOD_ALTERNATE = "alternate"
+        }
+    }
 
     /**
      * What the server makes of one incoming text frame. [Unknown] keeps

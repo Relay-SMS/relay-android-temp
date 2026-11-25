@@ -10,6 +10,7 @@ package com.relay.sms.domain.usecase
 
 import com.relay.sms.core.result.AppError
 import com.relay.sms.core.result.Outcome
+import com.relay.sms.domain.e2e.E2eGroupSendGate
 import com.relay.sms.domain.e2e.E2eMediaGate
 import com.relay.sms.domain.e2e.MediaFileInput
 import com.relay.sms.domain.mms.MediaAttachmentSpec
@@ -37,17 +38,29 @@ import javax.inject.Inject
  * ~1 MB). The cap is conservative on purpose so the user always gets a usable error before
  * the MMSC rejects the upload.
  *
- * Round 48 — media encryption (1:1 only, never for groups): before
- * any mirror row exists, each non-blocked recipient goes through
- * [E2eMediaGate.prepareMediaSend], which decides (ENCRYPTED +
- * media-capable → encrypt) and, when it encrypts, sends the key
- * messages FIRST and returns the ciphertext parts. The mirror row
- * keeps the PLAINTEXT sender copy (the durable files) and carries
- * the `encrypted` flag, so the bubble shows the lock + blue. A
- * Refuse (ciphertext over the cap) fails the WHOLE send before
- * anything is mirrored or dispatched; a fallback (encryption
- * failure) dispatches the originals plain — the gate records it
- * in the error log, so the fallback is never silent.
+ * Round 48 — media encryption (1:1 only in the per-recipient
+ * path): before any mirror row exists, each non-blocked recipient
+ * goes through [E2eMediaGate.prepareMediaSend], which decides
+ * (ENCRYPTED + media-capable → encrypt) and, when it encrypts,
+ * sends the key messages FIRST and returns the ciphertext parts.
+ * The mirror row keeps the PLAINTEXT sender copy (the durable
+ * files) and carries the `encrypted` flag, so the bubble shows
+ * the lock + blue. A Refuse (ciphertext over the cap) fails the
+ * WHOLE send before anything is mirrored or dispatched; a
+ * fallback (encryption failure) dispatches the originals plain —
+ * the gate records it in the error log, so the fallback is never
+ * silent.
+ *
+ * Round 54 — group media (design §13.7): the group-MMS path
+ * ([envoiDeGroupe]) prepares through [E2eGroupSendGate.prepareGroupMediaSend]
+ * instead — one per-file key wrapped in the sender's sender key,
+ * fanned out as one identical `GROUP_MEDIA_KEY` fragment set per
+ * file, then ONE group PDU with the ciphertext parts and ONE
+ * mirror row with `encrypted = true`. The group discipline
+ * applies: a group that cannot encrypt its media FAILS visibly,
+ * never plain. The per-recipient loop NEVER consults the 1:1 gate
+ * for a multi-recipient send (the echo path): a group send must
+ * go through the group gate only, never the pairwise gate.
  */
 class SendMediaMmsUseCase @Inject constructor(
     private val defaultAppManager: DefaultSmsAppChecker,
@@ -57,6 +70,13 @@ class SendMediaMmsUseCase @Inject constructor(
     private val settings: AppSettingsSource,
     private val attachmentStore: OutgoingAttachmentStore,
     private val mediaGate: E2eMediaGate = E2eMediaGate.NoOp,
+    /**
+     * Round 54 — the encrypted-group media gate. Default
+     * [E2eGroupSendGate.NoOp] keeps the existing tests compiling
+     * untouched (every group MMS routes as before); Hilt always
+     * provides the real gate (bound in `E2eModule`).
+     */
+    private val groupGate: E2eGroupSendGate = E2eGroupSendGate.NoOp,
 ) {
     private val envoi = EnvoiParDestinataire(blockedRepo, mirror)
 
@@ -149,25 +169,42 @@ class SendMediaMmsUseCase @Inject constructor(
         // jamais par le gate : leur ligne est marquée en échec sans
         // remise, un message-clé pour eux serait perdu. Les groupes
         // ne passent jamais ici (envoiDeGroupe, plus haut).
+        //
+        // Round 54 — le gate 1:1 n'est consulté que pour un
+        // destinataire UNIQUE : un envoi multi-destinataires
+        // (chemin écho de groupe, réglage MMS de groupe
+        // désactivé) ne doit jamais passer par le gate par
+        // paire — sinon il partirait chiffré par destinataire
+        // alors que l'écho de groupe prétend le contraire. Les
+        // groupes chiffrés passent par le gate de groupe, dans
+        // envoiDeGroupe uniquement.
         val mediaInputs = durableAttachments.map { MediaFileInput(it.file, it.mimeType) }
         val prepared = mutableMapOf<String, E2eMediaGate.PrepareResult.Encrypted>()
         try {
-            for (r in recipients) {
-                if (blockedRepo.isBlocked(r.raw)) continue
-                when (
-                    val result = mediaGate.prepareMediaSend(
-                        address = r.raw,
-                        files = mediaInputs,
-                        maxTotalBytes = MAX_PAYLOAD_BYTES,
-                        date = now,
-                        subId = effectiveSubId,
-                    )
-                ) {
-                    is E2eMediaGate.PrepareResult.Encrypted -> prepared[r.raw] = result
-                    is E2eMediaGate.PrepareResult.Plain,
-                    E2eMediaGate.PrepareResult.FallbackToPlain -> Unit
-                    is E2eMediaGate.PrepareResult.Refuse ->
-                        return Outcome.Failure(AppError.Validation(result.message))
+            // Round 54 — the 1:1 gate is consulted only for a
+            // UNIQUE recipient: the loop below runs for one
+            // recipient at most, so a multi-recipient send (the
+            // group echo path, group-MMS setting OFF) never gets a
+            // pairwise-encrypted part.
+            if (recipients.size == 1) {
+                for (r in recipients) {
+                    if (blockedRepo.isBlocked(r.raw)) continue
+                    when (
+                        val result = mediaGate.prepareMediaSend(
+                            address = r.raw,
+                            files = mediaInputs,
+                            maxTotalBytes = MAX_PAYLOAD_BYTES,
+                            date = now,
+                            subId = effectiveSubId,
+                        )
+                    ) {
+                        is E2eMediaGate.PrepareResult.Encrypted -> prepared[r.raw] = result
+                        is E2eMediaGate.PrepareResult.Plain,
+                        E2eMediaGate.PrepareResult.FallbackToPlain,
+                        -> Unit
+                        is E2eMediaGate.PrepareResult.Refuse ->
+                            return Outcome.Failure(AppError.Validation(result.message))
+                    }
                 }
             }
             // v1.28.3 (F21, second passage) — le `continue` muet était ici AUSSI : le correctif
@@ -250,6 +287,13 @@ class SendMediaMmsUseCase @Inject constructor(
      * v1.28.4 — **le MMS de groupe** : les membres bloqués sortent du PDU (et sont comptés), les
      * autres reçoivent UN seul MMS, et le miroir n'a qu'UNE ligne — dans le groupe — que le radio
      * suit par son id. Tous bloqués : refus de blocage, pas panne de téléphonie.
+     *
+     * Round 54 — la préparation du chiffrement de groupe a lieu AVANT toute ligne miroir
+     * (clés d'abord, ligne ensuite) : [E2eGroupSendGate.prepareGroupMediaSend] chiffre les
+     * fichiers et envoie les `GROUP_MEDIA_KEY` avant que le PDU ne parte. Un Refuse fait
+     * échouer l'envoi ENTIER avant toute ligne — jamais de demi-envoi, jamais de clair
+     * silencieux. Chiffré : le PDU porte les parties chiffrées et la ligne miroir
+     * `encrypted = true` (cadenas + bleu) ; la ligne garde la copie PLAINTEXTE.
      */
     @Suppress("LongParameterList")
     private suspend fun envoiDeGroupe(
@@ -260,31 +304,50 @@ class SendMediaMmsUseCase @Inject constructor(
         subId: Int?,
         deliveryReports: Boolean,
         clientMessageId: String? = null,
-    ): Outcome<SendReport> = envoi.enGroupe(
-        recipients = recipients,
-        sansRemise = "no MMS dispatched",
-        // v1.28.5 — le miroir porte les CIBLES, pas la liste d'origine : cf. `EnvoiParDestinataire.enGroupe`.
-        miroir = { cibles ->
-            mirror.upsertOutgoingGroupMms(
-                addresses = cibles,
-                attachments = mirrorSpecs,
-                textBody = textBody,
-                date = System.currentTimeMillis(),
-                subId = subId,
-                clientMessageId = clientMessageId,
-            )
-        },
-        envoi = { localId, cibles ->
-            sender.sendMediaMms(
-                localMessageId = localId,
-                recipients = cibles.map { it.raw },
-                attachments = pduAttachments,
-                textBody = textBody.ifBlank { null },
-                subId = subId,
-                requestDeliveryReport = deliveryReports,
-            )
-        },
-    )
+    ): Outcome<SendReport> {
+        val prepared = groupGate.prepareGroupMediaSend(
+            memberAddresses = recipients.map { it.raw },
+            files = mirrorSpecs.map { MediaFileInput(it.file, it.mimeType) },
+            maxTotalBytes = MAX_PAYLOAD_BYTES,
+            date = System.currentTimeMillis(),
+            subId = subId,
+        )
+        if (prepared is E2eGroupSendGate.GroupMediaPrepareResult.Refuse) {
+            return Outcome.Failure(AppError.Validation(prepared.message))
+        }
+        val encrypted = prepared as? E2eGroupSendGate.GroupMediaPrepareResult.Encrypted
+        val dispatchAttachments = encrypted?.attachments ?: pduAttachments
+        val result = envoi.enGroupe(
+            recipients = recipients,
+            sansRemise = "no MMS dispatched",
+            // v1.28.5 — le miroir porte les CIBLES, pas la liste d'origine : cf. `EnvoiParDestinataire.enGroupe`.
+            miroir = { cibles ->
+                mirror.upsertOutgoingGroupMms(
+                    addresses = cibles,
+                    attachments = mirrorSpecs,
+                    textBody = textBody,
+                    date = System.currentTimeMillis(),
+                    subId = subId,
+                    clientMessageId = clientMessageId,
+                    encrypted = encrypted != null,
+                )
+            },
+            envoi = { localId, cibles ->
+                sender.sendMediaMms(
+                    localMessageId = localId,
+                    recipients = cibles.map { it.raw },
+                    attachments = dispatchAttachments,
+                    textBody = textBody.ifBlank { null },
+                    subId = subId,
+                    requestDeliveryReport = deliveryReports,
+                )
+            },
+        )
+        // Les fichiers chiffrés sont lus par le builder pendant la
+        // remise ; après, ils sont morts — on les supprime.
+        encrypted?.attachments?.forEach { runCatching { it.file.delete() } }
+        return result
+    }
 
     private fun refusPrealable(
         recipients: List<PhoneAddress>,

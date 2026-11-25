@@ -158,13 +158,14 @@ class IntegrationMmsRecu @VisibleForTesting constructor(
         val systemThreadId = systemWrite?.threadId
             ?: if (membres != null) threadResolver?.resolve(membres.map { it.raw }) ?: 0L else 0L
         val telephonyUri = systemWrite?.let { "content://mms/${it.mmsId}" }
-        // Round 48 — an encrypted-media MMS: 1:1 only (`membres ==
-        // null`) with at least one ciphertext part. The part SHAPE
-        // is the signal — the receiver does not gate on the
-        // sender's capability flag, which could be stale if a
-        // bundle was missed. Groups stay plain even with an
-        // encrypted-looking part (v1 encrypts 1:1 only).
-        val encrypted = membres == null &&
+        // Round 48 — an encrypted-media MMS: at least one
+        // ciphertext part. The part SHAPE is the signal — the
+        // receiver does not gate on the sender's capability flag,
+        // which could be stale if a bundle was missed. Round 54 —
+        // groups too: a group MMS with a `relay-media-` part is
+        // encrypted group media, flagged the same way (pending
+        // until its key lands).
+        val encrypted =
             contenu.parties.any { RelayMediaFilename.isEncryptedPart(it.mime, it.name) }
         val inscription = try {
             mirror.inscrireMmsRecu(

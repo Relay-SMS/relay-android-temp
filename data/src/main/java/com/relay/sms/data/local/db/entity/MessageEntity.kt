@@ -120,6 +120,35 @@ data class MessageEntity(
      */
     @ColumnInfo(name = "reaction_emoji") val reactionEmoji: String? = null,
     /**
+     * Round 54 — **who set the reaction** (`reaction_emoji` alone could
+     * not say): the reactor's raw address when the badge came from an
+     * incoming tapback (plain or encrypted, live fold or import —
+     * [com.relay.sms.data.repository.ConversationMirror.applyIncomingReaction]
+     * records the reaction SMS's sender), `null` for our own reactions
+     * and for rows stored before this column existed (unknown owner).
+     * The display name is resolved at render time from this address,
+     * like any other sender address — never stored here.
+     *
+     * `@Transient` for the backup, like `encrypted`: a restored row
+     * simply has an unknown owner, and the toggle treats unknown as
+     * not-mine (safe default — it can be replaced, never removed).
+     */
+    @kotlinx.serialization.Transient
+    @ColumnInfo(name = "reaction_by_address") val reactionByAddress: String? = null,
+    /**
+     * Round 54 — **the badge is ours**: `true` only when the reaction
+     * was set by this user — on this phone
+     * ([com.relay.sms.domain.repository.ConversationRepository.setReaction])
+     * or from a linked device (the hub marks a desktop `set_reaction`
+     * the same way). `false` for a peer's tapback AND for legacy rows
+     * (unknown owner reads as not-mine — see [reactionByAddress]).
+     * The picker toggle only removes when this is `true`.
+     *
+     * `@Transient` for the backup, like [reactionByAddress].
+     */
+    @kotlinx.serialization.Transient
+    @ColumnInfo(name = "reaction_is_own", defaultValue = "0") val reactionIsOwn: Boolean = false,
+    /**
      * Schema v11 (v1.28.3, F23) — numéro de la **tentative d'envoi** en cours pour ce message.
      *
      * `0` à la création, incrémenté par chaque relance explicite

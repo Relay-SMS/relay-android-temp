@@ -7,17 +7,12 @@
 
 package com.relay.sms.e2e
 
-import android.content.Context
-import com.relay.sms.core.crypto.AeadCipher
 import com.relay.sms.core.result.Outcome
 import com.relay.sms.domain.e2e.E2eMediaGate
 import com.relay.sms.domain.e2e.MediaFileInput
 import com.relay.sms.domain.mms.MmsAttachment
-import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
 import timber.log.Timber
-import java.io.File
-import java.security.MessageDigest
 import javax.inject.Inject
 import javax.inject.Singleton
 import com.relay.sms.data.local.db.entity.E2ePeerState as StoredPeerState
@@ -33,7 +28,7 @@ import com.relay.sms.data.local.db.entity.E2ePeerState as StoredPeerState
  *   also triggers a fire-and-forget probe, like the SMS send path:
  *   the key exchange starts now, so the NEXT media send can encrypt.
  * - **Encrypt:** one fresh random 32-byte AES-256-GCM key per file,
- *   via [AeadCipher] (the notes attachment envelope —
+ *   via [E2eMediaFilePreparer] (the notes attachment envelope —
  *   `[version:1][iv:12][ciphertext+tag]`, 29 bytes overhead, no new
  *   crypto). The ciphertext lands in a temp file under the app's
  *   private cache (`cacheDir/media_encrypted/`, inside the
@@ -55,6 +50,15 @@ import com.relay.sms.data.local.db.entity.E2ePeerState as StoredPeerState
  *   and records it in the error log (`e2e-media-fallback`) —
  *   the send is never dropped, and the fallback is never silent.
  *
+ * Round 54 — the capability fix (design §8.4): the `!capable`
+ * branch now re-declares our capability ([E2eMediaCapabilityManager.announceIfNeeded])
+ * before returning Plain, mirroring the probe in the `!ENCRYPTED`
+ * branch above it. The current send stays plain (never block the
+ * user on a first media send); the peer's announce-back on
+ * receipt makes the NEXT media send encrypt. This closes the
+ * bundle-sender deferral hole, where a peer's declaration could
+ * lag the text session and media went out plain with no log.
+ *
  * Temp-file ownership: the caller deletes the returned ciphertext
  * files after dispatch (the PDU builder reads the bytes eagerly,
  * so the files are dead the moment the dispatcher returns). This
@@ -67,9 +71,9 @@ class E2eMediaGateImpl @Inject constructor(
     private val peers: E2ePeerRepository,
     private val sendManager: E2eSendManager,
     private val probeManager: E2eProbeManager,
-    private val cipher: AeadCipher,
+    private val preparer: E2eMediaFilePreparer,
+    private val mediaCapability: E2eMediaCapabilityManager,
     private val failureRecorder: E2eFailureRecorder,
-    @ApplicationContext private val context: Context,
 ) : E2eMediaGate {
 
     override suspend fun prepareMediaSend(
@@ -93,17 +97,21 @@ class E2eMediaGateImpl @Inject constructor(
                 probeManager.probeForSend(address, subId)
                 E2eMediaGate.PrepareResult.Plain
             }
-            !capable -> E2eMediaGate.PrepareResult.Plain
+            !capable -> {
+                // Round 54 — the media send itself is a
+                // capability-declaration trigger (design §8.4):
+                // re-declare OUR capability now, mirroring the
+                // probe in the !ENCRYPTED branch above. The peer's
+                // announce-back on receipt sends THEIR declaration
+                // back, so the NEXT media send encrypts. The
+                // current send stays plain — never block the user
+                // on a first media send.
+                runCatching { mediaCapability.announceIfNeeded(address, subId) }
+                E2eMediaGate.PrepareResult.Plain
+            }
             else -> encryptAll(address, files, maxTotalBytes, date, subId)
         }
     }
-
-    /**
-     * One prepared file: the ciphertext temp file + its key-message
-     * JSON. The JSON is sent (all files) before the caller
-     * dispatches (all parts) — keys first, parts second.
-     */
-    private data class PreparedFile(val file: File, val keyJson: String)
 
     private suspend fun encryptAll(
         address: String,
@@ -112,14 +120,14 @@ class E2eMediaGateImpl @Inject constructor(
         date: Long,
         subId: Int?,
     ): E2eMediaGate.PrepareResult {
-        pruneStaleCiphertext()
-        val dir = File(context.cacheDir, CIPHER_DIR).apply { mkdirs() }
-        val prepared = mutableListOf<PreparedFile>()
+        preparer.pruneStaleCiphertext()
+        val dir = preparer.cipherDir()
+        val prepared = mutableListOf<PreparedMediaFile>()
         return try {
             for (input in files) {
-                when (val one = prepareOne(input, dir)) {
-                    is PrepareOneResult.Ok -> prepared += one.file
-                    is PrepareOneResult.Failed -> return fallback(prepared, one.reason)
+                when (val one = preparer.prepareOne(input, dir)) {
+                    is E2eMediaFilePreparer.PrepareOneResult.Ok -> prepared += one.file
+                    is E2eMediaFilePreparer.PrepareOneResult.Failed -> return fallback(prepared, one.reason)
                 }
             }
             // The cap runs on the CIPHERTEXT total (the envelope
@@ -127,7 +135,7 @@ class E2eMediaGateImpl @Inject constructor(
             // goes out, so a refused send leaves no orphan keys.
             val total = prepared.sumOf { it.file.length() }
             if (total > maxTotalBytes) {
-                deleteAll(prepared)
+                preparer.deleteAll(prepared)
                 return E2eMediaGate.PrepareResult.Refuse(
                     "encrypted attachments exceed the MMS size cap ($total bytes)",
                 )
@@ -150,59 +158,11 @@ class E2eMediaGateImpl @Inject constructor(
                 },
             )
         } catch (ce: CancellationException) {
-            deleteAll(prepared)
+            preparer.deleteAll(prepared)
             throw ce
         } catch (t: Throwable) {
             Timber.w(t, "E2E: unexpected media encryption failure")
             fallback(prepared, "unexpected media encryption failure")
-        }
-    }
-
-    /**
-     * One file's encryption + staging, as a value: the per-file
-     * failure points (unreadable, empty, encrypt, stage) all
-     * report a reason instead of returning early, so [encryptAll]
-     * stays under the return-count limit.
-     */
-    private sealed interface PrepareOneResult {
-        data class Ok(val file: PreparedFile) : PrepareOneResult
-        data class Failed(val reason: String) : PrepareOneResult
-    }
-
-    private fun prepareOne(input: MediaFileInput, dir: File): PrepareOneResult {
-        val plaintext = runCatching { input.file.readBytes() }.getOrNull()
-        return when {
-            plaintext == null ->
-                PrepareOneResult.Failed("could not read the attachment")
-            plaintext.isEmpty() -> PrepareOneResult.Failed("attachment is empty")
-            else -> {
-                val id = E2eMediaKeyMessage.generateFileId()
-                val key = E2eMediaKeyMessage.generateKey()
-                when (val result = cipher.encryptRaw(key, plaintext)) {
-                    is Outcome.Success -> {
-                        val outFile = File(dir, E2eMediaKeyMessage.partFileName(id))
-                        val staged = runCatching {
-                            outFile.writeBytes(result.value)
-                        }.isSuccess
-                        if (!staged) {
-                            PrepareOneResult.Failed("could not stage the encrypted file")
-                        } else {
-                            val keyJson = E2eMediaKeyMessage.encode(
-                                E2eMediaKeyMessage.MediaKey(
-                                    id = id,
-                                    key = key,
-                                    mime = input.mimeType,
-                                    sizeBytes = plaintext.size.toLong(),
-                                    sha256Hex = sha256Hex(plaintext),
-                                    fileName = input.file.name,
-                                ),
-                            )
-                            PrepareOneResult.Ok(PreparedFile(outFile, keyJson))
-                        }
-                    }
-                    is Outcome.Failure -> PrepareOneResult.Failed("encryption failed")
-                }
-            }
         }
     }
 
@@ -212,8 +172,8 @@ class E2eMediaGateImpl @Inject constructor(
      * addresses, no filenames), and tell the caller to dispatch
      * the originals plain. Never throws.
      */
-    private fun fallback(prepared: List<PreparedFile>, reason: String): E2eMediaGate.PrepareResult {
-        deleteAll(prepared)
+    private fun fallback(prepared: List<PreparedMediaFile>, reason: String): E2eMediaGate.PrepareResult {
+        preparer.deleteAll(prepared)
         failureRecorder.recordEvent(
             MEDIA_FALLBACK_TAG,
             "Encrypted media failed ($reason); sent plain instead.",
@@ -221,39 +181,8 @@ class E2eMediaGateImpl @Inject constructor(
         return E2eMediaGate.PrepareResult.FallbackToPlain
     }
 
-    private fun deleteAll(prepared: List<PreparedFile>) {
-        for (item in prepared) runCatching { item.file.delete() }
-    }
-
-    /**
-     * Best-effort prune of ciphertext temp files older than 24h —
-     * the only leak path is a process death between prepare and
-     * the caller's post-dispatch delete. Fresh files (an in-flight
-     * send's parts) are never touched.
-     */
-    private fun pruneStaleCiphertext() {
-        runCatching {
-            val dir = File(context.cacheDir, CIPHER_DIR)
-            val cutoff = System.currentTimeMillis() - STALE_CIPHER_MS
-            dir.listFiles()
-                ?.filter { it.isFile && it.lastModified() < cutoff }
-                ?.forEach { runCatching { it.delete() } }
-        }
-    }
-
-    private fun sha256Hex(bytes: ByteArray): String {
-        val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
-        return digest.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
-    }
-
     companion object {
         /** Error-log tag for plain fallbacks (round 48). */
         const val MEDIA_FALLBACK_TAG = "e2e-media-fallback"
-
-        /** Ciphertext temp files live here (inside the private cache sandbox). */
-        private const val CIPHER_DIR = "media_encrypted"
-
-        /** A ciphertext temp file older than this is a leaked one (pruned on prepare). */
-        private const val STALE_CIPHER_MS = 24 * 60 * 60 * 1000L
     }
 }

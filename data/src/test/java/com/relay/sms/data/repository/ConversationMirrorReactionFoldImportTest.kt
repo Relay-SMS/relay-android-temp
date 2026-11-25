@@ -119,7 +119,7 @@ class ConversationMirrorReactionFoldImportTest {
         coEvery { phoneIdentity.snapshot() } returns PhoneIdentity.Snapshot("US")
         coEvery { conversationDao.findByAddressesCsv(any()) } returns convEntity()
         coEvery { conversationDao.snapshotGroupConversations() } returns emptyList()
-        coEvery { messageDao.setReaction(any(), any()) } just Runs
+        coEvery { messageDao.setReactionWithAuthor(any(), any(), any(), any()) } just Runs
         // Incoming adds bump the conversation: the touch reads the row
         // back and writes it.
         coEvery { conversationDao.findById(9L) } returns convEntity()
@@ -162,7 +162,7 @@ class ConversationMirrorReactionFoldImportTest {
         stubConversation()
 
         assertThat(fold("👍 to \"$PREVIEW\"")).isTrue()
-        coVerify { messageDao.setReaction(TARGET_ID, "👍") }
+        coVerify { messageDao.setReactionWithAuthor(TARGET_ID, "👍", ADDRESS, false) }
     }
 
     @Test
@@ -170,7 +170,7 @@ class ConversationMirrorReactionFoldImportTest {
         stubConversation()
 
         assertThat(fold("👍 to “$PREVIEW”")).isTrue()
-        coVerify { messageDao.setReaction(TARGET_ID, "👍") }
+        coVerify { messageDao.setReactionWithAuthor(TARGET_ID, "👍", ADDRESS, false) }
     }
 
     @Test
@@ -178,7 +178,7 @@ class ConversationMirrorReactionFoldImportTest {
         stubConversation()
 
         assertThat(fold("Reacted 👍 to “$PREVIEW”")).isTrue()
-        coVerify { messageDao.setReaction(TARGET_ID, "👍") }
+        coVerify { messageDao.setReactionWithAuthor(TARGET_ID, "👍", ADDRESS, false) }
     }
 
     @Test
@@ -186,7 +186,7 @@ class ConversationMirrorReactionFoldImportTest {
         stubConversation()
 
         assertThat(fold("\uFE0F to \"$PREVIEW\"")).isFalse()
-        coVerify(exactly = 0) { messageDao.setReaction(any(), any()) }
+        coVerify(exactly = 0) { messageDao.setReactionWithAuthor(any(), any(), any(), any()) }
     }
 
     @Test
@@ -194,7 +194,7 @@ class ConversationMirrorReactionFoldImportTest {
         stubConversation()
 
         assertThat(fold("\uD83C\uDFFB to \"$PREVIEW\"")).isFalse()
-        coVerify(exactly = 0) { messageDao.setReaction(any(), any()) }
+        coVerify(exactly = 0) { messageDao.setReactionWithAuthor(any(), any(), any(), any()) }
     }
 
     @Test
@@ -202,7 +202,7 @@ class ConversationMirrorReactionFoldImportTest {
         stubConversation()
 
         assertThat(fold("\u200D to \"$PREVIEW\"")).isFalse()
-        coVerify(exactly = 0) { messageDao.setReaction(any(), any()) }
+        coVerify(exactly = 0) { messageDao.setReactionWithAuthor(any(), any(), any(), any()) }
     }
 
     @Test
@@ -210,7 +210,7 @@ class ConversationMirrorReactionFoldImportTest {
         stubConversation()
 
         assertThat(fold("Reacted \uFE0F to \"$PREVIEW\"")).isFalse()
-        coVerify(exactly = 0) { messageDao.setReaction(any(), any()) }
+        coVerify(exactly = 0) { messageDao.setReactionWithAuthor(any(), any(), any(), any()) }
     }
 
     @Test
@@ -218,7 +218,7 @@ class ConversationMirrorReactionFoldImportTest {
         stubConversation()
 
         assertThat(fold(googleFramed("👍", '\u200B'))).isTrue()
-        coVerify { messageDao.setReaction(TARGET_ID, "👍") }
+        coVerify { messageDao.setReactionWithAuthor(TARGET_ID, "👍", ADDRESS, false) }
     }
 
     @Test
@@ -226,7 +226,7 @@ class ConversationMirrorReactionFoldImportTest {
         stubConversation()
 
         assertThat(fold(googleFramed("\uFE0F", '\u200B'))).isFalse()
-        coVerify(exactly = 0) { messageDao.setReaction(any(), any()) }
+        coVerify(exactly = 0) { messageDao.setReactionWithAuthor(any(), any(), any(), any()) }
     }
 
     @Test
@@ -234,7 +234,7 @@ class ConversationMirrorReactionFoldImportTest {
         stubConversation()
 
         assertThat(fold(googleFramed("👍", '\u200C'), targetReaction = "👍")).isTrue()
-        coVerify { messageDao.setReaction(TARGET_ID, null) }
+        coVerify { messageDao.setReactionWithAuthor(TARGET_ID, null, null, false) }
     }
 
     @Test
@@ -245,7 +245,7 @@ class ConversationMirrorReactionFoldImportTest {
         // The fold still reports applied (the target matched) — only the
         // clear is skipped.
         assertThat(fold("Removed a heart from \"$PREVIEW\"", targetReaction = "👍")).isTrue()
-        coVerify(exactly = 0) { messageDao.setReaction(TARGET_ID, null) }
+        coVerify(exactly = 0) { messageDao.setReactionWithAuthor(TARGET_ID, null, null, false) }
     }
 
     @Test
@@ -253,7 +253,7 @@ class ConversationMirrorReactionFoldImportTest {
         stubConversation()
 
         assertThat(fold("👍 to ‘$PREVIEW’")).isFalse()
-        coVerify(exactly = 0) { messageDao.setReaction(any(), any()) }
+        coVerify(exactly = 0) { messageDao.setReactionWithAuthor(any(), any(), any(), any()) }
     }
 
     @Test
@@ -261,7 +261,7 @@ class ConversationMirrorReactionFoldImportTest {
         stubConversation()
 
         assertThat(fold("👍 to „$PREVIEW“")).isFalse()
-        coVerify(exactly = 0) { messageDao.setReaction(any(), any()) }
+        coVerify(exactly = 0) { messageDao.setReactionWithAuthor(any(), any(), any(), any()) }
     }
 
     @Test
@@ -271,7 +271,7 @@ class ConversationMirrorReactionFoldImportTest {
         // EmojiOnly is never folded on import: its 5-minute window is
         // anchored at "now", so an old bare-emoji row would mis-attach.
         assertThat(fold("👍")).isFalse()
-        coVerify(exactly = 0) { messageDao.setReaction(any(), any()) }
+        coVerify(exactly = 0) { messageDao.setReactionWithAuthor(any(), any(), any(), any()) }
     }
 
     @Test
@@ -280,8 +280,8 @@ class ConversationMirrorReactionFoldImportTest {
 
         assertThat(fold("👍 to \"$PREVIEW\"")).isTrue()
         assertThat(fold("\uFE0F to \"$PREVIEW\"")).isFalse()
-        coVerify(exactly = 1) { messageDao.setReaction(TARGET_ID, "👍") }
-        coVerify(exactly = 0) { messageDao.setReaction(TARGET_ID, "\uFE0F") }
+        coVerify(exactly = 1) { messageDao.setReactionWithAuthor(TARGET_ID, "👍", ADDRESS, false) }
+        coVerify(exactly = 0) { messageDao.setReactionWithAuthor(TARGET_ID, "\uFE0F", ADDRESS, false) }
     }
 
     @Test
@@ -289,7 +289,7 @@ class ConversationMirrorReactionFoldImportTest {
         stubConversation()
 
         assertThat(fold("  👍 to \"$PREVIEW\"  \n")).isTrue()
-        coVerify { messageDao.setReaction(TARGET_ID, "👍") }
+        coVerify { messageDao.setReactionWithAuthor(TARGET_ID, "👍", ADDRESS, false) }
     }
 
     @Test
@@ -301,7 +301,7 @@ class ConversationMirrorReactionFoldImportTest {
         // alone. The decoder strips format chars from the token, so
         // the fold stores a clean 👍.
         assertThat(fold("\uFEFF👍 to \"$PREVIEW\"")).isTrue()
-        coVerify { messageDao.setReaction(TARGET_ID, "👍") }
+        coVerify { messageDao.setReactionWithAuthor(TARGET_ID, "👍", ADDRESS, false) }
     }
 
     @Test
@@ -310,7 +310,7 @@ class ConversationMirrorReactionFoldImportTest {
 
         assertThat(fold("\u200B👍 to \"$PREVIEW\"")).isTrue()
         assertThat(fold("\u200C👍 to \"$PREVIEW\"")).isTrue()
-        coVerify(exactly = 2) { messageDao.setReaction(TARGET_ID, "👍") }
+        coVerify(exactly = 2) { messageDao.setReactionWithAuthor(TARGET_ID, "👍", ADDRESS, false) }
     }
 
     @Test
@@ -318,7 +318,7 @@ class ConversationMirrorReactionFoldImportTest {
         stubConversation()
 
         assertThat(fold("👍 to \"\"")).isFalse()
-        coVerify(exactly = 0) { messageDao.setReaction(any(), any()) }
+        coVerify(exactly = 0) { messageDao.setReactionWithAuthor(any(), any(), any(), any()) }
     }
 
     private companion object {

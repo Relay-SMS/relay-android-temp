@@ -38,6 +38,21 @@ data class Message(
      */
     val reactionEmoji: String? = null,
     /**
+     * Round 54 — who set [reactionEmoji]: the reactor's raw address
+     * for a peer's tapback, `null` for our own reaction and for rows
+     * stored before the author columns existed (unknown owner). The
+     * UI resolves the display name from it, like any sender address.
+     */
+    val reactionByAddress: String? = null,
+    /**
+     * Round 54 — `true` only when the reaction is ours (set on this
+     * phone or from a linked device). `false` for a peer's reaction
+     * AND for unknown-ownership rows — the picker toggle only
+     * removes when this is `true`, so an unknown badge can be
+     * replaced but never removed by tapping it.
+     */
+    val reactionIsOwn: Boolean = false,
+    /**
      * Slice 3 — clé d'idempotence d'un envoi fait depuis un appareil lié (UUID généré par
      * l'appareil pour cet envoi). `null` pour tout le reste. Une seule ligne par envoi la
      * porte — celle que l'appareil affiche.

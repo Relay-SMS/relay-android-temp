@@ -37,11 +37,16 @@ import java.util.Base64
  * after the header are NOT an Olm message but a sender-key AEAD
  * envelope (`[group id: 16][key id: 8][AEAD blob]`, see
  * [E2eGroupWireFormat]). The group payload types (`0x05` /
- * `0x06`) only ever travel with the GROUP message type, and the
+ * `0x06` / `0x08`) only ever travel with the GROUP message type, and the
  * 1:1 payload types (`0x01`–`0x04`, `0x07`) only with PRE_KEY /
  * NORMAL — [parsePayload] enforces the pairing, so a group
  * envelope can never reach the Olm decryptor and a 1:1 payload
  * can never reach the group decryptor.
+ *
+ * Round 54 — group media (design §13.7): payload type `0x08`
+ * GROUP_MEDIA_KEY carries one file's media key JSON, wrapped in
+ * the sender's sender key like a group text. Assigned in this
+ * round; it was only "reserved" in the design doc before.
  *
  * Pure Kotlin, no Android APIs — fully unit-testable on the JVM.
  */
@@ -70,7 +75,7 @@ object E2eWireFormat {
     /**
      * Round 49 — a sender-key AEAD envelope (encrypted groups),
      * not an Olm message. Only valid with the GROUP_TEXT /
-     * GROUP_REACTION payload types.
+     * GROUP_REACTION / GROUP_MEDIA_KEY (round 54) payload types.
      */
     private const val MSG_TYPE_GROUP: Byte = 0x03
     private val BASE64_CHUNK_REGEX: Regex = Regex("[A-Za-z0-9+/=]+")
@@ -135,6 +140,20 @@ object E2eWireFormat {
          * per member per day.
          */
         GROUP_KEY_REQUEST(0x07),
+
+        /**
+         * Round 54 — a group media key: one file's [E2eMediaKeyMessage]
+         * JSON, encrypted with the sender's sender key for the group
+         * (msg type GROUP — the bytes are a sender-key AEAD envelope,
+         * not an Olm message). The receiver decodes the JSON and
+         * stores it in the same media-key store as a 1:1 key. Only
+         * ever sent to a group whose every member declared
+         * group-media capability: an old build throws on the unknown
+         * type and turns it into a placeholder + re-probe, so the
+         * group-media gate ([E2eGroupSessionManager]) is what keeps
+         * that from happening.
+         */
+        GROUP_MEDIA_KEY(0x08),
     }
 
     /** One parsed ciphertext fragment. */
@@ -241,7 +260,8 @@ object E2eWireFormat {
      * Decode reassembled payload bytes into the Olm message + content kind.
      *
      * Round 49 — the message type and the payload type must AGREE:
-     * GROUP travels only with GROUP_TEXT / GROUP_REACTION, and
+     * GROUP travels only with GROUP_TEXT / GROUP_REACTION /
+     * GROUP_MEDIA_KEY (round 54), and
      * PRE_KEY / NORMAL only with the 1:1 payload types. A crossed
      * pairing is rejected here, so a group envelope can never
      * reach the Olm decryptor (and a 1:1 payload never the group
@@ -279,7 +299,8 @@ object E2eWireFormat {
      */
     fun isValidPairing(type: OlmMessageType, payloadType: PayloadType): Boolean {
         val groupPayload = payloadType == PayloadType.GROUP_TEXT ||
-            payloadType == PayloadType.GROUP_REACTION
+            payloadType == PayloadType.GROUP_REACTION ||
+            payloadType == PayloadType.GROUP_MEDIA_KEY
         return if (type == OlmMessageType.GROUP) groupPayload else !groupPayload
     }
 

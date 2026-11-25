@@ -27,9 +27,11 @@ import java.io.File
 /**
  * Round 48 — the encrypted-media receive path: the writer
  * preserves ONLY the relay-media filename (the key lookup), and
- * `integrer` flags the message encrypted only for a 1:1 MMS
- * carrying a ciphertext part (the part SHAPE is the signal —
- * groups stay plain, plain MMS is untouched).
+ * `integrer` flags the message encrypted for an MMS carrying a
+ * ciphertext part (the part SHAPE is the signal — plain MMS is
+ * untouched). Round 54 — a group MMS carrying one flags
+ * encrypted too, once the group media key has arrived; until
+ * then the part waits pending (the resolver holds it).
  */
 class IntegrationMmsRecuMediaTest {
 
@@ -151,7 +153,7 @@ class IntegrationMmsRecuMediaTest {
     }
 
     @Test
-    fun `a group MMS with a relay-media part stays plain`() = runTest {
+    fun `a group MMS with a relay-media part reaches the mirror encrypted`() = runTest {
         preparerInscription()
         val membres = listOf(PhoneAddress.of(ALICE), PhoneAddress.of(BOB), PhoneAddress.of(CAROL))
 
@@ -165,7 +167,7 @@ class IntegrationMmsRecuMediaTest {
 
         assertThat(resultat).isEqualTo(IntegrationMmsRecu.Resultat.Ecrit(MESSAGE_ID))
         coVerify {
-            mirror.inscrireMmsRecu(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), false)
+            mirror.inscrireMmsRecu(any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), true)
         }
     }
 

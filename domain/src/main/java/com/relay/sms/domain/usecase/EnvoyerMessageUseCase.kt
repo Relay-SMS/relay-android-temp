@@ -53,6 +53,16 @@ import javax.inject.Inject
  * this pre-check only routes (and refuses an over-cap body before
  * any row is written). Media in groups stays plain — the gate is
  * never consulted when there are attachments.
+ *
+ * Round 54 (group media, design §13.7) — the gate IS consulted
+ * for group media too ([E2eGroupSendGate.decideGroupMediaSend]):
+ * an encrypted group media send rides the group-MMS path (the
+ * encryption itself happens in [SendMediaMmsUseCase], which
+ * re-takes the decision with the files), and a plain group media
+ * send probes its members in the background, like a plain group
+ * text. With the group-MMS setting OFF, group media stays plain
+ * on the per-recipient echo path — the 1:1 gate is explicitly
+ * skipped there, so no member gets a pairwise-encrypted part.
  */
 class EnvoyerMessageUseCase @Inject constructor(
     private val sendSms: SendSmsUseCase,
@@ -122,9 +132,9 @@ class EnvoyerMessageUseCase @Inject constructor(
         }
         val groupe = recipients.size > 1
         // Round 49 — the encrypted-group decision for a group TEXT
-        // send (media in groups stays plain, design §13.7 — the
-        // gate is never consulted when there are attachments). An
-        // encrypted group routes to the SMS fan-out regardless of
+        // send (the text gate is never consulted when there are
+        // attachments — group media has its own decision below).
+        // An encrypted group routes to the SMS fan-out regardless of
         // the group-MMS setting; a plain group probes its members
         // in the background (sending to the thread is intent to
         // talk — the exchange that flips the group starts here).
@@ -138,7 +148,22 @@ class EnvoyerMessageUseCase @Inject constructor(
         } else {
             null
         }
+        // Round 54 — the encrypted-group decision for a group
+        // MEDIA send: consulted so a plain group probes its
+        // members in the background (same intent-to-talk rule as
+        // text) and so the routing tests can pin that the gate is
+        // consulted. The encryption itself is re-decided with the
+        // files in [SendMediaMmsUseCase] — this pre-check only
+        // probes, it never encrypts or refuses here.
+        val groupMediaDecision = if (groupe && attachments.isNotEmpty()) {
+            groupGate.decideGroupMediaSend(recipients.map { it.raw })
+        } else {
+            null
+        }
         if (groupDecision == E2eGroupSendGate.Decision.Plain) {
+            recipients.forEach { e2eGate.probeForSend(it.raw, subId) }
+        }
+        if (groupMediaDecision == E2eGroupSendGate.Decision.Plain) {
             recipients.forEach { e2eGate.probeForSend(it.raw, subId) }
         }
         val mmsDeGroupe = groupe &&

@@ -78,6 +78,8 @@ class ConversationMirrorOwnReactionFoldTest {
         body: String,
         date: Long = 1000L,
         reactionEmoji: String? = null,
+        reactionByAddress: String? = null,
+        reactionIsOwn: Boolean = false,
     ) = MessageEntity(
         id = id,
         conversationId = 9L,
@@ -90,13 +92,15 @@ class ConversationMirrorOwnReactionFoldTest {
         dateSent = null,
         status = MessageStatus.RECEIVED,
         reactionEmoji = reactionEmoji,
+        reactionByAddress = reactionByAddress,
+        reactionIsOwn = reactionIsOwn,
     )
 
     private fun stubConversation() {
         coEvery { phoneIdentity.snapshot() } returns PhoneIdentity.Snapshot("US")
         coEvery { conversationDao.findByAddressesCsv(any()) } returns convEntity()
         coEvery { conversationDao.snapshotGroupConversations() } returns emptyList()
-        coEvery { messageDao.setReaction(any(), any()) } just Runs
+        coEvery { messageDao.setReactionWithAuthor(any(), any(), any(), any()) } just Runs
     }
 
     @Test
@@ -116,7 +120,8 @@ class ConversationMirrorOwnReactionFoldTest {
 
         assertThat(applied).isNotNull()
         assertThat(applied!!.targetMessageId).isEqualTo(42L)
-        coVerify { messageDao.setReaction(42L, "👍") }
+        // Round 54 — an own tapback is recorded as ours.
+        coVerify { messageDao.setReactionWithAuthor(42L, "👍", null, true) }
     }
 
     @Test
@@ -142,7 +147,7 @@ class ConversationMirrorOwnReactionFoldTest {
 
         assertThat(applied).isNotNull()
         assertThat(applied!!.targetMessageId).isEqualTo(43L)
-        coVerify { messageDao.setReaction(43L, "👍") }
+        coVerify { messageDao.setReactionWithAuthor(43L, "👍", null, true) }
     }
 
     @Test
@@ -153,6 +158,7 @@ class ConversationMirrorOwnReactionFoldTest {
             direction = MessageDirection.OUTGOING,
             body = "salut",
             reactionEmoji = "👍",
+            reactionIsOwn = true,
         )
         coEvery { messageDao.findRecentForConversation(9L, any()) } returns listOf(ours)
 
@@ -168,7 +174,7 @@ class ConversationMirrorOwnReactionFoldTest {
 
         assertThat(applied).isNotNull()
         assertThat(applied!!.targetMessageId).isEqualTo(42L)
-        coVerify { messageDao.setReaction(42L, null) }
+        coVerify { messageDao.setReactionWithAuthor(42L, null, null, false) }
     }
 
     @Test
@@ -192,7 +198,8 @@ class ConversationMirrorOwnReactionFoldTest {
 
         assertThat(applied).isNotNull()
         assertThat(applied!!.targetMessageId).isEqualTo(42L)
-        coVerify { messageDao.setReaction(42L, "👍") }
+        // Round 54 — an incoming tapback records its sender.
+        coVerify { messageDao.setReactionWithAuthor(42L, "👍", "+33600000001", false) }
     }
 
     @Test
@@ -210,6 +217,151 @@ class ConversationMirrorOwnReactionFoldTest {
         )
 
         assertThat(applied).isNull()
-        coVerify(exactly = 0) { messageDao.setReaction(any(), any()) }
+        coVerify(exactly = 0) { messageDao.setReactionWithAuthor(any(), any(), any(), any()) }
+    }
+
+    // Round 54 — removal ownership: a removal only clears a badge
+    // its sender could have set. The fold still reports the target
+    // (so the removal text is suppressed as a bubble) even when the
+    // badge itself is left alone.
+
+    @Test
+    fun `incoming removal clears their own badge`() = runTest {
+        stubConversation()
+        val theirs = messageEntity(
+            id = 42L,
+            direction = MessageDirection.OUTGOING,
+            body = "salut",
+            reactionEmoji = "👍",
+            reactionByAddress = "+33600000001",
+            reactionIsOwn = false,
+        )
+        coEvery { messageDao.findRecentForConversation(9L, any()) } returns listOf(theirs)
+
+        val applied = mirror().applyIncomingReaction(
+            address = "+33600000001",
+            emoji = "👍",
+            bodyPrefix = "salut",
+            kind = Kind.Tapback,
+            wasTruncated = false,
+            isRemoval = true,
+            isOwnReaction = false,
+        )
+
+        assertThat(applied).isNotNull()
+        assertThat(applied!!.targetMessageId).isEqualTo(42L)
+        coVerify { messageDao.setReactionWithAuthor(42L, null, null, false) }
+    }
+
+    @Test
+    fun `incoming removal does not clear our own badge`() = runTest {
+        stubConversation()
+        val ours = messageEntity(
+            id = 42L,
+            direction = MessageDirection.OUTGOING,
+            body = "salut",
+            reactionEmoji = "👍",
+            reactionIsOwn = true,
+        )
+        coEvery { messageDao.findRecentForConversation(9L, any()) } returns listOf(ours)
+
+        val applied = mirror().applyIncomingReaction(
+            address = "+33600000001",
+            emoji = "👍",
+            bodyPrefix = "salut",
+            kind = Kind.Tapback,
+            wasTruncated = false,
+            isRemoval = true,
+            isOwnReaction = false,
+        )
+
+        // Target found (removal text suppressed) but badge untouched.
+        assertThat(applied).isNotNull()
+        assertThat(applied!!.targetMessageId).isEqualTo(42L)
+        coVerify(exactly = 0) { messageDao.setReactionWithAuthor(any(), any(), any(), any()) }
+    }
+
+    @Test
+    fun `own removal does not clear their badge`() = runTest {
+        stubConversation()
+        val theirs = messageEntity(
+            id = 42L,
+            direction = MessageDirection.OUTGOING,
+            body = "salut",
+            reactionEmoji = "👍",
+            reactionByAddress = "+33600000001",
+            reactionIsOwn = false,
+        )
+        coEvery { messageDao.findRecentForConversation(9L, any()) } returns listOf(theirs)
+
+        val applied = mirror().applyIncomingReaction(
+            address = "+33600000001",
+            emoji = "👍",
+            bodyPrefix = "salut",
+            kind = Kind.Tapback,
+            wasTruncated = false,
+            isRemoval = true,
+            isOwnReaction = true,
+        )
+
+        assertThat(applied).isNotNull()
+        assertThat(applied!!.targetMessageId).isEqualTo(42L)
+        coVerify(exactly = 0) { messageDao.setReactionWithAuthor(any(), any(), any(), any()) }
+    }
+
+    @Test
+    fun `incoming removal clears an unknown-ownership badge`() = runTest {
+        stubConversation()
+        // Legacy row: stored before the author columns existed, so
+        // neither address nor own flag is set — the old
+        // clear-on-emoji-match behaviour is kept for those rows.
+        val legacy = messageEntity(
+            id = 42L,
+            direction = MessageDirection.OUTGOING,
+            body = "salut",
+            reactionEmoji = "👍",
+        )
+        coEvery { messageDao.findRecentForConversation(9L, any()) } returns listOf(legacy)
+
+        val applied = mirror().applyIncomingReaction(
+            address = "+33600000001",
+            emoji = "👍",
+            bodyPrefix = "salut",
+            kind = Kind.Tapback,
+            wasTruncated = false,
+            isRemoval = true,
+            isOwnReaction = false,
+        )
+
+        assertThat(applied).isNotNull()
+        assertThat(applied!!.targetMessageId).isEqualTo(42L)
+        coVerify { messageDao.setReactionWithAuthor(42L, null, null, false) }
+    }
+
+    @Test
+    fun `incoming removal of a different emoji leaves the badge alone`() = runTest {
+        stubConversation()
+        val theirs = messageEntity(
+            id = 42L,
+            direction = MessageDirection.OUTGOING,
+            body = "salut",
+            reactionEmoji = "❤️",
+            reactionByAddress = "+33600000001",
+            reactionIsOwn = false,
+        )
+        coEvery { messageDao.findRecentForConversation(9L, any()) } returns listOf(theirs)
+
+        val applied = mirror().applyIncomingReaction(
+            address = "+33600000001",
+            emoji = "👍",
+            bodyPrefix = "salut",
+            kind = Kind.Tapback,
+            wasTruncated = false,
+            isRemoval = true,
+            isOwnReaction = false,
+        )
+
+        assertThat(applied).isNotNull()
+        coVerify(exactly = 0) { messageDao.setReactionWithAuthor(any(), any(), any(), any()) }
     }
 }

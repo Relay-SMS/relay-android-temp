@@ -101,6 +101,7 @@ import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.relay.sms.R
 import com.relay.sms.core.ext.canonicalPhone
+import com.relay.sms.data.sync.TelephonySyncManager
 import com.relay.sms.domain.categories.MessageCategory
 import com.relay.sms.domain.model.Conversation
 import com.relay.sms.domain.model.Note
@@ -849,6 +850,7 @@ fun ConversationsScreen(
                 state.isImporting -> ImportingPlaceholder(
                     count = state.importedCount,
                     total = state.importTotalCount,
+                    phase = state.importPhase,
                 )
                 state.isLoading -> Unit
                 state.sansAucunResultat(messageHits) -> {
@@ -2478,7 +2480,11 @@ private fun ConversationActionsSheet(
 }
 
 @Composable
-private fun ImportingPlaceholder(count: Int, total: Int?) {
+private fun ImportingPlaceholder(
+    count: Int,
+    total: Int?,
+    phase: TelephonySyncManager.ImportPhase,
+) {
     val cs = MaterialTheme.colorScheme
     Column(
         modifier = Modifier.fillMaxSize().padding(32.dp),
@@ -2495,10 +2501,21 @@ private fun ImportingPlaceholder(count: Int, total: Int?) {
             textAlign = TextAlign.Center,
             modifier = Modifier.fillMaxWidth(),
         )
+        // Round 54 — the first run can sit at "0 of N" for a long
+        // while (the MMS phase reports no count), so say plainly
+        // that it takes a while instead of letting it look stuck.
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            text = stringResource(R.string.conversations_importing_patient),
+            style = RelayText.Preview,
+            color = cs.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.fillMaxWidth(),
+        )
         // The count line + progress bar live in [ImportProgressContent]:
         // this screen sits at the Detekt complexity ceiling, so no
         // branching lives here.
-        ImportProgressContent(imported = count, total = total)
+        ImportProgressContent(imported = count, total = total, phase = phase)
     }
 }
 

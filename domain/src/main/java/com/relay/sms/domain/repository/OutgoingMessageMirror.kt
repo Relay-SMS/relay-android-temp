@@ -156,6 +156,9 @@ interface OutgoingMessageMirror {
      * v1.28.4 — **la ligne d'un MMS de groupe** : UNE ligne, dans la conversation du groupe, que
      * le radio suivra par son id (accusé, échec). Contrairement à [upsertGroupEcho], ce n'est pas
      * une copie : c'est le vrai envoi. Un texte seul est permis — c'est un MMS de texte.
+     * @param encrypted round 54 — marque la ligne chiffrée (la bulle affiche le cadenas + le
+     * bleu). La ligne garde la copie PLAINTEXTE de l'expéditeur, exactement comme une ligne
+     * SMS chiffrée garde son corps en clair.
      */
     suspend fun upsertOutgoingGroupMms(
         addresses: List<PhoneAddress>,
@@ -164,6 +167,7 @@ interface OutgoingMessageMirror {
         date: Long,
         subId: Int? = null,
         clientMessageId: String? = null,
+        encrypted: Boolean = false,
     ): Long
 
     /**

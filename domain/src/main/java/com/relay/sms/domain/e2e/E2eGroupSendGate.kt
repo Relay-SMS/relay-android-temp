@@ -9,6 +9,7 @@ package com.relay.sms.domain.e2e
 
 import com.relay.sms.core.result.AppError
 import com.relay.sms.core.result.Outcome
+import com.relay.sms.domain.mms.MmsAttachment
 
 /**
  * Domain port for the encrypted-group send path (round 49, design
@@ -106,7 +107,8 @@ interface E2eGroupSendGate {
      * [E2ePayloadType.REACTION] for a group reaction (the
      * formatted tapback body, encrypted — the receiver folds it
      * onto its target in the group thread). MEDIA_KEY is refused:
-     * encrypted media in groups is a follow-up (design §13.7).
+     * group media keys go through [encryptGroupMediaKey], not
+     * this method (round 54, design §13.7).
      */
     suspend fun encryptGroupMessage(
         memberAddresses: List<String>,
@@ -129,6 +131,69 @@ interface E2eGroupSendGate {
      * dispatched.
      */
     suspend fun recordGroupActivated(memberAddresses: List<String>, now: Long)
+
+    /**
+     * The outcome of preparing one group MMS for sending (round
+     * 54, design §13.7). Deliberately NOT the 1:1
+     * [E2eMediaGate.PrepareResult]: there is NO
+     * `FallbackToPlain` here — an encrypted group that cannot
+     * encrypt its media FAILS visibly instead of going out plain
+     * (the group discipline, not the 1:1 discipline).
+     */
+    sealed interface GroupMediaPrepareResult {
+        /**
+         * Encrypted: dispatch [attachments] (ciphertext parts,
+         * `application/octet-stream`, `relay-media-<id>.bin`)
+         * and mirror the row encrypted. The caller deletes the
+         * temp files after dispatch — same ownership as the 1:1
+         * gate. Every `GROUP_MEDIA_KEY` fragment set was already
+         * accepted by the radio before this returns (keys first,
+         * parts second).
+         */
+        data class Encrypted(val attachments: List<MmsAttachment>) : GroupMediaPrepareResult
+
+        /** Plain by decision (the group is not fully encrypted for media): dispatch the originals. */
+        data object Plain : GroupMediaPrepareResult
+
+        /**
+         * Refuse the send: the ciphertext would exceed the cap,
+         * the group media key could not be sent, or our own
+         * number is unknown. Fail loudly with [message] — never
+         * dispatch plain instead.
+         */
+        data class Refuse(val message: String) : GroupMediaPrepareResult
+    }
+
+    /**
+     * Whether this group MMS to [memberAddresses] (the thread's
+     * addresses, excluding ourselves) goes out encrypted: every
+     * member ENCRYPTED + group-capable + group-media-capable.
+     * Pure decision — no sending, no key distribution. A
+     * state-read failure fails OPEN to [Decision.Plain], like
+     * [decideGroupSend].
+     */
+    suspend fun decideGroupMediaSend(memberAddresses: List<String>): Decision
+
+    /**
+     * Prepares one group MMS for sending: decides via
+     * [decideGroupMediaSend], encrypts each file with a fresh
+     * per-file key ([E2eMediaFilePreparer] — the same pipeline as
+     * 1:1), cap-checks the ciphertext total against
+     * [maxTotalBytes], then wraps each key JSON in our sender key
+     * and fans the SAME `GROUP_MEDIA_KEY` fragment set out to
+     * every member — BEFORE returning the ciphertext parts. Any
+     * failure inside returns [GroupMediaPrepareResult.Refuse]:
+     * the caller fails the send visibly, never plain. [date] is
+     * the message timestamp, written on the key-message fragment
+     * rows in the system sent box.
+     */
+    suspend fun prepareGroupMediaSend(
+        memberAddresses: List<String>,
+        files: List<MediaFileInput>,
+        maxTotalBytes: Long,
+        date: Long,
+        subId: Int?,
+    ): GroupMediaPrepareResult
 
     companion object {
         /**
@@ -157,6 +222,18 @@ interface E2eGroupSendGate {
                 memberAddresses: List<String>,
                 now: Long,
             ) = Unit
+
+            override suspend fun decideGroupMediaSend(
+                memberAddresses: List<String>,
+            ): Decision = Decision.Plain
+
+            override suspend fun prepareGroupMediaSend(
+                memberAddresses: List<String>,
+                files: List<MediaFileInput>,
+                maxTotalBytes: Long,
+                date: Long,
+                subId: Int?,
+            ): GroupMediaPrepareResult = GroupMediaPrepareResult.Plain
         }
     }
 }

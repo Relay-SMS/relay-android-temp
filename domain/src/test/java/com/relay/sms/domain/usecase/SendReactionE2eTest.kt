@@ -8,14 +8,18 @@
 package com.relay.sms.domain.usecase
 
 import com.google.common.truth.Truth.assertThat
+import com.relay.sms.core.result.AppError
 import com.relay.sms.core.result.Outcome
+import com.relay.sms.domain.e2e.E2eGroupSendGate
 import com.relay.sms.domain.e2e.E2ePayloadType
 import com.relay.sms.domain.e2e.E2eSendGate
+import com.relay.sms.domain.e2e.MediaFileInput
 import com.relay.sms.domain.model.Conversation
 import com.relay.sms.domain.model.Message
 import com.relay.sms.domain.model.PhoneAddress
 import com.relay.sms.domain.model.ReactionFormat
 import com.relay.sms.domain.sender.SenderNameProvider
+import com.relay.sms.domain.sender.SmsSender
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.Test
 
@@ -33,12 +37,16 @@ import org.junit.jupiter.api.Test
  *
  * - 1:1 (incoming or own message) + ENCRYPTED peer → the gate
  *   dispatches with REACTION; the plain sender never sees it.
- * - Group, multi-target, and a reaction to one member's message in a
- *   group (F2 — one target, but a group conversation) → plain,
- *   byte-identical to the pre-encryption behavior; the gate is never
- *   consulted.
+ * - Group + group gate Encrypted → ONE GROUP_REACTION fragment set
+ *   fanned out to every member; the plain sender never sees it and
+ *   no group echo is written. Group + group gate Plain (or NoOp) →
+ *   plain, byte-identical to the pre-encryption behavior (F2 single
+ *   target for an incoming message, all members for an own message);
+ *   the 1:1 gate is never consulted.
+ * - Group + group gate RefuseOverCap → failure, nothing sent, no
+ *   echo, no plain fallback.
  * - 1:1 + non-encrypted peer → plain + a background probe.
- * - Removals encrypt like adds when the peer is encrypted.
+ * - Removals encrypt like adds when the peer / group is encrypted.
  * - Client mode keeps its early return; the gate is untouched.
  */
 class SendReactionE2eTest {
@@ -126,19 +134,77 @@ class SendReactionE2eTest {
         scheduledAt = null,
     )
 
+    /** A recording [E2eGroupSendGate]: the test chooses the decision. */
+    private class FakeGroupGate(
+        var decision: E2eGroupSendGate.Decision = E2eGroupSendGate.Decision.Plain,
+        var encryptError: AppError? = null,
+    ) : E2eGroupSendGate {
+        val decidedFor = mutableListOf<List<String>>()
+        val encryptedFor = mutableListOf<List<String>>()
+        val encryptedBodies = mutableListOf<String>()
+        val encryptedPayloadTypes = mutableListOf<E2ePayloadType>()
+        val activatedFor = mutableListOf<List<String>>()
+
+        override suspend fun decideGroupSend(
+            memberAddresses: List<String>,
+            body: String,
+        ): E2eGroupSendGate.Decision {
+            decidedFor += memberAddresses
+            return decision
+        }
+
+        override suspend fun encryptGroupMessage(
+            memberAddresses: List<String>,
+            body: String,
+            subId: Int?,
+            date: Long,
+            payloadType: E2ePayloadType,
+        ): Outcome<E2eGroupSendGate.EncryptedGroupMessage> {
+            encryptedFor += memberAddresses
+            encryptedBodies += body
+            encryptedPayloadTypes += payloadType
+            val error = encryptError
+            return if (error != null) {
+                Outcome.Failure(error)
+            } else {
+                Outcome.Success(E2eGroupSendGate.EncryptedGroupMessage(FRAGMENTS, GROUP_ID))
+            }
+        }
+
+        override suspend fun recordGroupActivated(memberAddresses: List<String>, now: Long) {
+            activatedFor += memberAddresses
+        }
+
+        override suspend fun decideGroupMediaSend(
+            memberAddresses: List<String>,
+        ): E2eGroupSendGate.Decision = E2eGroupSendGate.Decision.Plain
+
+        override suspend fun prepareGroupMediaSend(
+            memberAddresses: List<String>,
+            files: List<MediaFileInput>,
+            maxTotalBytes: Long,
+            date: Long,
+            subId: Int?,
+        ): E2eGroupSendGate.GroupMediaPrepareResult =
+            E2eGroupSendGate.GroupMediaPrepareResult.Plain
+    }
+
     private fun useCase(
         messagesById: Map<Long, Message>,
         conversationsById: Map<Long, Conversation> = emptyMap(),
         gate: E2eSendGate,
+        groupGate: E2eGroupSendGate = E2eGroupSendGate.NoOp,
+        sender: SmsSender = sms,
         clientMode: Boolean = false,
     ): SendReactionUseCase {
         val reglages = FakeSettings()
         return SendReactionUseCase(
             sendSms = sendSmsUseCase(
                 settings = reglages,
-                sender = sms,
+                sender = sender,
                 mirror = miroir,
                 e2eGate = gate,
+                groupGate = groupGate,
             ),
             conversationRepo = FakeConversationRepository(
                 conversationsById = conversationsById,
@@ -146,6 +212,7 @@ class SendReactionE2eTest {
             ),
             senderNameProvider = senderName,
             clientActions = FakeClientActionGateway(clientMode = clientMode),
+            groupGate = groupGate,
         )
     }
 
@@ -193,8 +260,65 @@ class SendReactionE2eTest {
     }
 
     @Test
-    fun `group reaction stays plain even when the gate would encrypt`() = runBlocking {
+    fun `group reaction to an encrypted group fans one fragment set to every member`() =
+        runBlocking {
+            val gate = RecordingGate(decision = E2eSendGate.Decision.Encrypted)
+            val groupGate = FakeGroupGate(decision = E2eGroupSendGate.Decision.Encrypted)
+            val fragments = RecordingFragmentSender()
+            val own = message(
+                id = 13L,
+                conversationId = 10L,
+                address = "$ALICE;$BOB;$CAROL",
+                outgoing = true,
+            )
+            val conv = conversation(10L, ALICE, BOB, CAROL)
+            val res = useCase(
+                messagesById = mapOf(13L to own),
+                conversationsById = mapOf(10L to conv),
+                gate = gate,
+                groupGate = groupGate,
+                sender = fragments,
+            ).invoke(13L, "👍", ReactionFormat.IOS_TAPBACK)
+
+            assertThat(res).isInstanceOf(Outcome.Success::class.java)
+            // The group gate decides on ALL members — TWICE, by
+            // design: once in SendReactionUseCase (to pick the
+            // encrypted branch) and once in SendSmsUseCase's
+            // groupSendPlan (which re-decides with the final body
+            // before encrypting). The 1:1 gate is never consulted
+            // and no plain send goes out.
+            assertThat(groupGate.decidedFor).containsExactly(
+                listOf(ALICE, BOB, CAROL),
+                listOf(ALICE, BOB, CAROL),
+            )
+            assertThat(groupGate.encryptedFor).isEqualTo(listOf(listOf(ALICE, BOB, CAROL)))
+            assertThat(groupGate.encryptedBodies).isEqualTo(listOf("Liked \"salut\""))
+            assertThat(groupGate.encryptedPayloadTypes)
+                .isEqualTo(listOf(E2ePayloadType.REACTION))
+            assertThat(groupGate.activatedFor).isEqualTo(listOf(listOf(ALICE, BOB, CAROL)))
+            assertThat(gate.decidedFor).isEmpty()
+            assertThat(gate.encryptedCalls).isEmpty()
+            assertThat(gate.probed).isEmpty()
+            // ONE fragment set (2 fragments), fanned out identically
+            // to every member — 6 dispatches, no plain send.
+            assertThat(fragments.fragments).hasSize(6)
+            assertThat(fragments.fragments.map { it.destination })
+                .containsExactly(ALICE, ALICE, BOB, BOB, CAROL, CAROL)
+            assertThat(fragments.fragments.map { it.text }.toSet()).isEqualTo(FRAGMENTS.toSet())
+            assertThat(fragments.plainSends).isEmpty()
+            // Per-member mirror rows carry the lock; no group echo —
+            // a reaction is not a bubble.
+            assertThat(miroir.lignes.map { it.adresse })
+                .containsExactly(ALICE, BOB, CAROL)
+            assertThat(miroir.lignes.all { it.encrypted }).isTrue()
+            assertThat(miroir.echos).isEmpty()
+        }
+
+    @Test
+    fun `group reaction to a plain group stays plain and probes the members`() = runBlocking {
         val gate = RecordingGate(decision = E2eSendGate.Decision.Encrypted)
+        val groupGate = FakeGroupGate(decision = E2eGroupSendGate.Decision.Plain)
+        val fragments = RecordingFragmentSender()
         val own = message(
             id = 13L,
             conversationId = 10L,
@@ -206,25 +330,75 @@ class SendReactionE2eTest {
             messagesById = mapOf(13L to own),
             conversationsById = mapOf(10L to conv),
             gate = gate,
+            groupGate = groupGate,
+            sender = fragments,
         ).invoke(13L, "👍", ReactionFormat.IOS_TAPBACK)
 
         assertThat(res).isInstanceOf(Outcome.Success::class.java)
-        // Multi-target: the gate is never consulted, the plain send
-        // goes out to all members byte-identically.
+        // The group gate was consulted on all members and said Plain:
+        // the reaction goes out plain to all members, byte-identical
+        // to the pre-encryption behavior. The plain reaction path
+        // (TEXT payload) bypasses groupSendPlan entirely, so no
+        // member is probed here — the probe happens on the next
+        // group TEXT send, exactly as before group reactions.
+        assertThat(groupGate.decidedFor).isEqualTo(listOf(listOf(ALICE, BOB, CAROL)))
+        assertThat(groupGate.encryptedFor).isEmpty()
         assertThat(gate.decidedFor).isEmpty()
         assertThat(gate.encryptedCalls).isEmpty()
         assertThat(gate.probed).isEmpty()
-        assertThat(sms.sentTexts).hasSize(3)
-        assertThat(sms.sentTexts).isEqualTo(List(3) { "Liked \"salut\"" })
+        assertThat(fragments.plainSends).isEqualTo(List(3) { "Liked \"salut\"" })
+        assertThat(fragments.fragments).isEmpty()
         assertThat(miroir.lignes.all { !it.encrypted }).isTrue()
+        assertThat(miroir.echos).isEmpty()
+    }
+
+    @Test
+    fun `reaction to one member of an encrypted group encrypts to every member`() = runBlocking {
+        val gate = RecordingGate(decision = E2eSendGate.Decision.Encrypted)
+        val groupGate = FakeGroupGate(decision = E2eGroupSendGate.Decision.Encrypted)
+        val fragments = RecordingFragmentSender()
+        // F2 — reacting to Alice's message in a group notifies Alice
+        // alone when plain, but the encrypted attempt must reach
+        // every member (a member who never exchanged keys would
+        // otherwise leave the rest stale).
+        val incoming = message(id = 14L, conversationId = 10L, address = ALICE, outgoing = false)
+        val conv = conversation(10L, ALICE, BOB, CAROL)
+        val res = useCase(
+            messagesById = mapOf(14L to incoming),
+            conversationsById = mapOf(10L to conv),
+            gate = gate,
+            groupGate = groupGate,
+            sender = fragments,
+        ).invoke(14L, "👍", ReactionFormat.IOS_TAPBACK)
+
+        assertThat(res).isInstanceOf(Outcome.Success::class.java)
+        // Decided twice (reaction branch + groupSendPlan — see the
+        // own-message test); the encrypt itself runs once, to every
+        // member.
+        assertThat(groupGate.decidedFor).containsExactly(
+            listOf(ALICE, BOB, CAROL),
+            listOf(ALICE, BOB, CAROL),
+        )
+        assertThat(groupGate.encryptedFor).isEqualTo(listOf(listOf(ALICE, BOB, CAROL)))
+        assertThat(groupGate.encryptedBodies).isEqualTo(listOf("Liked \"salut\""))
+        assertThat(groupGate.encryptedPayloadTypes)
+            .isEqualTo(listOf(E2ePayloadType.REACTION))
+        assertThat(gate.decidedFor).isEmpty()
+        assertThat(gate.encryptedCalls).isEmpty()
+        assertThat(fragments.fragments).hasSize(6)
+        assertThat(fragments.plainSends).isEmpty()
+        assertThat(miroir.lignes.map { it.adresse })
+            .containsExactly(ALICE, BOB, CAROL)
+        assertThat(miroir.lignes.all { it.encrypted }).isTrue()
+        assertThat(miroir.echos).isEmpty()
     }
 
     @Test
     fun `reaction to one member of a group stays plain despite a single target`() = runBlocking {
         val gate = RecordingGate(decision = E2eSendGate.Decision.Encrypted)
         // F2 — reacting to Alice's message in a group notifies Alice
-        // alone: ONE target, but the conversation is a group, so the
-        // reaction must not encrypt.
+        // alone: ONE target, but the conversation is a group, and the
+        // group gate (NoOp here) leaves it Plain.
         val incoming = message(id = 14L, conversationId = 10L, address = ALICE, outgoing = false)
         val conv = conversation(10L, ALICE, BOB, CAROL)
         val res = useCase(
@@ -239,6 +413,70 @@ class SendReactionE2eTest {
         assertThat(sms.sentTexts).isEqualTo(listOf("Liked \"salut\""))
         assertThat(miroir.lignes.map { it.adresse }).isEqualTo(listOf(ALICE))
         assertThat(miroir.lignes.single().encrypted).isFalse()
+    }
+
+    @Test
+    fun `group reaction refused over cap fails with no send and no echo`() = runBlocking {
+        val gate = RecordingGate(decision = E2eSendGate.Decision.Encrypted)
+        val groupGate = FakeGroupGate(decision = E2eGroupSendGate.Decision.RefuseOverCap)
+        val own = message(
+            id = 13L,
+            conversationId = 10L,
+            address = "$ALICE;$BOB;$CAROL",
+            outgoing = true,
+        )
+        val conv = conversation(10L, ALICE, BOB, CAROL)
+        val res = useCase(
+            messagesById = mapOf(13L to own),
+            conversationsById = mapOf(10L to conv),
+            gate = gate,
+            groupGate = groupGate,
+        ).invoke(13L, "👍", ReactionFormat.IOS_TAPBACK)
+
+        // Visible failure, never a plain send and never a FAILED echo
+        // carrying the tapback text.
+        assertThat(res).isInstanceOf(Outcome.Failure::class.java)
+        assertThat((res as Outcome.Failure).error)
+            .isInstanceOf(AppError.Validation::class.java)
+        assertThat(groupGate.decidedFor).isEqualTo(listOf(listOf(ALICE, BOB, CAROL)))
+        assertThat(groupGate.encryptedFor).isEmpty()
+        assertThat(gate.decidedFor).isEmpty()
+        assertThat(gate.encryptedCalls).isEmpty()
+        assertThat(gate.probed).isEmpty()
+        assertThat(sms.sentTexts).isEmpty()
+        assertThat(miroir.lignes).isEmpty()
+        assertThat(miroir.echos).isEmpty()
+    }
+
+    @Test
+    fun `group removal in an encrypted group encrypts the removal form`() = runBlocking {
+        val gate = RecordingGate(decision = E2eSendGate.Decision.Encrypted)
+        val groupGate = FakeGroupGate(decision = E2eGroupSendGate.Decision.Encrypted)
+        val fragments = RecordingFragmentSender()
+        val own = message(
+            id = 13L,
+            conversationId = 10L,
+            address = "$ALICE;$BOB;$CAROL",
+            outgoing = true,
+        )
+        val conv = conversation(10L, ALICE, BOB, CAROL)
+        val res = useCase(
+            messagesById = mapOf(13L to own),
+            conversationsById = mapOf(10L to conv),
+            gate = gate,
+            groupGate = groupGate,
+            sender = fragments,
+        ).invoke(13L, "👍", ReactionFormat.IOS_TAPBACK, isRemoval = true)
+
+        assertThat(res).isInstanceOf(Outcome.Success::class.java)
+        assertThat(groupGate.encryptedBodies)
+            .isEqualTo(listOf("Removed a like from \"salut\""))
+        assertThat(groupGate.encryptedPayloadTypes)
+            .isEqualTo(listOf(E2ePayloadType.REACTION))
+        assertThat(fragments.fragments).hasSize(6)
+        assertThat(fragments.plainSends).isEmpty()
+        assertThat(miroir.lignes.all { it.encrypted }).isTrue()
+        assertThat(miroir.echos).isEmpty()
     }
 
     @Test
@@ -339,5 +577,7 @@ class SendReactionE2eTest {
         const val ALICE = "+33600000001"
         const val BOB = "+33600000002"
         const val CAROL = "+33600000003"
+        val FRAGMENTS = listOf("FRAG-1", "FRAG-2")
+        const val GROUP_ID = "0123456789abcdef0123456789abcdef"
     }
 }

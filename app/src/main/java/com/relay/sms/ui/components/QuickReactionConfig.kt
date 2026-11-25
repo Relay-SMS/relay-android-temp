@@ -33,6 +33,30 @@ data class QuickReactionConfig(
  * single emoji from it swaps the reaction instead, as before. Shared by
  * the tap bar and the long-press menu's reaction row, which both feed
  * the same [QuickReactionConfig.onSelect].
+ *
+ * Round 54 — ownership-aware: the toggle only removes the USER'S OWN
+ * reaction. [isOwnReaction] is `true` only when the stored reaction
+ * was set by this user (see `Message.reactionIsOwn`); a peer's
+ * reaction — or one of unknown ownership, stored before the author
+ * columns existed — is never removed by tapping it:
+ *   - same emoji + own → `null` (remove, as before);
+ *   - same emoji + not own → the stored reaction, unchanged (no-op —
+ *     the caller must not re-send it; `ConversationRepository`
+ *     refuses the removal too, as the choke point);
+ *   - different emoji → the tapped emoji (replace — the single-emoji
+ *     slot holds only the latest reactor, so reacting differently
+ *     always replaces whoever reacted before).
+ * Callers MUST pass the message's real ownership: the old two-arg
+ * shape defaulted to "removable", which is exactly the bug this
+ * fixes, so there is no default here.
  */
-fun toggleReaction(currentReaction: String?, tappedEmoji: String): String? =
-    if (tappedEmoji == currentReaction) null else tappedEmoji
+fun toggleReaction(
+    currentReaction: String?,
+    tappedEmoji: String,
+    isOwnReaction: Boolean,
+): String? =
+    if (tappedEmoji == currentReaction) {
+        if (isOwnReaction) null else currentReaction
+    } else {
+        tappedEmoji
+    }

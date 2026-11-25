@@ -59,8 +59,13 @@ class EnvoyerMessageGroupE2eTest {
     /** A recording [E2eGroupSendGate]: the test chooses the decision. */
     private class FakeGroupGate(
         var decision: E2eGroupSendGate.Decision = E2eGroupSendGate.Decision.Plain,
+        var mediaDecision: E2eGroupSendGate.Decision = E2eGroupSendGate.Decision.Plain,
+        var mediaPrepared: E2eGroupSendGate.GroupMediaPrepareResult =
+            E2eGroupSendGate.GroupMediaPrepareResult.Plain,
     ) : E2eGroupSendGate {
         val decidedFor = mutableListOf<List<String>>()
+        val mediaDecidedFor = mutableListOf<List<String>>()
+        val mediaPreparedFor = mutableListOf<List<String>>()
 
         override suspend fun decideGroupSend(
             memberAddresses: List<String>,
@@ -80,6 +85,24 @@ class EnvoyerMessageGroupE2eTest {
             Outcome.Success(E2eGroupSendGate.EncryptedGroupMessage(FRAGMENTS, GROUP_ID))
 
         override suspend fun recordGroupActivated(memberAddresses: List<String>, now: Long) = Unit
+
+        override suspend fun decideGroupMediaSend(
+            memberAddresses: List<String>,
+        ): E2eGroupSendGate.Decision {
+            mediaDecidedFor += memberAddresses
+            return mediaDecision
+        }
+
+        override suspend fun prepareGroupMediaSend(
+            memberAddresses: List<String>,
+            files: List<com.relay.sms.domain.e2e.MediaFileInput>,
+            maxTotalBytes: Long,
+            date: Long,
+            subId: Int?,
+        ): E2eGroupSendGate.GroupMediaPrepareResult {
+            mediaPreparedFor += memberAddresses
+            return mediaPrepared
+        }
     }
 
     /** Records the background probes (the 1:1 gate's only role on the group path). */
@@ -130,6 +153,7 @@ class EnvoyerMessageGroupE2eTest {
                 sender = mms,
                 settings = reglages,
                 attachmentStore = PassthroughAttachmentStore(),
+                groupGate = gate,
             ),
             settings = reglages,
             // Group-send own-number fix — number on file, so the
@@ -241,17 +265,43 @@ class EnvoyerMessageGroupE2eTest {
     }
 
     @Test
-    fun `group media never consults the group gate`(@TempDir dir: File) = runBlocking {
-        val gate = FakeGroupGate(decision = E2eGroupSendGate.Decision.Encrypted)
+    fun `group media consults the group media gate and routes to one group MMS`(@TempDir dir: File) = runBlocking {
+        val gate = FakeGroupGate(decision = E2eGroupSendGate.Decision.Plain)
 
         val res = routeur(groupMms = true, gate = gate, probeGate = ProbingGate())
             .invoke(groupe, "salut", attachments = photo(dir))
 
         assertThat(res).isInstanceOf(Outcome.Success::class.java)
-        // Group media stays plain (design §13.7) — the gate is
-        // never consulted when there are attachments.
+        // Round 54 (design §13.7) — the router consults the group
+        // MEDIA gate for group media (the old "never consults"
+        // behaviour is gone): the text decision stays untouched,
+        // the media decision is taken, and the send rides one
+        // group MMS.
         assertThat(gate.decidedFor).isEmpty()
+        assertThat(gate.mediaDecidedFor).containsExactly(listOf(ALICE, BOB))
         assertThat(mms.appels).isEqualTo(1)
         assertThat(sms.sentTexts).isEmpty()
+    }
+
+    @Test
+    fun `plain group media probes the members in the background`(@TempDir dir: File) = runBlocking {
+        val gate = FakeGroupGate(mediaDecision = E2eGroupSendGate.Decision.Plain)
+        val probeGate = ProbingGate()
+
+        val res = routeur(groupMms = true, gate = gate, probeGate = probeGate)
+            .invoke(groupe, "salut", attachments = photo(dir))
+
+        assertThat(res).isInstanceOf(Outcome.Success::class.java)
+        assertThat(mms.appels).isEqualTo(1)
+        // Only the MEDIA decision probes here: with attachments the
+        // TEXT gate is never consulted (see EnvoyerMessageUseCase —
+        // the text decision is skipped when there are attachments),
+        // so the members are probed exactly once. probeForSend is
+        // one-shot downstream, so the duplicate would have been
+        // harmless — but there is no duplicate to absorb.
+        // Ends with a void assertion (.inOrder()): JUnit silently
+        // skips a @Test whose runBlocking body returns a value.
+        assertThat(probeGate.probed)
+            .containsExactly(ALICE, BOB).inOrder()
     }
 }

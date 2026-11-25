@@ -203,6 +203,7 @@ class E2eReceiveManager @Inject constructor(
                     // `when` stays exhaustive.
                     E2eWireFormat.PayloadType.GROUP_TEXT,
                     E2eWireFormat.PayloadType.GROUP_REACTION,
+                    E2eWireFormat.PayloadType.GROUP_MEDIA_KEY,
                     -> Unit
                 }
                 if (result.newSession) {
@@ -365,6 +366,15 @@ class E2eReceiveManager @Inject constructor(
      * decrypt with the sender's sender key, then insert or fold.
      * An undecryptable message becomes a placeholder + a key
      * request (see [handleUndecryptableGroupMessage]).
+     *
+     * Round 54 — a group media key (GROUP_MEDIA_KEY): decrypt
+     * with the sender's sender key, then decode the plaintext as
+     * a [E2eMediaKeyMessage] and store it — nothing else (no
+     * message, no notification, no notice, exactly like the 1:1
+     * MEDIA_KEY branch). An undecryptable media key sends a key
+     * request but inserts NO placeholder: there is no message to
+     * show, the MMS part itself carries the visible state
+     * (pending → failed).
      */
     private suspend fun handleGroupMessage(
         address: String,
@@ -377,7 +387,16 @@ class E2eReceiveManager @Inject constructor(
     ) {
         val decrypted = groupSessions.decryptGroupMessage(address, payload.message.bytes)
         if (decrypted == null) {
-            handleUndecryptableGroupMessage(address, payload, base64, telephonyUri, dateMs, subId, now)
+            handleUndecryptableGroupMessage(
+                address,
+                payload,
+                base64,
+                telephonyUri,
+                dateMs,
+                subId,
+                now,
+                withPlaceholder = payload.payloadType != E2eWireFormat.PayloadType.GROUP_MEDIA_KEY,
+            )
             return
         }
         when (payload.payloadType) {
@@ -403,6 +422,16 @@ class E2eReceiveManager @Inject constructor(
                     now = now,
                     group = decrypted,
                 )
+            // Round 54 — a group media key: store the key, nothing
+            // else. The ciphertext MMS part — which may already
+            // have arrived (pending, waiting for this key) or may
+            // arrive later (the key waits) — decrypts against it
+            // on view. A malformed key JSON is dropped silently,
+            // as in [handleDecryptedMediaKey]: a malformed key is
+            // not a message, and the part stays pending until its
+            // key arrives (or the 24-hour prune fails it).
+            E2eWireFormat.PayloadType.GROUP_MEDIA_KEY ->
+                handleDecryptedGroupMediaKey(decrypted.plaintext, now)
             // 1:1 payloads never arrive with a GROUP message
             // type — wire pairing (E2eWireFormat.isValidPairing)
             // rejects them at parse time. Listed so the `when`
@@ -414,6 +443,16 @@ class E2eReceiveManager @Inject constructor(
             E2eWireFormat.PayloadType.GROUP_KEY_REQUEST,
             -> Unit
         }
+    }
+
+    /** Round 54 — a decrypted group media key: decode + store, nothing else. */
+    private suspend fun handleDecryptedGroupMediaKey(plaintext: String, now: Long) {
+        val key = E2eMediaKeyMessage.decode(plaintext)
+        if (key == null) {
+            Timber.i("E2E: malformed group media key message dropped")
+            return
+        }
+        mediaKeys.store(key, now)
     }
 
     /**
@@ -467,6 +506,14 @@ class E2eReceiveManager @Inject constructor(
      * placeholder, but the kept-envelope retry does not cover
      * groups in v1 (design §13.9): this message stays a
      * placeholder even after the key arrives.
+     *
+     * Round 54 — [withPlaceholder] is false for an undecryptable
+     * GROUP_MEDIA_KEY: a key message has no bubble to show, and
+     * the MMS part itself carries the visible state — so the key
+     * request goes out but nothing is inserted and nothing is
+     * notified. The v1 limitation stands: the request recovers
+     * the sender key for FUTURE messages only; this file stays
+     * pending until the 24-hour prune fails it (design §13.7).
      */
     private suspend fun handleUndecryptableGroupMessage(
         address: String,
@@ -476,6 +523,7 @@ class E2eReceiveManager @Inject constructor(
         dateMs: Long,
         subId: Int?,
         now: Long,
+        withPlaceholder: Boolean = true,
     ) {
         val envelope = E2eGroupWireFormat.parseEnvelope(payload.message.bytes)
         if (envelope == null) {
@@ -483,7 +531,7 @@ class E2eReceiveManager @Inject constructor(
             return
         }
         val conversationId = groupSessions.conversationIdForGroup(envelope.groupIdHex, members = null)
-        if (conversationId != null) {
+        if (withPlaceholder && conversationId != null) {
             val msgId = mirror.upsertIncomingGroupSms(
                 conversationId = conversationId,
                 senderAddress = address,

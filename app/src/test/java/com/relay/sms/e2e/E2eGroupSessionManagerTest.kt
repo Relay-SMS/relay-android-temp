@@ -21,6 +21,7 @@ import com.relay.sms.data.repository.ConversationMirror
 import com.relay.sms.data.sms.SimSelfNumber
 import com.relay.sms.domain.e2e.E2eGroupSendGate
 import com.relay.sms.domain.e2e.E2ePayloadType
+import com.relay.sms.domain.e2e.MediaFileInput
 import com.relay.sms.domain.sender.SentSmsRecorder
 import com.relay.sms.domain.sender.SmsSender
 import com.relay.sms.domain.settings.AppSettings
@@ -31,6 +32,161 @@ import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Test
+
+private const val ALICE = "6108423232"
+private const val BOB = "6108423233"
+private const val CAROL = "6108423234"
+private const val DANA = "6108423235"
+private const val CONV_ID = 11L
+private const val NOW = 1_800_000_000_000L
+private const val SUB_ID = 2
+
+private class RecordingRecorder : SentSmsRecorder {
+    val rows = mutableListOf<String>()
+
+    override fun insertSentSms(
+        address: String,
+        body: String,
+        date: Long,
+        threadId: Long?,
+        subId: Int?,
+    ): String? {
+        rows += body
+        return "content://sms/1"
+    }
+}
+
+/** One side of the exchange: its own stores, crypto, send manager, group manager. */
+private class Side(
+    val ownAddress: String,
+    val crypto: FakeE2eCrypto,
+    ownNumberFromSettings: String? = ownAddress,
+    simNumber: String? = null,
+) {
+    val peerDao = FakeE2ePeerDao()
+    val sessionDao = FakeE2eSessionDao()
+    val accountDao = FakeE2eAccountDao()
+    val groupKeyDao = FakeE2eGroupKeyDao()
+    val groupDistDao = FakeE2eGroupDistributionDao()
+    val noticeDao = FakeE2eNoticeDao()
+    val conversationDao = mockk<ConversationDao>()
+    val mirror = mockk<ConversationMirror>()
+    val settings = mockk<AppSettingsSource>()
+    val sim = mockk<SimSelfNumber>()
+    val dataSmsSender = RecordingDataSmsSender()
+    val recorder = RecordingRecorder()
+
+    val peers = E2ePeerRepository(peerDao)
+    val groupKeys = E2eGroupSenderKeyStore(groupKeyDao, groupDistDao)
+    val sessions = E2eSessionStore(sessionDao, crypto, fakeKeyManager())
+    val accountManager = E2eAccountManager(accountDao, crypto, fakeKeyManager())
+    val sendManager = E2eSendManager(
+        peers = peers,
+        sessions = lazyOf(sessions),
+        accountManager = lazyOf(accountManager),
+        crypto = lazyOf(crypto as E2eCrypto),
+        sender = mockk<SmsSender>().also {
+            every {
+                it.sendFragment(any(), any(), any(), any(), any(), any(), any(), any())
+            } returns Outcome.Success(Unit)
+        },
+        recorder = recorder,
+        messageDao = mockk<MessageDao>(),
+        probeManager = mockk<E2eProbeManager>(),
+        dataSmsSender = dataSmsSender,
+    )
+    val stateProvider = E2eGroupStateProvider(peers, FakeBlockedRepo())
+    val context = mockk<android.content.Context>().also {
+        every { it.cacheDir } returns java.nio.file.Files.createTempDirectory("group-media").toFile()
+    }
+    val manager = E2eGroupSessionManager(
+        peers = peers,
+        groupKeys = groupKeys,
+        sendManager = sendManager,
+        aead = AeadCipher(),
+        conversationDao = conversationDao,
+        notices = E2eNoticeStore(noticeDao),
+        settings = settings,
+        simSelfNumber = sim,
+        stateProvider = stateProvider,
+        mirror = mirror,
+        preparer = E2eMediaFilePreparer(AeadCipher(), context),
+    )
+
+    init {
+        coEvery { settings.hydratedOrNull() } returns AppSettings(
+            sending = SendingSettings(userMsisdn = ownNumberFromSettings),
+        )
+        every { sim.ownNumber(any()) } returns simNumber
+        coEvery { conversationDao.snapshotGroupConversations() } returns emptyList()
+        coEvery { conversationDao.findById(any()) } returns null
+        coEvery { mirror.findGroupConversationId(any()) } returns null
+        coEvery { mirror.ensureGroupConversation(any()) } returns CONV_ID
+    }
+
+    fun seedPeer(
+        address: String,
+        state: E2ePeerState = E2ePeerState.ENCRYPTED,
+        groupCapable: Boolean = true,
+        groupMediaCapable: Boolean = true,
+        curveKey: String? = null,
+    ) {
+        peerDao.peers[address] = E2ePeerEntity(
+            address = address,
+            state = state,
+            groupCapable = groupCapable,
+            groupMediaCapable = groupMediaCapable,
+            theirCurveKey = curveKey,
+            updatedAt = NOW,
+        )
+    }
+
+    /** Establishes this side's outbound session to [other] (as the handshake does). */
+    suspend fun establishSessionTo(other: FakeE2eCrypto, otherAddress: String) {
+        val otk = other.nextOneTimeKey() ?: error("$otherAddress has no one-time key")
+        val sessionId = crypto.createOutboundSession(
+            other.identityKeys().curve25519,
+            otk,
+        )
+        sessions.saveNewSession(otherAddress, sessionId, NOW)
+    }
+}
+
+private class Harness {
+    val aliceCrypto = FakeE2eCrypto("alice")
+    val bobCrypto = FakeE2eCrypto("bob")
+    val carolCrypto = FakeE2eCrypto("carol")
+
+    val alice = Side(ALICE, aliceCrypto)
+    val bob = Side(BOB, bobCrypto)
+
+    /** The fragments this side sent to [toAddress] with this kind, in send order. */
+    fun sentTextsTo(side: Side, toAddress: String, kind: DataSmsKind): List<String> =
+        side.dataSmsSender.sentTexts
+            .filter { it.address == toAddress && it.kind == kind }
+            .map { it.text }
+
+    /**
+     * Decrypts the FIRST control message one side sent to
+     * another (a pre-key message — the first message in a
+     * direction). Returns the payload type + plaintext.
+     */
+    fun firstControlDecrypts(
+        from: Side,
+        toCrypto: FakeE2eCrypto,
+        toAddress: String,
+        kind: DataSmsKind,
+    ): Pair<E2eWireFormat.PayloadType, String> {
+        val fragments = sentTextsTo(from, toAddress, kind)
+            .map { E2eWireFormat.parseFragment(it)!! }
+        val payload = E2eWireFormat.parsePayload(E2eWireFormat.assemble(fragments))
+        check(payload.message.type == OlmMessageType.PRE_KEY) {
+            "this helper only covers the first (pre-key) message"
+        }
+        val inbound = toCrypto.createInboundSession(payload.message.bytes)
+        return payload.payloadType to inbound.plaintext.toString(Charsets.UTF_8)
+    }
+}
 
 /**
  * Encrypted-group session manager tests (round 49, design §13):
@@ -49,158 +205,8 @@ import org.junit.jupiter.api.Test
  * Every test ends with a void assertion — JUnit silently skips a
  * `@Test` whose `runTest` body returns a value.
  */
+
 class E2eGroupSessionManagerTest {
-
-    private companion object {
-        const val ALICE = "6108423232"
-        const val BOB = "6108423233"
-        const val CAROL = "6108423234"
-        const val DANA = "6108423235"
-        const val CONV_ID = 11L
-        const val NOW = 1_800_000_000_000L
-        const val SUB_ID = 2
-    }
-
-    private class RecordingRecorder : SentSmsRecorder {
-        val rows = mutableListOf<String>()
-
-        override fun insertSentSms(
-            address: String,
-            body: String,
-            date: Long,
-            threadId: Long?,
-            subId: Int?,
-        ): String? {
-            rows += body
-            return "content://sms/1"
-        }
-    }
-
-    /** One side of the exchange: its own stores, crypto, send manager, group manager. */
-    private class Side(
-        val ownAddress: String,
-        val crypto: FakeE2eCrypto,
-        ownNumberFromSettings: String? = ownAddress,
-        simNumber: String? = null,
-    ) {
-        val peerDao = FakeE2ePeerDao()
-        val sessionDao = FakeE2eSessionDao()
-        val accountDao = FakeE2eAccountDao()
-        val groupKeyDao = FakeE2eGroupKeyDao()
-        val groupDistDao = FakeE2eGroupDistributionDao()
-        val noticeDao = FakeE2eNoticeDao()
-        val conversationDao = mockk<ConversationDao>()
-        val mirror = mockk<ConversationMirror>()
-        val settings = mockk<AppSettingsSource>()
-        val sim = mockk<SimSelfNumber>()
-        val dataSmsSender = RecordingDataSmsSender()
-        val recorder = RecordingRecorder()
-
-        val peers = E2ePeerRepository(peerDao)
-        val groupKeys = E2eGroupSenderKeyStore(groupKeyDao, groupDistDao)
-        val sessions = E2eSessionStore(sessionDao, crypto, fakeKeyManager())
-        val accountManager = E2eAccountManager(accountDao, crypto, fakeKeyManager())
-        val sendManager = E2eSendManager(
-            peers = peers,
-            sessions = lazyOf(sessions),
-            accountManager = lazyOf(accountManager),
-            crypto = lazyOf(crypto as E2eCrypto),
-            sender = mockk<SmsSender>().also {
-                every {
-                    it.sendFragment(any(), any(), any(), any(), any(), any(), any(), any())
-                } returns Outcome.Success(Unit)
-            },
-            recorder = recorder,
-            messageDao = mockk<MessageDao>(),
-            probeManager = mockk<E2eProbeManager>(),
-            dataSmsSender = dataSmsSender,
-        )
-        val stateProvider = E2eGroupStateProvider(peers, FakeBlockedRepo())
-        val manager = E2eGroupSessionManager(
-            peers = peers,
-            groupKeys = groupKeys,
-            sendManager = sendManager,
-            aead = AeadCipher(),
-            conversationDao = conversationDao,
-            notices = E2eNoticeStore(noticeDao),
-            settings = settings,
-            simSelfNumber = sim,
-            stateProvider = stateProvider,
-            mirror = mirror,
-        )
-
-        init {
-            coEvery { settings.hydratedOrNull() } returns AppSettings(
-                sending = SendingSettings(userMsisdn = ownNumberFromSettings),
-            )
-            every { sim.ownNumber(any()) } returns simNumber
-            coEvery { conversationDao.snapshotGroupConversations() } returns emptyList()
-            coEvery { conversationDao.findById(any()) } returns null
-            coEvery { mirror.findGroupConversationId(any()) } returns null
-            coEvery { mirror.ensureGroupConversation(any()) } returns CONV_ID
-        }
-
-        fun seedPeer(
-            address: String,
-            state: E2ePeerState = E2ePeerState.ENCRYPTED,
-            groupCapable: Boolean = true,
-            curveKey: String? = null,
-        ) {
-            peerDao.peers[address] = E2ePeerEntity(
-                address = address,
-                state = state,
-                groupCapable = groupCapable,
-                theirCurveKey = curveKey,
-                updatedAt = NOW,
-            )
-        }
-
-        /** Establishes this side's outbound session to [other] (as the handshake does). */
-        suspend fun establishSessionTo(other: FakeE2eCrypto, otherAddress: String) {
-            val otk = other.nextOneTimeKey() ?: error("$otherAddress has no one-time key")
-            val sessionId = crypto.createOutboundSession(
-                other.identityKeys().curve25519,
-                otk,
-            )
-            sessions.saveNewSession(otherAddress, sessionId, NOW)
-        }
-    }
-
-    private class Harness {
-        val aliceCrypto = FakeE2eCrypto("alice")
-        val bobCrypto = FakeE2eCrypto("bob")
-        val carolCrypto = FakeE2eCrypto("carol")
-
-        val alice = Side(ALICE, aliceCrypto)
-        val bob = Side(BOB, bobCrypto)
-
-        /** The fragments this side sent to [toAddress] with this kind, in send order. */
-        fun sentTextsTo(side: Side, toAddress: String, kind: DataSmsKind): List<String> =
-            side.dataSmsSender.sentTexts
-                .filter { it.address == toAddress && it.kind == kind }
-                .map { it.text }
-
-        /**
-         * Decrypts the FIRST control message one side sent to
-         * another (a pre-key message — the first message in a
-         * direction). Returns the payload type + plaintext.
-         */
-        fun firstControlDecrypts(
-            from: Side,
-            toCrypto: FakeE2eCrypto,
-            toAddress: String,
-            kind: DataSmsKind,
-        ): Pair<E2eWireFormat.PayloadType, String> {
-            val fragments = sentTextsTo(from, toAddress, kind)
-                .map { E2eWireFormat.parseFragment(it)!! }
-            val payload = E2eWireFormat.parsePayload(E2eWireFormat.assemble(fragments))
-            check(payload.message.type == OlmMessageType.PRE_KEY) {
-                "this helper only covers the first (pre-key) message"
-            }
-            val inbound = toCrypto.createInboundSession(payload.message.bytes)
-            return payload.payloadType to inbound.plaintext.toString(Charsets.UTF_8)
-        }
-    }
 
     // ──────────────────────────── Send gate ────────────────────────────
 
@@ -796,5 +802,173 @@ class E2eGroupSessionManagerTest {
         val found = harness.alice.manager.conversationIdForGroup(groupId, members = null)
 
         assertThat(found).isNull()
+    }
+}
+
+/**
+ * Encrypted-group MEDIA tests (round 54, design §13.7): the
+ * group-media send decision, the media-key wrap under the
+ * sender key, and the keys-first fan-out of
+ * [E2eGroupSessionManager.prepareGroupMediaSend]. Split out
+ * of [E2eGroupSessionManagerTest] so neither class trips
+ * Detekt's LargeClass threshold; both share the file-private
+ * [Harness] above.
+ *
+ * Every test ends with a void assertion — JUnit silently skips a
+ * `@Test` whose `runTest` body returns a value.
+ */
+class E2eGroupSessionManagerMediaTest {
+    // ──────────────────────────── Group media (round 54) ────────────────────────────
+
+    private fun mediaFile(bytes: ByteArray = ByteArray(100) { 7 }): java.io.File =
+        java.nio.file.Files.createTempFile("photo", ".jpg").toFile().apply { writeBytes(bytes) }
+
+    private fun keyJson(): String = E2eMediaKeyMessage.encode(
+        E2eMediaKeyMessage.MediaKey(
+            id = "0123456789abcdef",
+            key = ByteArray(32) { 3 },
+            mime = "image/jpeg",
+            sizeBytes = 100L,
+            sha256Hex = "a".repeat(64),
+            fileName = "photo.jpg",
+        ),
+    )
+
+    @Test
+    fun `decideGroupMediaSend is Encrypted when every member declared group media`() = runTest {
+        val harness = Harness()
+        harness.alice.seedPeer(BOB)
+        harness.alice.seedPeer(CAROL)
+
+        val decision = harness.alice.manager.decideGroupMediaSend(listOf(BOB, CAROL))
+
+        assertThat(decision).isEqualTo(E2eGroupSendGate.Decision.Encrypted)
+    }
+
+    @Test
+    fun `decideGroupMediaSend is Plain when a member is group-capable but not group-media-capable`() = runTest {
+        val harness = Harness()
+        harness.alice.seedPeer(BOB)
+        harness.alice.seedPeer(CAROL, groupMediaCapable = false)
+
+        val decision = harness.alice.manager.decideGroupMediaSend(listOf(BOB, CAROL))
+
+        assertThat(decision).isEqualTo(E2eGroupSendGate.Decision.Plain)
+    }
+
+    @Test
+    fun `encryptGroupMediaKey wraps the key JSON so bob can decrypt it`() = runTest {
+        val harness = Harness()
+        harness.alice.seedPeer(BOB)
+        harness.alice.seedPeer(CAROL)
+        harness.alice.establishSessionTo(harness.bobCrypto, BOB)
+        harness.alice.establishSessionTo(harness.carolCrypto, CAROL)
+        val json = keyJson()
+
+        val result = harness.alice.manager.encryptGroupMediaKey(listOf(BOB, CAROL), json, SUB_ID, NOW)
+
+        assertThat(result).isInstanceOf(Outcome.Success::class.java)
+        val encrypted = (result as Outcome.Success).value
+        val (bobType, bobJson) = harness.firstControlDecrypts(
+            harness.alice,
+            harness.bobCrypto,
+            BOB,
+            DataSmsKind.SENDER_KEY,
+        )
+        assertThat(bobType).isEqualTo(E2eWireFormat.PayloadType.SENDER_KEY)
+        assertThat(harness.bob.manager.onSenderKeyReceived(ALICE, bobJson, SUB_ID, NOW)).isTrue()
+        val payload = E2eWireFormat.parsePayload(
+            E2eWireFormat.assemble(encrypted.fragments.map { E2eWireFormat.parseFragment(it)!! }),
+        )
+        assertThat(payload.message.type).isEqualTo(OlmMessageType.GROUP)
+        assertThat(payload.payloadType).isEqualTo(E2eWireFormat.PayloadType.GROUP_MEDIA_KEY)
+        val decrypted = harness.bob.manager.decryptGroupMessage(ALICE, payload.message.bytes)
+        assertThat(decrypted).isNotNull()
+        assertThat(decrypted!!.plaintext).isEqualTo(json)
+        assertThat(decrypted.groupId).isEqualTo(encrypted.groupId)
+    }
+
+    @Test
+    fun `encryptGroupMediaKey fails fast without our own number`() = runTest {
+        val harness = Harness()
+        val noNumber = Side(ALICE, FakeE2eCrypto("alice2"), ownNumberFromSettings = null)
+
+        val result = noNumber.manager.encryptGroupMediaKey(listOf(BOB, CAROL), keyJson(), SUB_ID, NOW)
+
+        assertThat(result).isEqualTo(Outcome.Failure(AppError.OwnNumberMissing))
+    }
+
+    @Test
+    fun `prepareGroupMediaSend fans out one identical key set and returns ciphertext parts`() = runTest {
+        val harness = Harness()
+        harness.alice.seedPeer(BOB)
+        harness.alice.seedPeer(CAROL)
+        harness.alice.establishSessionTo(harness.bobCrypto, BOB)
+        harness.alice.establishSessionTo(harness.carolCrypto, CAROL)
+        val file = mediaFile()
+
+        val result = harness.alice.manager.prepareGroupMediaSend(
+            listOf(BOB, CAROL),
+            listOf(MediaFileInput(file, "image/jpeg")),
+            300L * 1024L,
+            NOW,
+            SUB_ID,
+        )
+
+        assertThat(result).isInstanceOf(E2eGroupSendGate.GroupMediaPrepareResult.Encrypted::class.java)
+        val encrypted =
+            result as E2eGroupSendGate.GroupMediaPrepareResult.Encrypted
+        assertThat(encrypted.attachments).hasSize(1)
+        assertThat(encrypted.attachments[0].mimeType).isEqualTo("application/octet-stream")
+        assertThat(encrypted.attachments[0].file.name).matches("relay-media-[0-9a-f]{16}\\.bin")
+        // One identical fragment set to every member.
+        val toBob = harness.sentTextsTo(harness.alice, BOB, DataSmsKind.GROUP_MEDIA_KEY)
+        val toCarol = harness.sentTextsTo(harness.alice, CAROL, DataSmsKind.GROUP_MEDIA_KEY)
+        assertThat(toBob).isNotEmpty()
+        assertThat(toBob).isEqualTo(toCarol)
+        // The key the set carries parses as a GROUP_MEDIA_KEY envelope.
+        val payload = E2eWireFormat.parsePayload(
+            E2eWireFormat.assemble(toBob.map { E2eWireFormat.parseFragment(it)!! }),
+        )
+        assertThat(payload.payloadType).isEqualTo(E2eWireFormat.PayloadType.GROUP_MEDIA_KEY)
+    }
+
+    @Test
+    fun `prepareGroupMediaSend is Plain when the group is not media-capable`() = runTest {
+        val harness = Harness()
+        harness.alice.seedPeer(BOB)
+        harness.alice.seedPeer(CAROL, groupMediaCapable = false)
+
+        val result = harness.alice.manager.prepareGroupMediaSend(
+            listOf(BOB, CAROL),
+            listOf(MediaFileInput(mediaFile(), "image/jpeg")),
+            300L * 1024L,
+            NOW,
+            SUB_ID,
+        )
+
+        assertThat(result).isEqualTo(E2eGroupSendGate.GroupMediaPrepareResult.Plain)
+        assertThat(harness.sentTextsTo(harness.alice, BOB, DataSmsKind.GROUP_MEDIA_KEY)).isEmpty()
+    }
+
+    @Test
+    fun `prepareGroupMediaSend refuses over the cap and sends no key`() = runTest {
+        val harness = Harness()
+        harness.alice.seedPeer(BOB)
+        harness.alice.seedPeer(CAROL)
+        harness.alice.establishSessionTo(harness.bobCrypto, BOB)
+        harness.alice.establishSessionTo(harness.carolCrypto, CAROL)
+
+        val result = harness.alice.manager.prepareGroupMediaSend(
+            listOf(BOB, CAROL),
+            listOf(MediaFileInput(mediaFile(), "image/jpeg")),
+            10L,
+            NOW,
+            SUB_ID,
+        )
+
+        assertThat(result).isInstanceOf(E2eGroupSendGate.GroupMediaPrepareResult.Refuse::class.java)
+        assertThat(harness.sentTextsTo(harness.alice, BOB, DataSmsKind.GROUP_MEDIA_KEY)).isEmpty()
+        assertThat(harness.sentTextsTo(harness.alice, CAROL, DataSmsKind.GROUP_MEDIA_KEY)).isEmpty()
     }
 }

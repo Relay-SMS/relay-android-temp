@@ -172,6 +172,9 @@
     <string name="conversations_importing_title">Importando sus mensajes</string>
     <string name="conversations_importing_body">Leyendo los SMS que ya tiene: esto ocurre una sola vez.</string>
     <string name="conversations_importing_count">%1$d mensajes importados…</string>
+    <string name="conversations_importing_patient">Tenga paciencia, esto puede tardar un rato</string>
+    <string name="conversations_importing_phase_mms">Importando fotos, vídeos y mensajes de voz…</string>
+    <string name="conversations_importing_phase_sms">Importando mensajes de texto…</string>
     <string name="conversations_delete_confirm_title">¿Eliminar esta conversación?</string>
     <string name="conversations_delete_confirm_body">Todos los mensajes de esta conversación se borrarán definitivamente de este dispositivo. Las demás conversaciones no se ven afectadas.</string>
     <!-- v1.28.9 — une conversation du coffre n'est plus supprimee si sa copie systeme resiste : elle reviendrait hors du coffre. -->
@@ -232,7 +235,7 @@
     <string name="e2e_verify_verified">Verificado</string>
     <string name="e2e_verify_copy">Copiar</string>
     <string name="e2e_verify_load_failed">No se pudo cargar el número de seguridad.</string>
-    <string name="e2e_settings_explainer">De Relay a Relay, el cifrado es automático. Cuando ambas personas usan Relay, vuestros mensajes 1:1 se cifran de extremo a extremo automáticamente, sin configurar nada. Los mensajes a personas sin Relay, y las fotos y los archivos en los grupos, se envían como SMS/MMS normales. Un grupo solo se cifra cuando todos sus miembros usan Relay. Los mensajes cifrados usan algunos segmentos de texto más que los normales.</string>
+    <string name="e2e_settings_explainer">De Relay a Relay, el cifrado es automático. Cuando ambas personas usan Relay, vuestros mensajes 1:1 se cifran de extremo a extremo automáticamente, sin configurar nada. Los mensajes a personas sin Relay se envían como SMS/MMS normales. Un grupo solo se cifra cuando todos sus miembros usan Relay; entonces sus textos, fotos, vídeos, mensajes de voz y archivos también se cifran. Los pies de texto de los archivos multimedia cifrados no se cifran. Los mensajes cifrados usan algunos segmentos de texto más que los normales.</string>
     <string name="e2e_settings_status_subtitle">Automático cuando ambas personas usan Relay</string>
     <string name="e2e_settings_fingerprint">Tu huella</string>
     <string name="e2e_settings_unavailable">Cifrado no disponible</string>
@@ -742,6 +745,10 @@
     <string name="action_star">Destacar</string>
     <string name="action_unstar">Quitar de destacados</string>
     <string name="reaction_picker_other">Otro emoji</string>
+    <!-- Round 54 — the picker sheet's header line, naming who set the
+         reaction on the message. The name is the contact name when known,
+         else the number. -->
+    <string name="reaction_picker_reacted_by">%1$s por %2$s</string>
     <!-- v1.5.0 — multi-emoji picker validate button -->
     <!-- v1.6.0 — a11y reaction badge (TalkBack) -->
     <string name="reaction_badge_content_description">Reacción %1$s</string>
@@ -809,10 +816,9 @@
     <string name="settings_maps_app_apple_hint">Apple Maps en la web: no existe una app de Apple Maps para Android.</string>
     <string name="settings_maps_app_osm">OpenStreetMap</string>
     <string name="settings_maps_app_osm_hint">Una app de OpenStreetMap si está instalada; si no, openstreetmap.org.</string>
-    <string name="map_preview_load">Cargar vista previa del mapa</string>
-    <string name="map_preview_load_hint">Carga un mapa de OpenStreetMap.</string>
-    <string name="map_preview_unavailable">Vista previa del mapa no disponible: toca para reintentar</string>
-    <string name="map_preview_attribution">© Colaboradores de OpenStreetMap</string>
+    <string name="map_show_map">Mostrar mapa</string>
+    <string name="map_get_directions">Cómo llegar</string>
+    <string name="map_directions_unavailable">No se pudo abrir Maps.</string>
     <string name="smart_action_no_app">Ninguna app puede abrir esto</string>
 
     <string name="settings_section_security">Seguridad y privacidad</string>

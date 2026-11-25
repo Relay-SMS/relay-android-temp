@@ -613,7 +613,7 @@ class SyncEngine(
     fun onRetryE2eProbe(request: SyncProtocol.RetryE2eProbe) {
         scope.launch {
             runAction("retry_e2e_probe", null, null, address = request.address) {
-                e2eSource?.retryProbe(request.address)
+                e2eSource?.retryProbe(request.address, request.method)
                     ?: ActionResult(
                         ok = false,
                         code = SyncProtocol.MessageFailed.INTERNAL,
@@ -950,6 +950,12 @@ class SyncEngine(
                         ok = result.ok,
                         code = result.code,
                         message = result.message,
+                        // Desktop encryption-box update — only a
+                        // successful `retry_e2e_probe` that spent
+                        // the last budget slot sets this; null
+                        // everywhere else, so the wire field is
+                        // absent (the phone's JSON drops nulls).
+                        budgetExhausted = result.budgetExhausted.takeIf { it },
                     ),
                 ),
             )
@@ -1232,11 +1238,19 @@ private suspend fun streamConversations(
 
 /** Builds the partial `message_updated` frame: only changed fields are present. */
 private fun buildMessageUpdated(old: MessageState, new: MessageState): String {
+    // Round 54 — the reaction's author rides with the reaction: when
+    // the emoji changes, the author fields are sent even if only one
+    // of them moved (an older client reads absent as not-mine, which
+    // is the safe default). A removal clears the author's fields on
+    // the client via `reaction_removed`, so nothing extra rides then.
+    val reactionChanged = new.reaction != old.reaction
     val updated = SyncProtocol.MessageUpdated(
         messageId = new.id.toString(),
         conversationId = new.conversationId.toString(),
         status = new.status.takeIf { it != old.status },
-        reaction = new.reaction.takeIf { it != old.reaction },
+        reaction = new.reaction.takeIf { reactionChanged },
+        reactionBy = new.reactionBy.takeIf { reactionChanged || it != old.reactionBy },
+        reactionIsOwn = new.reactionIsOwn.takeIf { reactionChanged || it != old.reactionIsOwn },
         reactionRemoved = old.reaction != null && new.reaction == null,
         read = new.read.takeIf { it != old.read },
         starred = new.starred.takeIf { it != old.starred },

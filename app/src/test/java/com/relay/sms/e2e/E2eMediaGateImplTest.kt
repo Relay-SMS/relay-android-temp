@@ -18,6 +18,7 @@ import com.relay.sms.domain.e2e.E2eMediaGate
 import com.relay.sms.domain.e2e.MediaFileInput
 import io.mockk.Runs
 import io.mockk.coEvery
+import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.just
 import io.mockk.mockk
@@ -57,6 +58,7 @@ class E2eMediaGateImplTest {
         val context = mockk<Context>()
         val sendManager = mockk<E2eSendManager>()
         val probeManager = mockk<E2eProbeManager>()
+        val mediaCapability = mockk<E2eMediaCapabilityManager>(relaxed = true)
         val recorder = mockk<E2eFailureRecorder>(relaxed = true)
         val keyJsons = mutableListOf<String>()
 
@@ -64,9 +66,9 @@ class E2eMediaGateImplTest {
             peers = E2ePeerRepository(peerDao),
             sendManager = sendManager,
             probeManager = probeManager,
-            cipher = AeadCipher(),
+            preparer = E2eMediaFilePreparer(AeadCipher(), context),
+            mediaCapability = mediaCapability,
             failureRecorder = recorder,
-            context = context,
         )
 
         init {
@@ -125,6 +127,47 @@ class E2eMediaGateImplTest {
         assertThat(attachments[0].file.name).matches("relay-media-[0-9a-f]{16}\\.bin")
         // The ciphertext is the envelope (29 bytes) over the plaintext.
         assertThat(attachments[0].file.length()).isEqualTo(bytes.size + 29L)
+    }
+
+    @Test
+    fun `ENCRYPTED but not media-capable sends plain and re-declares capability`() = runTest {
+        val harness = Harness(tempDir)
+        harness.seedPeer(mediaCapable = false)
+        val file = mediaFile("photo.jpg", plaintextBytes(100))
+
+        val result = harness.gate.prepareMediaSend(
+            BOB,
+            listOf(MediaFileInput(file, "image/jpeg")),
+            CAP,
+            NOW,
+            SUB_ID,
+        )
+
+        // Round 54 (design §8.4) — the current send stays plain
+        // (never block the user on a first media send), but the
+        // send itself re-declares OUR capability, so the peer's
+        // announce-back makes the NEXT media send encrypt.
+        assertThat(result).isEqualTo(E2eMediaGate.PrepareResult.Plain)
+        coVerify(exactly = 1) { harness.mediaCapability.announceIfNeeded(BOB, SUB_ID) }
+        assertThat(harness.keyJsons).isEmpty()
+    }
+
+    @Test
+    fun `capable ENCRYPTED peer does not re-declare on a media send`() = runTest {
+        val harness = Harness(tempDir)
+        harness.seedPeer()
+        val file = mediaFile("photo.jpg", plaintextBytes(100))
+
+        val result = harness.gate.prepareMediaSend(
+            BOB,
+            listOf(MediaFileInput(file, "image/jpeg")),
+            CAP,
+            NOW,
+            SUB_ID,
+        )
+
+        assertThat(result).isInstanceOf(E2eMediaGate.PrepareResult.Encrypted::class.java)
+        coVerify(exactly = 0) { harness.mediaCapability.announceIfNeeded(any(), any()) }
     }
 
     @Test

@@ -360,8 +360,10 @@ class ConversationMirror @Inject constructor(
      *     onto a message the sender received.
      *
      * When [isRemoval] is true, the target's badge is cleared (only if it
-     * currently shows the same emoji — the single-emoji storage cannot tell
-     * whose reaction it is) instead of being set. The caller still gets a
+     * currently shows the same emoji AND the remover could have set it —
+     * round 54: their removal never clears our badge, our removal never
+     * clears theirs; an unknown-ownership badge — stored before the
+     * author columns — still clears on emoji match). The caller still gets a
      * non-null result when a target was found, so the removal text is
      * suppressed as a bubble even when the badge itself was untouched.
      *
@@ -484,13 +486,40 @@ class ConversationMirror @Inject constructor(
                 isOwnReaction = isOwnReaction,
             ) ?: continue
             if (isRemoval) {
-                // Single-emoji storage cannot tell whose reaction the badge
-                // shows: only clear it when it is the emoji being removed.
-                if (target.reactionEmoji == emoji) {
-                    messageDao.setReaction(target.id, null)
+                // Round 54 — ownership: a removal only clears a badge
+                // the remover could have set. The stored badge is
+                // clearable when it is the emoji being removed AND:
+                //   - its owner is UNKNOWN (a row stored before the
+                //     author columns existed — the old clear-on-emoji
+                //     behaviour, kept for those rows), or
+                //   - its owner matches the remover: our own removal
+                //     clears our badge, their removal clears theirs
+                //     (the address comparison uses the phone-identity
+                //     match, so `+33` vs `06` forms still meet).
+                // A peer's removal of the same emoji never clears OUR
+                // badge, and our own removal never clears theirs.
+                val unknownOwner = target.reactionByAddress == null && !target.reactionIsOwn
+                val ownRemoval = target.reactionIsOwn == isOwnReaction && isOwnReaction
+                val peerRemoval = target.reactionIsOwn == isOwnReaction && !isOwnReaction &&
+                    target.reactionByAddress != null &&
+                    ident.matches(target.reactionByAddress, addr.raw)
+                val canClear = target.reactionEmoji == emoji &&
+                    (unknownOwner || ownRemoval || peerRemoval)
+                if (canClear) {
+                    messageDao.setReactionWithAuthor(target.id, null, null, false)
                 }
             } else {
-                messageDao.setReaction(target.id, emoji)
+                // Round 54 — the fold records the reactor: our own
+                // tapback (sent-box import / reparse) is ours, an
+                // incoming tapback carries its sender's address. The
+                // single-emoji slot still holds only the latest
+                // reactor — a different emoji from anyone replaces
+                // the badge, with the new author.
+                if (isOwnReaction) {
+                    messageDao.setReactionWithAuthor(target.id, emoji, null, true)
+                } else {
+                    messageDao.setReactionWithAuthor(target.id, emoji, address, false)
+                }
                 // Own reactions never bump: reacting is our own action,
                 // not news — and the live outgoing path never bumps either.
                 if (!isOwnReaction) {
@@ -1076,6 +1105,7 @@ class ConversationMirror @Inject constructor(
         date: Long,
         subId: Int?,
         clientMessageId: String?,
+        encrypted: Boolean,
     ): Long = withContext(io) {
         val corps = textBody.trim()
         require(attachments.isNotEmpty() || corps.isNotEmpty()) { "un MMS de groupe sans contenu" }
@@ -1100,6 +1130,7 @@ class ConversationMirror @Inject constructor(
                     scheduledAt = null,
                     attachmentsCount = attachments.size,
                     clientMessageId = clientMessageId,
+                    encrypted = encrypted,
                 ),
             )
             for (a in attachments) {
@@ -1453,13 +1484,11 @@ class ConversationMirror @Inject constructor(
                         listOf(PhoneAddress.of(first.address))
                     },
                 )
-                // Round 48 — media encryption is 1:1 only: a group
-                // thread's encrypted-looking part stays plain. The
-                // conversation row carries the member list
-                // (`addresses_csv`); one address = 1:1. Read once
-                // per thread group, not once per row.
-                val isOneToOne = conversationDao.findById(convId)
-                    ?.let { PhoneAddress.list(it.addressesCsv).size == 1 } == true
+                // Round 54 — a group thread's encrypted-looking
+                // part is encrypted group media, flagged the same
+                // way as a 1:1 part (see `insertPlainRow` below):
+                // the part SHAPE is the signal, whatever the
+                // thread size. No 1:1 gate is read here anymore.
                 var maxDate = 0L
                 var lastPreview = ""
                 var unreadDelta = 0
@@ -1478,6 +1507,9 @@ class ConversationMirror @Inject constructor(
                     // store (it is encrypted — any app with MMS
                     // permission reads only opaque bytes) and the
                     // row is flagged encrypted, pending its key.
+                    // Round 54 — the same for a GROUP import: a
+                    // `relay-media-` part in a group MMS is
+                    // encrypted group media.
                     // An OUTGOING row is failed outright: the
                     // sender keeps no copy of the per-file keys,
                     // and the plaintext original is gone with the
@@ -1485,7 +1517,7 @@ class ConversationMirror @Inject constructor(
                     // media can never decrypt again, so the row
                     // renders "couldn't be decrypted" instead of a
                     // file icon that opens garbage.
-                    val hasCiphertextPart = isOneToOne &&
+                    val hasCiphertextPart =
                         row.attachments.any {
                             RelayMediaFilename.isEncryptedPart(it.contentType, it.filename)
                         }
@@ -2410,7 +2442,7 @@ class ConversationMirror @Inject constructor(
      * Client mode — upserts one synced message (`messages_batch` /
      * `message_new` / `message_updated`). Found by hub id; the update
      * path patches only the live-mutable fields (status, read,
-     * starred, reaction, reply target, error code) — body, type,
+     * starred, reaction + its author, reply target, error code) — body, type,
      * direction, date and address never change after a sync. The E2E
      * flags (`encrypted`, `decrypt_failed`) ride the update too: they
      * are immutable in practice, but a re-sync re-sends the message
@@ -2443,6 +2475,8 @@ class ConversationMirror @Inject constructor(
                             read = data.read,
                             starred = data.starred,
                             reactionEmoji = data.reaction,
+                            reactionByAddress = data.reactionByAddress,
+                            reactionIsOwn = data.reactionIsOwn,
                             errorCode = data.errorCode,
                             replyToMessageId = replyLocalId ?: existing.replyToMessageId,
                             clientMessageId = data.clientMessageId ?: existing.clientMessageId,
@@ -2488,6 +2522,8 @@ class ConversationMirror @Inject constructor(
                                 read = data.read,
                                 starred = data.starred,
                                 reactionEmoji = data.reaction,
+                                reactionByAddress = data.reactionByAddress,
+                                reactionIsOwn = data.reactionIsOwn,
                                 errorCode = data.errorCode,
                                 replyToMessageId = keyReplyLocalId ?: optimistic.replyToMessageId,
                                 address = data.address,
@@ -2550,6 +2586,8 @@ class ConversationMirror @Inject constructor(
                         attachmentsCount = data.attachments.size,
                         replyToMessageId = replyLocalId,
                         reactionEmoji = data.reaction,
+                        reactionByAddress = data.reactionByAddress,
+                        reactionIsOwn = data.reactionIsOwn,
                         clientMessageId = data.clientMessageId,
                         hubMessageId = data.hubMessageId,
                         encrypted = data.encrypted,

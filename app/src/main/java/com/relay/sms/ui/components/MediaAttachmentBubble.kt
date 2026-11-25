@@ -401,9 +401,12 @@ fun MediaAttachmentBubble(
                 onReact = onReact,
                 // Round 23 — the menu's top row IS the quick-reaction row
                 // (same bundle [MessageBubble] gets); the applied reaction
-                // highlights in it, like the desktop popup.
+                // highlights in it, like the desktop popup. Round 54 —
+                // only the USER'S OWN reaction highlights (see
+                // [MessageBubble] — someone else's emoji is not a
+                // toggle target).
                 quickReactions = quickReactions,
-                currentReaction = message.reactionEmoji,
+                currentReaction = message.reactionEmoji.takeIf { message.reactionIsOwn },
                 toggles = toggles,
                 onDelete = onDelete,
             )

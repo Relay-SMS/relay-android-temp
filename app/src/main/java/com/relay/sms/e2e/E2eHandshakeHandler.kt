@@ -159,6 +159,7 @@ class E2eHandshakeHandler @Inject constructor(
                     now,
                     mediaCapable = packet.mediaCapable,
                     groupCapable = packet.groupCapable,
+                    groupMediaCapable = packet.groupMediaCapable,
                 )
                 true
             }

@@ -100,6 +100,15 @@ enum class DataSmsKind(val failureTag: String) {
     BUNDLE("e2e-bundle-send"),
 
     /**
+     * Round 54 — one fragment of a group media key message (an
+     * `RLY1:` fragment of a GROUP_MEDIA_KEY payload, regular SMS
+     * only). Unlike [MEDIA_KEY], the fragments are built by the
+     * group session manager (one identical set for every member)
+     * and fanned out here, not encrypted per member.
+     */
+    GROUP_MEDIA_KEY("e2e-group-media-key-send"),
+
+    /**
      * Round 48 (renamed round 49) — a capability declaration
      * (the 0x03 handshake packet, either channel): media
      * capability in round 48, media + group capability from
