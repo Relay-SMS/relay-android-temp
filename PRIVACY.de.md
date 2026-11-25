@@ -11,11 +11,13 @@ Relay (`com.relay.sms`) wird von **Relay Messaging** herausgegeben. Siehe auch d
 ## Was wir erheben
 
 **Nichts.** Relay erhebt, übermittelt und aggregiert keinerlei personenbezogene Daten — mit
-zwei Ausnahmen, beide von Ihnen ausgelöst: Wenn Sie nach einem GIF suchen, werden die eingegebenen
-Wörter an Klipy gesendet, damit es passende GIFs zurückgibt, und wenn eine Nachricht einen Link
-enthält, ruft Relay diese Seite einmal ab, um eine Vorschau anzuzeigen (siehe
+drei Ausnahmen, alle von Ihnen ausgelöst: Wenn Sie nach einem GIF suchen, werden die eingegebenen
+Wörter an Klipy gesendet, damit es passende GIFs zurückgibt; wenn eine Nachricht einen Link
+enthält, ruft Relay diese Seite einmal ab, um eine Vorschau anzuzeigen; und wenn eine Nachricht
+eine Straßenadresse enthält und Sie auf „Kartenvorschau laden" tippen, sendet Relay die Adresse
+an Nominatim, um sie zu geokodieren, und ruft ein statisches Kartenbild ab (siehe
 [Netzwerk](#netzwerk) unten). Relay behält aus diesen Vorgängen nichts außer dem GIF, das Sie
-senden, und der Vorschau, die es Ihnen zeigt. Das Verknüpfen eines Computers ändert daran nichts:
+senden, der Vorschau, die es Ihnen zeigt, und den zwischengespeicherten Kartenkoordinaten. Das Verknüpfen eines Computers ändert daran nichts:
 Telefon und Computer sprechen direkt miteinander über Ihr lokales WLAN — kein Relay-Server, keine
 Cloud, nichts verlässt das Netzwerk.
 
@@ -49,14 +51,21 @@ Daten weder auf Google Drive übertragen noch bei einer Geräteübertragung mitg
 
 ## Netzwerk
 
-Relay besitzt die Berechtigung `INTERNET` für drei Zwecke. (1) GIF-Suche: Wenn Sie den
+Relay besitzt die Berechtigung `INTERNET` für vier Zwecke. (1) GIF-Suche: Wenn Sie den
 GIF-Tab öffnen und eine Suche eingeben, werden die eingegebenen Wörter an Klipy (`api.klipy.com`)
 gesendet, das passende GIFs zurückgibt; das Antippen eines GIFs lädt es von Klipy herunter, und
 die Vorschaubilder im Raster stammen ebenfalls von Klipy. Klipy sieht Ihre Suchwörter und Ihre
 IP-Adresse, wie jeder Dienst, den Sie kontaktieren. (2) Link-Vorschauen: Wenn eine Nachricht eine
 URL enthält, ruft Relay diese Seite einmal auf dem Gerät ab und liest ihren Open-Graph-Titel und
 ihr Bild nur zur Anzeige — die verlinkte Seite sieht die Anfrage und Ihre IP-Adresse, wie bei
-jedem Besuch; das Vorschaubild wird nie als Anhang gesendet. (3) Verknüpfte Geräte: Das Telefon
+jedem Besuch; das Vorschaubild wird nie als Anhang gesendet. (3) Kartenvorschauen: Wenn eine
+Nachricht eine Straßenadresse enthält, bietet die Sprechblase eine Karte an — nur wenn Sie auf
+„Kartenvorschau laden" tippen, sendet Relay die Adresse an Nominatim
+(`nominatim.openstreetmap.org`), um sie zu geokodieren, und ruft ein statisches Kartenbild von
+`staticmap.openstreetmap.de` ab. Nominatim sieht die Adresse und Ihre IP-Adresse, wie jeder
+Dienst, den Sie kontaktieren; das Geokodierungsergebnis und das Bild werden auf dem Gerät
+zwischengespeichert, und nichts wird gesendet, bis Sie tippen — Adressen können Wohnadressen
+sein, daher lädt die Vorschau nie von selbst. (4) Verknüpfte Geräte: Das Telefon
 betreibt einen TLS-Server im lokalen Netzwerk (Port 47831, angekündigt per mDNS als
 `_relay._tcp.`), damit ein von Ihnen verknüpfter Computer es finden und sich verbinden kann. Der
 Server akzeptiert nur Geräte, deren öffentlichen Schlüssel Sie durch Scannen ihres Kopplungscodes
@@ -66,9 +75,11 @@ Cloud-Konto beteiligt. Der Server lässt sich in Einstellungen → Verknüpfte G
 die App arbeitet dann vollständig eigenständig. Das ist die einzige Netzwerknutzung der App:
 keine Update-Prüfung, keine Fernkonfiguration, kein Analyse-Ping, keine Absturzmeldung. Wenn die
 Berechtigung blockiert ist, funktioniert die App weiterhin — die GIF-Suche liefert dann einfach
-nichts, Links zeigen keine Vorschau, und kein Computer kann sich verknüpfen. (Die Berechtigung
+nichts, Links zeigen keine Vorschau, Kartenvorschauen laden einfach nicht, und kein Computer kann
+sich verknüpfen. (Die Berechtigung
 wurde in 1.28.13 entfernt, als die App noch keine Netzwerkanfragen stellte; sie kam für die
-GIF-Suche zurück, dann für Link-Vorschauen und jetzt für verknüpfte Geräte.)
+GIF-Suche zurück, dann für Link-Vorschauen, dann für Kartenvorschauen und jetzt für verknüpfte
+Geräte.)
 
 MMS werden über den MMS-Dienst von Android übertragen, der das MMSC Ihres Mobilfunkanbieters
 kontaktiert, wenn Sie eine MMS senden oder empfangen. MMS haben die Berechtigung `INTERNET` nie

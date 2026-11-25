@@ -11,10 +11,13 @@ Relay (`com.relay.sms`) is published by **Relay Messaging**. See also the [terms
 ## What we collect
 
 **Nothing.** Relay does not collect, transmit or aggregate any personal data of any kind —
-with two exceptions, both user-initiated: when you search for a GIF, the words you type are sent
-to Klipy so it can return matching GIFs, and when a message contains a link, Relay fetches that
-page once to show a preview card (see [Network use](#network-use) below). Relay itself keeps
-nothing from those exchanges beyond the GIF you choose to send and the preview it shows you.
+with three exceptions, all user-initiated: when you search for a GIF, the words you type are sent
+to Klipy so it can return matching GIFs; when a message contains a link, Relay fetches that
+page once to show a preview card; and when a message contains a street address and you tap
+"Load map preview", Relay sends the address to Nominatim to geocode it and fetches a static map
+image (see [Network use](#network-use) below). Relay itself keeps
+nothing from those exchanges beyond the GIF you choose to send, the preview it shows you and the
+cached map coordinates.
 Linking a computer changes nothing about this: the phone and the computer talk directly to each
 other on your local Wi-Fi network — no Relay server, no cloud, nothing leaves the network.
 
@@ -46,23 +49,30 @@ device transfer without your explicit consent.
 
 ## Network use
 
-Relay holds the `INTERNET` permission for three uses. (1) GIF search: when you open the
+Relay holds the `INTERNET` permission for four uses. (1) GIF search: when you open the
 GIF tab and type a search, the words you type are sent to Klipy (`api.klipy.com`), which returns
 matching GIFs; tapping one downloads it from Klipy, and the thumbnails in the grid come from
 Klipy too. Klipy sees your search words and your IP address, as any service you contact does.
 (2) Link previews: when a message contains a URL, Relay fetches that page once, on the device,
 and reads its Open Graph title and image for display only — the site you link to sees the request
 and your IP address, as with any visit; the preview image is never sent as an attachment.
-(3) Linked devices: the phone runs a TLS server on the local network (port 47831, advertised via
+(3) Map previews: when a message contains a street address, the bubble offers a map card — only
+when you tap "Load map preview", Relay sends the address to Nominatim
+(`nominatim.openstreetmap.org`) to geocode it and fetches a static map image from
+`staticmap.openstreetmap.de`. Nominatim sees the address and your IP address, as any service you
+contact does; the geocode result and the image are cached on the device, and nothing is sent
+until you tap — addresses can be home addresses, so the preview never loads on its own.
+(4) Linked devices: the phone runs a TLS server on the local network (port 47831, advertised via
 mDNS as `_relay._tcp.`) so a computer you linked can find it and connect. The server accepts only
 devices whose public key you stored by scanning their pairing code, and only after they prove
 they hold the matching private key; the traffic never leaves your Wi-Fi network, and there is no
 Relay server or cloud account involved. The server can be turned off in Settings → Linked
 devices; the app then works fully standalone. That is the only network use in the app: no update
 check, no remote configuration, no analytics ping, no crash report. If the permission is blocked,
-the app still works — GIF search just returns nothing, links show no preview, and no computer
-can link. (The permission was removed in 1.28.13, when the app made no network call at all; it
-returned for GIF search, then for link previews, and now for linked devices.)
+the app still works — GIF search just returns nothing, links show no preview, map previews just
+don't load, and no computer can link. (The permission was removed in 1.28.13, when the app made
+no network call at all; it returned for GIF search, then for link previews, then for map
+previews, and now for linked devices.)
 
 MMS are carried by Android's own MMS service, which talks to your carrier's MMSC when you send or
 receive one. MMS never needed the `INTERNET` permission and still do not use it.

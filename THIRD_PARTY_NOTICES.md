@@ -83,6 +83,13 @@ OkHttp is present because Coil depends on it. Relay uses Coil to display contact
 attachments stored on the phone; its network uses are MMS transport through your carrier and GIF
 search via Klipy (see [PRIVACY.md](PRIVACY.md)).
 
+Map data for the tap-to-load map previews is © OpenStreetMap contributors, available under the
+Open Database License (ODbL); geocoding is provided by Nominatim
+(`nominatim.openstreetmap.org`) and the static map images by `staticmap.openstreetmap.de`. Both
+are contacted only when you tap "Load map preview" on a message containing an address (see
+[PRIVACY.md](PRIVACY.md)). The map preview carries the "© OpenStreetMap contributors"
+attribution on the card itself.
+
 Twemoji graphics are bundled as SVG/PNG assets under `app/src/main/assets/twemoji/` and rendered
 by Coil; the Twemoji code is not used, only the graphics. The bundled set is a curated subset
 (241 emojis as SVG, 38 of them also as 72x72 PNG for sending stickers as MMS attachments).

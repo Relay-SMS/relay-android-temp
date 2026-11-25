@@ -18,6 +18,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Backup
+import androidx.compose.material.icons.outlined.Bolt
 import androidx.compose.material.icons.outlined.Devices
 import androidx.compose.material.icons.outlined.HelpOutline
 import androidx.compose.material.icons.outlined.Info
@@ -138,6 +139,7 @@ private fun landingIcon(section: SettingsSection): ImageVector = when (section) 
     SettingsSection.APPEARANCE -> Icons.Outlined.Palette
     SettingsSection.SENDING -> Icons.Outlined.Send
     SettingsSection.NOTIFICATIONS -> Icons.Outlined.Notifications
+    SettingsSection.SMART_ACTIONS -> Icons.Outlined.Bolt
     SettingsSection.SECURITY_PRIVACY -> Icons.Outlined.Security
     SettingsSection.BACKUP -> Icons.Outlined.Backup
     SettingsSection.APP_LANGUAGE -> Icons.Outlined.Language

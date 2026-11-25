@@ -10,12 +10,14 @@ Relay (`com.relay.sms`) está editada por **Relay Messaging**. Véanse también 
 
 ## Lo que recopilamos
 
-**Nada.** Relay no recopila, no transmite ni agrega ningún dato personal — con dos
-excepciones, ambas iniciadas por usted: cuando busca un GIF, las palabras que escribe se envían a
-Klipy para que devuelva GIF coincidentes, y cuando un mensaje contiene un enlace, Relay descarga
-esa página una vez para mostrar una tarjeta de vista previa (véase [Red](#red) más abajo). Relay
-no conserva nada de esos intercambios más allá del GIF que usted elige enviar y de la vista
-previa que le muestra. Vincular un ordenador no cambia nada de esto: el teléfono y el ordenador
+**Nada.** Relay no recopila, no transmite ni agrega ningún dato personal — con tres
+excepciones, todas iniciadas por usted: cuando busca un GIF, las palabras que escribe se envían a
+Klipy para que devuelva GIF coincidentes; cuando un mensaje contiene un enlace, Relay descarga
+esa página una vez para mostrar una tarjeta de vista previa; y cuando un mensaje contiene una
+dirección postal y usted toca «Cargar vista previa del mapa», Relay envía la dirección a
+Nominatim para geocodificarla y descarga una imagen de mapa estática (véase [Red](#red) más
+abajo). Relay no conserva nada de esos intercambios más allá del GIF que usted elige enviar, de
+la vista previa que le muestra y de las coordenadas de mapa en caché. Vincular un ordenador no cambia nada de esto: el teléfono y el ordenador
 se comunican directamente entre sí en su red Wi-Fi local — ningún servidor Relay, ninguna nube,
 nada sale de la red.
 
@@ -49,14 +51,21 @@ Google Drive ni en una transferencia de dispositivo sin su consentimiento explí
 
 ## Red
 
-Relay tiene el permiso `INTERNET` para tres usos. (1) Búsqueda de GIF: cuando abre la pestaña
+Relay tiene el permiso `INTERNET` para cuatro usos. (1) Búsqueda de GIF: cuando abre la pestaña
 de GIF y escribe una búsqueda, las palabras que escribe se envían a Klipy (`api.klipy.com`), que
 devuelve GIF coincidentes; tocar uno lo descarga de Klipy, y las miniaturas de la cuadrícula
 también provienen de Klipy. Klipy ve sus palabras de búsqueda y su dirección IP, como cualquier
 servicio al que usted se conecta. (2) Vistas previas de enlaces: cuando un mensaje contiene una
 URL, Relay descarga esa página una vez, en el dispositivo, y lee su título e imagen Open Graph
 solo para mostrarlos — el sitio enlazado ve la solicitud y su dirección IP, como en cualquier
-visita; la imagen de vista previa nunca se envía como archivo adjunto. (3) Dispositivos
+visita; la imagen de vista previa nunca se envía como archivo adjunto. (3) Vistas previas de
+mapas: cuando un mensaje contiene una dirección postal, el bocadillo ofrece un mapa — solo
+cuando usted toca «Cargar vista previa del mapa», Relay envía la dirección a Nominatim
+(`nominatim.openstreetmap.org`) para geocodificarla y descarga una imagen de mapa estática de
+`staticmap.openstreetmap.de`. Nominatim ve la dirección y su dirección IP, como cualquier
+servicio al que usted se conecta; el resultado de la geocodificación y la imagen se guardan en
+caché en el dispositivo, y nada se envía hasta que usted toca — las direcciones pueden ser
+domicilios, así que la vista previa nunca se carga sola. (4) Dispositivos
 vinculados: el teléfono ejecuta un servidor TLS en la red local (puerto 47831, anunciado por
 mDNS como `_relay._tcp.`) para que un ordenador que usted haya vinculado pueda encontrarlo y
 conectarse. El servidor solo acepta dispositivos cuya clave pública usted guardó escaneando su
@@ -66,9 +75,11 @@ la nube. El servidor puede desactivarse en Ajustes → Dispositivos vinculados; 
 funciona entonces plenamente por sí sola. Este es el único uso de red de la aplicación: ninguna
 comprobación de actualizaciones, ninguna configuración remota, ningún ping analítico, ningún
 informe de fallos. Si el permiso está bloqueado, la aplicación sigue funcionando — la búsqueda de
-GIF simplemente no devuelve nada, los enlaces no muestran vista previa y ningún ordenador puede
+GIF simplemente no devuelve nada, los enlaces no muestran vista previa, las vistas previas de
+mapas simplemente no se cargan y ningún ordenador puede
 vincularse. (El permiso se retiró en la 1.28.13, cuando la aplicación no realizaba ninguna
-solicitud de red; volvió para la búsqueda de GIF, luego para las vistas previas de enlaces y
+solicitud de red; volvió para la búsqueda de GIF, luego para las vistas previas de enlaces, luego
+para las vistas previas de mapas y
 ahora para los dispositivos vinculados.)
 
 Los MMS se encaminan a través del servicio MMS de Android, que se comunica con el MMSC de su

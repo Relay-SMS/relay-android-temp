@@ -213,6 +213,15 @@
     <string name="e2e_details_retry_encryption">Retry encryption</string>
     <string name="e2e_details_retry_via_sms">Retry another way</string>
     <string name="e2e_details_retrying">Retrying…</string>
+    <string name="e2e_retry_no_conversation">Conversation not found.</string>
+    <string name="e2e_retry_not_one_to_one">Encryption can only be retried in a one-to-one conversation.</string>
+    <string name="e2e_retry_invalid_address">That number can\'t receive an encryption probe.</string>
+    <string name="e2e_retry_blocked">This contact is blocked. Unblock them to retry encryption.</string>
+    <string name="e2e_retry_already_encrypted">This conversation is already encrypted.</string>
+    <string name="e2e_retry_rate_limited">Too many encryption attempts for this contact. Reset the timing in Settings → Advanced.</string>
+    <string name="e2e_retry_discovery_off">Encryption discovery is turned off.</string>
+    <string name="e2e_retry_send_failed">Encryption couldn\'t be retried right now.</string>
+    <string name="e2e_retry_budget_exhausted">Check sent. Automatic checks for this contact are paused — reset them in Settings → Advanced → “Reset encryption timing”.</string>
     <string name="e2e_details_view_safety_number">View safety number</string>
     <string name="e2e_verify_title">Safety number</string>
     <string name="e2e_verify_explainer">Compare this number with %1$s in person or over another channel — a call, or another app. If the numbers match, you\'re talking to each other and no one in between.</string>
@@ -787,6 +796,23 @@
     <string name="notifications_off_emergency_shortcut">The emergency shortcut cannot appear on the lock screen.</string>
     <string name="notifications_off_messages">New messages arrive without a notification.</string>
 
+    <!-- Round 53 — smart actions: the section + the maps-provider picker + the map preview card. -->
+    <string name="settings_section_smart_actions">Smart actions</string>
+    <string name="settings_maps_app_title">Maps app</string>
+    <string name="settings_maps_app_system">System default</string>
+    <string name="settings_maps_app_system_hint">Let Android choose which maps app opens.</string>
+    <string name="settings_maps_app_google">Google Maps</string>
+    <string name="settings_maps_app_google_hint">The Google Maps app when installed, otherwise the web version.</string>
+    <string name="settings_maps_app_apple">Apple Maps</string>
+    <string name="settings_maps_app_apple_hint">Apple Maps on the web — there is no Apple Maps app for Android.</string>
+    <string name="settings_maps_app_osm">OpenStreetMap</string>
+    <string name="settings_maps_app_osm_hint">An OpenStreetMap app when installed, otherwise openstreetmap.org.</string>
+    <string name="map_preview_load">Load map preview</string>
+    <string name="map_preview_load_hint">Loads a map from OpenStreetMap.</string>
+    <string name="map_preview_unavailable">Map preview unavailable — tap to retry</string>
+    <string name="map_preview_attribution">© OpenStreetMap contributors</string>
+    <string name="smart_action_no_app">No app can open this</string>
+
     <string name="settings_section_security">Security &amp; privacy</string>
     <string name="settings_flag_secure">Private screen</string>
     <string name="settings_flag_secure_desc">Hides the conversation thumbnail in the system task switcher and blocks screenshots / screen recording while the app is open.</string>
@@ -847,7 +873,7 @@
     <string name="about_perm_notifications">Show new-message notifications.</string>
     <string name="about_perm_biometric">Optional biometric unlock.</string>
     <string name="about_perm_record_audio">Record audio messages attached to outgoing MMS.</string>
-    <string name="about_perm_internet">GIF search (Klipy), link previews, and device syncing. The app works without it.</string>
+    <string name="about_perm_internet">GIF search (Klipy), link previews, map previews, and device syncing. The app works without it.</string>
     <string name="about_perm_foreground_service">Long-running migration / backup.</string>
     <string name="about_perm_location">Emergency mode only, if you turn it on: one position at the moment of the alert, precise or approximate.</string>
     <string name="about_perm_call_phone">Emergency call tiles: call directly. Refused, they open the dialer instead.</string>
@@ -891,6 +917,11 @@
     <string name="notif_reply_label">Reply</string>
     <string name="notif_mark_read_label">Mark as read</string>
     <string name="notif_copy_code_label">Copy code</string>
+    <string name="notif_call_label">Call</string>
+    <string name="notif_send_email_label">Send email</string>
+    <string name="notif_open_maps_label">Open Maps</string>
+    <string name="notif_add_to_calendar_label">Add to calendar</string>
+    <string name="notif_track_package_label">Track package</string>
     <string name="notif_code_copied">Code copied</string>
     <string name="notif_preview_hidden_content">New message</string>
 
@@ -1066,7 +1097,7 @@
     <string name="about_feat_ui_label">Smooth UI</string>
     <string name="about_feat_ui_desc">Compose + per-bubble isolated recomposition. Conversation sorting in the 3-dot menu.</string>
     <string name="about_feat_noads_label">Zero ads, zero trackers</string>
-    <string name="about_feat_noads_desc">No analytics, no Google services. Internet is used only for GIF search (Klipy), link previews, and device syncing; MMS are carried by Android\'s own MMS service.</string>
+    <string name="about_feat_noads_desc">No analytics, no Google services. Internet is used only for GIF search (Klipy), link previews, map previews, and device syncing; MMS are carried by Android\'s own MMS service.</string>
 
     <!-- Help recipes (7 titles + steps) -->
     <string name="about_help_default_title">Set as default SMS app</string>

@@ -22,6 +22,9 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withLink
+import com.relay.sms.domain.smartactions.SmartAction
+import com.relay.sms.domain.smartactions.SmartActionDetector
+import java.time.ZoneId
 
 /**
  * v1.3.2 — affiche le corps d'un message en détectant les URLs (http/https + domaines
@@ -42,6 +45,14 @@ import androidx.compose.ui.text.withLink
  * Style :
  *   - Le lien est souligné, en gras léger, couleur = couleur du texte parent
  *     (lisible sur fond clair comme foncé sans hardcode).
+ *
+ * Round 53 — smart actions: the same pass also detects emails, physical
+ * addresses, dates/times and tracking numbers ([SmartActionDetector]) and
+ * renders them as clickable spans in the same link style; a tap calls
+ * [onSmartAction] with the detected action. Overlap priority is Url >
+ * Email > Tracking > DateTime > Address > Phone (see
+ * [resolveHitOverlaps]), so a tracking number or an email inside a URL
+ * never fragments it.
  */
 @Composable
 fun MessageTextWithLinks(
@@ -62,6 +73,16 @@ fun MessageTextWithLinks(
      */
     onPhoneClick: (String) -> Unit = {},
     /**
+     * Round 53 — invoked when the user taps a smart action detected inside
+     * [text] (an email, address, date/time or tracking number). Default
+     * no-op so existing call sites keep working until they opt in. Wrapped
+     * in [rememberUpdatedState] below, like [onPhoneClick], so the lambda
+     * identity can change without invalidating the regex pass. Pass as a
+     * NAMED argument — adding a lambda parameter as the last one would
+     * silently rebind existing trailing lambdas (see AGENTS.md).
+     */
+    onSmartAction: (SmartAction) -> Unit = {},
+    /**
      * Feedback round 5 — thread search highlight: every occurrence of the
      * query in [text], and whether the search is currently sitting on this
      * message. Empty by default: no search, no highlight.
@@ -73,11 +94,13 @@ fun MessageTextWithLinks(
     // pass below only re-runs when [text] changes, while the actual phone callback the
     // listener forwards to always points to the latest [onPhoneClick].
     val phoneClickState = rememberUpdatedState(onPhoneClick)
+    val smartActionState = rememberUpdatedState(onSmartAction)
     val annotated = remember(text, searchHighlight) {
         buildLinkifiedText(
             text,
             messageId = messageId,
             onPhoneClick = { number -> phoneClickState.value(number) },
+            onSmartAction = { action -> smartActionState.value(action) },
             highlightRanges = searchHighlight.ranges,
             highlightCurrent = searchHighlight.current,
         )
@@ -129,8 +152,26 @@ private val URL_TRAILING_PUNCTUATION = charArrayOf('.', ',', ';', ':', '!', '?',
 private const val PHONE_MIN_DIGITS = 7
 private const val PHONE_MAX_DIGITS = 15
 
-private enum class HitKind { Url, Phone }
-private data class LinkHit(val start: Int, val end: Int, val kind: HitKind)
+/**
+ * Round 53 — the kinds of clickable span. Declaration order IS the
+ * overlap priority ([resolveHitOverlaps] sorts on [ordinal]): Url 0,
+ * Email 1, Tracking 2, DateTime 3, Address 4, Phone 5. An email beats a
+ * tracking number so `1Z…@example.com` stays one email; an address beats
+ * a phone so a ZIP code is not offered as a call.
+ */
+internal enum class HitKind { Url, Email, Tracking, DateTime, Address, Phone }
+
+/**
+ * One clickable span: [start]/[end] are exclusive-end offsets into the
+ * body; [action] carries the detected smart action for the Email /
+ * Tracking / DateTime / Address kinds (`null` for Url and Phone).
+ */
+internal data class LinkHit(
+    val start: Int,
+    val end: Int,
+    val kind: HitKind,
+    val action: SmartAction? = null,
+)
 
 /**
  * v1.3.2 (URL) + v1.3.11 F4 (phone) — construit l'AnnotatedString avec les URLs ET les
@@ -161,6 +202,11 @@ private data class LinkHit(val start: Int, val end: Int, val kind: HitKind)
  * Chevauchements URL ↔ téléphone : URL gagne (priorité 0 vs 1 dans le tri). Évite
  * qu'une URL contenant des chiffres soit fragmentée en un lien URL + un sous-lien
  * téléphone décalé.
+ *
+ * Round 53 — smart actions: [onSmartAction] receives the tap for an
+ * email, address, date/time or tracking-number span. Like the phone tap,
+ * it triggers NO intent from this composable — the caller owns the
+ * intent (see `SmartActionIntents.perform`).
  */
 internal fun buildLinkifiedText(
     text: String,
@@ -172,6 +218,7 @@ internal fun buildLinkifiedText(
      */
     messageId: Long = -1L,
     onPhoneClick: (String) -> Unit = {},
+    onSmartAction: (SmartAction) -> Unit = {},
     /**
      * Feedback round 5 — thread search highlight, applied on top of the
      * linkified text (see [addSearchHighlight]). The ranges index into
@@ -230,6 +277,25 @@ internal fun buildLinkifiedText(
                     append(number)
                 }
             }
+            HitKind.Email, HitKind.Tracking, HitKind.DateTime, HitKind.Address -> {
+                // The action is bound into a local for the same reason as
+                // the phone number above. A hit without its action (never
+                // produced by collectLinkHits) renders as plain text.
+                val action = hit.action
+                if (action != null) {
+                    withLink(
+                        LinkAnnotation.Clickable(
+                            tag = raw,
+                            styles = LINK_STYLE,
+                            linkInteractionListener = { onSmartAction(action) },
+                        ),
+                    ) {
+                        append(raw)
+                    }
+                } else {
+                    append(raw)
+                }
+            }
         }
         cursor = hit.end
     }
@@ -253,6 +319,20 @@ internal fun firstPreviewUrl(text: String, messageId: Long = -1L): String? {
     val first = hits.firstOrNull { it.kind == HitKind.Url } ?: return null
     val raw = text.substring(first.start, first.end)
     return raw.trimEnd(*URL_TRAILING_PUNCTUATION).toSafeHttpsTargetOrNull()
+}
+
+/**
+ * Round 53 — the first physical address in [text], for the map preview
+ * card ([MapPreviewCard]). Reuses the same hits the linkify pass finds
+ * ([collectLinkHits] / [LinkHitCache]), so the preview always matches an
+ * address the bubble renders clickable. `null` when there is no address
+ * or the body exceeds [LINKIFY_INPUT_CAP] (no linkify there either).
+ */
+internal fun firstSmartAddress(text: String, messageId: Long = -1L): String? {
+    if (text.isEmpty() || text.length > LINKIFY_INPUT_CAP) return null
+    val hits = if (messageId >= 0L) LinkHitCache.hitsFor(messageId, text) else collectLinkHits(text)
+    val first = hits.firstOrNull { it.kind == HitKind.Address } ?: return null
+    return (first.action as? SmartAction.Address)?.text
 }
 
 /**
@@ -304,12 +384,12 @@ private val SEARCH_CURRENT_MATCH_STYLE = SpanStyle(
 
 /**
  * Feedback round 6 — per-message cache for the linkify regex hits
- * ([collectLinkHits] runs `Patterns.WEB_URL` + `Patterns.PHONE` over the
- * whole body). The composable `remember` only survives while the bubble is
- * composed; scrolling a bubble off-screen disposes it, so scrolling back
- * re-ran both regexes on every first composition. Hits are keyed by message
- * id and validated against the body (bodies are immutable per id — the
- * check is a safety net). Only the regex pass is cached: the final
+ * ([collectLinkHits] runs `Patterns.WEB_URL` + `Patterns.PHONE` + the
+ * smart-action detectors over the whole body). The composable `remember`
+ * only survives while the bubble is composed; scrolling a bubble
+ * off-screen disposes it, so scrolling back re-ran the regexes on every
+ * first composition. Hits are keyed by message id and validated against
+ * the body (bodies are immutable per id — the check is a safety net). Only the regex pass is cached: the final
  * `AnnotatedString` is still built per composition, because the search
  * highlights change with navigation and must not be cached. Bounded (256
  * entries, eldest evicted) so a long thread cannot grow it without limit.
@@ -333,9 +413,9 @@ private object LinkHitCache {
 }
 
 /**
- * v1.3.11 (F4) — runs the URL and PHONE regexes once each, then merges + dedupes
- * overlapping ranges. URL wins on conflict (priority 0 vs 1) to keep things like
- * `https://example.com/+33612345678` rendered as a single URL link.
+ * v1.3.11 (F4) — runs the URL and PHONE regexes once each, plus the
+ * round-53 smart-action detectors (email, address, date/time, tracking),
+ * then merges + dedupes overlapping ranges ([resolveHitOverlaps]).
  */
 private fun collectLinkHits(text: String): List<LinkHit> {
     val all = ArrayList<LinkHit>(8)
@@ -352,13 +432,41 @@ private fun collectLinkHits(text: String): List<LinkHit> {
             all += LinkHit(start, end, HitKind.Phone)
         }
     }
-    if (all.isEmpty()) return emptyList()
-    // Sort by start (asc) then URL-first on equal starts.
-    all.sortWith(compareBy({ it.start }, { if (it.kind == HitKind.Url) 0 else 1 }))
-    // Drop any hit whose range overlaps the previous accepted one.
-    val accepted = ArrayList<LinkHit>(all.size)
+    // Round 53 — the smart-action detectors run over the same body; their
+    // matches join the same overlap resolution below. Dates resolve
+    // against now in the device's time zone.
+    val nowMillis = System.currentTimeMillis()
+    val zone = ZoneId.systemDefault()
+    for (match in SmartActionDetector.detectAll(text, nowMillis, zone)) {
+        val kind = when (match.action) {
+            is SmartAction.Email -> HitKind.Email
+            is SmartAction.Tracking -> HitKind.Tracking
+            is SmartAction.DateTime -> HitKind.DateTime
+            is SmartAction.Address -> HitKind.Address
+            // Phones come from Patterns.PHONE above; the detector never
+            // produces a Call (it is a notification-only representation).
+            is SmartAction.Call -> continue
+        }
+        all += LinkHit(match.range.first, match.range.last + 1, kind, match.action)
+    }
+    return resolveHitOverlaps(all)
+}
+
+/**
+ * Round 53 — merges + dedupes overlapping ranges. Sort by start (asc),
+ * then by kind priority ([HitKind.ordinal]: Url 0, Email 1, Tracking 2,
+ * DateTime 3, Address 4, Phone 5), then drop any hit whose range overlaps
+ * the previous accepted one — so `https://example.com/+33612345678`
+ * renders as a single URL link, an email inside a URL never fragments
+ * it, and a ZIP code is not offered as a call. Internal so JUnit can pin
+ * the priority without Compose or `Patterns`.
+ */
+internal fun resolveHitOverlaps(hits: List<LinkHit>): List<LinkHit> {
+    if (hits.isEmpty()) return emptyList()
+    val sorted = hits.sortedWith(compareBy({ it.start }, { it.kind.ordinal }))
+    val accepted = ArrayList<LinkHit>(sorted.size)
     var lastEnd = 0
-    for (hit in all) {
+    for (hit in sorted) {
         if (hit.start >= lastEnd) {
             accepted += hit
             lastEnd = hit.end

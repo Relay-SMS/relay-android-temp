@@ -239,6 +239,17 @@
             <data android:mimeType="vnd.android.cursor.dir/contact" />
         </intent>
         <package android:name="com.android.contacts" />
+        <!-- Round 53 — smart actions: the maps-provider choice pins a `geo:`
+             intent to a specific maps app when it is installed
+             (`SmartActionIntents.mapsIntent`, via
+             `getLaunchIntentForPackage`), and that check needs the package
+             visible on Android 11+. Four named packages only — no
+             `QUERY_ALL_PACKAGES`, and the choice still works without them
+             (the web fallback opens). -->
+        <package android:name="com.google.android.apps.maps" />
+        <package android:name="net.osmand.plus" />
+        <package android:name="net.osmand" />
+        <package android:name="app.organicmaps" />
     </queries>
 
     <!-- `enableOnBackInvokedCallback` réactivé (predictive back) après le bump

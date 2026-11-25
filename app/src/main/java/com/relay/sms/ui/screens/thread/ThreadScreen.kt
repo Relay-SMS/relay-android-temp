@@ -152,9 +152,11 @@ import com.relay.sms.data.voice.VoicePlaybackController
 import com.relay.sms.domain.model.Message
 import com.relay.sms.domain.model.PhoneAddress
 import com.relay.sms.domain.model.SendErrorCode
+import com.relay.sms.domain.smartactions.SmartAction
 import com.relay.sms.e2e.E2eNoticesForItem
 import com.relay.sms.e2e.E2eThreadNotices
 import com.relay.sms.e2e.GroupEncryptionState
+import com.relay.sms.smartactions.SmartActionIntents
 import com.relay.sms.sync.client.ClientCallState
 import com.relay.sms.ui.components.AttachmentKind
 import com.relay.sms.ui.components.AttachmentPickerSheet
@@ -353,6 +355,21 @@ fun ThreadScreen(
     // multiply dialog instances across hundreds of bubbles in a busy thread.
     var pickingPhoneNumber by remember { mutableStateOf<String?>(null) }
     val onPhoneClick: (String) -> Unit = { pickingPhoneNumber = it }
+    // Round 53 — smart action tapped inside any bubble body / caption (or
+    // the map preview card): perform it with the current maps provider.
+    // The provider is read through `rememberUpdatedState` so this lambda
+    // stays stable (it rides the `itemActions` bundle, rebuilt only when
+    // the view model or the client mode changes) while the provider value
+    // stays fresh. When no app can take the intent, a snackbar says so
+    // instead of failing silently.
+    val mapsProviderState = rememberUpdatedState(state.mapsProvider)
+    val onSmartAction: (SmartAction) -> Unit = { action ->
+        val performed = SmartActionIntents.perform(context, action, mapsProviderState.value)
+        if (!performed) {
+            val label = context.getString(R.string.smart_action_no_app)
+            scope.launch { snackbarHost.showSnackbar(label) }
+        }
+    }
     // v1.3.11 (F5) — message being forwarded. Non-null = open the picker sheet. The
     // selected destination conversation (or new-recipient flow) consumes the staged
     // payload via [IncomingShareHolder] which the dest [ThreadViewModel] picks up at
@@ -1362,6 +1379,7 @@ fun ThreadScreen(
                     }
                 },
                 onPhoneClick = onPhoneClick,
+                onSmartAction = onSmartAction,
                 // E2E — a key-change notice tap opens the safety-number
                 // sheet for this thread's peer.
                 onE2eNoticeVerify = { e2eVerificationOpen = true },
@@ -3953,6 +3971,8 @@ private class ThreadMessageItemActions(
     /** Feedback round 5 — bascule « épingler » (un seul message épinglé par fil). */
     val onTogglePin: (Message) -> Unit,
     val onPhoneClick: (String) -> Unit,
+    /** Round 53 — smart-action tap (email, address, date/time, tracking). */
+    val onSmartAction: (SmartAction) -> Unit,
     /**
      * E2E — a key-change notice tap: opens the safety-number
      * verification sheet for this thread's peer.
@@ -4162,6 +4182,10 @@ private fun ThreadMessageItem(
                 // Tapback, or your own reaction), and tapping it clears
                 // the local badge — same as the original wiring.
                 onRemoveReaction = { actions.onRemoveReaction(msg.id) },
+                // Round 53 — smart-action tap, same bundle (the text
+                // bubble is at the parameter limit). Not gated in
+                // client mode: it never writes, like the phone tap.
+                onSmartAction = actions.onSmartAction,
             )
         }
         // Client mode C3 — the gated actions, one decision for the

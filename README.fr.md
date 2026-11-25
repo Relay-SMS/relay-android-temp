@@ -37,7 +37,11 @@ Versions : [GitHub Releases](https://github.com/relay-sms/relay-android/releases
   notifications.
 - **Messages épinglés** : épinglez un message dans un fil et revenez-y depuis la bannière.
 - **Réactions emoji** sur les bulles de message, envoyées sous forme de tapbacks.
-- **Détection des codes OTP / de connexion** : copie en un geste depuis le message et depuis la notification.
+- **Actions intelligentes** : des actions en un geste sur le contenu d'un message — codes OTP / de
+  connexion (copier), numéros de téléphone (appeler), adresses e-mail (envoyer un e-mail), adresses
+  postales (ouvrir dans votre application de cartes, avec un aperçu de carte à charger au toucher),
+  dates et heures (ajouter au calendrier) et numéros de suivi (suivre le colis — UPS, USPS,
+  FedEx). Dans la bulle et dans la notification ; la détection se fait sur l'appareil.
 - **Détection d'arnaque** hors ligne (liens raccourcis, formules d'urgence, numéros surtaxés, domaines
   usurpés), fondée sur des règles : elle peut se tromper dans les deux sens.
 - Blocage synchronisé avec la liste de blocage de Téléphone / Samsung Messages ; blocage facultatif

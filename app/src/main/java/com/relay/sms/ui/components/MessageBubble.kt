@@ -391,6 +391,14 @@ fun MessageBubble(
                                 body = message.body,
                                 messageId = message.id,
                             )
+                            // Round 53 — map preview: the first address in
+                            // the body gets its tap-to-load map card, right
+                            // after the link preview. Same FAILED skip.
+                            MapPreviewCard(
+                                body = message.body,
+                                messageId = message.id,
+                                onSmartAction = toggles?.onSmartAction ?: {},
+                            )
                         }
                         if (message.status == com.relay.sms.domain.model.Message.Status.FAILED) {
                             Text(
@@ -417,6 +425,10 @@ fun MessageBubble(
                                 style = textStyle,
                                 color = textColor,
                                 onPhoneClick = onPhoneClick,
+                                // Round 53 — smart-action taps ride the
+                                // toggles bundle: the bubble is at the
+                                // parameter limit (see [BubbleMenuToggles]).
+                                onSmartAction = toggles?.onSmartAction ?: {},
                                 searchHighlight = searchHighlight,
                             )
                         }

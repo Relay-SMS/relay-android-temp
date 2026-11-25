@@ -44,7 +44,10 @@ Releases: [GitHub Releases](https://github.com/relay-sms/relay-android/releases/
 - Named groups and group MMS, contextual replies with quotes, inline reply from notifications.
 - **Pinned messages**: pin a message in a thread and jump back to it from the banner.
 - **Emoji reactions** on message bubbles, sent as tapbacks.
-- **OTP / login-code detection**: one-tap copy from the message and from the notification.
+- **Smart actions**: one-tap actions on what a message contains — OTP / login codes (copy), phone
+  numbers (call), email addresses (send email), physical addresses (open in your maps app, with a
+  tap-to-load map preview), dates and times (add to calendar), and tracking numbers (track the
+  package — UPS, USPS, FedEx). In the bubble and in the notification; detection is on-device.
 - Offline **scam detection** (shortened links, urgency wording, premium numbers, spoofed domains), on
   rules: it can be wrong both ways.
 - Blocking synchronized with the Phone / Samsung Messages blocklist; optional blocking of unknown

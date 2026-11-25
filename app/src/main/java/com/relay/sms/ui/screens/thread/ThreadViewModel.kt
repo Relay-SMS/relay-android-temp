@@ -37,6 +37,7 @@ import com.relay.sms.e2e.E2eNoticeUi
 import com.relay.sms.e2e.E2eThreadEntryPoint
 import com.relay.sms.e2e.E2eWireFormat
 import com.relay.sms.e2e.GroupEncryptionState
+import com.relay.sms.e2e.HandshakeChannel
 import com.relay.sms.e2e.PlainReason
 import com.relay.sms.sync.client.ClientSendManagerEntryPoint
 import com.relay.sms.sync.client.ClientSyncEngineEntryPoint
@@ -536,6 +537,14 @@ class ThreadViewModel @Inject constructor(
          */
         val isClientMode: Boolean = false,
         /**
+         * Round 53 — the maps provider for smart actions ("Open in
+         * Maps"), from the same settings snapshot as
+         * [smishingDetectionEnabled]. ThreadScreen's smart-action
+         * handler reads it to build the maps intent.
+         */
+        val mapsProvider: com.relay.sms.domain.settings.MapsProvider =
+            com.relay.sms.domain.settings.MapsProvider.SYSTEM_DEFAULT,
+        /**
          * Client mode C5 — the attachment download states for this
          * thread's bubbles, keyed by local attachment id. Empty in
          * hub mode (and before the first download starts).
@@ -738,6 +747,9 @@ class ThreadViewModel @Inject constructor(
                         // from the same snapshot (one collect, no
                         // extra subscription).
                         isClientMode = snapshot.mode == DeviceMode.CLIENT,
+                        // Round 53 — the maps provider for smart
+                        // actions, from the same snapshot.
+                        mapsProvider = snapshot.smartActions.mapsProvider,
                     )
                 }
                 // Audit P1 : recompute sur IO lorsque le toggle change.
@@ -2063,12 +2075,16 @@ class ThreadViewModel @Inject constructor(
      * explicit consent for this one probe). Hub mode only, like the
      * probe-on-open: the panel shows no encryption row in client
      * mode, so this never fires there.
+     *
+     * Desktop encryption-box update — result-aware: a retry that
+     * did not send (gated, or the radio refused) used to leave the
+     * user with no feedback at all (only the error-log entry), so
+     * the outcome now shows as a snackbar ([e2eRetryNotice]); a
+     * send that spent the last budget slot names the reset in
+     * Settings → Advanced.
      */
     fun retryE2eProbe() {
-        runCatching { e2eEntryPoint().probeManager().retryProbe(conversationId) }
-            .onFailure {
-                timber.log.Timber.w(it, "ThreadViewModel: e2e manual probe retry failed")
-            }
+        retryE2eProbeOn(HandshakeChannel.DATA_SMS)
     }
 
     /**
@@ -2077,13 +2093,41 @@ class ThreadViewModel @Inject constructor(
      * [retryE2eProbe], but the probe travels as one `RLYH:` text —
      * for peers whose data SMS never arrive. Hub mode only, like
      * [retryE2eProbe]: the panel shows no encryption row in client
-     * mode, so this never fires there.
+     * mode, so this never fires there. Result-aware like
+     * [retryE2eProbe] (desktop encryption-box update).
      */
     fun retryE2eProbeViaSms() {
-        runCatching { e2eEntryPoint().probeManager().retryProbeViaSms(conversationId) }
-            .onFailure {
-                timber.log.Timber.w(it, "ThreadViewModel: e2e manual SMS probe retry failed")
+        retryE2eProbeOn(HandshakeChannel.TEXT_SMS)
+    }
+
+    /**
+     * Shared result-aware core of the two manual retries: runs the
+     * detailed retry off the main thread (the SMS send is a
+     * blocking call) and shows the outcome's snackbar, if any. An
+     * entry-point failure (JVM unit tests, where Hilt cannot
+     * serve it) stays silent, like before.
+     */
+    private fun retryE2eProbeOn(channel: HandshakeChannel) {
+        viewModelScope.launch {
+            val result = runCatching {
+                withContext(io) {
+                    e2eEntryPoint().probeManager().retryProbeDetailed(conversationId, channel)
+                }
+            }.onFailure {
+                timber.log.Timber.w(
+                    it,
+                    "ThreadViewModel: e2e manual probe retry failed (channel=$channel)",
+                )
+            }.getOrNull() ?: return@launch
+            e2eRetryNotice(result)?.let { notice ->
+                _events.tryEmit(
+                    Event.ShowSnackbar(
+                        message = context.getString(notice.messageRes),
+                        isError = notice.isError,
+                    ),
+                )
             }
+        }
     }
 
     fun deleteMessage(messageId: Long) {

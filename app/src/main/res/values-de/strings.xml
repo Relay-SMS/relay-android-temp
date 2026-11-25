@@ -213,6 +213,15 @@
     <string name="e2e_details_retry_encryption">Verschlüsselung erneut versuchen</string>
     <string name="e2e_details_retry_via_sms">Anders erneut versuchen</string>
     <string name="e2e_details_retrying">Wird erneut versucht…</string>
+    <string name="e2e_retry_no_conversation">Unterhaltung nicht gefunden.</string>
+    <string name="e2e_retry_not_one_to_one">Verschlüsselung kann nur in einer Einzelunterhaltung erneut versucht werden.</string>
+    <string name="e2e_retry_invalid_address">Diese Nummer kann keine Verschlüsselungsanfrage empfangen.</string>
+    <string name="e2e_retry_blocked">Dieser Kontakt ist blockiert. Hebe die Blockierung auf, um die Verschlüsselung erneut zu versuchen.</string>
+    <string name="e2e_retry_already_encrypted">Diese Unterhaltung ist bereits verschlüsselt.</string>
+    <string name="e2e_retry_rate_limited">Zu viele Verschlüsselungsversuche für diesen Kontakt. Setze das Timing unter Einstellungen → Erweitert zurück.</string>
+    <string name="e2e_retry_discovery_off">Die Verschlüsselungserkennung ist deaktiviert.</string>
+    <string name="e2e_retry_send_failed">Verschlüsselung konnte gerade nicht erneut versucht werden.</string>
+    <string name="e2e_retry_budget_exhausted">Prüfung gesendet. Automatische Prüfungen für diesen Kontakt sind pausiert — setze sie unter Einstellungen → Erweitert → „Verschlüsselungs-Timing zurücksetzen“ zurück.</string>
     <string name="e2e_details_view_safety_number">Sicherheitsnummer ansehen</string>
     <string name="e2e_verify_title">Sicherheitsnummer</string>
     <string name="e2e_verify_explainer">Vergleiche diese Nummer mit %1$s persönlich oder über einen anderen Kanal – einen Anruf oder eine andere App. Wenn die Nummern übereinstimmen, sprecht ihr miteinander und niemand sitzt dazwischen.</string>
@@ -787,6 +796,23 @@
     <string name="notifications_off_emergency_shortcut">Die Notfall-Verknüpfung kann nicht auf dem Sperrbildschirm erscheinen.</string>
     <string name="notifications_off_messages">Neue Nachrichten kommen ohne Benachrichtigung an.</string>
 
+    <!-- Round 53 — smart actions: the section + the maps-provider picker + the map preview card. -->
+    <string name="settings_section_smart_actions">Intelligente Aktionen</string>
+    <string name="settings_maps_app_title">Karten-App</string>
+    <string name="settings_maps_app_system">Systemstandard</string>
+    <string name="settings_maps_app_system_hint">Android die Karten-App wählen lassen.</string>
+    <string name="settings_maps_app_google">Google Maps</string>
+    <string name="settings_maps_app_google_hint">Die Google-Maps-App, falls installiert, sonst die Webversion.</string>
+    <string name="settings_maps_app_apple">Apple Maps</string>
+    <string name="settings_maps_app_apple_hint">Apple Maps im Web – es gibt keine Apple-Maps-App für Android.</string>
+    <string name="settings_maps_app_osm">OpenStreetMap</string>
+    <string name="settings_maps_app_osm_hint">Eine OpenStreetMap-App, falls installiert, sonst openstreetmap.org.</string>
+    <string name="map_preview_load">Kartenvorschau laden</string>
+    <string name="map_preview_load_hint">Lädt eine Karte von OpenStreetMap.</string>
+    <string name="map_preview_unavailable">Kartenvorschau nicht verfügbar – zum Wiederholen tippen</string>
+    <string name="map_preview_attribution">© OpenStreetMap-Mitwirkende</string>
+    <string name="smart_action_no_app">Keine App kann dies öffnen</string>
+
     <string name="settings_section_security">Sicherheit &amp; Privatsphäre</string>
     <string name="settings_flag_secure">Privater Bildschirm</string>
     <string name="settings_flag_secure_desc">Verbirgt das Vorschaubild der Unterhaltung in der Systemübersicht und verhindert Bildschirmfotos und Bildschirmaufnahmen, solange die App geöffnet ist.</string>
@@ -847,7 +873,7 @@
     <string name="about_perm_notifications">Benachrichtigungen über neue Nachrichten anzeigen.</string>
     <string name="about_perm_biometric">Optionales Entsperren per Biometrie.</string>
     <string name="about_perm_record_audio">Sprachnachrichten aufnehmen, die an ausgehende MMS angehängt werden.</string>
-    <string name="about_perm_internet">GIF-Suche (Klipy), Link-Vorschau und Gerätesynchronisierung. Die App funktioniert auch ohne sie.</string>
+    <string name="about_perm_internet">GIF-Suche (Klipy), Link-Vorschau, Kartenvorschau und Gerätesynchronisierung. Die App funktioniert auch ohne sie.</string>
     <string name="about_perm_foreground_service">Lang laufende Migration bzw. Sicherung.</string>
     <string name="about_perm_location">Nur Notfallmodus, wenn Sie ihn aktivieren: eine Position im Moment des Alarms, genau oder ungefähr.</string>
     <string name="about_perm_call_phone">Notruf-Kacheln: direkter Anruf. Verweigert, öffnen sie stattdessen die Telefon-App.</string>
@@ -892,6 +918,11 @@
     <string name="notif_reply_label">Antworten</string>
     <string name="notif_mark_read_label">Als gelesen markieren</string>
     <string name="notif_copy_code_label">Code kopieren</string>
+    <string name="notif_call_label">Anrufen</string>
+    <string name="notif_send_email_label">E-Mail senden</string>
+    <string name="notif_open_maps_label">Karte öffnen</string>
+    <string name="notif_add_to_calendar_label">Zum Kalender hinzufügen</string>
+    <string name="notif_track_package_label">Paket verfolgen</string>
     <string name="notif_code_copied">Code kopiert</string>
     <string name="notif_preview_hidden_content">Neue Nachricht</string>
 
@@ -1067,7 +1098,7 @@
     <string name="about_feat_ui_label">Flüssige Oberfläche</string>
     <string name="about_feat_ui_desc">Compose mit pro Sprechblase isolierter Neuzeichnung. Sortierung der Unterhaltungen im Drei-Punkte-Menü.</string>
     <string name="about_feat_noads_label">Keine Werbung, keine Tracker</string>
-    <string name="about_feat_noads_desc">Keine Analyse, keine Google-Dienste. Internet wird nur für die GIF-Suche (Klipy), Link-Vorschau und Gerätesynchronisierung verwendet; MMS überträgt der MMS-Dienst von Android.</string>
+    <string name="about_feat_noads_desc">Keine Analyse, keine Google-Dienste. Internet wird nur für die GIF-Suche (Klipy), Link-Vorschau, Kartenvorschau und Gerätesynchronisierung verwendet; MMS überträgt der MMS-Dienst von Android.</string>
 
     <!-- Help recipes (7 titles + steps) -->
     <string name="about_help_default_title">Als Standard-SMS-App festlegen</string>

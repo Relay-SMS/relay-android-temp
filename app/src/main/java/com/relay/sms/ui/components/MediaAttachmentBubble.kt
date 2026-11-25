@@ -374,6 +374,9 @@ fun MediaAttachmentBubble(
                         // white on the green fill and on a custom colour.
                         color = if (isOut) outgoingTextColor else cs.onSurface,
                         onPhoneClick = onPhoneClick,
+                        // Round 53 — smart-action taps ride the toggles
+                        // bundle (see [BubbleMenuToggles]).
+                        onSmartAction = toggles?.onSmartAction ?: {},
                         searchHighlight = searchHighlight,
                     )
                     BubbleTimestamp(

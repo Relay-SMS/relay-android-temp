@@ -32,12 +32,14 @@ import com.relay.sms.domain.settings.EmergencyCallBehavior
 import com.relay.sms.domain.settings.EncryptionSettings
 import com.relay.sms.domain.settings.ListDensity
 import com.relay.sms.domain.settings.LockMode
+import com.relay.sms.domain.settings.MapsProvider
 import com.relay.sms.domain.settings.MmsImageQuality
 import com.relay.sms.domain.settings.NotificationSettings
 import com.relay.sms.domain.settings.NotificationStyle
 import com.relay.sms.domain.settings.PreviewMode
 import com.relay.sms.domain.settings.SecuritySettings
 import com.relay.sms.domain.settings.SendingSettings
+import com.relay.sms.domain.settings.SmartActionSettings
 import com.relay.sms.domain.settings.SortMode
 import com.relay.sms.domain.settings.TextScale
 import com.relay.sms.domain.settings.ThemeMode
@@ -472,7 +474,15 @@ class SettingsRepository(
                 stickyCategoryBackfilledV20 = p[K.stickyCategoryBackfilledV20] ?: false,
                 stickyCategoryBackfilledV22 = p[K.stickyCategoryBackfilledV22] ?: false,
                 stickyCategoryBackfilledPostImport = p[K.stickyCategoryBackfilledPostImport] ?: false,
-                groupConversationsRepairedV25 = p[K.groupConversationsRepairedV25] ?: false,
+                groupConversationsRepairedV26 = p[K.groupConversationsRepairedV26] ?: false,
+            ),
+            smartActions = SmartActionSettings(
+                mapsProvider = enumOr(
+                    p,
+                    K.mapsProvider,
+                    MapsProvider.SYSTEM_DEFAULT,
+                    MapsProvider::valueOf,
+                ),
             ),
         )
     }
@@ -612,7 +622,10 @@ class SettingsRepository(
         this[K.stickyCategoryBackfilledV20] = s.advanced.stickyCategoryBackfilledV20
         this[K.stickyCategoryBackfilledV22] = s.advanced.stickyCategoryBackfilledV22
         this[K.stickyCategoryBackfilledPostImport] = s.advanced.stickyCategoryBackfilledPostImport
-        this[K.groupConversationsRepairedV25] = s.advanced.groupConversationsRepairedV25
+        this[K.groupConversationsRepairedV26] = s.advanced.groupConversationsRepairedV26
+
+        // Round 53 — the maps provider for "Open in Maps", persisted by enum name.
+        this[K.mapsProvider] = s.smartActions.mapsProvider.name
     }
 
     private inline fun <reified E : Enum<E>> enumOr(p: Preferences, key: Preferences.Key<String>, def: E, valueOf: (String) -> E): E =
@@ -859,8 +872,11 @@ class SettingsRepository(
         val stickyCategoryBackfilledPostImport =
             booleanPreferencesKey("advanced.stickyCategoryBackfilledPostImport")
 
-        /** Round 50 — reparation one-shot des conversations de groupe mal classees. Round 52: V25. */
-        val groupConversationsRepairedV25 =
-            booleanPreferencesKey("advanced.groupConversationsRepairedV25")
+        /** Round 50 — reparation one-shot des conversations de groupe mal classees. Round 52: V25. Member-ID fix: V26. */
+        val groupConversationsRepairedV26 =
+            booleanPreferencesKey("advanced.groupConversationsRepairedV26")
+
+        /** Round 53 — the maps provider for "Open in Maps" (smart actions). */
+        val mapsProvider = stringPreferencesKey("smart.mapsProvider")
     }
 }

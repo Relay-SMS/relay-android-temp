@@ -10,12 +10,14 @@ Relay (`com.relay.sms`) est éditée par **Relay Messaging**. Voir aussi les [co
 
 ## Ce que nous collectons
 
-**Rien.** Relay ne collecte, ne transmet ni n'agrège aucune donnée personnelle — avec deux
-exceptions, toutes deux à votre initiative : lorsque vous recherchez un GIF, les mots tapés sont
-envoyés à Klipy pour qu'il renvoie des GIF correspondants, et lorsqu'un message contient un lien,
-Relay récupère cette page une fois pour afficher une carte d'aperçu (voir
+**Rien.** Relay ne collecte, ne transmet ni n'agrège aucune donnée personnelle — avec trois
+exceptions, toutes à votre initiative : lorsque vous recherchez un GIF, les mots tapés sont
+envoyés à Klipy pour qu'il renvoie des GIF correspondants ; lorsqu'un message contient un lien,
+Relay récupère cette page une fois pour afficher une carte d'aperçu ; et lorsqu'un message
+contient une adresse postale et que vous touchez « Charger l'aperçu de la carte », Relay envoie
+l'adresse à Nominatim pour la géocoder et récupère une image de carte statique (voir
 [Réseau](#réseau) ci-dessous). Relay ne conserve rien de ces échanges au-delà du GIF que vous
-choisissez d'envoyer et de l'aperçu qu'il vous montre. Lier un ordinateur ne change rien à cela :
+choisissez d'envoyer, de l'aperçu qu'il vous montre et des coordonnées de carte mises en cache. Lier un ordinateur ne change rien à cela :
 le téléphone et l'ordinateur se parlent directement sur votre réseau Wi-Fi local — aucun serveur
 Relay, aucun cloud, rien ne quitte le réseau.
 
@@ -49,14 +51,21 @@ lors d'un transfert d'appareil sans votre accord explicite.
 
 ## Réseau
 
-Relay détient la permission `INTERNET` pour trois usages. (1) Recherche de GIF : lorsque vous
+Relay détient la permission `INTERNET` pour quatre usages. (1) Recherche de GIF : lorsque vous
 ouvrez l'onglet GIF et tapez une recherche, les mots tapés sont envoyés à Klipy
 (`api.klipy.com`), qui renvoie des GIF correspondants ; en toucher un le télécharge depuis Klipy,
 et les vignettes de la grille viennent aussi de Klipy. Klipy voit vos mots de recherche et votre
 adresse IP, comme tout service contacté. (2) Aperçus de liens : lorsqu'un message contient une
 URL, Relay récupère cette page une fois, sur l'appareil, et lit son titre et son image Open Graph
 pour l'affichage uniquement — le site lié voit la requête et votre adresse IP, comme lors de toute
-visite ; l'image d'aperçu n'est jamais envoyée en pièce jointe. (3) Appareils liés : le téléphone
+visite ; l'image d'aperçu n'est jamais envoyée en pièce jointe. (3) Aperçus de cartes : lorsqu'un
+message contient une adresse postale, la bulle propose une carte — seulement quand vous touchez
+« Charger l'aperçu de la carte », Relay envoie l'adresse à Nominatim
+(`nominatim.openstreetmap.org`) pour la géocoder et récupère une image de carte statique depuis
+`staticmap.openstreetmap.de`. Nominatim voit l'adresse et votre adresse IP, comme tout service
+contacté ; le résultat du géocodage et l'image sont mis en cache sur l'appareil, et rien n'est
+envoyé tant que vous ne touchez pas — une adresse peut être une adresse personnelle, donc
+l'aperçu ne se charge jamais tout seul. (4) Appareils liés : le téléphone
 fait tourner un serveur TLS sur le réseau local (port 47831, annoncé via mDNS sous
 `_relay._tcp.`) pour qu'un ordinateur que vous avez lié puisse le trouver et se connecter. Le
 serveur n'accepte que les appareils dont vous avez enregistré la clé publique en scannant leur
@@ -66,10 +75,11 @@ n'intervient. Le serveur se désactive dans Réglages → Appareils liés ; l'ap
 alors pleinement seule. C'est la seule utilisation réseau de l'application : aucune vérification
 de mise à jour, aucune configuration distante, aucun ping analytique, aucun rapport de plantage.
 Si la permission est bloquée, l'application fonctionne toujours — la recherche de GIF ne renvoie
-simplement rien, les liens n'affichent pas d'aperçu, et aucun ordinateur ne peut se lier. (La
+simplement rien, les liens n'affichent pas d'aperçu, les aperçus de cartes ne se chargent
+simplement pas, et aucun ordinateur ne peut se lier. (La
 permission avait été retirée en 1.28.13, lorsque l'application n'émettait aucune requête réseau ;
-elle est revenue pour la recherche de GIF, puis pour les aperçus de liens, et maintenant pour les
-appareils liés.)
+elle est revenue pour la recherche de GIF, puis pour les aperçus de liens, puis pour les aperçus
+de cartes, et maintenant pour les appareils liés.)
 
 Les messages que vous envoyez passent par le réseau de votre opérateur, comme avec toute application
 de SMS. Le développeur ne les reçoit jamais.

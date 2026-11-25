@@ -43,6 +43,7 @@ import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.Key
 import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.LockOpen
+import androidx.compose.material.icons.outlined.Map
 import androidx.compose.material.icons.outlined.Notifications
 import androidx.compose.material.icons.outlined.NotificationsOff
 import androidx.compose.material.icons.outlined.Palette
@@ -196,6 +197,8 @@ fun SettingsScreen(
     var reactionFormatPickerOpen by remember { mutableStateOf(false) }
     // v1.21.0 — picker indicatif pays par défaut (conversion E.164 à l'envoi).
     var defaultRegionPickerOpen by remember { mutableStateOf(false) }
+    // Round 53 — picker Maps provider (smart actions).
+    var mapsProviderPickerOpen by remember { mutableStateOf(false) }
     // v1.8.0 — dialog de confirmation pour l'action destructive restante ici :
     // purge des conversations bloquées. (Resync et reset-all vivaient ici
     // aussi ; feedback round 6, ils ont déménagé sur l'écran Advanced avec
@@ -414,7 +417,7 @@ fun SettingsScreen(
         }
     }
 
-    // Round 24 — the landing shows only the ten section titles; tapping one
+    // Round 24 — the landing shows only the eleven section titles; tapping one
     // opens its sub-screen in place (same Scaffold, same ViewModel, same
     // dialogs — the security dialogs stay at this level so their event
     // collection and snackbars keep working). `null` = the landing.
@@ -515,6 +518,12 @@ fun SettingsScreen(
                         onUpdate = viewModel::update,
                         onOpenPreviewPicker = { previewModePickerOpen = true },
                         onOpenStylePicker = { notifStylePickerOpen = true },
+                    )
+                }
+                SettingsSection.SMART_ACTIONS -> SettingsPageColumn(padding) {
+                    SmartActionsSectionContent(
+                        smartActions = state.smartActions,
+                        onOpenMapsProviderPicker = { mapsProviderPickerOpen = true },
                     )
                 }
                 SettingsSection.SECURITY_PRIVACY -> SettingsPageColumn(padding) {
@@ -851,6 +860,19 @@ fun SettingsScreen(
                 defaultRegionPickerOpen = false
             },
             onDismiss = { defaultRegionPickerOpen = false },
+        )
+    }
+
+    if (mapsProviderPickerOpen) {
+        MapsProviderPickerDialog(
+            current = state.smartActions.mapsProvider,
+            onSelect = { provider ->
+                viewModel.update {
+                    it.copy(smartActions = it.smartActions.copy(mapsProvider = provider))
+                }
+                mapsProviderPickerOpen = false
+            },
+            onDismiss = { mapsProviderPickerOpen = false },
         )
     }
 
@@ -1287,6 +1309,97 @@ private fun BackupSectionContent(
             )
         }
     }
+}
+
+/**
+ * Round 53 — the Smart actions sub-screen: the maps provider for
+ * "Open in Maps". One row; the picker lists the four providers with
+ * hints. The choice affects "Open in" only — the tap-to-load map
+ * preview image is always OpenStreetMap.
+ */
+@Composable
+private fun SmartActionsSectionContent(
+    smartActions: com.relay.sms.domain.settings.SmartActionSettings,
+    onOpenMapsProviderPicker: () -> Unit,
+) {
+    RelaySettingsGroup {
+        item(onClick = onOpenMapsProviderPicker) {
+            RelaySettingRow(
+                icon = Icons.Outlined.Map,
+                title = stringResource(R.string.settings_maps_app_title),
+                subtitle = stringResource(
+                    when (smartActions.mapsProvider) {
+                        com.relay.sms.domain.settings.MapsProvider.SYSTEM_DEFAULT ->
+                            R.string.settings_maps_app_system
+                        com.relay.sms.domain.settings.MapsProvider.GOOGLE_MAPS ->
+                            R.string.settings_maps_app_google
+                        com.relay.sms.domain.settings.MapsProvider.APPLE_MAPS ->
+                            R.string.settings_maps_app_apple
+                        com.relay.sms.domain.settings.MapsProvider.OPENSTREETMAP ->
+                            R.string.settings_maps_app_osm
+                    },
+                ),
+                chevron = true,
+            )
+        }
+    }
+}
+
+/**
+ * Round 53 — picker for [com.relay.sms.domain.settings.MapsProvider],
+ * aligned on [ReactionFormatPickerDialog] (label + hint per option).
+ * The hints carry the trade-offs: Google Maps falls back to the web
+ * when the app is not installed, Apple Maps is web-only on Android,
+ * OpenStreetMap falls back to openstreetmap.org.
+ */
+@Composable
+private fun MapsProviderPickerDialog(
+    current: com.relay.sms.domain.settings.MapsProvider,
+    onSelect: (com.relay.sms.domain.settings.MapsProvider) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    RelayPickerDialog(
+        title = stringResource(R.string.settings_maps_app_title),
+        options = listOf(
+            RelayPickerOption(
+                label = stringResource(R.string.settings_maps_app_system),
+                hint = stringResource(R.string.settings_maps_app_system_hint),
+                selected = current ==
+                    com.relay.sms.domain.settings.MapsProvider.SYSTEM_DEFAULT,
+                onClick = {
+                    onSelect(com.relay.sms.domain.settings.MapsProvider.SYSTEM_DEFAULT)
+                },
+            ),
+            RelayPickerOption(
+                label = stringResource(R.string.settings_maps_app_google),
+                hint = stringResource(R.string.settings_maps_app_google_hint),
+                selected = current ==
+                    com.relay.sms.domain.settings.MapsProvider.GOOGLE_MAPS,
+                onClick = {
+                    onSelect(com.relay.sms.domain.settings.MapsProvider.GOOGLE_MAPS)
+                },
+            ),
+            RelayPickerOption(
+                label = stringResource(R.string.settings_maps_app_apple),
+                hint = stringResource(R.string.settings_maps_app_apple_hint),
+                selected = current ==
+                    com.relay.sms.domain.settings.MapsProvider.APPLE_MAPS,
+                onClick = {
+                    onSelect(com.relay.sms.domain.settings.MapsProvider.APPLE_MAPS)
+                },
+            ),
+            RelayPickerOption(
+                label = stringResource(R.string.settings_maps_app_osm),
+                hint = stringResource(R.string.settings_maps_app_osm_hint),
+                selected = current ==
+                    com.relay.sms.domain.settings.MapsProvider.OPENSTREETMAP,
+                onClick = {
+                    onSelect(com.relay.sms.domain.settings.MapsProvider.OPENSTREETMAP)
+                },
+            ),
+        ),
+        onDismiss = onDismiss,
+    )
 }
 
 /**

@@ -41,6 +41,7 @@ data class AppSettings(
     val blocking: BlockingSettings = BlockingSettings(),
     val backup: BackupSettings = BackupSettings(),
     val advanced: AdvancedSettings = AdvancedSettings(),
+    val smartActions: SmartActionSettings = SmartActionSettings(),
 )
 
 /**
@@ -700,10 +701,15 @@ data class AdvancedSettings(
      * (it queried the thread's MESSAGES URI, not the thread row, so
      * it "completed" without repairing anything) — and on a fresh
      * install the pass ran before the import, on an empty database.
-     * The V25 flag makes every install re-run the pass once with
-     * the fixed lookup.
+     *
+     * Member-ID fix — V26: the V25 pass ran with a broken
+     * `canonical-addresses` read (it took column 0, which AOSP
+     * fills with the recipient `_id`, so groups came back with
+     * ids as members). The V26 flag makes every install re-run
+     * the pass once with the fixed lookup, plus the new
+     * CorrectMembers arm that heals the id-member groups.
      */
-    val groupConversationsRepairedV25: Boolean = false,
+    val groupConversationsRepairedV26: Boolean = false,
     /**
      * v1.3.10 — **opt-in** : démarre [com.relay.sms.system.service.KeepAliveService]
      * qui maintient le processus Relay vivant via une notification persistante

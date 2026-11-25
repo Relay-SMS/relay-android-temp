@@ -14,6 +14,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
+import android.util.Patterns
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.Person
@@ -29,9 +30,17 @@ import com.relay.sms.domain.model.PhoneAddress
 import com.relay.sms.domain.notification.ConversationNotificationCanceller
 import com.relay.sms.domain.otp.OtpCodeDetector
 import com.relay.sms.domain.repository.ContactRepository
+import com.relay.sms.domain.settings.MapsProvider
 import com.relay.sms.domain.settings.NotificationSettings
 import com.relay.sms.domain.settings.NotificationStyle
 import com.relay.sms.domain.settings.PreviewMode
+import com.relay.sms.domain.smartactions.SmartAction
+import com.relay.sms.domain.smartactions.SmartActionDetector
+import com.relay.sms.domain.smartactions.SmartActionMatch
+import com.relay.sms.smartactions.SmartActionIntents
+import com.relay.sms.ui.components.PHONE_DIGITS_MAX
+import com.relay.sms.ui.components.PHONE_DIGITS_MIN
+import com.relay.sms.ui.components.countDigits
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.withContext
@@ -297,6 +306,28 @@ class IncomingMessageNotifier @Inject constructor(
                         ),
                     )
                 }
+                // Round 53 — one smart-action button for the first
+                // detected action in the body (a phone number offers
+                // "Call"), after the copy-code action and before
+                // mark-read. Same hidePreview gate as the OTP action:
+                // with a hidden preview no action content may leave the
+                // app through the shade.
+                if (!hidePreview) {
+                    val smartAction = pickNotificationSmartAction(
+                        SmartActionDetector.firstAction(body),
+                        firstPhoneMatch(body),
+                    )
+                    if (smartAction != null) {
+                        b.addAction(
+                            buildSmartAction(
+                                smartAction,
+                                appSettings?.smartActions?.mapsProvider
+                                    ?: MapsProvider.SYSTEM_DEFAULT,
+                                notificationId,
+                            ),
+                        )
+                    }
+                }
                 b.addAction(buildMarkReadAction(address, messageId, notificationId, conversationId))
                 if (isActiveConversation) {
                     b.setTimeoutAfter(ACTIVE_CONV_TIMEOUT_MS)
@@ -440,6 +471,75 @@ class IncomingMessageNotifier @Inject constructor(
         ).build()
     }
 
+    /**
+     * Round 53 — the notification's smart-action button for [action]
+     * ("Call" / "Send email" / "Open Maps" / "Add to calendar" / "Track
+     * package"). Unlike the reply / copy-code / mark-read actions this
+     * one is a direct `PendingIntent.getActivity`: a tap on a
+     * notification action is an allowed background-activity-start
+     * trigger, so no `BroadcastReceiver` hop is needed. The intent
+     * itself (tel:/mailto:/geo:/https:) carries the action's identity
+     * for `filterEquals`, and the request code is salted so it cannot
+     * collide with the other actions of the same message (cf.
+     * [identiteAction], audit F19).
+     */
+    private fun buildSmartAction(
+        action: SmartAction,
+        provider: MapsProvider,
+        notificationId: Int,
+    ): NotificationCompat.Action {
+        val intent = SmartActionIntents.intentFor(action, provider, context)
+        val pi = PendingIntent.getActivity(
+            context,
+            notificationId.xor(SMART_ACTION_REQUEST_SALT),
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val (icon, label) = when (action) {
+            is SmartAction.Call ->
+                R.drawable.ic_notification_call to R.string.notif_call_label
+            is SmartAction.Email ->
+                R.drawable.ic_notification_mail to R.string.notif_send_email_label
+            is SmartAction.Address ->
+                R.drawable.ic_notification_map to R.string.notif_open_maps_label
+            is SmartAction.DateTime ->
+                R.drawable.ic_notification_calendar to R.string.notif_add_to_calendar_label
+            is SmartAction.Tracking ->
+                R.drawable.ic_notification_package to R.string.notif_track_package_label
+        }
+        return NotificationCompat.Action.Builder(
+            icon,
+            context.getString(label),
+            pi,
+        ).build()
+    }
+
+    /**
+     * Round 53 — the first phone number in [body] as (start, number),
+     * for the notification's "Call" action. Same filter as the bubble's
+     * linkify pass ([Patterns.PHONE] + the 7–15 digit band), and a
+     * number inside a URL is skipped — it is part of the link, not a
+     * call target (mirrors the detector's URL-span rule).
+     */
+    private fun firstPhoneMatch(body: String): Pair<Int, String>? {
+        val urlSpans = ArrayList<IntRange>()
+        val webMatcher = Patterns.WEB_URL.matcher(body)
+        while (webMatcher.find()) {
+            urlSpans += webMatcher.start() until webMatcher.end()
+        }
+        val phoneMatcher = Patterns.PHONE.matcher(body)
+        while (phoneMatcher.find()) {
+            val start = phoneMatcher.start()
+            val end = phoneMatcher.end()
+            if (urlSpans.any { start in it }) continue
+            val digits = countDigits(body, start, end)
+            if (digits in PHONE_DIGITS_MIN..PHONE_DIGITS_MAX) {
+                return start to body.substring(start, end)
+            }
+        }
+        return null
+    }
+
     private fun buildMarkReadAction(
         address: String,
         messageId: Long,
@@ -580,6 +680,7 @@ class IncomingMessageNotifier @Inject constructor(
         private const val REPLY_REQUEST_SALT = 0x52455050 // 'REPL'
         private const val MARK_READ_REQUEST_SALT = 0x4D524541 // 'MREA'
         private const val COPY_CODE_REQUEST_SALT = 0x434F5059 // 'COPY'
+        private const val SMART_ACTION_REQUEST_SALT = 0x534D5254 // 'SMRT'
 
         /**
          * v1.3.9 — durée après laquelle Android cancel automatiquement la notification
@@ -646,4 +747,27 @@ internal fun notificationsToCancel(
         for (messageId in messages) voulues += tag to notificationIdFor(messageId)
     }
     return actives.mapNotNull { (tag, id) -> if (tag != null && (tag to id) in voulues) tag to id else null }
+}
+
+/**
+ * Round 53 — the notification's single smart action: the earliest of
+ * the first detector match ([smartAction]) and the first phone number
+ * ([phone], as (start, number)), by text position. Phones are found by
+ * the notifier ([Patterns.PHONE] cannot run on plain JVM, so they are
+ * not in the detector run) and merged here, so the shade offers "Call"
+ * for a number that precedes any email, address, date or tracking
+ * number. `null` when neither matched.
+ *
+ * A pure function, and that is the point: the choice is testable
+ * without a `Context` or `Patterns` — the caller supplies both
+ * candidates.
+ */
+internal fun pickNotificationSmartAction(
+    smartAction: SmartActionMatch?,
+    phone: Pair<Int, String>?,
+): SmartAction? = when {
+    smartAction == null -> phone?.let { SmartAction.Call(it.second) }
+    phone == null -> smartAction.action
+    phone.first < smartAction.range.first -> SmartAction.Call(phone.second)
+    else -> smartAction.action
 }

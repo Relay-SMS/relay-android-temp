@@ -215,6 +215,15 @@
     <string name="e2e_details_retry_encryption">Reintentar el cifrado</string>
     <string name="e2e_details_retry_via_sms">Reintentar de otra manera</string>
     <string name="e2e_details_retrying">Reintentando…</string>
+    <string name="e2e_retry_no_conversation">Conversación no encontrada.</string>
+    <string name="e2e_retry_not_one_to_one">El cifrado solo se puede reintentar en una conversación individual.</string>
+    <string name="e2e_retry_invalid_address">Ese número no puede recibir una sonda de cifrado.</string>
+    <string name="e2e_retry_blocked">Este contacto está bloqueado. Desbloquéalo para reintentar el cifrado.</string>
+    <string name="e2e_retry_already_encrypted">Esta conversación ya está cifrada.</string>
+    <string name="e2e_retry_rate_limited">Demasiados intentos de cifrado para este contacto. Restablece los tiempos en Ajustes → Avanzado.</string>
+    <string name="e2e_retry_discovery_off">El descubrimiento de cifrado está desactivado.</string>
+    <string name="e2e_retry_send_failed">No se pudo reintentar el cifrado ahora mismo.</string>
+    <string name="e2e_retry_budget_exhausted">Comprobación enviada. Las comprobaciones automáticas están en pausa para este contacto — restablécelas en Ajustes → Avanzado → «Restablecer los tiempos de cifrado».</string>
     <string name="e2e_details_view_safety_number">Ver número de seguridad</string>
     <string name="e2e_verify_title">Número de seguridad</string>
     <string name="e2e_verify_explainer">Compara este número con %1$s en persona o por otro canal: una llamada u otra app. Si los números coinciden, habláis entre vosotros sin nadie en medio.</string>
@@ -790,6 +799,23 @@
     <string name="notifications_off_emergency_shortcut">El acceso directo de emergencia no puede aparecer en la pantalla de bloqueo.</string>
     <string name="notifications_off_messages">Los mensajes nuevos llegan sin notificación.</string>
 
+    <!-- Round 53 — smart actions: the section + the maps-provider picker + the map preview card. -->
+    <string name="settings_section_smart_actions">Acciones inteligentes</string>
+    <string name="settings_maps_app_title">App de mapas</string>
+    <string name="settings_maps_app_system">Predeterminada del sistema</string>
+    <string name="settings_maps_app_system_hint">Dejar que Android elija la app de mapas.</string>
+    <string name="settings_maps_app_google">Google Maps</string>
+    <string name="settings_maps_app_google_hint">La app de Google Maps si está instalada; si no, la versión web.</string>
+    <string name="settings_maps_app_apple">Apple Maps</string>
+    <string name="settings_maps_app_apple_hint">Apple Maps en la web: no existe una app de Apple Maps para Android.</string>
+    <string name="settings_maps_app_osm">OpenStreetMap</string>
+    <string name="settings_maps_app_osm_hint">Una app de OpenStreetMap si está instalada; si no, openstreetmap.org.</string>
+    <string name="map_preview_load">Cargar vista previa del mapa</string>
+    <string name="map_preview_load_hint">Carga un mapa de OpenStreetMap.</string>
+    <string name="map_preview_unavailable">Vista previa del mapa no disponible: toca para reintentar</string>
+    <string name="map_preview_attribution">© Colaboradores de OpenStreetMap</string>
+    <string name="smart_action_no_app">Ninguna app puede abrir esto</string>
+
     <string name="settings_section_security">Seguridad y privacidad</string>
     <string name="settings_flag_secure">Pantalla privada</string>
     <string name="settings_flag_secure_desc">Oculta la miniatura de la conversación en el selector de apps del sistema y bloquea las capturas y la grabación de pantalla mientras la app está abierta.</string>
@@ -851,7 +877,7 @@
     <string name="about_perm_notifications">Mostrar las notificaciones de mensajes nuevos.</string>
     <string name="about_perm_biometric">Desbloqueo biométrico opcional.</string>
     <string name="about_perm_record_audio">Grabar mensajes de audio adjuntos a los MMS salientes.</string>
-    <string name="about_perm_internet">Búsqueda de GIF (Klipy), vista previa de enlaces y sincronización entre dispositivos. La app funciona sin ella.</string>
+    <string name="about_perm_internet">Búsqueda de GIF (Klipy), vista previa de enlaces, vista previa de mapas y sincronización entre dispositivos. La app funciona sin ella.</string>
     <string name="about_perm_foreground_service">Migración o copia de seguridad de larga duración.</string>
     <string name="about_perm_location">Solo modo emergencia, si lo activa: una posición en el momento de la alerta, precisa o aproximada.</string>
     <string name="about_perm_call_phone">Botones de llamada de emergencia: llamada directa. Si se deniega, abren la app de teléfono.</string>
@@ -895,6 +921,11 @@
     <string name="notif_reply_label">Responder</string>
     <string name="notif_mark_read_label">Marcar como leído</string>
     <string name="notif_copy_code_label">Copiar código</string>
+    <string name="notif_call_label">Llamar</string>
+    <string name="notif_send_email_label">Enviar correo</string>
+    <string name="notif_open_maps_label">Abrir mapa</string>
+    <string name="notif_add_to_calendar_label">Añadir al calendario</string>
+    <string name="notif_track_package_label">Rastrear paquete</string>
     <string name="notif_code_copied">Código copiado</string>
     <string name="notif_preview_hidden_content">Mensaje nuevo</string>
 
@@ -1069,7 +1100,7 @@
     <string name="about_feat_ui_label">Interfaz fluida</string>
     <string name="about_feat_ui_desc">Compose + recomposición aislada por globo. Ordenación de las conversaciones en el menú de tres puntos.</string>
     <string name="about_feat_noads_label">Cero publicidad, cero rastreadores</string>
-    <string name="about_feat_noads_desc">Sin analítica, sin servicios de Google. Internet solo se usa para buscar GIF (Klipy), vista previa de enlaces y sincronización entre dispositivos; los MMS los transporta el servicio MMS de Android.</string>
+    <string name="about_feat_noads_desc">Sin analítica, sin servicios de Google. Internet solo se usa para buscar GIF (Klipy), vista previa de enlaces, vista previa de mapas y sincronización entre dispositivos; los MMS los transporta el servicio MMS de Android.</string>
 
     <!-- Help recipes (7 titles + steps) -->
     <string name="about_help_default_title">Establecerla como app de SMS predeterminada</string>

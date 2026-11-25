@@ -25,12 +25,13 @@ import org.junit.jupiter.api.Test
 class SettingsSectionsTest {
 
     @Test
-    fun `landing order is exactly the ten sections in Kristin's order`() {
+    fun `landing order is exactly the eleven sections in Kristin's order`() {
         assertThat(SettingsSection.entries).containsExactly(
             SettingsSection.LINKED_DEVICES,
             SettingsSection.APPEARANCE,
             SettingsSection.SENDING,
             SettingsSection.NOTIFICATIONS,
+            SettingsSection.SMART_ACTIONS,
             SettingsSection.SECURITY_PRIVACY,
             SettingsSection.BACKUP,
             SettingsSection.APP_LANGUAGE,
@@ -48,8 +49,8 @@ class SettingsSectionsTest {
     }
 
     @Test
-    fun `total item count is 52 - a dropped row fails here, not on device`() {
-        assertThat(SettingsItem.entries).hasSize(52)
+    fun `total item count is 53 - a dropped row fails here, not on device`() {
+        assertThat(SettingsItem.entries).hasSize(53)
     }
 
     @Test
@@ -101,6 +102,12 @@ class SettingsSectionsTest {
                 SettingsItem.NOTIFICATIONS_STYLE,
                 SettingsItem.NOTIFICATIONS_OPEN_SYSTEM,
             ).inOrder()
+    }
+
+    @Test
+    fun `smart actions holds exactly its one maps-provider row`() {
+        assertThat(SettingsSectionMapping.itemsFor(SettingsSection.SMART_ACTIONS))
+            .containsExactly(SettingsItem.SMART_ACTIONS_MAPS_PROVIDER)
     }
 
     @Test
@@ -172,6 +179,8 @@ class SettingsSectionsTest {
             .isEqualTo(SettingsDestination.SUB_SCREEN)
         assertThat(SettingsSection.NOTIFICATIONS.destination)
             .isEqualTo(SettingsDestination.SUB_SCREEN)
+        assertThat(SettingsSection.SMART_ACTIONS.destination)
+            .isEqualTo(SettingsDestination.SUB_SCREEN)
         assertThat(SettingsSection.SECURITY_PRIVACY.destination)
             .isEqualTo(SettingsDestination.SUB_SCREEN)
         assertThat(SettingsSection.BACKUP.destination)
@@ -196,6 +205,8 @@ class SettingsSectionsTest {
             .isEqualTo(R.string.settings_section_sending)
         assertThat(SettingsSection.NOTIFICATIONS.titleRes)
             .isEqualTo(R.string.settings_section_notifications)
+        assertThat(SettingsSection.SMART_ACTIONS.titleRes)
+            .isEqualTo(R.string.settings_section_smart_actions)
         assertThat(SettingsSection.SECURITY_PRIVACY.titleRes)
             .isEqualTo(R.string.settings_section_security)
         assertThat(SettingsSection.BACKUP.titleRes)

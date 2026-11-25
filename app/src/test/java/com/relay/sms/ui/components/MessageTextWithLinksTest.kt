@@ -9,6 +9,8 @@ package com.relay.sms.ui.components
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.buildAnnotatedString
 import com.google.common.truth.Truth.assertThat
+import com.relay.sms.domain.smartactions.SmartAction
+import com.relay.sms.domain.smartactions.TrackingCarrier
 import org.junit.jupiter.api.Test
 
 /**
@@ -165,5 +167,81 @@ class MessageTextWithLinksTest {
         // one produces nothing.
         assertThat(out.spanStyles.map { it.start to it.end })
             .containsExactly(6 to 11)
+    }
+
+    // ──────────────── Round 53 — smart-action overlap priority ────────────────
+    //
+    // [resolveHitOverlaps] is exercised directly (no `Patterns` involved, so it
+    // runs in plain JVM): the priority is Url > Email > Tracking > DateTime >
+    // Address > Phone, so a tracking number or an email inside a URL never
+    // fragments it, and a ZIP code is not offered as a call.
+
+    @Test fun `url wins over an email inside it`() {
+        val url = LinkHit(0, 30, HitKind.Url)
+        val email = LinkHit(
+            10,
+            25,
+            HitKind.Email,
+            SmartAction.Email("bob@example.com"),
+        )
+        assertThat(resolveHitOverlaps(listOf(email, url))).containsExactly(url)
+    }
+
+    @Test fun `url wins over a tracking number inside it`() {
+        val url = LinkHit(0, 40, HitKind.Url)
+        val tracking = LinkHit(
+            20,
+            38,
+            HitKind.Tracking,
+            SmartAction.Tracking(TrackingCarrier.UPS, "1Z999AA10123456784"),
+        )
+        assertThat(resolveHitOverlaps(listOf(tracking, url))).containsExactly(url)
+    }
+
+    @Test fun `email wins over a tracking number at the same start`() {
+        val email = LinkHit(0, 20, HitKind.Email, SmartAction.Email("1z999@example.com"))
+        val tracking = LinkHit(
+            0,
+            18,
+            HitKind.Tracking,
+            SmartAction.Tracking(TrackingCarrier.UPS, "1Z999AA10123456784"),
+        )
+        assertThat(resolveHitOverlaps(listOf(tracking, email))).containsExactly(email)
+    }
+
+    @Test fun `address wins over a phone at the same start`() {
+        val address = LinkHit(0, 14, HitKind.Address, SmartAction.Address("123 Main Street"))
+        val phone = LinkHit(0, 3, HitKind.Phone)
+        assertThat(resolveHitOverlaps(listOf(phone, address))).containsExactly(address)
+    }
+
+    @Test fun `date time wins over an address at the same start`() {
+        val date = LinkHit(
+            0,
+            10,
+            HitKind.DateTime,
+            SmartAction.DateTime("Dec 25", 0L, 0L, true),
+        )
+        val address = LinkHit(0, 14, HitKind.Address, SmartAction.Address("123 Main Street"))
+        assertThat(resolveHitOverlaps(listOf(address, date))).containsExactly(date)
+    }
+
+    @Test fun `non-overlapping hits are all kept in position order`() {
+        val hits = listOf(
+            LinkHit(20, 30, HitKind.Phone),
+            LinkHit(0, 10, HitKind.Email, SmartAction.Email("a@b.com")),
+            LinkHit(
+                12,
+                18,
+                HitKind.DateTime,
+                SmartAction.DateTime("Dec 25", 0L, 0L, true),
+            ),
+        )
+        assertThat(resolveHitOverlaps(hits).map { it.kind })
+            .containsExactly(HitKind.Email, HitKind.DateTime, HitKind.Phone).inOrder()
+    }
+
+    @Test fun `empty input resolves to empty`() {
+        assertThat(resolveHitOverlaps(emptyList())).isEmpty()
     }
 }

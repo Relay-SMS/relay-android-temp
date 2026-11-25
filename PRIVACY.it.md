@@ -10,12 +10,14 @@ Relay (`com.relay.sms`) è pubblicata da **Relay Messaging**. Si vedano anche le
 
 ## Che cosa raccogliamo
 
-**Nulla.** Relay non raccoglie, non trasmette né aggrega alcun dato personale — con due
-eccezioni, entrambe avviate da lei: quando cerca un GIF, le parole digitate vengono inviate a
-Klipy affinché restituisca GIF corrispondenti, e quando un messaggio contiene un link, Relay
-scarica quella pagina una volta per mostrare una scheda di anteprima (vedere [Rete](#rete) di
-seguito). Relay non conserva nulla di questi scambi oltre al GIF che lei sceglie di inviare e
-all'anteprima che le mostra. Collegare un computer non cambia nulla di tutto ciò: telefono e
+**Nulla.** Relay non raccoglie, non trasmette né aggrega alcun dato personale — con tre
+eccezioni, tutte avviate da lei: quando cerca un GIF, le parole digitate vengono inviate a
+Klipy affinché restituisca GIF corrispondenti; quando un messaggio contiene un link, Relay
+scarica quella pagina una volta per mostrare una scheda di anteprima; e quando un messaggio
+contiene un indirizzo postale e lei tocca «Carica anteprima mappa», Relay invia l'indirizzo a
+Nominatim per geocodificarlo e scarica un'immagine di mappa statica (vedere [Rete](#rete) di
+seguito). Relay non conserva nulla di questi scambi oltre al GIF che lei sceglie di inviare,
+all'anteprima che le mostra e alle coordinate di mappa memorizzate nella cache. Collegare un computer non cambia nulla di tutto ciò: telefono e
 computer comunicano direttamente tra loro sulla sua rete Wi-Fi locale — nessun server Relay,
 nessun cloud, nulla lascia la rete.
 
@@ -51,14 +53,21 @@ in un trasferimento di dispositivo senza il suo consenso esplicito.
 
 ## Rete
 
-Relay detiene l'autorizzazione `INTERNET` per tre usi. (1) Ricerca di GIF: quando apre la
+Relay detiene l'autorizzazione `INTERNET` per quattro usi. (1) Ricerca di GIF: quando apre la
 scheda GIF e digita una ricerca, le parole digitate vengono inviate a Klipy (`api.klipy.com`), che
 restituisce GIF corrispondenti; toccarne uno lo scarica da Klipy e anche le miniature nella
 griglia provengono da Klipy. Klipy vede le sue parole di ricerca e il suo indirizzo IP, come
 qualsiasi servizio contattato. (2) Anteprime dei link: quando un messaggio contiene un URL, Relay
 scarica quella pagina una volta, sul dispositivo, e ne legge titolo e immagine Open Graph solo
 per la visualizzazione — il sito collegato vede la richiesta e il suo indirizzo IP, come in
-qualsiasi visita; l'immagine di anteprima non viene mai inviata come allegato. (3) Dispositivi
+qualsiasi visita; l'immagine di anteprima non viene mai inviata come allegato. (3) Anteprime
+delle mappe: quando un messaggio contiene un indirizzo postale, la bolla offre una mappa — solo
+quando lei tocca «Carica anteprima mappa», Relay invia l'indirizzo a Nominatim
+(`nominatim.openstreetmap.org`) per geocodificarlo e scarica un'immagine di mappa statica da
+`staticmap.openstreetmap.de`. Nominatim vede l'indirizzo e il suo indirizzo IP, come qualsiasi
+servizio contattato; il risultato della geocodifica e l'immagine vengono memorizzati nella cache
+sul dispositivo, e nulla viene inviato finché lei non tocca — gli indirizzi possono essere
+indirizzi di casa, quindi l'anteprima non si carica mai da sola. (4) Dispositivi
 collegati: il telefono esegue un server TLS nella rete locale (porta 47831, annunciato via mDNS
 come `_relay._tcp.`) affinché un computer da lei collegato possa trovarlo e connettersi. Il
 server accetta solo i dispositivi la cui chiave pubblica lei ha memorizzato scansionando il loro
@@ -68,9 +77,11 @@ né alcun account cloud. Il server può essere disattivato in Impostazioni → D
 l'app funziona allora pienamente da sola. Questo è l'unico uso di rete dell'app: nessun controllo
 degli aggiornamenti, nessuna configurazione remota, nessun ping di analisi, nessuna segnalazione
 di arresti anomali. Se l'autorizzazione è bloccata, l'app funziona comunque — la ricerca di GIF
-semplicemente non restituisce nulla, i link non mostrano anteprime e nessun computer può
+semplicemente non restituisce nulla, i link non mostrano anteprime, le anteprime delle mappe
+semplicemente non si caricano e nessun computer può
 collegarsi. (L'autorizzazione era stata rimossa nella 1.28.13, quando l'app non effettuava alcuna
-richiesta di rete; è tornata per la ricerca di GIF, poi per le anteprime dei link e ora per i
+richiesta di rete; è tornata per la ricerca di GIF, poi per le anteprime dei link, poi per le
+anteprime delle mappe e ora per i
 dispositivi collegati.)
 
 Gli MMS sono instradati dal servizio MMS di Android, che contatta l'MMSC del suo operatore quando

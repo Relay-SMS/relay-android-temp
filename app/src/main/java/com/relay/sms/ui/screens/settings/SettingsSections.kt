@@ -13,7 +13,7 @@ import com.relay.sms.R
 /**
  * Round 24 — where a landing row takes the user.
  *
- * Five sections open a sub-screen inside Settings ([SUB_SCREEN]); the other
+ * Six sections open a sub-screen inside Settings ([SUB_SCREEN]); the other
  * five open a screen that already exists (or, for [SYSTEM_LANGUAGE], the
  * Android per-app language page). The landing routes on this, so the
  * navigation and the [SettingsItem] mapping below can never disagree about
@@ -40,13 +40,14 @@ enum class SettingsDestination {
 }
 
 /**
- * Round 24 — the ten Settings sections, in landing order.
+ * Round 24 — the eleven Settings sections, in landing order.
  *
  * The enum order IS the landing order: the landing renders
  * [SettingsSection.entries] top to bottom, and [SettingsSectionsTest]
  * pins that order so a reorder is a deliberate, reviewed change. Every
  * title reuses a string that already exists in all five locales — no new
- * strings were needed for the restructure.
+ * strings were needed for the restructure. (Round 53 added one new
+ * string for the Smart actions title.)
  */
 enum class SettingsSection(
     @StringRes val titleRes: Int,
@@ -56,6 +57,7 @@ enum class SettingsSection(
     APPEARANCE(R.string.settings_section_appearance, SettingsDestination.SUB_SCREEN),
     SENDING(R.string.settings_section_sending, SettingsDestination.SUB_SCREEN),
     NOTIFICATIONS(R.string.settings_section_notifications, SettingsDestination.SUB_SCREEN),
+    SMART_ACTIONS(R.string.settings_section_smart_actions, SettingsDestination.SUB_SCREEN),
     SECURITY_PRIVACY(R.string.settings_section_security, SettingsDestination.SUB_SCREEN),
     BACKUP(R.string.settings_section_backup, SettingsDestination.SUB_SCREEN),
     APP_LANGUAGE(R.string.settings_language, SettingsDestination.SYSTEM_LANGUAGE),
@@ -137,6 +139,12 @@ enum class SettingsItem(
     NOTIFICATIONS_OPEN_SYSTEM(
         "action.openSystemNotifications",
         SettingsSection.NOTIFICATIONS,
+    ),
+
+    // Smart actions — the maps provider for "Open in Maps".
+    SMART_ACTIONS_MAPS_PROVIDER(
+        "smartActions.mapsProvider",
+        SettingsSection.SMART_ACTIONS,
     ),
 
     // Security & privacy — the lock rows, the vault PIN rows, the purge
