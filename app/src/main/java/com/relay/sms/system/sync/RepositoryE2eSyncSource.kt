@@ -22,7 +22,10 @@ import com.relay.sms.e2e.E2eNoticeStore
 import com.relay.sms.e2e.E2ePeerRepository
 import com.relay.sms.e2e.E2eProbeManager
 import com.relay.sms.e2e.E2eSafetyNumber
+import com.relay.sms.e2e.HandshakeChannel
 import com.relay.sms.e2e.IdentityKeys
+import com.relay.sms.e2e.ProbeGate
+import com.relay.sms.e2e.ProbeResult
 import com.relay.sms.sync.ActionResult
 import com.relay.sms.sync.E2eSyncSource
 import com.relay.sms.sync.SyncProtocol
@@ -102,7 +105,7 @@ class RepositoryE2eSyncSource @Inject constructor(
         return ActionResult(ok = true)
     }
 
-    override suspend fun retryProbe(address: String): ActionResult =
+    override suspend fun retryProbe(address: String, method: String?): ActionResult =
         withContext(Dispatchers.IO) {
             val conversationId = conversationIdForAddress(address)
             if (conversationId == null) {
@@ -111,14 +114,23 @@ class RepositoryE2eSyncSource @Inject constructor(
                     code = SyncProtocol.MessageFailed.UNKNOWN_CONVERSATION,
                     message = "Conversation not found.",
                 )
-            } else if (probeManager.probeConversation(conversationId, manual = true)) {
-                ActionResult(ok = true)
             } else {
-                ActionResult(
-                    ok = false,
-                    code = SyncProtocol.MessageFailed.SEND_FAILED,
-                    message = "Encryption couldn't be retried right now.",
-                )
+                // Desktop encryption-box update — the detailed
+                // manual retry (shared with the phone's own
+                // buttons): the method picks the transport, and
+                // every outcome maps to its own code + the
+                // user-facing message the desktop shows verbatim.
+                // The recording of failed manual retries
+                // (`e2e-manual-retry`) happens inside
+                // `retryProbeDetailed`, so the desktop retry is
+                // traced like a tap on the phone.
+                val channel =
+                    if (method == SyncProtocol.RetryE2eProbe.METHOD_ALTERNATE) {
+                        HandshakeChannel.TEXT_SMS
+                    } else {
+                        HandshakeChannel.DATA_SMS
+                    }
+                probeManager.retryProbeDetailed(conversationId, channel).toActionResult()
             }
         }
 
@@ -227,3 +239,63 @@ private fun E2eNoticeEntity.toSynced(): SyncedE2eNotice = SyncedE2eNotice(
     date = date,
     subject = subject,
 )
+
+/**
+ * Desktop encryption-box update — one manual probe outcome → its
+ * `action_result`. Every gate gets its own code, and the message
+ * is user-facing: the desktop shows it verbatim in its dialog.
+ * `rate_limited` / `discovery_off` are UNREACHABLE from a manual
+ * retry (the budget and the discovery toggle are lifted there —
+ * see `E2eProbeManager.gateFor`), but the mapping is total, so
+ * the codes exist with their messages anyway. A sent probe
+ * carries the budget flag when the send consumed the last
+ * probe-budget slot.
+ */
+private fun ProbeResult.toActionResult(): ActionResult = when (this) {
+    is ProbeResult.Sent -> ActionResult(ok = true, budgetExhausted = budgetExhausted)
+    is ProbeResult.Gated -> when (reason) {
+        ProbeGate.NoConversation -> ActionResult(
+            ok = false,
+            code = SyncProtocol.MessageFailed.UNKNOWN_CONVERSATION,
+            message = "Conversation not found.",
+        )
+        ProbeGate.NotOneToOne -> ActionResult(
+            ok = false,
+            code = SyncProtocol.MessageFailed.NOT_ONE_TO_ONE,
+            message = "Encryption can only be retried in a one-to-one conversation.",
+        )
+        ProbeGate.InvalidAddress -> ActionResult(
+            ok = false,
+            code = SyncProtocol.MessageFailed.INVALID_ADDRESS,
+            message = "That number can't receive an encryption probe.",
+        )
+        ProbeGate.Blocked -> ActionResult(
+            ok = false,
+            code = SyncProtocol.MessageFailed.BLOCKED,
+            message = "This contact is blocked. Unblock them to retry encryption.",
+        )
+        ProbeGate.AlreadyEncrypted -> ActionResult(
+            ok = false,
+            code = SyncProtocol.MessageFailed.ALREADY_ENCRYPTED,
+            message = "This conversation is already encrypted.",
+        )
+        // Unreachable from a manual retry (see the KDoc above).
+        ProbeGate.BudgetExhausted -> ActionResult(
+            ok = false,
+            code = SyncProtocol.MessageFailed.RATE_LIMITED,
+            message = "Too many encryption attempts for this contact. " +
+                "Reset the timing in Settings → Advanced on your phone.",
+        )
+        // Unreachable from a manual retry (see the KDoc above).
+        ProbeGate.DiscoveryOff -> ActionResult(
+            ok = false,
+            code = SyncProtocol.MessageFailed.DISCOVERY_OFF,
+            message = "Encryption discovery is turned off on your phone.",
+        )
+    }
+    ProbeResult.SendFailed -> ActionResult(
+        ok = false,
+        code = SyncProtocol.MessageFailed.SEND_FAILED,
+        message = "Encryption couldn't be retried right now.",
+    )
+}

@@ -104,11 +104,21 @@ interface E2eSyncSource {
      * peer — the same one-probe-now path as the phone's Details
      * panel encryption-row tap (budget + discovery-toggle gates
      * lifted, address / blocked / ENCRYPTED gates still apply).
-     * Answers `ok: false` `unknown_conversation` when no 1:1
-     * conversation exists for the address, `send_failed` when the
-     * probe could not go out.
+     * [method] picks the transport (desktop encryption-box
+     * update): `"standard"` (or null — old desktops send no
+     * method — or any unknown value) sends the probe as a data
+     * SMS, `"alternate"` as one `RLYH:` text. Answers `ok: true`
+     * when the probe went out — with `budgetExhausted` set when
+     * the send consumed the last probe-budget slot — and `ok:
+     * false` with a code per refusal: `unknown_conversation`
+     * (no 1:1 conversation for the address), `not_one_to_one`,
+     * `invalid_address`, `blocked`, `already_encrypted`,
+     * `rate_limited` / `discovery_off` (unreachable from a
+     * manual retry — the mapping is total anyway), `send_failed`
+     * when the probe could not go out. The `message` is
+     * user-facing: the desktop shows it verbatim in its dialog.
      */
-    suspend fun retryProbe(address: String): ActionResult
+    suspend fun retryProbe(address: String, method: String?): ActionResult
 }
 
 /**
