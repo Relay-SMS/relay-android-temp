@@ -1067,7 +1067,14 @@ class ConversationRepositoryImpl @Inject constructor(
             if (clientActions.isClientMode()) {
                 val sent = clientActions.sendAction(
                     ClientAction.SetReaction(current.conversationId, messageId, emoji),
-                ) { messageDao.setReactionWithAuthor(messageId, previous, current.reactionByAddress, current.reactionIsOwn) }
+                ) {
+                    messageDao.setReactionWithAuthor(
+                        messageId,
+                        previous,
+                        current.reactionByAddress,
+                        current.reactionIsOwn,
+                    )
+                }
                 return@withContext if (sent) {
                     reactionTransition(previous, emoji, messageId)
                 } else {

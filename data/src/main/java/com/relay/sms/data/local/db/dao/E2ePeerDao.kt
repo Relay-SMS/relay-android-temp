@@ -166,7 +166,11 @@ interface E2ePeerDao {
      * encrypted media in groups (the 0x03 capability packet,
      * flags bit 2). Targeted UPDATE, like the other peer writes.
      */
-    @Query("UPDATE e2e_peers SET group_media_capable = :groupMediaCapable, updated_at = :updatedAt WHERE address = :address")
+    @Query(
+        """
+        UPDATE e2e_peers SET group_media_capable = :groupMediaCapable, updated_at = :updatedAt WHERE address = :address
+        """,
+    )
     suspend fun setGroupMediaCapable(address: String, groupMediaCapable: Boolean, updatedAt: Long)
 
     /** Round 54 — records that our capability declaration (all three bits) went out to this peer. */
