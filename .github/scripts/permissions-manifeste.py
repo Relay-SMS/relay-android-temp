@@ -113,6 +113,14 @@ AUTORISEES = {
     "android.permission.ACCESS_FINE_LOCATION",
     "android.permission.ACCESS_COARSE_LOCATION",
     "android.permission.CALL_PHONE",
+    # Round 51 — ANSWER_PHONE_CALLS, pour qu'un appareil lie puisse
+    # raccrocher un appel en cours (TelecomManager.endCall) sans
+    # Bluetooth : la permission est la seule condition exigee par
+    # endCall (aucun role de composeur par defaut requis). Demandee
+    # a l'execution depuis l'ecran Appareils lies, serveur allume
+    # uniquement, jamais au lancement. Documentee dans
+    # PERMISSIONS.md.
+    "android.permission.ANSWER_PHONE_CALLS",
     "android.permission.HIDE_OVERLAY_WINDOWS",
     "android.permission.FOREGROUND_SERVICE",
     "android.permission.FOREGROUND_SERVICE_DATA_SYNC",
@@ -142,10 +150,6 @@ AUTORISEES = {
     "android.permission.ACCESS_NETWORK_STATE",
     # Signature, generee par androidx.core pour ses recepteurs non exportes.
     "com.relay.sms.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION",
-    # Meme permission generee par androidx.core, sous l'identifiant du build
-    # release de test (applicationIdSuffix ".relay", round 6 A/B) : le nom de
-    # la permission derive de l'applicationId.
-    "com.relay.sms.relay.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION",
 }
 
 NS_TOOLS = "http://schemas.android.com/tools"
