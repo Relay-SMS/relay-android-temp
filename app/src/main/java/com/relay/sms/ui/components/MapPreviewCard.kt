@@ -45,20 +45,6 @@ import com.relay.sms.domain.settings.MapsProvider
 import com.relay.sms.smartactions.SmartActionIntents
 
 /**
- * Round 55 — a map open the thread gates behind the "Set your map
- * provider" sheet ([MapProviderSheet]): the first map tap shows the
- * sheet instead of opening, and the sheet's choice (or dismissal)
- * opens the pending request with the chosen (or current) provider.
- */
-sealed interface MapOpenRequest {
-    /** Open the provider's preview page (the Apple Maps page for the Apple card). */
-    data class OpenPage(val url: String, val address: String) : MapOpenRequest
-
-    /** Open directions to [address] in the user's maps provider. */
-    data class OpenDirections(val address: String) : MapOpenRequest
-}
-
-/**
  * Round 53 — a map preview for the first physical address in a message
  * body; reworked round 54 (provider matrix); reworked round 55 (see
  * below). Renders nothing when the body has no address.
