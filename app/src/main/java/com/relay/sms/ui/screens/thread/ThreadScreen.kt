@@ -858,6 +858,12 @@ fun ThreadScreen(
     val sendErrorMmsRetryUnsupported = stringResource(R.string.error_retry_mms_unsupported)
     val sendErrorGroupEchoRetryUnsupported = stringResource(R.string.error_retry_group_echo)
     val sendErrorFailed = stringResource(R.string.error_send_failed)
+    // Round 55 CI lint fix #2 — the same rule, second round: the
+    // provider-sheet lambdas below are passed directly to a composable,
+    // so a `context.getString` inside them fails the build too
+    // (LocalContextGetResourceValueCall). The val-assigned `onSmartAction`
+    // lambda above is NOT flagged — only direct-argument lambdas are.
+    val noAppLabel = stringResource(R.string.smart_action_no_app)
 
     LaunchedEffect(Unit) {
         viewModel.onConversationOpened()
@@ -2173,16 +2179,14 @@ fun ThreadScreen(
                 viewModel.setMapsProvider(provider)
                 pendingMapOpen = null
                 if (!executeMapOpen(pendingMapRequest, provider)) {
-                    val label = context.getString(R.string.smart_action_no_app)
-                    scope.launch { snackbarHost.showSnackbar(label) }
+                    scope.launch { snackbarHost.showSnackbar(noAppLabel) }
                 }
             },
             onDismiss = {
                 viewModel.markMapsProviderAsked()
                 pendingMapOpen = null
                 if (!executeMapOpen(pendingMapRequest, state.mapsProvider)) {
-                    val label = context.getString(R.string.smart_action_no_app)
-                    scope.launch { snackbarHost.showSnackbar(label) }
+                    scope.launch { snackbarHost.showSnackbar(noAppLabel) }
                 }
             },
         )
