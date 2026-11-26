@@ -107,11 +107,12 @@ class TelephonySyncManager @Inject constructor(
 
     /**
      * Round 54 — which half of the first-run import is running. The
-     * MMS import runs BEFORE the SMS loop and never reported progress
-     * (see [runSync]), so the screen sat at "0 of N" for the whole
-     * MMS phase while conversations were already landing. The phase
-     * rides the same [State] the UI already observes, so the
-     * placeholder can name the phase instead of looking dead.
+     * MMS import runs BEFORE the SMS loop; round 54 only named the
+     * phase, round 55 reports its progress too (see [runSync]), so
+     * the screen shows a moving bar (or a spinner when the MMS
+     * total could not be counted) instead of sitting at "0 of N".
+     * The phase rides the same [State] the UI already observes, so
+     * the placeholder can name the phase instead of looking dead.
      */
     enum class ImportPhase { MMS, SMS }
 
@@ -119,17 +120,31 @@ class TelephonySyncManager @Inject constructor(
         data object Idle : State
         data class Running(
             val isFirstRun: Boolean,
+            /**
+             * Rows imported so far IN THE CURRENT PHASE — MMS rows
+             * while [phase] is [ImportPhase.MMS], SMS rows while it
+             * is [ImportPhase.SMS]. Resets to 0 at the phase flip
+             * (see [runSync]).
+             */
             val importedSoFar: Int,
             /**
              * Total SMS rows the first-run import will read, counted
              * up front (see [firstRunTotal]) so the import screen
-             * can show a determinate bar. Null when unknown — delta
-             * syncs never count, and a failed count query degrades
-             * to the indeterminate bar rather than blocking the
-             * import. SMS only, like [importedSoFar]: the MMS import
-             * has its own counter and never reports here.
+             * can show a determinate bar during the SMS phase. Null
+             * when unknown — delta syncs never count, and a failed
+             * count query degrades to the indeterminate bar rather
+             * than blocking the import.
              */
             val totalMessages: Int? = null,
+            /**
+             * Round 55 — total MMS rows the first-run import will
+             * read, counted up front (see [firstRunMmsTotal]) so
+             * the import screen can show a determinate bar during
+             * the MMS phase too. Null when unknown — same
+             * degradation as [totalMessages]: the MMS phase shows
+             * a spinner instead.
+             */
+            val totalMms: Int? = null,
             /** Round 54 — which import phase is running; SMS by default. */
             val phase: ImportPhase = ImportPhase.SMS,
         ) : State
@@ -206,13 +221,14 @@ class TelephonySyncManager @Inject constructor(
      * from the cheap aggregate in [TelephonyReader.snapshotSmsFingerprint]
      * (~1 ms for 50 k rows — metadata only, no row bodies). On a first
      * run the cursor is 0, so the fingerprint counts exactly the
-     * universe [runSync]'s SMS loop imports (`_ID > 0`): SMS rows
-     * only — the MMS import has its own counter and never reports
-     * into `importedSoFar`. Two small divergences, both benign:
+     * universe [runSync]'s SMS loop imports (`_ID > 0`). Two small
+     * divergences, both benign:
      * blocked rows are counted here but skipped there, and
      * unparseable rows are counted but never imported, so the bar
      * can stop a hair short of full — the fraction is coerced and
-     * the screen disappears on completion either way.
+     * the screen disappears on completion either way. The MMS phase
+     * has its own total ([firstRunMmsTotal]) and [State.Running.importedSoFar]
+     * counts MMS rows while the phase is MMS.
      *
      * Null when there is nothing to count (a delta sync — the import
      * screen never shows for those) or when the count fails or is
@@ -222,6 +238,28 @@ class TelephonySyncManager @Inject constructor(
     private fun firstRunTotal(isFirstRun: Boolean): Int? {
         if (!isFirstRun) return null
         return runCatching { telephonyReader.snapshotSmsFingerprint().count }
+            .getOrNull()
+            ?.takeIf { it > 0 }
+    }
+
+    /**
+     * Round 55 — the first-run MMS total: the system store's MMS row
+     * count, from the cheap aggregate in
+     * [TelephonyReader.snapshotMmsCount] (metadata only, no row
+     * bodies), mirroring [firstRunTotal] for SMS. The count can
+     * overstate importable rows slightly: rows whose address lookup
+     * fails and part-less MMS (e.g. not yet downloaded) are dropped
+     * by the importer, so the bar can stop a hair short of full —
+     * the fraction is coerced and the screen disappears on
+     * completion either way.
+     *
+     * Null when there is nothing to count (a delta sync) or when
+     * the count fails or is empty: the MMS phase renders a spinner
+     * instead. A failure here must never block the import itself.
+     */
+    private fun firstRunMmsTotal(isFirstRun: Boolean): Int? {
+        if (!isFirstRun) return null
+        return runCatching { telephonyReader.snapshotMmsCount() }
             .getOrNull()
             ?.takeIf { it > 0 }
     }
@@ -259,6 +297,9 @@ class TelephonySyncManager @Inject constructor(
             val current = advanced.lastSyncedSmsId
             val isFirstRun = current == 0L
             val totalMessages = firstRunTotal(isFirstRun)
+            // Round 55 — the MMS total, counted up front the same
+            // cheap way, so the media phase gets a moving bar too.
+            val totalMms = firstRunMmsTotal(isFirstRun)
             // MMS import : the SMS-cursor delta (below) doesn't catch `content://mms` rows
             // and re-reading the entire MMS table on every sync would be wasteful. We trigger
             // it when EITHER the cursor is still zero (first install) OR Room currently has
@@ -288,6 +329,7 @@ class TelephonySyncManager @Inject constructor(
                 isFirstRun = isFirstRun,
                 importedSoFar = 0,
                 totalMessages = totalMessages,
+                totalMms = totalMms,
                 phase = if (needsMmsImport) ImportPhase.MMS else ImportPhase.SMS,
             )
             Timber.i("runSync(%s) starting; cursor=%d firstRun=%b", reason, current, isFirstRun)
@@ -316,6 +358,16 @@ class TelephonySyncManager @Inject constructor(
                         } else page
                         mirror.bulkImportMmsFromTelephony(pageForImport)
                         imported += pageForImport.size
+                        // Round 55 — report MMS progress per page, so
+                        // the bar moves during the media phase instead
+                        // of sitting at 0 until the SMS loop starts.
+                        _state.value = State.Running(
+                            isFirstRun = isFirstRun,
+                            importedSoFar = imported,
+                            totalMessages = totalMessages,
+                            totalMms = totalMms,
+                            phase = ImportPhase.MMS,
+                        )
                     }
                     // 🔴 v1.27.2 (audit Codex du 2026-08-05, C-05) — LE RETOUR NE PROUVAIT RIEN.
                     //
@@ -390,6 +442,7 @@ class TelephonySyncManager @Inject constructor(
                 isFirstRun = isFirstRun,
                 importedSoFar = imported,
                 totalMessages = totalMessages,
+                totalMms = totalMms,
                 phase = ImportPhase.SMS,
             )
             val newCursor = try {
@@ -418,6 +471,7 @@ class TelephonySyncManager @Inject constructor(
                         isFirstRun = isFirstRun,
                         importedSoFar = imported,
                         totalMessages = totalMessages,
+                        totalMms = totalMms,
                         phase = ImportPhase.SMS,
                     )
                 }

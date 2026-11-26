@@ -9,12 +9,19 @@
 package com.relay.sms.ui.components
 
 import android.util.Patterns
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Call
+import androidx.compose.material.icons.outlined.DateRange
+import androidx.compose.material.icons.outlined.Email
+import androidx.compose.material.icons.outlined.LocalShipping
+import androidx.compose.material.icons.outlined.Map
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
 import androidx.compose.ui.text.SpanStyle
@@ -24,6 +31,7 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.withLink
+import com.relay.sms.R
 import com.relay.sms.domain.smartactions.SmartAction
 import com.relay.sms.domain.smartactions.SmartActionDetector
 import java.time.ZoneId
@@ -50,11 +58,18 @@ import java.time.ZoneId
  *
  * Round 53 — smart actions: the same pass also detects emails, physical
  * addresses, dates/times and tracking numbers ([SmartActionDetector]) and
- * renders them as clickable spans in the same link style; a tap calls
- * [onSmartAction] with the detected action. Overlap priority is Url >
+ * renders them as clickable spans; a tap calls [onSmartAction] with the
+ * detected action. Overlap priority is Url >
  * Email > Tracking > DateTime > Address > Phone (see
  * [resolveHitOverlaps]), so a tracking number or an email inside a URL
  * never fragments it.
+ *
+ * Round 55 — the smart-action spans are NOT underlined (the detected
+ * phone number, email, address, date or tracking number reads as plain
+ * text — only plain URLs keep the underline, [LINK_STYLE]). The action
+ * itself is offered by the pill under the text ([smartActionPillsFor],
+ * rendered by [MessageBubble] in the OTP pill's style): the pill is the
+ * affordance, the span tap stays as a quiet secondary path.
  */
 @Composable
 fun MessageTextWithLinks(
@@ -138,6 +153,25 @@ private val LINK_STYLE = TextLinkStyles(
         fontWeight = FontWeight.Medium,
     ),
 )
+
+/**
+ * Round 55 — the smart-action + phone span style: same medium weight as
+ * the URL links, but NO underline — the detected entity reads as plain
+ * text and the pill under the bubble carries the action (see the file
+ * KDoc). Plain URLs keep [LINK_STYLE].
+ */
+private val ACTION_STYLE = TextLinkStyles(
+    style = SpanStyle(fontWeight = FontWeight.Medium),
+)
+
+/**
+ * Round 55 — the span style per hit kind, pinned by unit test: plain
+ * URLs stay underlined ([LINK_STYLE]); smart-action + phone spans read
+ * as plain text ([ACTION_STYLE]) — the pill under the bubble carries
+ * the action instead.
+ */
+internal fun linkStyleFor(kind: HitKind): TextLinkStyles =
+    if (kind == HitKind.Url) LINK_STYLE else ACTION_STYLE
 
 /** v1.3.2 — caractères de ponctuation strippés en queue d'URL avant linkify. */
 private val URL_TRAILING_PUNCTUATION = charArrayOf('.', ',', ';', ':', '!', '?', ')', ']', '}', '»', '"', '\'')
@@ -254,7 +288,7 @@ internal fun buildLinkifiedText(
                 val stripped = raw.trimEnd(*URL_TRAILING_PUNCTUATION)
                 val safeTarget = stripped.toSafeHttpsTargetOrNull()
                 if (safeTarget != null) {
-                    withLink(LinkAnnotation.Url(url = safeTarget, styles = LINK_STYLE)) {
+                    withLink(LinkAnnotation.Url(url = safeTarget, styles = linkStyleFor(hit.kind))) {
                         append(stripped)
                     }
                 } else {
@@ -272,7 +306,7 @@ internal fun buildLinkifiedText(
                 withLink(
                     LinkAnnotation.Clickable(
                         tag = number,
-                        styles = LINK_STYLE,
+                        styles = linkStyleFor(hit.kind),
                         linkInteractionListener = { onPhoneClick(number) },
                     ),
                 ) {
@@ -288,7 +322,7 @@ internal fun buildLinkifiedText(
                     withLink(
                         LinkAnnotation.Clickable(
                             tag = raw,
-                            styles = LINK_STYLE,
+                            styles = linkStyleFor(hit.kind),
                             linkInteractionListener = { onSmartAction(action) },
                         ),
                     ) {
@@ -335,6 +369,86 @@ internal fun firstSmartAddress(text: String, messageId: Long = -1L): String? {
     val hits = if (messageId >= 0L) LinkHitCache.hitsFor(messageId, text) else collectLinkHits(text)
     val first = hits.firstOrNull { it.kind == HitKind.Address } ?: return null
     return (first.action as? SmartAction.Address)?.text
+}
+
+/**
+ * Round 55 — one smart-action pill under the bubble text, in the OTP
+ * pill's style (bordered capsule, icon on the left, label text):
+ * [labelRes] is the pill label, [icon] its leading icon. Call pills
+ * carry the raw [phoneNumber] (phones come from `Patterns.PHONE`, not
+ * the detector, so there is no [SmartAction] for them); every other
+ * pill carries its detected [action]. `null` action = no pill.
+ */
+internal data class SmartActionPillData(
+    val labelRes: Int,
+    val icon: ImageVector,
+    val action: SmartAction? = null,
+    val phoneNumber: String? = null,
+)
+
+/**
+ * Round 55 — the pills for [text]: one per detected smart action, in
+ * detection order, URLs excluded (a URL keeps its underlined link, it
+ * gets no pill). The same hits the linkify pass renders
+ * ([LinkHitCache]), so a pill always matches a span in the text. The
+ * same entity twice in one body gets one pill. Empty past the input
+ * cap (no linkify there either).
+ */
+internal fun smartActionPillsFor(messageId: Long, text: String): List<SmartActionPillData> {
+    if (text.isEmpty() || text.length > LINKIFY_INPUT_CAP) return emptyList()
+    val hits = if (messageId >= 0L) LinkHitCache.hitsFor(messageId, text) else collectLinkHits(text)
+    return smartActionPillsForHits(hits, text)
+}
+
+/**
+ * Round 55 — the pure core of [smartActionPillsFor], over pre-resolved
+ * hits: unit-testable without `Patterns` (see the test). One pill per
+ * detected smart action, in detection order, URLs excluded.
+ */
+internal fun smartActionPillsForHits(hits: List<LinkHit>, text: String): List<SmartActionPillData> {
+    val pills = ArrayList<SmartActionPillData>(hits.size)
+    val seen = HashSet<String>(hits.size)
+    for (hit in hits) {
+        val pill = when (hit.kind) {
+            HitKind.Url -> null
+            HitKind.Phone -> SmartActionPillData(
+                labelRes = R.string.smart_action_call,
+                icon = Icons.Outlined.Call,
+                phoneNumber = text.substring(hit.start, hit.end),
+            )
+            HitKind.Email -> hit.action?.let {
+                SmartActionPillData(
+                    labelRes = R.string.smart_action_send_email,
+                    icon = Icons.Outlined.Email,
+                    action = it,
+                )
+            }
+            HitKind.Tracking -> hit.action?.let {
+                SmartActionPillData(
+                    labelRes = R.string.smart_action_track_package,
+                    icon = Icons.Outlined.LocalShipping,
+                    action = it,
+                )
+            }
+            HitKind.DateTime -> hit.action?.let {
+                SmartActionPillData(
+                    labelRes = R.string.smart_action_add_to_calendar,
+                    icon = Icons.Outlined.DateRange,
+                    action = it,
+                )
+            }
+            HitKind.Address -> hit.action?.let {
+                SmartActionPillData(
+                    labelRes = R.string.smart_action_open_maps,
+                    icon = Icons.Outlined.Map,
+                    action = it,
+                )
+            }
+        } ?: continue
+        val key = "${hit.kind}:${text.substring(hit.start, hit.end)}"
+        if (seen.add(key)) pills += pill
+    }
+    return pills
 }
 
 /**

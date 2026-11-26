@@ -18,4 +18,10 @@ data class MapCoordinates(
     val latitude: Double,
     val longitude: Double,
     val displayName: String? = null,
+    /**
+     * Round 55 — the city/town/village from Nominatim's structured
+     * `address` object, when it gave one: the OSM city strip
+     * ([stripCityFromAddress]) drops this component from the query.
+     */
+    val city: String? = null,
 )

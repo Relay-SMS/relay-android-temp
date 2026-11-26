@@ -187,6 +187,14 @@ fun MessageBubble(
         if (isOut) null else OtpCodeCache.detectFor(message.id, message.body)
     }
 
+    // Round 55 — smart-action pills under the text (Call / Send email /
+    // Open Maps / Add to calendar / Track package): the same hits the
+    // linkify pass renders, so a pill always matches a span in the
+    // text. Cached per message id like the OTP scan above.
+    val smartPills: List<SmartActionPillData> = remember(message.body, message.id) {
+        smartActionPillsFor(message.id, message.body)
+    }
+
     // Round 17 — a message that is only emoji (1–3) renders big with no
     // bubble background; the timestamp stays where it is, below the emoji.
     // The text colour follows: with no blue bubble behind it, an outgoing
@@ -394,19 +402,6 @@ fun MessageBubble(
                                 body = message.body,
                                 messageId = message.id,
                             )
-                            // Round 53 — map preview: the first address in
-                            // the body gets its tap-to-load map card, right
-                            // after the link preview. Same FAILED skip.
-                            // Round 54 — the card follows the provider
-                            // (Apple: preview; the rest: directions button),
-                            // which rides the toggles bundle: the bubble is
-                            // at the parameter limit (see [BubbleMenuToggles]).
-                            MapPreviewCard(
-                                body = message.body,
-                                messageId = message.id,
-                                mapsProvider = toggles?.mapsProvider
-                                    ?: com.relay.sms.domain.settings.MapsProvider.SYSTEM_DEFAULT,
-                            )
                         }
                         if (message.status == com.relay.sms.domain.model.Message.Status.FAILED) {
                             Text(
@@ -452,6 +447,64 @@ fun MessageBubble(
                                 // (was 8dp): breathing room between the text
                                 // and the pill, as in Kristin's screenshot.
                                 modifier = Modifier.padding(top = 12.dp).align(Alignment.Start),
+                            )
+                        }
+                        // Round 55 — smart-action pills under the text, in
+                        // the OTP pill's style (bordered capsule, icon on
+                        // the left, label text). Same FAILED skip as the
+                        // linkify: on a failed message the whole-bubble
+                        // tap retries, so no pill competes with it. A
+                        // restored MMS without its parts shows no body,
+                        // so no pills either. A pill tap performs the
+                        // action (phone → the call dialog, the rest →
+                        // onSmartAction), exactly like tapping the span.
+                        if (message.status !=
+                            com.relay.sms.domain.model.Message.Status.FAILED &&
+                            !message.estUnMmsSansContenu() &&
+                            smartPills.isNotEmpty()
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .padding(top = if (otpCode != null) 8.dp else 12.dp)
+                                    .align(Alignment.Start),
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                                horizontalAlignment = Alignment.Start,
+                            ) {
+                                for (pill in smartPills) {
+                                    SmartActionPill(
+                                        icon = pill.icon,
+                                        labelRes = pill.labelRes,
+                                        onClick = {
+                                            val number = pill.phoneNumber
+                                            if (number != null) {
+                                                onPhoneClick(number)
+                                            } else {
+                                                pill.action?.let { action ->
+                                                    toggles?.onSmartAction?.invoke(action)
+                                                }
+                                            }
+                                        },
+                                    )
+                                }
+                            }
+                        }
+                        // Round 55 — map preview BELOW the text (it sat
+                        // above it until now): the action buttons live
+                        // under the text, next to the OTP pill and the
+                        // smart-action pills. Same FAILED skip as the
+                        // link preview — the card tap would fight the
+                        // tap-to-retry. The provider + the first-tap
+                        // gate ride the toggles bundle: the bubble is
+                        // at the parameter limit (see [BubbleMenuToggles]).
+                        if (message.status !=
+                            com.relay.sms.domain.model.Message.Status.FAILED
+                        ) {
+                            MapPreviewCard(
+                                body = message.body,
+                                messageId = message.id,
+                                mapsProvider = toggles?.mapsProvider
+                                    ?: com.relay.sms.domain.settings.MapsProvider.SYSTEM_DEFAULT,
+                                onMapOpen = toggles?.onMapOpen,
                             )
                         }
                         // Relay — heure (+ statut sortant) en petit, en bas à droite,

@@ -341,14 +341,20 @@ class ConversationsViewModel @Inject constructor(
         val duplicateDisplayNames: Set<String> = emptySet(),
         val isImporting: Boolean = false,
         val importedCount: Int = 0,
-        /** First-run import total, when the system store could be counted up front (null = unknown). */
+        /**
+         * First-run import total for the CURRENT phase, when the
+         * system store could be counted up front (null = unknown):
+         * MMS rows during the MMS phase, SMS rows during the SMS
+         * phase. The bar is determinate when this is known, a
+         * spinner when it is not.
+         */
         val importTotalCount: Int? = null,
         /**
          * Round 54 — which half of the first-run import is running
          * ([TelephonySyncManager.ImportPhase.MMS] while the MMS table
-         * is walked, SMS once the text-message loop starts). The MMS
-         * phase reports no count, so without this the screen sat at
-         * "0 of N" for the whole of it.
+         * is walked, SMS once the text-message loop starts). Round 55
+         * — the MMS phase now reports its own count too, so the
+         * screen shows "N of M" for media as well as for texts.
          */
         val importPhase: TelephonySyncManager.ImportPhase =
             TelephonySyncManager.ImportPhase.SMS,
@@ -552,7 +558,12 @@ class ConversationsViewModel @Inject constructor(
             // delta syncs touch a handful of rows and complete in milliseconds, no banner needed.
             isImporting = syncState is TelephonySyncManager.State.Running && syncState.isFirstRun,
             importedCount = (syncState as? TelephonySyncManager.State.Running)?.importedSoFar ?: 0,
-            importTotalCount = (syncState as? TelephonySyncManager.State.Running)?.totalMessages,
+            // Round 55 — the total follows the phase: MMS rows while
+            // the media phase runs, SMS rows once the text loop
+            // starts. Either one may be unknown (null → spinner).
+            importTotalCount = (syncState as? TelephonySyncManager.State.Running)?.let {
+                if (it.phase == TelephonySyncManager.ImportPhase.MMS) it.totalMms else it.totalMessages
+            },
             importPhase = (syncState as? TelephonySyncManager.State.Running)?.phase
                 ?: TelephonySyncManager.ImportPhase.SMS,
             isPanicDecoy = isPanic,

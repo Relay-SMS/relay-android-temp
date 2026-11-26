@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -27,28 +28,26 @@ import com.relay.sms.ui.theme.RelayText
 import com.relay.sms.ui.theme.brandBlue
 
 /**
- * The first-run import progress: the count line plus the bar, in the
- * same look as the client-mode sync bar ([ClientSyncProgressRow] —
- * count line, 8 dp spacer, [LinearProgressIndicator]).
+ * The first-run import progress: the phase desc, the count line plus
+ * the bar, in the same look as the client-mode sync bar
+ * ([ClientSyncProgressRow] — count line, 8 dp spacer,
+ * [LinearProgressIndicator]).
  *
  * Lives in its own file because `ConversationsScreen` sits at the
  * Detekt complexity ceiling: the count-line and determinate /
- * indeterminate branches live here, and [ImportingPlaceholder] stays
+ * spinner branches live here, and [ImportingPlaceholder] stays
  * a dumb render that just passes the numbers through.
  *
- * - Total known (`total > 0`): "N of M" (the title already says
- *   "Importing your messages", so the bare count reads like the
- *   client bar's — it reuses `client_sync_count`) + a determinate bar.
- *   The total is counted up front, so the bar is meaningful from the
- *   very first frame — no more bare spinner while the first page lands.
- * - Total unknown: the plain "N messages imported…" line while pages
- *   land, the "Reading your existing SMS…" line before the first one,
- *   and an indeterminate bar either way.
- * - Round 54 — the phase line under the bar names what is running
- *   (`MMS` while the media-message table is walked, `SMS` once the
- *   text-message loop starts). The MMS phase reports no count, so
- *   without it the screen sat at "0 of N" for the whole of it while
- *   conversations were already landing behind the placeholder.
+ * - Round 55 — the layout follows Kristin's spec: the title above
+ *   already says "Importing:", so this starts with the per-phase
+ *   desc ("Photos, videos and voice messages" / "Text messages"),
+ *   then the progress. Total known (`total > 0`): "N of M" (it
+ *   reuses `client_sync_count`) + a determinate bar, in BOTH
+ *   phases — the MMS phase counts its rows up front just like SMS.
+ * - Total unknown: a spinner instead of a bar stuck at 0, so the
+ *   screen never looks dead while the phase is still working. When
+ *   some rows already landed, the "N messages imported…" line
+ *   still shows above the spinner.
  */
 @Composable
 fun ImportProgressContent(
@@ -61,36 +60,6 @@ fun ImportProgressContent(
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Text(
-            text = if (total != null && total > 0) {
-                stringResource(R.string.client_sync_count, imported, total)
-            } else if (imported > 0) {
-                stringResource(R.string.conversations_importing_count, imported)
-            } else {
-                stringResource(R.string.conversations_importing_body)
-            },
-            style = RelayText.Preview,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            textAlign = TextAlign.Center,
-            modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
-        )
-        Spacer(modifier = Modifier.height(8.dp))
-        if (total != null && total > 0) {
-            val fraction = (imported.toFloat() / total).coerceIn(0f, 1f)
-            LinearProgressIndicator(
-                progress = { fraction },
-                modifier = Modifier.fillMaxWidth(),
-                color = brandBlue(),
-                trackColor = MaterialTheme.colorScheme.surfaceVariant,
-            )
-        } else {
-            LinearProgressIndicator(
-                modifier = Modifier.fillMaxWidth(),
-                color = brandBlue(),
-                trackColor = MaterialTheme.colorScheme.surfaceVariant,
-            )
-        }
-        Spacer(modifier = Modifier.height(8.dp))
-        Text(
             text = stringResource(
                 when (phase) {
                     TelephonySyncManager.ImportPhase.MMS ->
@@ -102,7 +71,39 @@ fun ImportProgressContent(
             style = RelayText.Preview,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center,
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
         )
+        Spacer(modifier = Modifier.height(8.dp))
+        if (total != null && total > 0) {
+            Text(
+                text = stringResource(R.string.client_sync_count, imported, total),
+                style = RelayText.Preview,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            val fraction = (imported.toFloat() / total).coerceIn(0f, 1f)
+            LinearProgressIndicator(
+                progress = { fraction },
+                modifier = Modifier.fillMaxWidth(),
+                color = brandBlue(),
+                trackColor = MaterialTheme.colorScheme.surfaceVariant,
+            )
+        } else {
+            if (imported > 0) {
+                Text(
+                    text = stringResource(R.string.conversations_importing_count, imported),
+                    style = RelayText.Preview,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+            }
+            CircularProgressIndicator(
+                color = brandBlue(),
+            )
+        }
     }
 }

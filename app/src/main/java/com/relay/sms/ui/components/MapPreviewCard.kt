@@ -7,6 +7,7 @@
 
 package com.relay.sms.ui.components
 
+import android.content.Context
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -15,7 +16,9 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -29,6 +32,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.platform.UriHandler
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -41,136 +45,165 @@ import com.relay.sms.domain.settings.MapsProvider
 import com.relay.sms.smartactions.SmartActionIntents
 
 /**
- * Round 53 — a tap-to-load map preview for the first physical address in
- * a message body; reworked round 54 (see below). Renders nothing when
- * the body has no address.
+ * Round 55 — a map open the thread gates behind the "Set your map
+ * provider" sheet ([MapProviderSheet]): the first map tap shows the
+ * sheet instead of opening, and the sheet's choice (or dismissal)
+ * opens the pending request with the chosen (or current) provider.
+ */
+sealed interface MapOpenRequest {
+    /** Open the provider's preview page (the Apple Maps page for the Apple card). */
+    data class OpenPage(val url: String, val address: String) : MapOpenRequest
+
+    /** Open directions to [address] in the user's maps provider. */
+    data class OpenDirections(val address: String) : MapOpenRequest
+}
+
+/**
+ * Round 53 — a map preview for the first physical address in a message
+ * body; reworked round 54 (provider matrix); reworked round 55 (see
+ * below). Renders nothing when the body has no address.
  *
- * What the card shows follows the Settings maps-provider choice (the
- * same rule as desktop `MapPreviewCard.tsx`):
- * - Apple Maps: a tap-to-load PREVIEW — Relay unfurls the Apple Maps
- *   link for the address through the link-preview Open Graph machinery
- *   (og:image, og:title — Apple's own map card, fetched with a Safari
- *   User-Agent; see [MapPreviewFetcher]). The tap geocodes (Nominatim)
- *   and fetches the Apple page, so nothing is sent to anyone until the
- *   user taps "Show map". A cached preview renders on first paint,
- *   like the link preview card. The card's image opens the Apple Maps
- *   page; the "Get directions" button under it opens directions in
- *   Apple Maps.
- * - Every other provider (Google, OpenStreetMap, System default): no
- *   preview image exists (Google needs a billed API key, the OSM static
- *   service is dead, System has no provider), so the card IS the "Get
- *   directions" button — no tap-to-load step, no fetch of any kind
- *   before the tap.
+ * Round 55 — the preview is INLINE and AUTO-LOADED: the card fetches
+ * on render, no tap gate, no "Show map" button. Per provider
+ * ([MapPreviewFetcher.fetchMapPreview], all verified by live fetch
+ * 2026-11-25):
+ * - Apple Maps: the Apple Maps link unfurled (og:image = Apple's own
+ *   map snapshot, 450x300) — the prettiest of the three.
+ * - Google Maps: the Google Maps link unfurled (og:image = Google's
+ *   own static map, 900x900, centred on the place via the `ll=` pin).
+ * - OpenStreetMap: the OSM search page unfurled (og:image = the OSM
+ *   logo — generic, accepted for now); the search query drops the
+ *   city name, which breaks the map load on the OSM page.
+ * - System default: no preview exists, so the card IS the "Get
+ *   directions" button — no fetch of any kind before the tap.
  *
- * Fail-soft, Apple: a geocode failure, a page with no usable OG tags
- * (og:image is UNCONFIRMED — see [MapPreviewFetcher], the device test
- * is the final confirmation), or a failed image all land on the "Get
- * directions" button, exactly like the other providers. A failed open
- * shows a note under the button; the address itself stays tappable
- * ("Open in Maps") whatever happens here.
+ * Fail-soft: a geocode failure, a page with no usable OG tags, or a
+ * failed image all land on the "Get directions" button, exactly like
+ * System default. A failed open shows a note under the button; the
+ * address itself stays tappable ("Open in Maps") whatever happens here.
+ *
+ * Round 55 diagnosis of the round-54 "Show map does nothing" report:
+ * the button WAS wired (tap → fetch → card or button) and the Apple
+ * og:image IS fetchable — the dead feeling was the Loading state: a
+ * bare empty box with no spinner while the geocode + page fetch ran
+ * (up to ~50s of network on a slow connection), so the tap looked
+ * like nothing happened. The placeholder now shows a spinner, and
+ * the tap gate is gone, so the card loads on render instead.
  *
  * The caller ([MessageBubble]) skips this on FAILED messages: the card
  * tap would fight the tap-to-retry, the same reason linkification is off
- * there.
+ * there. The card sits BELOW the message text (round 55): the action
+ * buttons live under the text, next to the OTP pill and the
+ * smart-action pills.
+ *
+ * Map opens go through [onMapOpen] where the thread wires it: the
+ * thread gates the FIRST map tap behind the "Set your map provider"
+ * sheet (see [MapProviderSheet]). Where nothing is wired (previews,
+ * standalone cards) the tap opens directly. The handler returns
+ * whether the tap was consumed, so the directions button can show
+ * its "couldn't open" note when the open itself failed.
  */
 @Composable
 fun MapPreviewCard(
     body: String,
     messageId: Long,
     mapsProvider: MapsProvider = MapsProvider.SYSTEM_DEFAULT,
+    onMapOpen: ((MapOpenRequest) -> Boolean)? = null,
     modifier: Modifier = Modifier,
 ) {
     val address = remember(body, messageId) { firstSmartAddress(body, messageId) }
     if (address == null) return
-    // Every provider but Apple: the card is the button, no fetch.
-    if (mapsProvider != MapsProvider.APPLE_MAPS) {
+    // System default: no preview exists — the card is the button, no fetch.
+    if (mapsProvider == MapsProvider.SYSTEM_DEFAULT) {
         MapDirectionsButton(
             address = address,
             mapsProvider = mapsProvider,
+            onMapOpen = onMapOpen,
             modifier = modifier,
         )
         return
     }
+    val context = LocalContext.current
+    val uriHandler = LocalUriHandler.current
+    val open: (MapOpenRequest) -> Boolean = onMapOpen ?: { request ->
+        defaultOpenMap(request, mapsProvider, context, uriHandler)
+    }
     val fetcher = remember { MapPreviewFetcher() }
-    val isCached = remember(address) { fetcher.isAppleMapsPreviewCached(address) }
-    var requested by remember(address) { mutableStateOf(isCached) }
+    val isCached = remember(address, mapsProvider) {
+        fetcher.isMapPreviewCached(address, mapsProvider)
+    }
     val state by produceState<MapPreviewState>(
         initialValue = if (isCached) {
-            when (val cached = fetcher.cachedAppleMapsPreview(address)) {
+            when (val cached = fetcher.cachedMapPreview(address, mapsProvider)) {
                 null -> MapPreviewState.NoPreview
-                else -> MapPreviewState.Loaded(cached)
+                else -> MapPreviewState.Loaded(cached.preview, cached.openAddress)
             }
         } else {
-            MapPreviewState.Idle
+            MapPreviewState.Loading
         },
         address,
-        requested,
+        mapsProvider,
     ) {
-        if (!requested || isCached) return@produceState
+        if (isCached) return@produceState
         value = MapPreviewState.Loading
-        value = fetcher.fetchAppleMapsPreview(address)?.let { MapPreviewState.Loaded(it) }
-            ?: MapPreviewState.NoPreview
+        value = fetcher.fetchMapPreview(address, mapsProvider)?.let {
+            MapPreviewState.Loaded(it.preview, it.openAddress)
+        } ?: MapPreviewState.NoPreview
     }
     when (val current = state) {
-        MapPreviewState.Idle -> MapPreviewShowMapButton(
-            onLoad = { requested = true },
-            modifier = modifier,
-        )
         MapPreviewState.Loading -> MapPreviewPlaceholder(modifier = modifier)
-        is MapPreviewState.Loaded -> MapPreviewAppleCard(
+        is MapPreviewState.Loaded -> MapPreviewLoadedCard(
             preview = current.preview,
-            address = address,
+            openAddress = current.openAddress,
+            mapsProvider = mapsProvider,
+            onMapOpen = open,
             modifier = modifier,
         )
         MapPreviewState.NoPreview -> MapDirectionsButton(
-            address = address,
+            address = fetcher.openAddressFor(address, mapsProvider),
             mapsProvider = mapsProvider,
+            onMapOpen = open,
             modifier = modifier,
         )
     }
 }
 
-/** The Apple card's load state (see [MapPreviewCard]). */
+/** The map card's load state (see [MapPreviewCard]). */
 private sealed interface MapPreviewState {
-    /** Not requested yet: show the "Show map" button. */
-    data object Idle : MapPreviewState
-
-    /** A geocode + Apple page fetch is in flight: show the placeholder. */
+    /** The geocode + provider page fetch is in flight: show the spinner. */
     data object Loading : MapPreviewState
 
-    /** Unfurled: show the Apple map card. */
-    data class Loaded(val preview: LinkPreview) : MapPreviewState
+    /** Unfurled: show the provider's map card. */
+    data class Loaded(val preview: LinkPreview, val openAddress: String) : MapPreviewState
 
     /** No preview for this address: show the directions button instead. */
     data object NoPreview : MapPreviewState
 }
 
-/** The tap-to-load button: "Show map" — nothing is fetched until the tap. */
-@Composable
-private fun MapPreviewShowMapButton(onLoad: () -> Unit, modifier: Modifier = Modifier) {
-    val cs = MaterialTheme.colorScheme
-    val shape = RoundedCornerShape(MAP_PREVIEW_CORNER_DP.dp)
-    Box(
-        modifier = modifier
-            .fillMaxWidth()
-            .padding(bottom = MAP_PREVIEW_BELOW_GAP_DP.dp)
-            .clip(shape)
-            .border(width = 1.dp, color = cs.outlineVariant, shape = shape)
-            .background(cs.surface)
-            .clickable { onLoad() }
-            .padding(MAP_PREVIEW_TEXT_PADDING_DP.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        Text(
-            text = stringResource(R.string.map_show_map),
-            style = MaterialTheme.typography.bodyMedium,
-            color = cs.primary,
-            textAlign = TextAlign.Center,
-        )
-    }
+/**
+ * The direct open used where the thread does not wire a gate
+ * (previews, standalone cards): the page opens in the browser, the
+ * directions open in the user's maps provider. Returns whether the
+ * open was taken (the page open cannot fail visibly, so it reports
+ * taken unless the handler itself throws).
+ */
+private fun defaultOpenMap(
+    request: MapOpenRequest,
+    mapsProvider: MapsProvider,
+    context: Context,
+    uriHandler: UriHandler,
+): Boolean = when (request) {
+    is MapOpenRequest.OpenPage ->
+        runCatching { uriHandler.openUri(request.url) }.isSuccess
+    is MapOpenRequest.OpenDirections ->
+        SmartActionIntents.performDirections(context, request.address, mapsProvider)
 }
 
-/** Loading skeleton: the same box as the loaded card, so the thread barely grows. */
+/**
+ * Loading skeleton: the same box as the loaded card, with a spinner in
+ * the middle — the round-54 box was bare, so a slow geocode + fetch
+ * looked like the tap did nothing. The thread barely grows either way.
+ */
 @Composable
 private fun MapPreviewPlaceholder(modifier: Modifier = Modifier) {
     val cs = MaterialTheme.colorScheme
@@ -183,22 +216,32 @@ private fun MapPreviewPlaceholder(modifier: Modifier = Modifier) {
             .clip(shape)
             .border(width = 1.dp, color = cs.outlineVariant, shape = shape)
             .background(cs.surface),
-    )
+        contentAlignment = Alignment.Center,
+    ) {
+        CircularProgressIndicator(
+            color = cs.primary,
+            strokeWidth = 2.dp,
+            modifier = Modifier.size(24.dp),
+        )
+    }
 }
 
 /**
  * The "Get directions" button (+ failed-open note) — the whole card for
- * non-Apple providers, the footer for the Apple preview card. Opens
- * directions to the address in the user's maps provider.
+ * System default and for a failed preview, the footer for a loaded
+ * card. Opens directions to the address in the user's maps provider
+ * (through [onMapOpen] where the thread gates the first tap).
  */
 @Composable
 private fun MapDirectionsButton(
     address: String,
     mapsProvider: MapsProvider,
+    onMapOpen: ((MapOpenRequest) -> Boolean)?,
     modifier: Modifier = Modifier,
 ) {
     val cs = MaterialTheme.colorScheme
     val context = LocalContext.current
+    val uriHandler = LocalUriHandler.current
     var openFailed by remember(address, mapsProvider) { mutableStateOf(false) }
     val shape = RoundedCornerShape(MAP_PREVIEW_CORNER_DP.dp)
     Column(
@@ -210,7 +253,10 @@ private fun MapDirectionsButton(
             .background(cs.surface)
             .clickable {
                 openFailed = false
-                if (!SmartActionIntents.performDirections(context, address, mapsProvider)) {
+                val open = onMapOpen ?: { request ->
+                    defaultOpenMap(request, mapsProvider, context, uriHandler)
+                }
+                if (!open(MapOpenRequest.OpenDirections(address))) {
                     openFailed = true
                 }
             }
@@ -236,23 +282,24 @@ private fun MapDirectionsButton(
 }
 
 /**
- * The loaded Apple card: the Open Graph image on top (16:9 crop, from
- * the shared link-preview image cache), then the title (or the
+ * The loaded card: the provider's Open Graph image on top (16:9 crop,
+ * from the shared link-preview image cache), then the title (or the
  * description when there is no title) and the site name (or the URL
  * host), with the "Get directions" button as the footer. Tapping the
- * card opens the Apple Maps page; the button opens directions in Apple
- * Maps. Its own surface background plus a hairline outline, so it reads
- * on both the blue outgoing bubble and the grey incoming one, in either
- * theme.
+ * card opens the provider's page; the button opens directions in the
+ * user's maps provider. Its own surface background plus a hairline
+ * outline, so it reads on both the blue outgoing bubble and the grey
+ * incoming one, in either theme.
  */
 @Composable
-private fun MapPreviewAppleCard(
+private fun MapPreviewLoadedCard(
     preview: LinkPreview,
-    address: String,
+    openAddress: String,
+    mapsProvider: MapsProvider,
+    onMapOpen: (MapOpenRequest) -> Boolean,
     modifier: Modifier = Modifier,
 ) {
     val cs = MaterialTheme.colorScheme
-    val uriHandler = LocalUriHandler.current
     val host = remember(preview.url) { preview.url.hostOrNull() }
     val headline = preview.title ?: preview.description
     val shape = RoundedCornerShape(MAP_PREVIEW_CORNER_DP.dp)
@@ -263,7 +310,9 @@ private fun MapPreviewAppleCard(
             .clip(shape)
             .border(width = 1.dp, color = cs.outlineVariant, shape = shape)
             .background(cs.surface)
-            .clickable { uriHandler.openUri(preview.url) },
+            .clickable {
+                onMapOpen(MapOpenRequest.OpenPage(preview.url, openAddress))
+            },
     ) {
         val imageUrl = preview.imageUrl
         if (imageUrl != null) {
@@ -293,8 +342,9 @@ private fun MapPreviewAppleCard(
             }
         }
         MapDirectionsButton(
-            address = address,
-            mapsProvider = MapsProvider.APPLE_MAPS,
+            address = openAddress,
+            mapsProvider = mapsProvider,
+            onMapOpen = onMapOpen,
             modifier = Modifier.padding(
                 start = MAP_PREVIEW_TEXT_PADDING_DP.dp,
                 end = MAP_PREVIEW_TEXT_PADDING_DP.dp,

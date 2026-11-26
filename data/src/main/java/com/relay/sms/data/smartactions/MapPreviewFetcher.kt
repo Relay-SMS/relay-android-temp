@@ -11,6 +11,7 @@ import com.relay.sms.data.linkpreview.LinkPreviewFetcher
 import com.relay.sms.data.linkpreview.extractJsonStringField
 import com.relay.sms.di.IoDispatcher
 import com.relay.sms.domain.linkpreview.LinkPreview
+import com.relay.sms.domain.settings.MapsProvider
 import com.relay.sms.domain.smartactions.MapCoordinates
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
@@ -32,39 +33,46 @@ import javax.inject.Singleton
  * (nominatim.openstreetmap.org, free, no key) and centred a static map
  * image from staticmap.openstreetmap.de on the result. That static
  * service is DEAD (DNS NXDOMAIN, verified twice) and no provider has a
- * free keyless static image — Google needs a billed API key, Apple
- * static images need a paid Developer account — so round 54 drops the
- * static map entirely. What the card shows now follows the Settings
+ * free keyless static image — so round 54 dropped the static map and
+ * round 55 unfurls each provider's own page instead (see
+ * [fetchMapPreview]). What the card shows follows the Settings
  * maps-provider choice (the same rule as desktop `mapPreview.ts`):
- * - Apple Maps: a tap-to-load PREVIEW — Relay unfurls the Apple Maps
- *   link for the address (`maps.apple.com/?q=ADDRESS&ll=LAT,LON`,
- *   [appleMapsPreviewUrl]) through the link-preview Open Graph
- *   machinery ([fetchAppleMapsPreview]) — Apple's own map card, free,
- *   no key, Relay doesn't own or host the image. Nominatim is still
- *   needed, for the `ll=` pin.
- * - Google Maps, OpenStreetMap, System default: NO preview image — the
- *   card IS the "Get directions" button (see
+ * - Apple Maps: Relay unfurls the Apple Maps link for the address
+ *   (`maps.apple.com/?q=ADDRESS&ll=LAT,LON`, [appleMapsPreviewUrl])
+ *   through the link-preview Open Graph machinery — Apple's own map
+ *   card (a snapshot.apple-mapkit.com image), free, no key, Relay
+ *   doesn't own or host the image. Nominatim is still needed, for
+ *   the `ll=` pin.
+ * - Google Maps: the same unfurl of the Google Maps link
+ *   (`maps.google.com/maps?q=ADDRESS&ll=LAT,LON`,
+ *   [googleMapsPreviewUrl]) — Google's page carries an og:image that
+ *   IS its own static map (maps.google.com/maps/api/staticmap, keyed
+ *   by Google itself, so no billed key on our side). The `ll=` pin
+ *   matters: without it Google serves a generic country view.
+ * - OpenStreetMap: the same unfurl of the OSM search page
+ *   (`openstreetmap.org/search?query=ADDRESS`, [osmSearchUrl]) — its
+ *   og:image is the OSM logo, not a map snapshot (generic, accepted
+ *   for now). The query drops the city/town ([stripCityFromAddress]):
+ *   the city name breaks the map load on the OSM page; without it
+ *   the map loads.
+ * - System default: NO preview image — the card IS the "Get
+ *   directions" button (see
  *   [com.relay.sms.smartactions.SmartActionIntents.mapsDirectionsUrl]).
  *
- * The Apple OG preview is HONESTLY UNCONFIRMED: the live fetch of a
- * maps.apple.com place page serves the page, but the fetch returned
- * rendered text, not head meta tags, so og:image/og:title were never
- * directly observed. The balance of evidence says they exist and are
- * UA-gated (Clerk.AI's docs: Apple Maps URLs render a map-snapshot
- * card, "pull Open Graph data for title and image", "scrape with a
- * Safari user agent — a Firefox user agent is rejected"; Apple's TN3156
- * documents the OG image rules — 900px minimum width, 1 MB page limit —
- * and iMessage unfurls maps.apple.com links into map cards in the real
- * world). One counterpoint: a SwiftLinkPreview issue reports Apple Maps
- * previews failing (title came back as "Google maps") — possibly the
- * same UA issue. So the fetch uses a Safari User-Agent
- * ([APPLE_PREVIEW_USER_AGENT]), and the card FAILS SOFT: no og:image
- * (or any fetch/geocode failure) → the Apple card is just the "Get
- * directions" button, exactly like OSM. Do NOT present the Apple preview
- * as working until Kristin sees the card on a device — the device test
- * is the final confirmation. A failed OG fetch is cached as "no preview"
- * by the link-preview cache, like every other link, so it sticks for
- * the session; the button still works.
+ * The OG previews are VERIFIED by live fetch (2026-11-25, round 55):
+ * Apple serves og:image (snapshot.apple-mapkit.com, 450x300) on both
+ * the `/?q=&ll=` link and a directions URL, under a Safari
+ * User-Agent; Google serves og:image (its own staticmap, 900x900,
+ * correctly centred when `ll=` is given — verified: the image itself
+ * fetches as a 900x900 PNG) on maps.google.com/maps under a Chrome
+ * User-Agent (google.com/maps/search 403s from a datacentre IP — the
+ * `maps.google.com/maps?q=` form is the one to unfurl); OSM serves
+ * og:image (the site logo) on its search page. The card still FAILS
+ * SOFT: no og:image (or any fetch/geocode failure) → the card is
+ * just the "Get directions" button, exactly like System default. A
+ * failed OG fetch is cached as "no preview" by the link-preview
+ * cache, like every other link, so it sticks for the session; the
+ * button still works.
  *
  * Nominatim's usage policy is binding and is honoured here:
  * - at most one request per second per app — [throttle] serialises
@@ -81,11 +89,12 @@ import javax.inject.Singleton
  * are cached.
  *
  * Privacy: geocoding sends the address to OSM's server, and fetching
- * the Apple page contacts Apple — and addresses can be home addresses —
- * so [fetchAppleMapsPreview] is only ever called from the map-preview
- * card after the user taps "Show map" (tap-to-load, user-initiated like
- * the Klipy GIF search). Nothing in this fetcher triggers a request on
- * its own, and the non-Apple providers fetch nothing at all.
+ * a provider page contacts that provider — and addresses can be home
+ * addresses — so round 54 kept this tap-to-load (nothing sent until
+ * the user tapped "Show map"). Round 55 drops the tap gate on
+ * Kristin's call: the card fetches on render, like the link preview
+ * card (which also fetches on render). System default fetches nothing
+ * at all.
  */
 @Singleton
 open class MapPreviewFetcher @Inject constructor(
@@ -135,55 +144,119 @@ open class MapPreviewFetcher @Inject constructor(
         synchronized(cacheLock) { cache.containsKey(normalizeAddressForCache(address)) }
 
     /**
-     * The Apple Maps preview for [address]: geocode it (Nominatim),
-     * then unfurl the Apple Maps link through the link-preview Open
-     * Graph machinery with a Safari User-Agent. Returns the preview, or
-     * `null` when there is no preview to show (geocode failure, page
-     * fetch failure, or a page with no usable OG tags) — the caller
-     * falls back to the "Get directions" button. Never throws. The
-     * preview is only usable as a card when it carries an image
-     * (`imageUrl`); a title-only preview is also `null` here, so the
-     * card never renders a text-only box for Apple.
+     * The address the card opens with (city-stripped for OSM when the
+     * geocode is cached): the NoPreview button's address, where there
+     * is no fetched preview to carry it.
      */
-    suspend fun fetchAppleMapsPreview(address: String): LinkPreview? {
-        val found = geocode(address) ?: return null
-        val preview = linkPreviews.preview(
-            appleMapsPreviewUrl(address, found.latitude, found.longitude),
-            APPLE_PREVIEW_USER_AGENT,
-        )
-        return preview?.takeIf { it.imageUrl != null }
+    fun openAddressFor(address: String, provider: MapsProvider): String =
+        openAddress(address, provider, cachedGeocode(address))
+
+    /**
+     * The map preview for [address] under [provider]: geocode it
+     * (Nominatim), then unfurl the provider's own page through the
+     * link-preview Open Graph machinery. Returns the preview plus the
+     * address the card opens with ([MapPreview.openAddress] — the
+     * city-stripped query for OSM), or `null` when there is no preview
+     * to show (geocode failure, page fetch failure, or a page with no
+     * usable OG tags) — the caller falls back to the "Get directions"
+     * button. Never throws. The preview is only usable as a card when
+     * it carries an image (`imageUrl`); a title-only preview is also
+     * `null` here, so the card never renders a text-only box.
+     *
+     * Per provider (see the class KDoc for the verification):
+     * - Apple: geocode required (the `ll=` pin); Safari User-Agent.
+     * - Google: geocode pins `ll=` (a centred map); without it the
+     *   `q`-only page still unfurls, with a generic image.
+     * - OpenStreetMap: geocode is best-effort (only for the city
+     *   strip); the search page unfurls without it too.
+     * - System default: no preview — `null`, the caller shows the
+     *   button without fetching anything.
+     */
+    suspend fun fetchMapPreview(address: String, provider: MapsProvider): MapPreview? {
+        if (provider == MapsProvider.SYSTEM_DEFAULT) return null
+        val coords = geocode(address)
+        // Apple needs the geocode for its ll= pin; Google/OSM unfurl without it.
+        val url = if (provider == MapsProvider.APPLE_MAPS && coords == null) {
+            null
+        } else {
+            mapPreviewUrl(address, provider, coords)
+        } ?: return null
+        val preview = if (provider == MapsProvider.APPLE_MAPS) {
+            linkPreviews.preview(url, APPLE_PREVIEW_USER_AGENT)
+        } else {
+            linkPreviews.preview(url)
+        }?.takeIf { it.imageUrl != null } ?: return null
+        return MapPreview(preview, openAddress(address, provider, coords))
     }
 
     /**
-     * The cached Apple preview for [address], if this process already
-     * resolved it — a preview with an image, `null` for a cached "no
-     * preview" (or a cached preview with no image). Also `null` when
-     * uncached: call [isAppleMapsPreviewCached] first to tell the two
-     * apart. Lets a card render its cached preview on first composition
-     * instead of popping in after mount (the pop-in grows the thread
-     * and shifts the view up).
+     * The cached map preview for [address] under [provider], if this
+     * process already resolved it — a preview with an image, `null`
+     * for a cached "no preview" (or a cached preview with no image).
+     * Also `null` when uncached: call [isMapPreviewCached] first to
+     * tell the two apart. Lets a card render its cached preview on
+     * first composition instead of popping in after mount (the pop-in
+     * grows the thread and shifts the view up).
      */
-    fun cachedAppleMapsPreview(address: String): LinkPreview? {
-        val found = cachedGeocode(address) ?: return null
-        val cached = linkPreviews.cachedPreview(
-            appleMapsPreviewUrl(address, found.latitude, found.longitude),
-        ) ?: return null
-        return cached.takeIf { it.imageUrl != null }
+    fun cachedMapPreview(address: String, provider: MapsProvider): MapPreview? {
+        if (provider == MapsProvider.SYSTEM_DEFAULT) return null
+        val coords = cachedGeocode(address)
+        val url = mapPreviewUrl(address, provider, coords) ?: return null
+        val cached = linkPreviews.cachedPreview(url)?.takeIf { it.imageUrl != null }
+            ?: return null
+        return MapPreview(cached, openAddress(address, provider, coords))
     }
 
     /**
-     * Whether [address] has a cached Apple preview result (including
-     * "no preview"): the geocode is cached AND the Apple link's preview
-     * is cached for those coordinates. A failed OG fetch counts as
-     * cached "no preview" (the link-preview cache keeps the `null`),
-     * so the card shows the button instead of re-fetching on scroll.
+     * Whether [address] has a cached map preview result (including
+     * "no preview"): the provider page's preview is cached for the
+     * URL [mapPreviewUrl] builds. A failed OG fetch counts as cached
+     * "no preview" (the link-preview cache keeps the `null`), so the
+     * card shows the button instead of re-fetching on scroll.
      */
-    fun isAppleMapsPreviewCached(address: String): Boolean {
-        val found = cachedGeocode(address) ?: return false
-        return linkPreviews.isCached(
-            appleMapsPreviewUrl(address, found.latitude, found.longitude),
-        )
+    fun isMapPreviewCached(address: String, provider: MapsProvider): Boolean {
+        if (provider == MapsProvider.SYSTEM_DEFAULT) return false
+        val coords = cachedGeocode(address)
+        val url = mapPreviewUrl(address, provider, coords) ?: return false
+        return linkPreviews.isCached(url)
     }
+
+    /**
+     * The provider page to unfurl for [address]: Apple and Google
+     * need the geocoded coordinates for the `ll=` pin (Google falls
+     * back to a `q`-only page when the geocode failed — generic
+     * image, still a card); OSM takes the city-stripped search query
+     * and needs no coordinates at all.
+     */
+    internal fun mapPreviewUrl(
+        address: String,
+        provider: MapsProvider,
+        coords: MapCoordinates?,
+    ): String? = when (provider) {
+        MapsProvider.APPLE_MAPS ->
+            coords?.let { appleMapsPreviewUrl(address, it.latitude, it.longitude) }
+        MapsProvider.GOOGLE_MAPS ->
+            coords?.let { googleMapsPreviewUrl(address, it.latitude, it.longitude) }
+                ?: googleMapsSearchUrl(address)
+        MapsProvider.OPENSTREETMAP ->
+            osmSearchUrl(openAddress(address, provider, coords))
+        MapsProvider.SYSTEM_DEFAULT -> null
+    }
+
+    /**
+     * The address the card opens with: the city-stripped query for
+     * OSM (see [stripCityFromAddress]), the full address otherwise.
+     */
+    internal fun openAddress(
+        address: String,
+        provider: MapsProvider,
+        coords: MapCoordinates?,
+    ): String =
+        if (provider == MapsProvider.OPENSTREETMAP) {
+            stripCityFromAddress(address, coords?.city)
+        } else {
+            address
+        }
 
     /**
      * Nominatim's one-request-per-second policy: each caller reserves the
@@ -209,7 +282,7 @@ open class MapPreviewFetcher @Inject constructor(
         val encoded = runCatching { URLEncoder.encode(address, Charsets.UTF_8.name()) }
             .getOrNull() ?: return null
         val connection = openGetConnection(
-            "$NOMINATIM_URL?format=json&limit=1&q=$encoded",
+            "$NOMINATIM_URL?format=json&limit=1&addressdetails=1&q=$encoded",
         ) ?: return null
         try {
             return runCatching {
@@ -314,12 +387,80 @@ internal fun normalizeAddressForCache(address: String): String =
  * `Stub!`.
  */
 fun appleMapsPreviewUrl(address: String, latitude: Double, longitude: Double): String {
-    val encoded = runCatching {
-        URLEncoder.encode(address, Charsets.UTF_8.name())
-    }.getOrNull()?.replace("+", "%20") ?: ""
+    val encoded = encodeAddressQuery(address)
     val lat = String.format(Locale.US, "%.6f", latitude)
     val lon = String.format(Locale.US, "%.6f", longitude)
     return "https://maps.apple.com/?q=$encoded&ll=$lat,$lon"
+}
+
+/**
+ * Round 55 — the Google Maps link Relay unfurls for the preview: the
+ * address as the search query plus the geocoded coordinates as the pin
+ * (`ll`). The `ll=` matters: without it Google's page carries a
+ * generic country view as its og:image; with it the static map is
+ * centred on the queried place (verified by live fetch). Same
+ * encoding + 6-decimal rule as [appleMapsPreviewUrl].
+ */
+fun googleMapsPreviewUrl(address: String, latitude: Double, longitude: Double): String {
+    val encoded = encodeAddressQuery(address)
+    val lat = String.format(Locale.US, "%.6f", latitude)
+    val lon = String.format(Locale.US, "%.6f", longitude)
+    return "https://maps.google.com/maps?q=$encoded&ll=$lat,$lon"
+}
+
+/**
+ * Round 55 — the Google Maps search link without coordinates: the
+ * fallback when the geocode failed. It still unfurls (Google's page
+ * carries an og:image), but the static map is a generic country view,
+ * not the queried place.
+ */
+fun googleMapsSearchUrl(address: String): String {
+    val encoded = encodeAddressQuery(address)
+    return "https://maps.google.com/maps?q=$encoded"
+}
+
+/**
+ * Round 55 — the OpenStreetMap search link Relay unfurls for the
+ * preview (and opens on tap): the query is the address with the city
+ * stripped (see [stripCityFromAddress] — the city name breaks the map
+ * load on the OSM page). Same encoding as the other builders.
+ */
+fun osmSearchUrl(queryAddress: String): String {
+    val encoded = encodeAddressQuery(queryAddress)
+    return "https://www.openstreetmap.org/search?query=$encoded"
+}
+
+/** The address as a URL query value (`+` back to `%20`, the `encodeURIComponent` shape). */
+internal fun encodeAddressQuery(address: String): String =
+    runCatching { URLEncoder.encode(address, Charsets.UTF_8.name()) }
+        .getOrNull()?.replace("+", "%20") ?: ""
+
+/**
+ * Round 55 — a fetched map preview: the unfurled provider page
+ * ([preview]) plus the address the card opens with ([openAddress] —
+ * the city-stripped query for OSM, the full address otherwise).
+ */
+data class MapPreview(
+    val preview: LinkPreview,
+    val openAddress: String,
+)
+
+/**
+ * Round 55 — the OSM search query for [address] with the city/town
+ * stripped: Kristin's device finding is that the city name breaks the
+ * map load on the openstreetmap.org page, and without it the map
+ * loads. The strip drops the comma-separated component that IS the
+ * city (case-insensitive, whole-component match — a street name that
+ * contains the city word is left alone). No city, or an address that
+ * IS only the city, comes back unchanged.
+ */
+internal fun stripCityFromAddress(address: String, city: String?): String {
+    val cityName = city?.trim().takeUnless { it.isNullOrBlank() } ?: return address
+    val parts = address.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+    if (parts.size < 2) return address
+    val stripped = parts.filterNot { it.equals(cityName, ignoreCase = true) }
+    if (stripped.isEmpty() || stripped.size == parts.size) return address
+    return stripped.joinToString(", ")
 }
 
 /**
@@ -327,7 +468,9 @@ fun appleMapsPreviewUrl(address: String, latitude: Double, longitude: Double): S
  * `null` when the answer is empty (`[]`), malformed, or its first result
  * carries no parseable `lat`/`lon`. The first result is the most relevant
  * one (the request asks for `limit=1` anyway). `display_name` is kept
- * for the card's content description; it is optional.
+ * for the card's content description; it is optional. Round 55 — the
+ * structured `address` object (`addressdetails=1`) also yields the
+ * city/town/village, for the OSM city strip; it is optional too.
  */
 internal fun parseNominatimFirstResult(json: String): MapCoordinates? {
     if (json.trim() == EMPTY_ARRAY_BODY) return null
@@ -337,5 +480,8 @@ internal fun parseNominatimFirstResult(json: String): MapCoordinates? {
         ?.toDoubleOrNull() ?: return null
     val displayName = extractJsonStringField(json, "display_name")
         ?.trim()?.takeIf { it.isNotBlank() }?.take(MAX_DISPLAY_NAME_CHARS)
-    return MapCoordinates(lat, lon, displayName)
+    val city = listOf("city", "town", "village", "municipality")
+        .firstNotNullOfOrNull { extractJsonStringField(json, it) }
+        ?.trim()?.takeIf { it.isNotBlank() }
+    return MapCoordinates(lat, lon, displayName, city)
 }

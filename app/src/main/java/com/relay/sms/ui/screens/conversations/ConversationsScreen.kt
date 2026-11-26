@@ -2501,9 +2501,11 @@ private fun ImportingPlaceholder(
             textAlign = TextAlign.Center,
             modifier = Modifier.fillMaxWidth(),
         )
-        // Round 54 — the first run can sit at "0 of N" for a long
-        // while (the MMS phase reports no count), so say plainly
+        // Round 54 — the first run can take a while, so say plainly
         // that it takes a while instead of letting it look stuck.
+        // (Round 55 — the MMS phase now reports its own count, or a
+        // spinner when it could not be counted, so the screen no
+        // longer sits at "0 of N" through the media phase.)
         Spacer(modifier = Modifier.height(8.dp))
         Text(
             text = stringResource(R.string.conversations_importing_patient),

@@ -485,6 +485,7 @@ class SettingsRepository(
                     MapsProvider.SYSTEM_DEFAULT,
                     MapsProvider::valueOf,
                 ),
+                mapsProviderAsked = p[K.mapsProviderAsked] ?: false,
             ),
         )
     }
@@ -628,6 +629,8 @@ class SettingsRepository(
 
         // Round 53 — the maps provider for "Open in Maps", persisted by enum name.
         this[K.mapsProvider] = s.smartActions.mapsProvider.name
+        // Round 55 — whether the provider was ever explicitly chosen (see above).
+        this[K.mapsProviderAsked] = s.smartActions.mapsProviderAsked
     }
 
     private inline fun <reified E : Enum<E>> enumOr(p: Preferences, key: Preferences.Key<String>, def: E, valueOf: (String) -> E): E =
@@ -880,5 +883,8 @@ class SettingsRepository(
 
         /** Round 53 — the maps provider for "Open in Maps" (smart actions). */
         val mapsProvider = stringPreferencesKey("smart.mapsProvider")
+
+        /** Round 55 — whether the maps provider was ever explicitly chosen. */
+        val mapsProviderAsked = booleanPreferencesKey("smart.mapsProviderAsked")
     }
 }

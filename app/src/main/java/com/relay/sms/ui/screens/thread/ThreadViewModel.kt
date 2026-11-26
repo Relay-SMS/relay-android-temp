@@ -547,6 +547,12 @@ class ThreadViewModel @Inject constructor(
         val mapsProvider: com.relay.sms.domain.settings.MapsProvider =
             com.relay.sms.domain.settings.MapsProvider.SYSTEM_DEFAULT,
         /**
+         * Round 55 — whether the user has ever explicitly chosen a
+         * maps provider (see [SmartActionSettings.mapsProviderAsked]):
+         * the first-map-tap sheet shows only while this is false.
+         */
+        val mapsProviderAsked: Boolean = false,
+        /**
          * Client mode C5 — the attachment download states for this
          * thread's bubbles, keyed by local attachment id. Empty in
          * hub mode (and before the first download starts).
@@ -752,6 +758,9 @@ class ThreadViewModel @Inject constructor(
                         // Round 53 — the maps provider for smart
                         // actions, from the same snapshot.
                         mapsProvider = snapshot.smartActions.mapsProvider,
+                        // Round 55 — whether the provider was ever
+                        // explicitly chosen (first-map-tap sheet gate).
+                        mapsProviderAsked = snapshot.smartActions.mapsProviderAsked,
                     )
                 }
                 // Audit P1 : recompute sur IO lorsque le toggle change.
@@ -1320,6 +1329,38 @@ class ThreadViewModel @Inject constructor(
         viewModelScope.launch {
             val conv = _state.value.conversation ?: return@launch
             toggleConvState.setMuted(conv.id, !conv.muted)
+        }
+    }
+
+    /**
+     * Round 55 — the first-map-tap sheet's choice: save the provider
+     * and mark it explicitly chosen, so the sheet never shows again.
+     */
+    fun setMapsProvider(provider: com.relay.sms.domain.settings.MapsProvider) {
+        viewModelScope.launch {
+            settings.update {
+                it.copy(
+                    smartActions = it.smartActions.copy(
+                        mapsProvider = provider,
+                        mapsProviderAsked = true,
+                    ),
+                )
+            }
+        }
+    }
+
+    /**
+     * Round 55 — the first-map-tap sheet dismissed without choosing:
+     * mark the provider as asked (the sheet never re-prompts) without
+     * changing the provider itself.
+     */
+    fun markMapsProviderAsked() {
+        viewModelScope.launch {
+            settings.update {
+                it.copy(
+                    smartActions = it.smartActions.copy(mapsProviderAsked = true),
+                )
+            }
         }
     }
 

@@ -35,6 +35,13 @@ import com.relay.sms.domain.smartactions.SmartAction
  * follows the Settings maps-provider choice (Apple gets a tap-to-load
  * preview, the rest get the "Get directions" button), and the text
  * bubble has no parameter slot left for it either.
+ *
+ * Round 55 — [onMapOpen] rides it too: a tap on the map preview card
+ * (or its "Get directions" button) forwards here, so the thread can
+ * gate the FIRST map tap behind the "Set your map provider" sheet.
+ * `null` where the thread does not wire the gate (previews,
+ * standalone bubbles) — the card then opens directly. Returns whether
+ * the tap was consumed (the sheet showing counts as consumed).
  */
 data class BubbleMenuToggles(
     val isPinned: Boolean,
@@ -56,4 +63,10 @@ data class BubbleMenuToggles(
      */
     val mapsProvider: com.relay.sms.domain.settings.MapsProvider =
         com.relay.sms.domain.settings.MapsProvider.SYSTEM_DEFAULT,
+    /**
+     * Round 55 — a tap on the map preview card (the card itself or
+     * its "Get directions" button). `null` where the thread does not
+     * wire the first-tap provider gate — the card then opens directly.
+     */
+    val onMapOpen: ((MapOpenRequest) -> Boolean)? = null,
 )

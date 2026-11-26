@@ -21,6 +21,15 @@ data class SmartActionSettings(
      * reads back as [MapsProvider.SYSTEM_DEFAULT].
      */
     val mapsProvider: MapsProvider = MapsProvider.SYSTEM_DEFAULT,
+    /**
+     * Round 55 — whether the user has ever explicitly chosen a maps
+     * provider (in Settings, or through the first-map-tap sheet): the
+     * sheet shows once, on the first map tap, only while this is
+     * false. Persisted (`smart.mapsProviderAsked`); a provider picked
+     * in Settings before this flag existed still skips the sheet,
+     * because the thread also checks `mapsProvider != SYSTEM_DEFAULT`.
+     */
+    val mapsProviderAsked: Boolean = false,
 )
 
 /**

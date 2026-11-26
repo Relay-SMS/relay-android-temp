@@ -168,12 +168,12 @@
     <string name="conversations_empty_body">Non appena riceverà o invierà un messaggio, comparirà qui.</string>
     <string name="conversations_archived_empty">Nessuna conversazione archiviata</string>
     <string name="conversations_archived_empty_body">Tieni ordinata la tua casella di posta spostando le conversazioni fuori dall\'elenco principale senza eliminarle. Puoi accedervi in qualsiasi momento in Archivio.</string>
-    <string name="conversations_importing_title">Importazione dei suoi messaggi</string>
+    <string name="conversations_importing_title">Importazione:</string>
     <string name="conversations_importing_body">Lettura degli SMS già presenti — accade una sola volta.</string>
     <string name="conversations_importing_count">%1$d messaggi importati…</string>
     <string name="conversations_importing_patient">Si prega di pazientare, potrebbe richiedere del tempo</string>
-    <string name="conversations_importing_phase_mms">Importazione di foto, video e messaggi vocali…</string>
-    <string name="conversations_importing_phase_sms">Importazione dei messaggi di testo…</string>
+    <string name="conversations_importing_phase_mms">Foto, video e messaggi vocali</string>
+    <string name="conversations_importing_phase_sms">Messaggi di testo</string>
     <string name="conversations_delete_confirm_title">Eliminare questa conversazione?</string>
     <string name="conversations_delete_confirm_body">Tutti i messaggi di questa conversazione saranno rimossi definitivamente da questo dispositivo. Le altre conversazioni non sono toccate.</string>
     <!-- v1.28.9 — une conversation du coffre n'est plus supprimee si sa copie systeme resiste : elle reviendrait hors du coffre. -->
@@ -816,10 +816,18 @@
     <string name="settings_maps_app_apple_hint">Apple Maps sul web: non esiste un\'app Apple Maps per Android.</string>
     <string name="settings_maps_app_osm">OpenStreetMap</string>
     <string name="settings_maps_app_osm_hint">Un\'app OpenStreetMap se installata, altrimenti openstreetmap.org.</string>
-    <string name="map_show_map">Mostra mappa</string>
     <string name="map_get_directions">Indicazioni stradali</string>
     <string name="map_directions_unavailable">Impossibile aprire Mappe.</string>
     <string name="smart_action_no_app">Nessuna app può aprire questo elemento</string>
+    <!-- Round 55 — smart-action pills under the bubble text, same style as the OTP pill. -->
+    <string name="smart_action_call">Chiama</string>
+    <string name="smart_action_send_email">Invia e-mail</string>
+    <string name="smart_action_open_maps">Apri Mappe</string>
+    <string name="smart_action_add_to_calendar">Aggiungi al calendario</string>
+    <string name="smart_action_track_package">Traccia pacco</string>
+    <!-- Round 55 — first-map-tap provider sheet. -->
+    <string name="map_provider_sheet_title">Scegli la tua app di mappe</string>
+    <string name="map_provider_sheet_subtitle">Scegli quale app di mappe si apre quando tocchi un indirizzo o una mappa. Puoi modificarla in qualsiasi momento in Impostazioni.</string>
 
     <string name="settings_section_security">Sicurezza e privacy</string>
     <string name="settings_flag_secure">Schermata privata</string>

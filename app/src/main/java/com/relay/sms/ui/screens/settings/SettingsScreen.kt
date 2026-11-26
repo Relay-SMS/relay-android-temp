@@ -870,7 +870,12 @@ fun SettingsScreen(
             current = state.smartActions.mapsProvider,
             onSelect = { provider ->
                 viewModel.update {
-                    it.copy(smartActions = it.smartActions.copy(mapsProvider = provider))
+                    it.copy(
+                        smartActions = it.smartActions.copy(
+                            mapsProvider = provider,
+                            mapsProviderAsked = true,
+                        ),
+                    )
                 }
                 mapsProviderPickerOpen = false
             },

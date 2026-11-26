@@ -79,13 +79,14 @@ class ConversationsImportProgressTest {
     }
 
     @Test
-    fun `first run in the MMS phase surfaces the MMS phase`() {
+    fun `first run in the MMS phase surfaces the MMS phase and the MMS total`() {
         runTest(dispatcher) {
             val syncState = MutableStateFlow<TelephonySyncManager.State>(
                 TelephonySyncManager.State.Running(
                     isFirstRun = true,
-                    importedSoFar = 0,
+                    importedSoFar = 120,
                     totalMessages = 5000,
+                    totalMms = 800,
                     phase = TelephonySyncManager.ImportPhase.MMS,
                 ),
             )
@@ -94,12 +95,67 @@ class ConversationsImportProgressTest {
             val loaded = vm.state.first { !it.isLoading }
             advanceUntilIdle()
 
-            // Round 54 — the counter sits at 0 through the whole MMS
-            // phase (it counts SMS only), so the phase is what tells
-            // the user the import is alive.
+            // Round 55 — the MMS phase reports its own count, so the
+            // total the screen shows is the MMS total, not the SMS
+            // one, and the bar moves during the media phase.
+            assertThat(loaded.isImporting).isTrue()
+            assertThat(loaded.importedCount).isEqualTo(120)
+            assertThat(loaded.importTotalCount).isEqualTo(800)
+            assertThat(loaded.importPhase).isEqualTo(TelephonySyncManager.ImportPhase.MMS)
+        }
+    }
+
+    @Test
+    fun `first run in the MMS phase with an unknown MMS total surfaces a null total`() {
+        runTest(dispatcher) {
+            val syncState = MutableStateFlow<TelephonySyncManager.State>(
+                TelephonySyncManager.State.Running(
+                    isFirstRun = true,
+                    importedSoFar = 0,
+                    totalMessages = 5000,
+                    totalMms = null,
+                    phase = TelephonySyncManager.ImportPhase.MMS,
+                ),
+            )
+            val vm = viewModel(syncState, backgroundScope)
+
+            val loaded = vm.state.first { !it.isLoading }
+            advanceUntilIdle()
+
+            // Round 55 — the MMS count could not be taken up front
+            // (or the phase never counted): the screen shows a
+            // spinner instead of a bar stuck at 0.
             assertThat(loaded.isImporting).isTrue()
             assertThat(loaded.importedCount).isEqualTo(0)
+            assertThat(loaded.importTotalCount).isNull()
             assertThat(loaded.importPhase).isEqualTo(TelephonySyncManager.ImportPhase.MMS)
+        }
+    }
+
+    @Test
+    fun `first run in the SMS phase surfaces the SMS total even when an MMS total exists`() {
+        runTest(dispatcher) {
+            val syncState = MutableStateFlow<TelephonySyncManager.State>(
+                TelephonySyncManager.State.Running(
+                    isFirstRun = true,
+                    importedSoFar = 250,
+                    totalMessages = 5000,
+                    totalMms = 800,
+                    phase = TelephonySyncManager.ImportPhase.SMS,
+                ),
+            )
+            val vm = viewModel(syncState, backgroundScope)
+
+            val loaded = vm.state.first { !it.isLoading }
+            advanceUntilIdle()
+
+            // Round 55 — the total follows the phase: once the text
+            // loop starts, the screen counts SMS rows again, not the
+            // MMS total from the phase before.
+            assertThat(loaded.isImporting).isTrue()
+            assertThat(loaded.importedCount).isEqualTo(250)
+            assertThat(loaded.importTotalCount).isEqualTo(5000)
+            assertThat(loaded.importPhase).isEqualTo(TelephonySyncManager.ImportPhase.SMS)
         }
     }
 

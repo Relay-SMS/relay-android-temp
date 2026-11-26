@@ -120,6 +120,7 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
@@ -154,6 +155,7 @@ import com.relay.sms.data.voice.VoicePlaybackController
 import com.relay.sms.domain.model.Message
 import com.relay.sms.domain.model.PhoneAddress
 import com.relay.sms.domain.model.SendErrorCode
+import com.relay.sms.domain.settings.MapsProvider
 import com.relay.sms.domain.smartactions.SmartAction
 import com.relay.sms.e2e.E2eNoticesForItem
 import com.relay.sms.e2e.E2eThreadNotices
@@ -174,6 +176,8 @@ import com.relay.sms.ui.components.EmojiPickerButton
 import com.relay.sms.ui.components.EmojiPickerPanel
 import com.relay.sms.ui.components.EmojiPickerTab
 import com.relay.sms.ui.components.EmojiPickerTabStore
+import com.relay.sms.ui.components.MapOpenRequest
+import com.relay.sms.ui.components.MapProviderSheet
 import com.relay.sms.ui.components.MessageBubble
 import com.relay.sms.ui.components.RelayAvatar
 import com.relay.sms.ui.components.RelayDialog
@@ -185,6 +189,7 @@ import com.relay.sms.ui.components.ReplyQuotePreview
 import com.relay.sms.ui.components.ScheduleMenuActions
 import com.relay.sms.ui.components.SchedulePresetMenu
 import com.relay.sms.ui.components.SearchHighlight
+import com.relay.sms.ui.components.shouldShowMapProviderSheet
 import com.relay.sms.ui.components.showError
 import com.relay.sms.ui.components.stickerSendUri
 import com.relay.sms.ui.components.toPlaybackUri
@@ -364,12 +369,54 @@ fun ThreadScreen(
     // the view model or the client mode changes) while the provider value
     // stays fresh. When no app can take the intent, a snackbar says so
     // instead of failing silently.
+    //
+    // Round 55 — the first-map-tap gate, declared before the handler so
+    // the handler can call it: a map tap (preview card, its directions
+    // button, or an address span) shows the "Set your map provider"
+    // sheet once, while no explicit provider choice exists. The pending
+    // request waits until the user chooses (save + open with the chosen
+    // provider) or dismisses (mark asked + open with the current
+    // provider). The asked flag rides `rememberUpdatedState` like the
+    // provider, so the stable lambdas stay fresh.
     val mapsProviderState = rememberUpdatedState(state.mapsProvider)
+    val mapsProviderAskedState = rememberUpdatedState(state.mapsProviderAsked)
+    var pendingMapOpen by remember { mutableStateOf<MapOpenRequest?>(null) }
+    val uriHandler = LocalUriHandler.current
+    fun executeMapOpen(request: MapOpenRequest, provider: MapsProvider): Boolean =
+        when (request) {
+            is MapOpenRequest.OpenPage ->
+                runCatching { uriHandler.openUri(request.url) }.isSuccess
+            is MapOpenRequest.OpenDirections ->
+                SmartActionIntents.performDirections(context, request.address, provider)
+        }
+    val onMapOpen: (MapOpenRequest) -> Boolean = { request ->
+        if (
+            shouldShowMapProviderSheet(
+                mapsProviderState.value,
+                mapsProviderAskedState.value,
+            )
+        ) {
+            pendingMapOpen = request
+            true
+        } else {
+            executeMapOpen(request, mapsProviderState.value)
+        }
+    }
     val onSmartAction: (SmartAction) -> Unit = { action ->
-        val performed = SmartActionIntents.perform(context, action, mapsProviderState.value)
-        if (!performed) {
-            val label = context.getString(R.string.smart_action_no_app)
-            scope.launch { snackbarHost.showSnackbar(label) }
+        if (action is SmartAction.Address) {
+            // Round 55 — an address tap is a map tap: the first one
+            // shows the provider sheet instead of opening directly.
+            val opened = onMapOpen(MapOpenRequest.OpenDirections(action.text))
+            if (!opened) {
+                val label = context.getString(R.string.smart_action_no_app)
+                scope.launch { snackbarHost.showSnackbar(label) }
+            }
+        } else {
+            val performed = SmartActionIntents.perform(context, action, mapsProviderState.value)
+            if (!performed) {
+                val label = context.getString(R.string.smart_action_no_app)
+                scope.launch { snackbarHost.showSnackbar(label) }
+            }
         }
     }
     // v1.3.11 (F5) — message being forwarded. Non-null = open the picker sheet. The
@@ -1382,6 +1429,8 @@ fun ThreadScreen(
                 onSmartAction = onSmartAction,
                 // Round 54 — the maps provider for the map preview card.
                 mapsProvider = state.mapsProvider,
+                // Round 55 — the first-map-tap gate for the card.
+                onMapOpen = onMapOpen,
                 // E2E — a key-change notice tap opens the safety-number
                 // sheet for this thread's peer.
                 onE2eNoticeVerify = { e2eVerificationOpen = true },
@@ -2102,6 +2151,31 @@ fun ThreadScreen(
                 onDismissRequest = { e2eVerificationOpen = false },
             )
         }
+    }
+    // Round 55 — the first-map-tap sheet: choosing a provider saves it
+    // and opens the pending map with it; dismissing opens the pending
+    // map with the current provider and never re-prompts.
+    val pendingMapRequest = pendingMapOpen
+    if (pendingMapRequest != null) {
+        MapProviderSheet(
+            current = state.mapsProvider,
+            onSelect = { provider ->
+                viewModel.setMapsProvider(provider)
+                pendingMapOpen = null
+                if (!executeMapOpen(pendingMapRequest, provider)) {
+                    val label = context.getString(R.string.smart_action_no_app)
+                    scope.launch { snackbarHost.showSnackbar(label) }
+                }
+            },
+            onDismiss = {
+                viewModel.markMapsProviderAsked()
+                pendingMapOpen = null
+                if (!executeMapOpen(pendingMapRequest, state.mapsProvider)) {
+                    val label = context.getString(R.string.smart_action_no_app)
+                    scope.launch { snackbarHost.showSnackbar(label) }
+                }
+            },
+        )
     }
     // v1.11.0 — Sujet 5 apparence : dialog couleur bulle (Chat colors).
     if (appearanceOpen) {
@@ -4034,6 +4108,13 @@ private class ThreadMessageItemActions(
      */
     val mapsProvider: com.relay.sms.domain.settings.MapsProvider,
     /**
+     * Round 55 — a tap on the map preview card (the card itself or its
+     * "Get directions" button), gated on the first tap behind the
+     * "Set your map provider" sheet. Returns whether the tap was
+     * consumed (the sheet showing counts as consumed).
+     */
+    val onMapOpen: (MapOpenRequest) -> Boolean,
+    /**
      * E2E — a key-change notice tap: opens the safety-number
      * verification sheet for this thread's peer.
      */
@@ -4266,6 +4347,8 @@ private fun ThreadMessageItem(
                     // when the provider changes), not a `rememberUpdatedState`
                     // — this item is a separate composable from ThreadScreen.
                     mapsProvider = actions.mapsProvider,
+                    // Round 55 — the first-map-tap gate, same bundle.
+                    onMapOpen = actions.onMapOpen,
                 )
             }
             // Client mode C3 — the gated actions, one decision for the

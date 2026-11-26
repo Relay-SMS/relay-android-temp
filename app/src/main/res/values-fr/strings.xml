@@ -164,12 +164,12 @@
     <string name="conversations_empty_body">Dès qu\'un message arrive ou est envoyé, il s\'affichera ici.</string>
     <string name="conversations_archived_empty">Aucune conversation archivée</string>
     <string name="conversations_archived_empty_body">Gardez votre boîte de réception bien rangée en déplaçant les conversations hors de la liste principale sans les supprimer. Retrouvez-les à tout moment dans les archives.</string>
-    <string name="conversations_importing_title">Importation de vos messages</string>
+    <string name="conversations_importing_title">Importation :</string>
     <string name="conversations_importing_body">Lecture de vos SMS existants — opération unique.</string>
     <string name="conversations_importing_count">%1$d messages importés…</string>
     <string name="conversations_importing_patient">Merci de patienter, cela peut prendre un moment</string>
-    <string name="conversations_importing_phase_mms">Importation des photos, vidéos et messages vocaux…</string>
-    <string name="conversations_importing_phase_sms">Importation des messages texte…</string>
+    <string name="conversations_importing_phase_mms">Photos, vidéos et messages vocaux</string>
+    <string name="conversations_importing_phase_sms">Messages texte</string>
     <string name="conversations_delete_confirm_title">Supprimer cette conversation ?</string>
     <string name="conversations_delete_confirm_body">Tous les messages de cette conversation seront définitivement supprimés de cet appareil. Les autres conversations ne sont pas affectées.</string>
     <!-- v1.28.9 — une conversation du coffre n'est plus supprimee si sa copie systeme resiste : elle reviendrait hors du coffre. -->
@@ -806,10 +806,18 @@
     <string name="settings_maps_app_apple_hint">Apple Maps sur le web — il n\'existe pas d\'application Apple Maps pour Android.</string>
     <string name="settings_maps_app_osm">OpenStreetMap</string>
     <string name="settings_maps_app_osm_hint">Une application OpenStreetMap si elle est installée, sinon openstreetmap.org.</string>
-    <string name="map_show_map">Afficher la carte</string>
     <string name="map_get_directions">Itinéraire</string>
     <string name="map_directions_unavailable">Impossible d\'ouvrir Plans.</string>
     <string name="smart_action_no_app">Aucune application ne peut ouvrir ceci</string>
+    <!-- Round 55 — smart-action pills under the bubble text, same style as the OTP pill. -->
+    <string name="smart_action_call">Appeler</string>
+    <string name="smart_action_send_email">Envoyer un e-mail</string>
+    <string name="smart_action_open_maps">Ouvrir Maps</string>
+    <string name="smart_action_add_to_calendar">Ajouter au calendrier</string>
+    <string name="smart_action_track_package">Suivre le colis</string>
+    <!-- Round 55 — first-map-tap provider sheet. -->
+    <string name="map_provider_sheet_title">Choisir votre application de cartes</string>
+    <string name="map_provider_sheet_subtitle">Choisissez l\'application de cartes qui s\'ouvre lorsque vous touchez une adresse ou une carte. Vous pouvez la modifier à tout moment dans les Réglages.</string>
 
     <string name="settings_section_security">Sécurité &amp; confidentialité</string>
     <string name="settings_flag_secure">Écran privé</string>

@@ -10,7 +10,9 @@ package com.relay.sms.ui.components
 
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.style.TextDecoration
 import com.google.common.truth.Truth.assertThat
+import com.relay.sms.R
 import com.relay.sms.domain.smartactions.SmartAction
 import com.relay.sms.domain.smartactions.TrackingCarrier
 import org.junit.jupiter.api.Test
@@ -245,5 +247,95 @@ class MessageTextWithLinksTest {
 
     @Test fun `empty input resolves to empty`() {
         assertThat(resolveHitOverlaps(emptyList())).isEmpty()
+    }
+
+    // ──────────────────── Round 55 — smart-action pills + no underline ────────────────────
+    //
+    // [linkStyleFor] and [smartActionPillsForHits] are exercised directly (no
+    // `Patterns` involved, so they run in plain JVM): the pills list is built
+    // over pre-resolved hits, and the span style is pinned per kind — URLs
+    // stay underlined, every smart-action + phone span reads as plain text
+    // (the pill under the bubble carries the action instead).
+
+    @Test fun `url span stays underlined`() {
+        assertThat(linkStyleFor(HitKind.Url).style?.textDecoration)
+            .isEqualTo(TextDecoration.Underline)
+    }
+
+    @Test fun `smart action and phone spans are not underlined`() {
+        for (kind in listOf(
+            HitKind.Email,
+            HitKind.Tracking,
+            HitKind.DateTime,
+            HitKind.Address,
+            HitKind.Phone,
+        )) {
+            assertThat(linkStyleFor(kind).style?.textDecoration).isNull()
+        }
+    }
+
+    @Test fun `one pill per kind with the right label, in detection order`() {
+        val text = "0123456789012345678901234567890123456789"
+        val hits = listOf(
+            LinkHit(0, 10, HitKind.Phone),
+            LinkHit(11, 20, HitKind.Email, SmartAction.Email("a@b.com")),
+            LinkHit(
+                21,
+                30,
+                HitKind.Tracking,
+                SmartAction.Tracking(TrackingCarrier.UPS, "1Z999AA10123456784"),
+            ),
+            LinkHit(
+                31,
+                38,
+                HitKind.DateTime,
+                SmartAction.DateTime("Dec 25", 0L, 0L, true),
+            ),
+            LinkHit(39, 40, HitKind.Address, SmartAction.Address("123 Main Street")),
+        )
+        val pills = smartActionPillsForHits(hits, text)
+        assertThat(pills.map { it.labelRes }).containsExactly(
+            R.string.smart_action_call,
+            R.string.smart_action_send_email,
+            R.string.smart_action_track_package,
+            R.string.smart_action_add_to_calendar,
+            R.string.smart_action_open_maps,
+        ).inOrder()
+        assertThat(pills[0].phoneNumber).isEqualTo("0123456789")
+        assertThat(pills[1].action).isEqualTo(SmartAction.Email("a@b.com"))
+        assertThat(pills[2].action).isEqualTo(
+            SmartAction.Tracking(TrackingCarrier.UPS, "1Z999AA10123456784"),
+        )
+        assertThat(pills[4].action).isEqualTo(SmartAction.Address("123 Main Street"))
+    }
+
+    @Test fun `url gets no pill`() {
+        val text = "Call 0612345678 or mail bob@example.com, see https://example.com"
+        val hits = listOf(
+            LinkHit(5, 15, HitKind.Phone),
+            LinkHit(24, 39, HitKind.Email, SmartAction.Email("bob@example.com")),
+            LinkHit(45, 64, HitKind.Url),
+        )
+        val pills = smartActionPillsForHits(hits, text)
+        assertThat(pills.map { it.labelRes }).containsExactly(
+            R.string.smart_action_call,
+            R.string.smart_action_send_email,
+        ).inOrder()
+        assertThat(pills[0].phoneNumber).isEqualTo("0612345678")
+    }
+
+    @Test fun `same entity twice gets one pill`() {
+        val text = "0612345678 and 0612345678"
+        val hits = listOf(
+            LinkHit(0, 10, HitKind.Phone),
+            LinkHit(15, 25, HitKind.Phone),
+        )
+        assertThat(smartActionPillsForHits(hits, text)).hasSize(1)
+    }
+
+    @Test fun `hit without its action renders no pill`() {
+        val text = "bob@example.com"
+        val hits = listOf(LinkHit(0, 15, HitKind.Email, null))
+        assertThat(smartActionPillsForHits(hits, text)).isEmpty()
     }
 }

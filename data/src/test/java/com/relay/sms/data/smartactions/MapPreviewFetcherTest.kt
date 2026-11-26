@@ -89,4 +89,61 @@ class MapPreviewFetcherTest {
         assertThat(normalizeAddressForCache("123 Main St,\nSpringfield"))
             .isEqualTo("123 main st, springfield")
     }
+
+    // ──────────────────── Round 55 — Google + OSM preview URLs, city strip ────────────────────
+
+    @Test fun `google maps preview url pins ll`() {
+        assertThat(googleMapsPreviewUrl("1600 Amphitheatre Parkway", 37.422, -122.084))
+            .isEqualTo(
+                "https://maps.google.com/maps?q=1600%20Amphitheatre%20Parkway" +
+                    "&ll=37.422000,-122.084000",
+            )
+    }
+
+    @Test fun `google maps search url has no ll`() {
+        assertThat(googleMapsSearchUrl("New York, NY"))
+            .isEqualTo("https://maps.google.com/maps?q=New%20York%2C%20NY")
+    }
+
+    @Test fun `osm search url encodes the query`() {
+        assertThat(osmSearchUrl("1600 Amphitheatre Parkway, CA"))
+            .isEqualTo(
+                "https://www.openstreetmap.org/search?query=" +
+                    "1600%20Amphitheatre%20Parkway%2C%20CA",
+            )
+    }
+
+    @Test fun `city strip drops the city component`() {
+        assertThat(
+            stripCityFromAddress(
+                "1600 Amphitheatre Parkway, Mountain View, CA 94043",
+                "Mountain View",
+            ),
+        ).isEqualTo("1600 Amphitheatre Parkway, CA 94043")
+    }
+
+    @Test fun `city strip leaves a street name containing the city word alone`() {
+        // "Mountain View" inside the street name is not a component.
+        assertThat(
+            stripCityFromAddress("1 Mountain View Road, Springfield, IL", "Mountain View"),
+        ).isEqualTo("1 Mountain View Road, Springfield, IL")
+    }
+
+    @Test fun `city strip is a no-op without a city or for a city-only address`() {
+        assertThat(stripCityFromAddress("1600 Amphitheatre Parkway, CA", null))
+            .isEqualTo("1600 Amphitheatre Parkway, CA")
+        assertThat(stripCityFromAddress("Mountain View", "Mountain View"))
+            .isEqualTo("Mountain View")
+    }
+
+    @Test fun `nominatim city parses from the structured address`() {
+        val json = """[{"lat":"37.422","lon":"-122.084","display_name":"1600 Amphitheatre """ +
+            """Parkway, Mountain View, CA","address":{"city":"Mountain View","state":"California"}}]"""
+        assertThat(parseNominatimFirstResult(json)?.city).isEqualTo("Mountain View")
+    }
+
+    @Test fun `nominatim town falls back when there is no city`() {
+        val json = """[{"lat":"48.0","lon":"2.0","address":{"town":"Versailles"}}]"""
+        assertThat(parseNominatimFirstResult(json)?.city).isEqualTo("Versailles")
+    }
 }

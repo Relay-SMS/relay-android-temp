@@ -120,6 +120,28 @@ class TelephonyReader @Inject constructor(
     data class SmsFingerprint(val count: Int, val maxId: Long)
 
     /**
+     * Round 55 — cheap MMS row count for the first-run import
+     * progress: the aggregate touches only the SQLite metadata,
+     * like [snapshotSmsFingerprint]; no row bodies. 0 when the
+     * provider is empty or the query fails (null cursor) — callers
+     * treat 0 as "unknown" and degrade that phase to the spinner
+     * rather than blocking the import.
+     */
+    fun snapshotMmsCount(): Int {
+        var count = 0
+        resolver.query(
+            Uri.parse("content://mms"),
+            arrayOf("COUNT(_id) AS c"),
+            null,
+            null,
+            null,
+        )?.use { c ->
+            if (c.moveToFirst()) count = c.getInt(0)
+        }
+        return count
+    }
+
+    /**
      * Returns every `_ID` currently in `content://sms`. Used by [TelephonySyncManager] for the
      * deletion-reconciliation pass: any [MessageEntity.telephonyUri] in our Room DB whose `_ID`
      * is missing from this set has been deleted from the system (by us, by another SMS app, or
