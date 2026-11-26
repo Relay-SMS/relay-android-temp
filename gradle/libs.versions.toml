@@ -67,7 +67,7 @@ sqlcipher = "4.19.0"
 ktor = "3.6.1"
 # Netty version is Ktor 3.6.1's own (see ktor-server-netty's pom) — the
 # -classes- artifacts below must match it exactly.
-netty = "4.2.17.Final"
+netty = "4.2.21.Final"
 camerax = "1.6.2"
 zxing = "3.5.4"
 bouncycastle = "1.87"
