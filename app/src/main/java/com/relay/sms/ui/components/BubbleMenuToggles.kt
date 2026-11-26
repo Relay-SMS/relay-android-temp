@@ -28,20 +28,14 @@ import com.relay.sms.domain.smartactions.SmartAction
  * clear a reaction whose author the badge cannot tell.)
  *
  * Round 53 — [onSmartAction] rides it too: a tap on a smart-action span
- * (email, address, date/time, tracking number) in the bubble's text, and
- * the map preview card's tap, both forward here.
+ * (email, address, date/time, tracking number) in the bubble's text
+ * forwards here.
  *
- * Round 54 — [mapsProvider] rides it as well: the map preview card
- * follows the Settings maps-provider choice (Apple gets a tap-to-load
- * preview, the rest get the "Get directions" button), and the text
- * bubble has no parameter slot left for it either.
- *
- * Round 55 — [onMapOpen] rides it too: a tap on the map preview card
- * (or its "Get directions" button) forwards here, so the thread can
- * gate the FIRST map tap behind the "Set your map provider" sheet.
- * `null` where the thread does not wire the gate (previews,
- * standalone bubbles) — the card then opens directly. Returns whether
- * the tap was consumed (the sheet showing counts as consumed).
+ * Round 56 — the map preview card is gone (Kristin tested
+ * Apple/Google/OSM and none of them really work): [mapsProvider] and
+ * [onMapOpen] went with it — the address pill tap now forwards
+ * through [onSmartAction], and the thread gates the first map tap
+ * behind the provider sheet itself.
  */
 data class BubbleMenuToggles(
     val isPinned: Boolean,
@@ -49,24 +43,10 @@ data class BubbleMenuToggles(
     /** Round 52 emoji fix — badge tap opens the reaction picker; never clears. */
     val onReactionBadgeTap: () -> Unit,
     /**
-     * Round 53 — tap on a smart-action span or on the map preview card.
+     * Round 53 — tap on a smart-action span.
      * `null` where the thread does not wire smart actions (previews,
      * standalone bubbles) — the tap then does nothing, like the default
      * phone callback.
      */
     val onSmartAction: ((SmartAction) -> Unit)? = null,
-    /**
-     * Round 54 — the maps provider for the map preview card (and for
-     * [onSmartAction] address taps, which the host resolves with the
-     * same value). Defaults to the system maps app where the thread
-     * does not wire a provider (previews, standalone bubbles, notes).
-     */
-    val mapsProvider: com.relay.sms.domain.settings.MapsProvider =
-        com.relay.sms.domain.settings.MapsProvider.SYSTEM_DEFAULT,
-    /**
-     * Round 55 — a tap on the map preview card (the card itself or
-     * its "Get directions" button). `null` where the thread does not
-     * wire the first-tap provider gate — the card then opens directly.
-     */
-    val onMapOpen: ((MapOpenRequest) -> Boolean)? = null,
 )

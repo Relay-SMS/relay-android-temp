@@ -12,6 +12,9 @@ Releases: [GitHub Releases](https://github.com/relay-sms/relay-android/releases/
 
 - Default SMS / MMS app for Android 8.0 and later (tested up to Android 16), with a one-time import
   of your existing messages.
+- **RCS messaging is not supported:** Relay currently supports SMS and MMS messaging. RCS messaging is
+  not yet available to third-party messaging apps through Android's public APIs. For RCS conversations,
+  you may need to use Google Messages.
 - Single-Activity Compose UI, Material 3 with dynamic colors, AMOLED true-black and
   System / Light / Dark themes.
 - **End-to-end encryption between Relay users**: texts, reactions, photos, videos, voice messages
@@ -43,8 +46,8 @@ Releases: [GitHub Releases](https://github.com/relay-sms/relay-android/releases/
 - **Pinned messages**: pin a message in a thread and jump back to it from the banner.
 - **Emoji reactions** on message bubbles, sent as tapbacks.
 - **Smart actions**: one-tap actions on what a message contains — OTP / login codes (copy), phone
-  numbers (call), email addresses (send email), physical addresses (open in your maps app, with a
-  tap-to-load map preview), dates and times (add to calendar), and tracking numbers (track the
+  numbers (call), email addresses (send email), physical addresses (get directions in your maps app),
+  dates and times (add to calendar), and tracking numbers (track the
   package — UPS, USPS, FedEx). In the bubble and in the notification; detection is on-device.
 - Offline **scam detection** (shortened links, urgency wording, premium numbers, spoofed domains), on
   rules: it can be wrong both ways.

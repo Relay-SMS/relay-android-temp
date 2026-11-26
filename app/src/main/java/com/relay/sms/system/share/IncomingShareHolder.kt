@@ -33,12 +33,20 @@ class IncomingShareHolder @Inject constructor() {
      * (a) user qui partage depuis Galerie puis met l'app en arrière-plan et oublie ;
      * (b) tap sur une notif `OPEN_CONVERSATION` qui consommerait le holder oublié sur
      * la mauvaise conversation.
+     *
+     * Round 56 — [isForward] : true quand le pending vient d'un transfert
+     * in-app ([com.relay.sms.ui.screens.thread.ThreadViewModel.stageForward]),
+     * false pour un partage externe (`ACTION_SEND` via [com.relay.sms.MainActivity]).
+     * Le garde d'AppRoot doit ignorer les transferts : le flux de transfert
+     * navigue lui-même, et l'ancien garde les effaçait ici avant que le
+     * thread de destination ne les consomme.
      */
     data class Pending(
         val uris: List<Uri>,
         val mimeType: String?,
         val text: String?,
         val postedAt: Long = System.currentTimeMillis(),
+        val isForward: Boolean = false,
     ) {
         val isEmpty: Boolean get() = uris.isEmpty() && text.isNullOrBlank()
         fun isExpired(now: Long = System.currentTimeMillis()): Boolean =

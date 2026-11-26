@@ -9,9 +9,9 @@ package com.relay.sms.domain.settings
 
 /**
  * Round 53 — the smart-actions settings: which maps app opens when the
- * user taps an address in a message (or the "Open Maps" notification
- * action). The choice affects "Open in" only; the tap-to-load map
- * preview image is always OpenStreetMap, whatever the choice.
+ * user taps an address in a message (or the "Get directions"
+ * notification action). The choice drives every directions open — the
+ * pill, the address span tap, and the notification action.
  */
 data class SmartActionSettings(
     /**
@@ -33,7 +33,7 @@ data class SmartActionSettings(
 )
 
 /**
- * The maps provider for "Open in Maps".
+ * The maps provider for "Get directions".
  *
  * ⚠️ Persisted BY NAME (`smart.mapsProvider`): add a provider, never
  * rename or remove one. An unknown name — an older version reading a

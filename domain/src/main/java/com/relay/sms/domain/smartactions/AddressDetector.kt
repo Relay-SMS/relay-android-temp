@@ -9,8 +9,7 @@ package com.relay.sms.domain.smartactions
 
 /**
  * Round 53 — street addresses in a message body, so the bubble can offer
- * "Open Maps" (plus a tap-to-load map preview) and the notification a
- * matching action.
+ * "Get directions" and the notification a matching action.
  *
  * **Pure function**, like [OtpCodeDetector][com.relay.sms.domain.otp.OtpCodeDetector]:
  * input = raw text, output = matches. No Android dependency.

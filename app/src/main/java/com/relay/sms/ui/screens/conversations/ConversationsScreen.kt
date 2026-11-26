@@ -97,6 +97,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.hilt.lifecycle.viewmodel.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.relay.sms.R
@@ -2501,23 +2502,29 @@ private fun ImportingPlaceholder(
             textAlign = TextAlign.Center,
             modifier = Modifier.fillMaxWidth(),
         )
-        // Round 54 — the first run can take a while, so say plainly
-        // that it takes a while instead of letting it look stuck.
-        // (Round 55 — the MMS phase now reports its own count, or a
-        // spinner when it could not be counted, so the screen no
-        // longer sits at "0 of N" through the media phase.)
-        Spacer(modifier = Modifier.height(8.dp))
-        Text(
-            text = stringResource(R.string.conversations_importing_patient),
-            style = RelayText.Preview,
-            color = cs.onSurfaceVariant,
-            textAlign = TextAlign.Center,
-            modifier = Modifier.fillMaxWidth(),
-        )
         // The count line + progress bar live in [ImportProgressContent]:
         // this screen sits at the Detekt complexity ceiling, so no
         // branching lives here.
         ImportProgressContent(imported = count, total = total, phase = phase)
+        // Round 56 — the full paragraph sits BELOW the bar, at 13sp:
+        // the first run can take a while, so say plainly that it takes
+        // a while instead of letting it look stuck. (Round 55 — the MMS
+        // phase now reports its own count, or a spinner when it could
+        // not be counted, so the screen no longer sits at "0 of N"
+        // through the media phase.) The spacer above it is Kristin's
+        // Figma 23px bar->paragraph visual gap: 17.75dp + 5.27
+        // paragraph top inset (the bar/spinner bottom edge is its
+        // layout edge; full derivation in ImportProgressContent's
+        // KDoc). Same gap in both branches — the spinner's bottom edge
+        // is its layout edge too.
+        Spacer(modifier = Modifier.height(17.75.dp))
+        Text(
+            text = stringResource(R.string.conversations_importing_patient),
+            style = RelayText.Preview.copy(fontSize = 13.sp),
+            color = cs.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.fillMaxWidth(),
+        )
     }
 }
 

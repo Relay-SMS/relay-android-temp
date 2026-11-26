@@ -76,11 +76,11 @@ open class LinkPreviewFetcher @Inject constructor(
     /**
      * The preview for [url], or `null` when the page yields none. The
      * [userAgent] is the browser the page is fetched as — the default
-     * mobile Chrome UA, except the Apple Maps preview
-     * ([com.relay.sms.data.smartactions.MapPreviewFetcher]), which Apple
-     * only serves Open Graph tags to under a Safari UA (see that
-     * fetcher's KDoc). The cache key stays the URL: a maps.apple.com URL
-     * is only ever fetched this one way.
+     * mobile Chrome UA, except Apple Maps pages, which Apple only serves
+     * Open Graph tags to under a Safari UA (so a caller fetching a
+     * maps.apple.com URL passes the Safari UA here). The cache key
+     * stays the URL: a maps.apple.com URL is only ever fetched this
+     * one way.
      */
     override suspend fun preview(url: String): LinkPreview? = preview(url, USER_AGENT)
 

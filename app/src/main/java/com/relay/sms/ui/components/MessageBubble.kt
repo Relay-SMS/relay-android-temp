@@ -188,7 +188,7 @@ fun MessageBubble(
     }
 
     // Round 55 — smart-action pills under the text (Call / Send email /
-    // Open Maps / Add to calendar / Track package): the same hits the
+    // Get directions / Add to calendar / Track package): the same hits the
     // linkify pass renders, so a pill always matches a span in the
     // text. Cached per message id like the OTP scan above.
     val smartPills: List<SmartActionPillData> = remember(message.body, message.id) {
@@ -474,6 +474,7 @@ fun MessageBubble(
                                     SmartActionPill(
                                         icon = pill.icon,
                                         labelRes = pill.labelRes,
+                                        labelArg = pill.labelArg,
                                         onClick = {
                                             val number = pill.phoneNumber
                                             if (number != null) {
@@ -487,25 +488,6 @@ fun MessageBubble(
                                     )
                                 }
                             }
-                        }
-                        // Round 55 — map preview BELOW the text (it sat
-                        // above it until now): the action buttons live
-                        // under the text, next to the OTP pill and the
-                        // smart-action pills. Same FAILED skip as the
-                        // link preview — the card tap would fight the
-                        // tap-to-retry. The provider + the first-tap
-                        // gate ride the toggles bundle: the bubble is
-                        // at the parameter limit (see [BubbleMenuToggles]).
-                        if (message.status !=
-                            com.relay.sms.domain.model.Message.Status.FAILED
-                        ) {
-                            MapPreviewCard(
-                                body = message.body,
-                                messageId = message.id,
-                                mapsProvider = toggles?.mapsProvider
-                                    ?: com.relay.sms.domain.settings.MapsProvider.SYSTEM_DEFAULT,
-                                onMapOpen = toggles?.onMapOpen,
-                            )
                         }
                         // Relay — heure (+ statut sortant) en petit, en bas à droite,
                         // À L'INTÉRIEUR de la bulle, alignée sur la dernière ligne de texte.

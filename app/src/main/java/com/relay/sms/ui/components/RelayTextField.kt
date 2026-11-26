@@ -148,9 +148,13 @@ fun RelayTextField(
 }
 
 /**
- * Filled search field: 36dp high, 10dp corners, 16dp magnifier leading, placeholder in
+ * Filled search field: 48dp high, 24dp pill corners, 24dp magnifier leading, placeholder in
  * [placeholderColor], cursor in `textFieldCursorColor` (see [RelayTextField]). The trailing
  * clear affordance appears only while [query] is non-empty.
+ *
+ * Round 56 — the same pill as the conversations search bar and the picker search bar
+ * ([EmojiPickerSearchBar]): it used to be 36dp high with 10dp corners and 16dp icons,
+ * visibly different from every other search box in the app.
  *
  * [focusRequester] (when given) is attached to the inner text field itself, so a
  * caller can move focus into the field when it appears.
@@ -169,19 +173,19 @@ fun RelaySearchField(
     RelayTextField(
         value = query,
         onValueChange = onQueryChange,
-        modifier = modifier.height(36.dp),
+        modifier = modifier.height(48.dp),
         placeholder = placeholder,
         singleLine = true,
         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-        cornerRadius = 10.dp,
-        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+        cornerRadius = 24.dp,
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 0.dp),
         focusRequester = focusRequester,
         leadingIcon = {
             Icon(
                 imageVector = Icons.Outlined.Search,
                 contentDescription = null,
                 tint = cs.onSurfaceVariant,
-                modifier = Modifier.size(16.dp),
+                modifier = Modifier.size(24.dp),
             )
         },
         trailingIcon = {
@@ -201,7 +205,7 @@ fun RelaySearchField(
                         imageVector = Icons.Outlined.Close,
                         contentDescription = null,
                         tint = cs.onSurfaceVariant,
-                        modifier = Modifier.size(16.dp),
+                        modifier = Modifier.size(24.dp),
                     )
                 }
             }

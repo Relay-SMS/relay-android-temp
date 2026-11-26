@@ -177,24 +177,28 @@ fun AppRoot() {
     //     by design — the user's real conversations are not available there).
     val pendingShare by incomingShare.pending.collectAsStateWithLifecycle()
     LaunchedEffect(pendingShare, showLock, isPanicDecoy) {
-        val current = pendingShare ?: return@LaunchedEffect
-        if (showLock || isPanicDecoy) return@LaunchedEffect
-        if (current.isExpired()) return@LaunchedEffect
-        val route = nav.currentDestination?.route
-        val alreadyInFlow = route?.contains("Compose") == true ||
-            route?.contains("Thread") == true
-        if (alreadyInFlow) {
-            // v1.4.1 (SEC-03) — privacy fix : when a share arrives while the user is
-            // already inside a Thread (or in Compose), the Pending used to linger up to
-            // its 60 s TTL. If the user then navigated to ANOTHER thread within that
-            // window, `ThreadViewModel.consumeIncomingShareIfAny` would silently stage
-            // the shared attachment into that wrong conversation's composer — risking
-            // an accidental send to the wrong recipient. Clearing the Pending here is
-            // a small UX cost (the user has to share again) for a real privacy guard.
-            incomingShare.clear()
-            return@LaunchedEffect
+        when (
+            decideSharePendingAction(
+                pendingShare,
+                nav.currentDestination?.route,
+                showLock,
+                isPanicDecoy,
+            )
+        ) {
+            SharePendingAction.Ignore -> return@LaunchedEffect
+            SharePendingAction.Clear -> {
+                // v1.4.1 (SEC-03) — privacy fix : when a share arrives while the user is
+                // already inside a Thread (or in Compose), the Pending used to linger up to
+                // its 60 s TTL. If the user then navigated to ANOTHER thread within that
+                // window, `ThreadViewModel.consumeIncomingShareIfAny` would silently stage
+                // the shared attachment into that wrong conversation's composer — risking
+                // an accidental send to the wrong recipient. Clearing the Pending here is
+                // a small UX cost (the user has to share again) for a real privacy guard.
+                incomingShare.clear()
+                return@LaunchedEffect
+            }
+            SharePendingAction.NavigateToCompose -> nav.navigate(Compose())
         }
-        nav.navigate(Compose())
     }
 
     // v1.8.0 (bug 4 fix) — auto-navigate to Thread on notification tap.

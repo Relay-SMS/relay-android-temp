@@ -18,9 +18,11 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowForward
 import androidx.compose.material.icons.outlined.PushPin
@@ -40,6 +42,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.rememberVectorPainter
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
@@ -70,7 +73,8 @@ import com.relay.sms.ui.util.rememberChatFormatters
  * Notes — the list row for a note: the [ConversationRow] layout
  * (72dp, 16dp inset, 48dp avatar, 17dp avatar-text gap, name over
  * preview, relative date right) with the note avatar (soft-green
- * tint + note glyph) and NO unread badge, NO mute icon, NO "Blocked"
+ * tint + note glyph, carrying the lock badge of an encrypted row —
+ * a note is encrypted) and NO unread badge, NO mute icon, NO "Blocked"
  * label — a note has none of those.
  *
  * The preview follows the conversation rule: the draft (with the
@@ -105,11 +109,36 @@ fun NoteRow(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             if (showAvatars) {
-                RelayAvatar(
-                    label = note.title,
-                    size = 48.dp,
-                    isNote = true,
-                )
+                // Round 56, item 18 — the lock badge on a note row's
+                // avatar, the same badge as an encrypted conversation
+                // row ([ConversationRow]): a note is encrypted, so its
+                // avatar carries the lock — an 18dp surface disc
+                // overlapping the bottom-right, `ic_lock_encrypted`
+                // 9x11dp in `onSurface`. The note glyph itself is
+                // unchanged.
+                Box {
+                    RelayAvatar(
+                        label = note.title,
+                        size = 48.dp,
+                        isNote = true,
+                    )
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .offset(x = 2.dp, y = 2.dp)
+                            .size(18.dp)
+                            .clip(CircleShape)
+                            .background(cs.surface),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Icon(
+                            painter = painterResource(R.drawable.ic_lock_encrypted),
+                            contentDescription = null,
+                            tint = cs.onSurface,
+                            modifier = Modifier.size(9.dp, 11.dp),
+                        )
+                    }
+                }
                 Spacer(Modifier.width(17.dp))
             }
             MessageTextSize {

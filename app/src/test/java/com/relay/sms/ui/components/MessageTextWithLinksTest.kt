@@ -306,6 +306,8 @@ class MessageTextWithLinksTest {
         assertThat(pills[2].action).isEqualTo(
             SmartAction.Tracking(TrackingCarrier.UPS, "1Z999AA10123456784"),
         )
+        // Round 56 — the tracking pill names its carrier.
+        assertThat(pills[2].labelArg).isEqualTo("UPS")
         assertThat(pills[4].action).isEqualTo(SmartAction.Address("123 Main Street"))
     }
 

@@ -18,15 +18,15 @@ import org.junit.jupiter.api.Test
  * the directions URLs.
  *
  * The intent builders themselves (`emailIntent`, `dialIntent`,
- * `calendarIntent`, `trackingIntent`, `mapsIntent`, `geoUriString`,
- * `mapsWebUrl`, `directionsIntent`) call `android.net.Uri` / `Intent`,
- * which throw `Stub!` on plain JVM — they are covered by the device
- * test, not here. The URL shaping they hand to the browser is pinned
- * here instead: a wrong tracking URL sends the user to a carrier 404,
- * and a wrong directions URL to a maps 404, so the carriers' and the
- * providers' forms are asserted exactly. [SmartActionIntents
- * .mapsDirectionsUrl] stays pure on purpose (URL-encoded with
- * `URLEncoder`, not `Uri.encode`) so it is testable here.
+ * `calendarIntent`, `trackingIntent`, `directionsIntent`) call
+ * `android.net.Uri` / `Intent`, which throw `Stub!` on plain JVM —
+ * they are covered by the device test, not here. The URL shaping they
+ * hand to the browser is pinned here instead: a wrong tracking URL
+ * sends the user to a carrier 404, and a wrong directions URL to a
+ * maps 404, so the carriers' and the providers' forms are asserted
+ * exactly. [SmartActionIntents.mapsDirectionsUrl] stays pure on
+ * purpose (URL-encoded with `URLEncoder`, not `Uri.encode`) so it is
+ * testable here.
  */
 class SmartActionIntentsTest {
 
@@ -35,7 +35,25 @@ class SmartActionIntentsTest {
             SmartActionIntents.trackingUrl(
                 SmartAction.Tracking(TrackingCarrier.UPS, "1Z999AA10123456784"),
             ),
-        ).isEqualTo("https://www.ups.com/track?tracknum=1Z999AA10123456784")
+        ).isEqualTo(
+            "https://www.ups.com/track?tracknum=1Z999AA10123456784" +
+                "&accept_UPS_license_agreement=yes&loc=en_US&requester=ST/trackdetails",
+        )
+    }
+
+    // Round 56 — the UPS deep link Kristin's device test verified: the
+    // bare track?tracknum= URL redirects to a broken page; the
+    // license-agreement + loc + /trackdetails form lands on the details
+    // page (sample: her real 1Z7A377E0392030514).
+    @Test fun `ups tracking url carries the license agreement and trackdetails`() {
+        assertThat(
+            SmartActionIntents.trackingUrl(
+                SmartAction.Tracking(TrackingCarrier.UPS, "1Z7A377E0392030514"),
+            ),
+        ).isEqualTo(
+            "https://www.ups.com/track?tracknum=1Z7A377E0392030514" +
+                "&accept_UPS_license_agreement=yes&loc=en_US&requester=ST/trackdetails",
+        )
     }
 
     @Test fun `usps tracking url`() {
@@ -54,16 +72,6 @@ class SmartActionIntentsTest {
                 SmartAction.Tracking(TrackingCarrier.FEDEX, "449044304137821"),
             ),
         ).isEqualTo("https://www.fedex.com/fedextrack/?trknbr=449044304137821")
-    }
-
-    @Test fun `google maps package name`() {
-        assertThat(SmartActionIntents.GOOGLE_MAPS_PACKAGE)
-            .isEqualTo("com.google.android.apps.maps")
-    }
-
-    @Test fun `osm packages in preference order`() {
-        assertThat(SmartActionIntents.OSM_PACKAGES)
-            .containsExactly("net.osmand.plus", "net.osmand", "app.organicmaps").inOrder()
     }
 
     @Test fun `google directions url`() {
@@ -115,5 +123,61 @@ class SmartActionIntentsTest {
         ).isEqualTo(
             "https://www.google.com/maps/dir/?api=1&destination=123%20Main%20St%2C%20Springfield",
         )
+    }
+
+    @Test fun `osm strip drops the locality before state and zip`() {
+        assertThat(stripLocalityForOsm("5466 Elam Rd, Kinzers, PA 17535"))
+            .isEqualTo("5466 Elam Rd, PA 17535")
+    }
+
+    @Test fun `osm strip keeps earlier components and drops only the locality`() {
+        assertThat(stripLocalityForOsm("123 Main St, Apt 4, Kinzers, PA 17535"))
+            .isEqualTo("123 Main St, Apt 4, PA 17535")
+    }
+
+    @Test fun `osm strip leaves short addresses unchanged`() {
+        assertThat(stripLocalityForOsm("Kinzers, PA 17535"))
+            .isEqualTo("Kinzers, PA 17535")
+        assertThat(stripLocalityForOsm("5466 Elam Rd, PA 17535"))
+            .isEqualTo("5466 Elam Rd, PA 17535")
+        assertThat(stripLocalityForOsm("Kinzers")).isEqualTo("Kinzers")
+        assertThat(stripLocalityForOsm("")).isEqualTo("")
+    }
+
+    @Test fun `osm strip leaves a non state zip tail unchanged`() {
+        assertThat(stripLocalityForOsm("5466 Elam Rd, Kinzers, PA"))
+            .isEqualTo("5466 Elam Rd, Kinzers, PA")
+        assertThat(stripLocalityForOsm("5466 Elam Rd, Kinzers"))
+            .isEqualTo("5466 Elam Rd, Kinzers")
+        assertThat(stripLocalityForOsm("10 Downing St, London SW1A 2AA"))
+            .isEqualTo("10 Downing St, London SW1A 2AA")
+    }
+
+    @Test fun `osm directions url carries the stripped query`() {
+        assertThat(
+            SmartActionIntents.mapsDirectionsUrl(
+                "5466 Elam Rd, Kinzers, PA 17535",
+                MapsProvider.OPENSTREETMAP,
+            ),
+        ).isEqualTo(
+            "https://www.openstreetmap.org/directions?to=5466%20Elam%20Rd%2C%20PA%2017535",
+        )
+    }
+
+    @Test fun `other providers directions urls keep the full address`() {
+        assertThat(
+            SmartActionIntents.mapsDirectionsUrl(
+                "5466 Elam Rd, Kinzers, PA 17535",
+                MapsProvider.GOOGLE_MAPS,
+            ),
+        ).isEqualTo(
+            "https://www.google.com/maps/dir/?api=1&destination=5466%20Elam%20Rd%2C%20Kinzers%2C%20PA%2017535",
+        )
+        assertThat(
+            SmartActionIntents.mapsDirectionsUrl(
+                "5466 Elam Rd, Kinzers, PA 17535",
+                MapsProvider.SYSTEM_DEFAULT,
+            ),
+        ).isEqualTo("geo:0,0?q=5466%20Elam%20Rd%2C%20Kinzers%2C%20PA%2017535")
     }
 }

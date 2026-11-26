@@ -172,7 +172,7 @@
     <string name="conversations_importing_title">Importando:</string>
     <string name="conversations_importing_body">Leyendo los SMS que ya tiene: esto ocurre una sola vez.</string>
     <string name="conversations_importing_count">%1$d mensajes importados…</string>
-    <string name="conversations_importing_patient">Tenga paciencia, esto puede tardar un rato</string>
+    <string name="conversations_importing_patient">Tenga paciencia; esto puede tardar un rato. Si la sincronización se reinicia, desactive el tiempo de espera de la pantalla hasta que se complete la importación. Nota: los mensajes RCS no se pueden importar.</string>
     <string name="conversations_importing_phase_mms">Fotos, vídeos y mensajes de voz</string>
     <string name="conversations_importing_phase_sms">Mensajes de texto</string>
     <string name="conversations_delete_confirm_title">¿Eliminar esta conversación?</string>
@@ -816,18 +816,16 @@
     <string name="settings_maps_app_apple_hint">Apple Maps en la web: no existe una app de Apple Maps para Android.</string>
     <string name="settings_maps_app_osm">OpenStreetMap</string>
     <string name="settings_maps_app_osm_hint">Una app de OpenStreetMap si está instalada; si no, openstreetmap.org.</string>
-    <string name="map_get_directions">Cómo llegar</string>
-    <string name="map_directions_unavailable">No se pudo abrir Maps.</string>
     <string name="smart_action_no_app">Ninguna app puede abrir esto</string>
     <!-- Round 55 — smart-action pills under the bubble text, same style as the OTP pill. -->
     <string name="smart_action_call">Llamar</string>
     <string name="smart_action_send_email">Enviar correo</string>
-    <string name="smart_action_open_maps">Abrir Maps</string>
+    <string name="smart_action_open_maps">Cómo llegar</string>
     <string name="smart_action_add_to_calendar">Añadir al calendario</string>
-    <string name="smart_action_track_package">Rastrear paquete</string>
+    <string name="smart_action_track_package">Rastrear paquete %1$s</string>
     <!-- Round 55 — first-map-tap provider sheet. -->
     <string name="map_provider_sheet_title">Elige tu app de mapas</string>
-    <string name="map_provider_sheet_subtitle">Elige qué app de mapas se abre cuando tocas una dirección o un mapa. Puedes cambiarla cuando quieras en Ajustes.</string>
+    <string name="map_provider_sheet_subtitle">Elige qué app de mapas se abre cuando tocas una dirección. Puedes cambiarla cuando quieras en Ajustes.</string>
 
     <string name="settings_section_security">Seguridad y privacidad</string>
     <string name="settings_flag_secure">Pantalla privada</string>
@@ -936,7 +934,7 @@
     <string name="notif_copy_code_label">Copiar código</string>
     <string name="notif_call_label">Llamar</string>
     <string name="notif_send_email_label">Enviar correo</string>
-    <string name="notif_open_maps_label">Abrir mapa</string>
+    <string name="notif_open_maps_label">Cómo llegar</string>
     <string name="notif_add_to_calendar_label">Añadir al calendario</string>
     <string name="notif_track_package_label">Rastrear paquete</string>
     <string name="notif_code_copied">Código copiado</string>
@@ -1119,6 +1117,10 @@
     <string name="about_help_default_title">Establecerla como app de SMS predeterminada</string>
     <string name="about_help_default_step1">Botón azul «Establecer como predeterminada» arriba de la lista de conversaciones</string>
     <string name="about_help_default_step2">O Ajustes de Android → Apps predeterminadas → SMS → Relay</string>
+    <string name="about_help_rcs_title">Mensajes RCS</string>
+    <string name="about_help_rcs_step1">Relay actualmente admite mensajes SMS y MMS.</string>
+    <string name="about_help_rcs_step2">La mensajería RCS aún no está disponible para las aplicaciones de mensajería de terceros a través de las API públicas de Android.</string>
+    <string name="about_help_rcs_step3">Para las conversaciones RCS, es posible que sea necesario usar Google Messages.</string>
     <string name="about_help_voice_title">Enviar un mensaje de voz</string>
     <string name="about_help_voice_step1">Mantenga pulsado el micrófono a la derecha de la ventana de escritura</string>
     <string name="about_help_voice_step2">Hable y luego suelte para enviar (deslice a la izquierda para cancelar)</string>

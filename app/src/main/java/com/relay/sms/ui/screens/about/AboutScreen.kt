@@ -337,12 +337,13 @@ private fun HeaderBlock(
         // (adaptive-icon foreground vector, tail bottom-right) on a
         // brand-blue rounded tile, the same treatment as the splash. The
         // old upstream PNG was removed.
-        // Round 11 — the bubble is sized up: the adaptive-icon foreground
-        // carries the 108dp safe-zone padding, so the bubble itself is only
-        // ~48x44 of the 108 viewport and read as tiny inside the tile.
-        // The 11dp inset is dropped and the image is scaled 1.8x around its
-        // centre (the bubble is centred on the viewport), so the bubble
-        // fills the tile; the tile's rounded clip keeps the overflow inside.
+        // Round 56 — the mark was way too big in the tile: the round-11
+        // scale(1.8f) overshoots with the finalized round-41 mark. Measured
+        // from the foreground vector, the mark spans 30→78 of the 108
+        // viewport (48dp, 44%), so at scale 1.0 it reads 35.6dp in the
+        // 80dp tile; scale 1.5x lands it at ~53dp, ~2/3 of the tile (the
+        // round-41 mark-to-frame spec is 0.669), with even blue padding
+        // on all sides. The tile's rounded clip keeps the overflow inside.
         Box(
             modifier = Modifier
                 .size(80.dp)
@@ -355,7 +356,7 @@ private fun HeaderBlock(
                 contentDescription = null,
                 modifier = Modifier
                     .fillMaxSize()
-                    .scale(1.8f),
+                    .scale(1.5f),
             )
         }
         Spacer(Modifier.size(14.dp))

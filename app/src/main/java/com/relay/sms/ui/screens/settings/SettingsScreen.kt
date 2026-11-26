@@ -1321,9 +1321,9 @@ private fun BackupSectionContent(
 
 /**
  * Round 53 — the Smart actions sub-screen: the maps provider for
- * "Open in Maps". One row; the picker lists the four providers with
- * hints. The choice affects "Open in" only — the tap-to-load map
- * preview image is always OpenStreetMap.
+ * "Get directions". One row; the picker lists the four providers with
+ * hints. The choice drives every directions open — the pill, the
+ * address span tap, and the notification action.
  */
 @Composable
 private fun SmartActionsSectionContent(

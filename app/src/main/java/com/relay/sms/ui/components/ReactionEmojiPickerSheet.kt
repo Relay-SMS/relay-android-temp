@@ -68,7 +68,7 @@ import com.relay.sms.R
  * ([EmojiPickerSearchBar]): the same 48dp pill, close button,
  * placeholder ("Search emoji") and live per-keystroke filtering as the
  * composer panel's emoji tab — it previously used [RelaySearchField]
- * (36dp, 10dp corners, magnifier, no close button), which read as a
+ * (36dp, 10dp corners, magnifier, no close button back then), which read as a
  * different search. The only deliberate difference from the composer
  * bar: this picker is emoji-only, so the composer's tab icons on the
  * right are replaced by a clear button, shown only while the query is

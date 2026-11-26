@@ -34,7 +34,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.scale
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.clearAndSetSemantics
@@ -190,9 +189,6 @@ fun SplashScreen(
     BackHandler(enabled = true) { dismissOnce() }
 
     val interaction = remember { MutableInteractionSource() }
-    val configuration = LocalConfiguration.current
-    val logoSizeDp = (configuration.screenWidthDp * LOGO_SIZE_RATIO)
-        .coerceIn(LOGO_MIN_DP, LOGO_MAX_DP).dp
 
     Box(
         modifier = Modifier
@@ -216,27 +212,21 @@ fun SplashScreen(
                 .fillMaxSize()
                 .padding(horizontal = 32.dp),
         ) {
-            // Relay logo: white chat bubble (adaptive-icon foreground vector)
-            // on a #1E4FD8 rounded tile. The old upstream logo PNG was removed
-            // (Kristin, 2026-11-06 — the splash showed the old logo).
-            androidx.compose.foundation.layout.Box(
-                contentAlignment = Alignment.Center,
+            // Round 56 — the mark alone, like the system splash: the blue
+            // tile is gone (the white mark nearly touched its edges).
+            // `ic_splash_logo` is the mark on transparent (blue on light,
+            // white on dark, via the night variant); the mark spans ~51%
+            // of the 108 viewport, so the drawable is ~2x the intended
+            // mark size — 240dp here for a ~120dp mark, the presence the
+            // tile had (it was 128–200dp wide).
+            Image(
+                painter = painterResource(R.drawable.ic_splash_logo),
+                contentDescription = stringResource(R.string.splash_logo_content_description),
                 modifier = Modifier
-                    .size(logoSizeDp)
+                    .size(240.dp)
                     .scale(logoScale.value)
-                    .alpha(logoAlpha.value)
-                    .background(
-                        color = com.relay.sms.ui.theme.BrandBlue,
-                        shape = androidx.compose.foundation.shape.RoundedCornerShape(24.dp),
-                    )
-                    .padding(logoSizeDp * 0.14f),
-            ) {
-                Image(
-                    painter = painterResource(R.drawable.ic_launcher_foreground),
-                    contentDescription = stringResource(R.string.splash_logo_content_description),
-                    modifier = Modifier.fillMaxSize(),
-                )
-            }
+                    .alpha(logoAlpha.value),
+            )
             Spacer(modifier = Modifier.height(24.dp))
             Text(
                 text = stringResource(R.string.app_name),
@@ -278,6 +268,3 @@ private const val HINT_DELAY_MS = 2500L
 private const val HINT_ANIM_MS = 500
 private const val HINT_FINAL_ALPHA = 0.6f
 private const val AUTO_DISMISS_MS = 5500L
-private const val LOGO_SIZE_RATIO = 0.4f
-private const val LOGO_MIN_DP = 128f
-private const val LOGO_MAX_DP = 200f

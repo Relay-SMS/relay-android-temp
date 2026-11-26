@@ -32,7 +32,7 @@ import androidx.compose.ui.unit.dp
 
 /**
  * Round 55 — one smart-action pill under the bubble text (Call / Send
- * email / Open Maps / Add to calendar / Track package): the OTP pill's
+ * email / Get directions / Add to calendar / Track package): the OTP pill's
  * style exactly — a transparent capsule with a 1dp on-surface border,
  * 15dp horizontal / 9dp vertical padding, body text in the on-surface
  * colour — with the icon on the LEFT and the label on the right (the
@@ -40,7 +40,9 @@ import androidx.compose.ui.unit.dp
  * it first, as Kristin asked). The pill carries its own `clickable`
  * like the OTP pill: it sits inside the bubble's `combinedClickable`
  * and the inner clickable wins, so tapping the pill acts instead of
- * opening the menu.
+ * opening the menu. [labelArg] fills a format label (the tracking
+ * pill's "Track %1$s package" takes the carrier's display name);
+ * `null` renders [labelRes] as-is.
  */
 @Composable
 fun SmartActionPill(
@@ -48,10 +50,11 @@ fun SmartActionPill(
     @StringRes labelRes: Int,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
+    labelArg: String? = null,
 ) {
     val cs = MaterialTheme.colorScheme
     // Hoisted: stringResource is @Composable and cannot run inside .semantics {}.
-    val label = stringResource(labelRes)
+    val label = if (labelArg != null) stringResource(labelRes, labelArg) else stringResource(labelRes)
     Row(
         modifier = modifier
             .clip(CircleShape)

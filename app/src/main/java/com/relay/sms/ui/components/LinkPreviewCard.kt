@@ -176,8 +176,7 @@ internal fun String.hostOrNull(): String? =
  * immediately instead of re-fetching them on every open (the
  * reload that made scrolling glitchy). The 16:9 box is always
  * reserved, so a first-time download never grows the card when it
- * lands. Shared with the Apple map preview card ([MapPreviewCard]),
- * which renders the same Open Graph image.
+ * lands.
  */
 @Composable
 internal fun LinkPreviewCachedImage(imageUrl: String) {

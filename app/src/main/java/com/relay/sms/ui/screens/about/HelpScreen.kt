@@ -177,6 +177,17 @@ private fun helpRecipes(isPanicDecoy: Boolean): List<HelpRecipe> = listOf(
             stringResource(R.string.about_help_default_step2),
         ),
     ),
+    // Round 56 — RCS is outside what Relay can receive: no public Android
+    // API for third-party apps. Same wording as the README note, split
+    // into the recipe's steps.
+    HelpRecipe(
+        title = stringResource(R.string.about_help_rcs_title),
+        steps = listOf(
+            stringResource(R.string.about_help_rcs_step1),
+            stringResource(R.string.about_help_rcs_step2),
+            stringResource(R.string.about_help_rcs_step3),
+        ),
+    ),
     HelpRecipe(
         title = stringResource(R.string.about_help_voice_title),
         steps = listOf(

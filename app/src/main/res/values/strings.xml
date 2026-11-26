@@ -171,7 +171,7 @@
     <string name="conversations_importing_title">Importing:</string>
     <string name="conversations_importing_body">Reading your existing SMS — this happens only once.</string>
     <string name="conversations_importing_count">%1$d messages imported…</string>
-    <string name="conversations_importing_patient">Please be patient, this may take a while</string>
+    <string name="conversations_importing_patient">Please be patient; this may take a while. If syncing restarts, disable screen timeout until the import is complete. Note: RCS messages cannot be imported.</string>
     <string name="conversations_importing_phase_mms">Photos, videos and voice messages</string>
     <string name="conversations_importing_phase_sms">Text messages</string>
     <string name="conversations_delete_confirm_title">Delete this conversation?</string>
@@ -813,18 +813,16 @@
     <string name="settings_maps_app_apple_hint">Apple Maps on the web — there is no Apple Maps app for Android.</string>
     <string name="settings_maps_app_osm">OpenStreetMap</string>
     <string name="settings_maps_app_osm_hint">An OpenStreetMap app when installed, otherwise openstreetmap.org.</string>
-    <string name="map_get_directions">Get directions</string>
-    <string name="map_directions_unavailable">Couldn\'t open Maps.</string>
     <string name="smart_action_no_app">No app can open this</string>
     <!-- Round 55 — smart-action pills under the bubble text, same style as the OTP pill. -->
     <string name="smart_action_call">Call</string>
     <string name="smart_action_send_email">Send email</string>
-    <string name="smart_action_open_maps">Open Maps</string>
+    <string name="smart_action_open_maps">Get directions</string>
     <string name="smart_action_add_to_calendar">Add to calendar</string>
-    <string name="smart_action_track_package">Track package</string>
+    <string name="smart_action_track_package">Track %1$s package</string>
     <!-- Round 55 — first-map-tap provider sheet. -->
     <string name="map_provider_sheet_title">Set your map provider</string>
-    <string name="map_provider_sheet_subtitle">Choose which maps app opens when you tap an address or a map. You can change this anytime in Settings.</string>
+    <string name="map_provider_sheet_subtitle">Choose which maps app opens when you tap an address. You can change this anytime in Settings.</string>
 
     <string name="settings_section_security">Security &amp; privacy</string>
     <string name="settings_flag_secure">Private screen</string>
@@ -932,7 +930,7 @@
     <string name="notif_copy_code_label">Copy code</string>
     <string name="notif_call_label">Call</string>
     <string name="notif_send_email_label">Send email</string>
-    <string name="notif_open_maps_label">Open Maps</string>
+    <string name="notif_open_maps_label">Get directions</string>
     <string name="notif_add_to_calendar_label">Add to calendar</string>
     <string name="notif_track_package_label">Track package</string>
     <string name="notif_code_copied">Code copied</string>
@@ -1116,6 +1114,10 @@
     <string name="about_help_default_title">Set as default SMS app</string>
     <string name="about_help_default_step1">Blue button \"Set as default\" at the top of the conversation list</string>
     <string name="about_help_default_step2">Or Android Settings → Default apps → SMS → Relay</string>
+    <string name="about_help_rcs_title">RCS messages</string>
+    <string name="about_help_rcs_step1">Relay currently supports SMS and MMS messaging.</string>
+    <string name="about_help_rcs_step2">RCS messaging is not yet available to third-party messaging apps through Android\'s public APIs.</string>
+    <string name="about_help_rcs_step3">For RCS conversations, you may need to use Google Messages.</string>
     <string name="about_help_voice_title">Send a voice message</string>
     <string name="about_help_voice_step1">Long-press the mic to the right of the composer</string>
     <string name="about_help_voice_step2">Speak, then release to send (slide left = cancel)</string>

@@ -383,9 +383,9 @@ private fun PickerDragHandle(dragModifier: Modifier) {
 /**
  * Round 54 — the SHARED picker search bar: the composer's search field,
  * extracted so the "+" reaction picker ([ReactionEmojiPickerSheet]) uses
- * the exact same bar instead of its own ([RelaySearchField], 36dp high
- * with 10dp corners, a magnifier and a clear button — visibly different
- * from this 48dp pill). Same pill, same text, same behaviour in both
+ * the exact same bar instead of its own ([RelaySearchField] was 36dp high
+ * with 10dp corners then — visibly different from this 48dp pill; round 56
+ * restyled it to the same pill). Same pill, same text, same behaviour in both
  * places: 48dp high, `surfaceVariant` fill, 24dp corners, `bodyLarge`
  * text in `onSurface` with an `onSurface` cursor, `onSurfaceVariant`
  * placeholder, `ImeAction.Search`, live filtering on every keystroke

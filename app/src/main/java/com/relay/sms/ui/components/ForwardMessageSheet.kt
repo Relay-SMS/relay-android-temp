@@ -70,6 +70,9 @@ fun ForwardMessageSheet(
     viewModel: ForwardPickerViewModel = hiltViewModel(),
 ) {
     val filtered by viewModel.filtered.collectAsStateWithLifecycle()
+    val contactPhotos by viewModel.contactPhotos.collectAsStateWithLifecycle()
+    val groupMemberPhotos by viewModel.groupMemberPhotos.collectAsStateWithLifecycle()
+    val showAvatars by viewModel.showAvatars.collectAsStateWithLifecycle()
     // v1.3.11 (P1) — hand the source conversation id to the ViewModel so the filter
     // (and its mémoïsation) is owned end-to-end by the VM. Keyed on `currentConversationId`
     // so a configuration change that swaps the source id re-syncs the exclusion list.
@@ -152,17 +155,29 @@ fun ForwardMessageSheet(
                     items(filtered, key = { it.id }) { conv ->
                         val firstAddress = conv.addresses.firstOrNull()?.raw.orEmpty()
                         val label = conv.displayName?.takeIf { it.isNotBlank() } ?: firstAddress
+                        // Round 56 — the list's avatar rendering
+                        // ([ConversationAvatar]): same size, same colours,
+                        // contact photo when the person has one. The old
+                        // [Avatar] gradient was 44dp and never loaded the
+                        // contact photo. Hidden entirely when the list's
+                        // show-avatars setting is off.
+                        val avatarContent: (@Composable () -> Unit)? = if (showAvatars) {
+                            {
+                                ConversationAvatar(
+                                    conversation = conv,
+                                    contactPhotoUri = contactPhotos[conv.id],
+                                    groupMemberPhotos = groupMemberPhotos[conv.id],
+                                )
+                            }
+                        } else {
+                            null
+                        }
                         ListItem(
                             headlineContent = { Text(label) },
                             supportingContent = conv.lastMessagePreview
                                 ?.takeIf { it.isNotBlank() }
                                 ?.let { preview -> { Text(preview, maxLines = 1) } },
-                            // v1.11.0 audit C4 — propage avatarUri custom de la
-                            // conversation (Sujet 5 Apparence). Sans ce param, l'user
-                            // voyait des initiales-gradient au lieu de l'avatar
-                            // qu'il a configuré — incohérence visuelle entre
-                            // l'écran principal et le ForwardSheet.
-                            leadingContent = { Avatar(label = label, customUri = conv.avatarUri) },
+                            leadingContent = avatarContent,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clickable { onPickConversation(conv.id) },
@@ -173,4 +188,3 @@ fun ForwardMessageSheet(
         }
     }
 }
-

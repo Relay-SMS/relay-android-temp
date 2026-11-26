@@ -170,7 +170,7 @@
     <string name="conversations_importing_title">Importieren:</string>
     <string name="conversations_importing_body">Ihre vorhandenen SMS werden gelesen — das geschieht nur einmal.</string>
     <string name="conversations_importing_count">%1$d Nachrichten importiert…</string>
-    <string name="conversations_importing_patient">Bitte haben Sie Geduld, dies kann eine Weile dauern</string>
+    <string name="conversations_importing_patient">Bitte haben Sie Geduld; dies kann eine Weile dauern. Falls die Synchronisation neu startet, deaktivieren Sie das Bildschirm-Timeout, bis der Import abgeschlossen ist. Hinweis: RCS-Nachrichten können nicht importiert werden.</string>
     <string name="conversations_importing_phase_mms">Fotos, Videos und Sprachnachrichten</string>
     <string name="conversations_importing_phase_sms">Textnachrichten</string>
     <string name="conversations_delete_confirm_title">Diese Unterhaltung löschen?</string>
@@ -813,18 +813,16 @@
     <string name="settings_maps_app_apple_hint">Apple Maps im Web – es gibt keine Apple-Maps-App für Android.</string>
     <string name="settings_maps_app_osm">OpenStreetMap</string>
     <string name="settings_maps_app_osm_hint">Eine OpenStreetMap-App, falls installiert, sonst openstreetmap.org.</string>
-    <string name="map_get_directions">Route anzeigen</string>
-    <string name="map_directions_unavailable">Karten konnten nicht geöffnet werden.</string>
     <string name="smart_action_no_app">Keine App kann dies öffnen</string>
     <!-- Round 55 — smart-action pills under the bubble text, same style as the OTP pill. -->
     <string name="smart_action_call">Anrufen</string>
     <string name="smart_action_send_email">E-Mail senden</string>
-    <string name="smart_action_open_maps">Maps öffnen</string>
+    <string name="smart_action_open_maps">Route anzeigen</string>
     <string name="smart_action_add_to_calendar">Zum Kalender hinzufügen</string>
-    <string name="smart_action_track_package">Sendung verfolgen</string>
+    <string name="smart_action_track_package">%1$s-Sendung verfolgen</string>
     <!-- Round 55 — first-map-tap provider sheet. -->
     <string name="map_provider_sheet_title">Karten-App festlegen</string>
-    <string name="map_provider_sheet_subtitle">Wähle aus, welche Karten-App geöffnet wird, wenn du auf eine Adresse oder eine Karte tippst. Du kannst dies jederzeit in den Einstellungen ändern.</string>
+    <string name="map_provider_sheet_subtitle">Wähle aus, welche Karten-App geöffnet wird, wenn du auf eine Adresse tippst. Du kannst dies jederzeit in den Einstellungen ändern.</string>
 
     <string name="settings_section_security">Sicherheit &amp; Privatsphäre</string>
     <string name="settings_flag_secure">Privater Bildschirm</string>
@@ -933,7 +931,7 @@
     <string name="notif_copy_code_label">Code kopieren</string>
     <string name="notif_call_label">Anrufen</string>
     <string name="notif_send_email_label">E-Mail senden</string>
-    <string name="notif_open_maps_label">Karte öffnen</string>
+    <string name="notif_open_maps_label">Route anzeigen</string>
     <string name="notif_add_to_calendar_label">Zum Kalender hinzufügen</string>
     <string name="notif_track_package_label">Paket verfolgen</string>
     <string name="notif_code_copied">Code kopiert</string>
@@ -1117,6 +1115,10 @@
     <string name="about_help_default_title">Als Standard-SMS-App festlegen</string>
     <string name="about_help_default_step1">Blaue Schaltfläche \"Als Standard festlegen\" oben in der Liste der Unterhaltungen</string>
     <string name="about_help_default_step2">Oder Android-Einstellungen → Standard-Apps → SMS → Relay</string>
+    <string name="about_help_rcs_title">RCS-Nachrichten</string>
+    <string name="about_help_rcs_step1">Relay unterstützt derzeit SMS- und MMS-Nachrichten.</string>
+    <string name="about_help_rcs_step2">RCS-Messaging ist für Messaging-Apps von Drittanbietern über die öffentlichen APIs von Android noch nicht verfügbar.</string>
+    <string name="about_help_rcs_step3">Für RCS-Unterhaltungen muss eventuell Google Messages verwendet werden.</string>
     <string name="about_help_voice_title">Eine Sprachnachricht senden</string>
     <string name="about_help_voice_step1">Das Mikrofon rechts neben dem Eingabefeld lange drücken</string>
     <string name="about_help_voice_step2">Sprechen, dann loslassen zum Senden (nach links ziehen = abbrechen)</string>

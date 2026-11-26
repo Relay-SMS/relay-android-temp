@@ -42,16 +42,15 @@ internal fun shouldShowMapProviderSheet(
 
 /**
  * Round 55 — the first-map-tap bottom sheet: "Set your map provider",
- * sliding up from the bottom the first time the user taps a map (a map
- * preview card, its "Get directions" button, or an address in the
- * text) while no explicit provider choice exists. Choosing a provider
- * saves it and opens the pending map with it; dismissing (swipe,
- * scrim, back) opens the pending map with the current provider and
- * never re-prompts. The sheet shows once — the caller gates it on
- * [shouldShowMapProviderSheet] and persists the choice/dismissal —
- * and never when the user already picked a provider in Settings. The
- * provider setting drives all map links, so the sheet is for map taps
- * generally, not Apple-only.
+ * sliding up from the bottom the first time the user taps a map (an
+ * address pill or span) while no explicit provider choice exists.
+ * Choosing a provider saves it and opens the pending map with it;
+ * dismissing (swipe, scrim, back) opens the pending map with the
+ * current provider and never re-prompts. The sheet shows once — the
+ * caller gates it on [shouldShowMapProviderSheet] and persists the
+ * choice/dismissal — and never when the user already picked a provider
+ * in Settings. The provider setting drives all map links, so the sheet
+ * is for map taps generally, not Apple-only.
  */
 @Composable
 fun MapProviderSheet(
@@ -67,6 +66,12 @@ fun MapProviderSheet(
                 .padding(horizontal = 24.dp)
                 .padding(bottom = 24.dp),
         ) {
+            // Round 56 — the 12dp spacer above the title, matching the
+            // forward sheet: the title was jammed against the top of
+            // the sheet, right under the drag handle (the shell carries
+            // no gap of its own — the content owns it, see
+            // [RelaySheet]).
+            Spacer(modifier = Modifier.size(12.dp))
             Text(
                 text = stringResource(R.string.map_provider_sheet_title),
                 style = MaterialTheme.typography.titleLarge,

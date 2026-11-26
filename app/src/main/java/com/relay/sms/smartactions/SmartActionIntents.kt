@@ -25,22 +25,22 @@ import timber.log.Timber
  * itself.
  *
  * The intent builders are pure ([emailIntent], [dialIntent],
- * [calendarIntent], [trackingIntent], [mapsIntent]) so the URL and URI
- * shaping is unit-testable; [perform] is the one place that actually
- * starts an activity, and it returns `false` (with a log) instead of
- * throwing when no app can handle the intent.
+ * [calendarIntent], [trackingIntent]) so the URL and URI shaping is
+ * unit-testable; [perform] is the one place that actually starts an
+ * activity, and it returns `false` (with a log) instead of throwing
+ * when no app can handle the intent.
  *
- * Maps: [mapsIntent] honours the user's provider choice
- * ([MapsProvider]). A `geo:` intent is offered to the chosen app only
- * when it is installed (checked with [Context.getLaunchIntentForPackage],
- * which needs the package in the manifest's `<queries>` block on API
- * 30+) — otherwise the provider's web version opens. Round 54 — the map
- * preview card's "Get directions" button ([directionsIntent] /
- * [performDirections]) is a second maps path: Google, Apple and OSM go
- * straight to their keyless directions web URL (the `geo:` URI has no
- * directions mode), while SYSTEM_DEFAULT tries `geo:` first and falls
- * back to OSM directions on the web when nothing handles it — the same
- * rule as the desktop's `openMapsDirections`.
+ * Maps: an address tap opens directions in the user's provider choice
+ * ([MapsProvider]) — [directionsIntent] / [performDirections]: Google,
+ * Apple and OSM go straight to their keyless directions web URL (the
+ * `geo:` URI has no directions mode), while SYSTEM_DEFAULT tries `geo:`
+ * first and falls back to OSM directions on the web when nothing
+ * handles it — the same rule as the desktop's `openMapsDirections`.
+ * Round 56 — the inline map preview card is gone, so the directions
+ * pill (and the notification's address action) are the only map
+ * actions left; the OSM directions query drops the locality
+ * component ([stripLocalityForOsm]) because the city name breaks the
+ * map load on the OSM page.
  */
 object SmartActionIntents {
 
@@ -72,9 +72,17 @@ object SmartActionIntents {
             }
         }
 
-    /** The carrier's tracking page for [action], as a URL string. */
+    /**
+     * The carrier's tracking page for [action], as a URL string.
+     * UPS needs the full deep-link form (round 56, Kristin's device
+     * test on 1Z7A377E0392030514): the bare `track?tracknum=` URL
+     * redirects to a broken page; the license-agreement + `loc` +
+     * `requester=ST/trackdetails` form lands on the details page.
+     */
     fun trackingUrl(action: SmartAction.Tracking): String = when (action.carrier) {
-        TrackingCarrier.UPS -> "https://www.ups.com/track?tracknum=${action.number}"
+        TrackingCarrier.UPS ->
+            "https://www.ups.com/track?tracknum=${action.number}" +
+                "&accept_UPS_license_agreement=yes&loc=en_US&requester=ST/trackdetails"
         TrackingCarrier.USPS ->
             "https://tools.usps.com/go/TrackConfirmAction?tLabels=${action.number}"
         TrackingCarrier.FEDEX -> "https://www.fedex.com/fedextrack/?trknbr=${action.number}"
@@ -87,91 +95,8 @@ object SmartActionIntents {
         }
 
     /**
-     * The `geo:` URI for [address] — the form handed to a maps app (the
-     * system default, Google Maps, or an OSM app). The address is
-     * URI-encoded; `geo:0,0?q=` is the query form every maps app
-     * understands.
-     */
-    fun geoUriString(address: String): String =
-        "geo:0,0?q=${Uri.encode(address)}"
-
-    /** The provider's web search URL for [address] (Google/Apple/OSM web fallbacks). */
-    fun mapsWebUrl(address: String, provider: MapsProvider): String {
-        val encoded = Uri.encode(address)
-        return when (provider) {
-            MapsProvider.GOOGLE_MAPS ->
-                "https://www.google.com/maps/search/?api=1&query=$encoded"
-            MapsProvider.APPLE_MAPS -> "https://maps.apple.com/?q=$encoded"
-            MapsProvider.OPENSTREETMAP ->
-                "https://www.openstreetmap.org/search?query=$encoded"
-            MapsProvider.SYSTEM_DEFAULT -> "https://www.openstreetmap.org/search?query=$encoded"
-        }
-    }
-
-    /**
-     * The "Open in Maps" intent for [address] under [provider], pure
-     * except for the install check: [isInstalled] answers whether a
-     * package is on the device (the context overload passes
-     * `getLaunchIntentForPackage(package) != null`).
-     *
-     * - SYSTEM_DEFAULT: a plain `geo:` intent — Android resolves it.
-     * - GOOGLE_MAPS: `geo:` pinned to the Maps app when installed, else
-     *   the Google Maps web search.
-     * - APPLE_MAPS: Apple Maps on the web — there is no Apple Maps app
-     *   for Android.
-     * - OPENSTREETMAP: `geo:` pinned to the first installed known OSM
-     *   app (OsmAnd, Organic Maps), else openstreetmap.org.
-     */
-    fun mapsIntent(
-        address: String,
-        provider: MapsProvider,
-        isInstalled: (String) -> Boolean,
-    ): Intent = when (provider) {
-        MapsProvider.SYSTEM_DEFAULT -> Intent(Intent.ACTION_VIEW).apply {
-            data = Uri.parse(geoUriString(address))
-        }
-        MapsProvider.GOOGLE_MAPS -> {
-            if (isInstalled(GOOGLE_MAPS_PACKAGE)) {
-                Intent(Intent.ACTION_VIEW).apply {
-                    data = Uri.parse(geoUriString(address))
-                    setPackage(GOOGLE_MAPS_PACKAGE)
-                }
-            } else {
-                Intent(Intent.ACTION_VIEW).apply {
-                    data = Uri.parse(mapsWebUrl(address, provider))
-                }
-            }
-        }
-        MapsProvider.APPLE_MAPS -> Intent(Intent.ACTION_VIEW).apply {
-            data = Uri.parse(mapsWebUrl(address, provider))
-        }
-        MapsProvider.OPENSTREETMAP -> {
-            val installed = OSM_PACKAGES.firstOrNull { isInstalled(it) }
-            if (installed != null) {
-                Intent(Intent.ACTION_VIEW).apply {
-                    data = Uri.parse(geoUriString(address))
-                    setPackage(installed)
-                }
-            } else {
-                Intent(Intent.ACTION_VIEW).apply {
-                    data = Uri.parse(mapsWebUrl(address, provider))
-                }
-            }
-        }
-    }
-
-    /** [mapsIntent] with the install check against the device's packages. */
-    fun mapsIntent(
-        address: String,
-        provider: MapsProvider,
-        context: Context,
-    ): Intent = mapsIntent(address, provider) { packageName ->
-        context.packageManager.getLaunchIntentForPackage(packageName) != null
-    }
-
-    /**
      * Round 54 — the directions URL for [address] under [provider]: the
-     * "Get directions" button's target (see `mapPreview.ts` on desktop —
+     * "Get directions" pill's target (see `mapPreview.ts` on desktop —
      * the same provider matrix). Google uses the keyless Maps URLs
      * directions form (`dir/?api=1&destination=`), Apple the `daddr`
      * destination parameter (no `saddr`, so the route starts from the
@@ -184,12 +109,19 @@ object SmartActionIntents {
      * back into `%20` so the shape matches `encodeURIComponent`): the
      * URL shaping is unit-tested on plain JVM, where `android.net.Uri`
      * throws `Stub!` — the same reason [trackingUrl] is the tested shape
-     * for tracking. Only [mapsWebUrl] keeps `Uri.encode`, for the search
-     * URLs it already builds.
+     * for tracking.
      */
     fun mapsDirectionsUrl(address: String, provider: MapsProvider): String {
+        // Round 56 — OSM only: the directions query drops the locality
+        // ([stripLocalityForOsm]); the other providers take the full
+        // address. SYSTEM_DEFAULT ignores `encoded` (see below).
+        val queryAddress = if (provider == MapsProvider.OPENSTREETMAP) {
+            stripLocalityForOsm(address)
+        } else {
+            address
+        }
         val encoded = runCatching {
-            java.net.URLEncoder.encode(address, Charsets.UTF_8.name())
+            java.net.URLEncoder.encode(queryAddress, Charsets.UTF_8.name())
         }.getOrNull()?.replace("+", "%20") ?: ""
         return when (provider) {
             MapsProvider.GOOGLE_MAPS ->
@@ -204,9 +136,9 @@ object SmartActionIntents {
     /**
      * The `geo:` search URI for [address], as the System-default
      * directions target (the `geo:` URI has no directions mode — see
-     * [mapsDirectionsUrl]). Kept separate from [geoUriString] so the
-     * directions path stays pure and unit-testable: [geoUriString] needs
-     * `android.net.Uri` and throws `Stub!` on plain JVM.
+     * [mapsDirectionsUrl]). Pure on purpose (URL-encoded with
+     * `java.net.URLEncoder`) so the directions path stays unit-testable
+     * on plain JVM, where `android.net.Uri` throws `Stub!`.
      */
     private fun geoUriStringForDirections(address: String): String =
         "geo:0,0?q=" + runCatching {
@@ -256,13 +188,13 @@ object SmartActionIntents {
 
     /**
      * The intent for [action] under [provider] (the provider only matters
-     * for addresses, where the install check runs against the device).
+     * for addresses, which open directions under it).
      */
-    fun intentFor(action: SmartAction, provider: MapsProvider, context: Context): Intent =
+    fun intentFor(action: SmartAction, provider: MapsProvider): Intent =
         when (action) {
             is SmartAction.Call -> dialIntent(action.number)
             is SmartAction.Email -> emailIntent(action.address)
-            is SmartAction.Address -> mapsIntent(action.text, provider, context)
+            is SmartAction.Address -> directionsIntent(action.text, provider)
             is SmartAction.DateTime -> calendarIntent(action)
             is SmartAction.Tracking -> trackingIntent(action)
         }
@@ -276,13 +208,31 @@ object SmartActionIntents {
      */
     fun perform(context: Context, action: SmartAction, provider: MapsProvider): Boolean =
         runCatching {
-            context.startActivity(intentFor(action, provider, context))
+            context.startActivity(intentFor(action, provider))
             true
         }.onFailure { Timber.d(it, "Smart action had no handler") }.getOrDefault(false)
-
-    /** Google Maps' package, for the installed check and the pin. */
-    const val GOOGLE_MAPS_PACKAGE = "com.google.android.apps.maps"
-
-    /** Known OpenStreetMap apps, in preference order, for the installed check. */
-    val OSM_PACKAGES = listOf("net.osmand.plus", "net.osmand", "app.organicmaps")
 }
+
+/**
+ * Round 56 — the OSM directions query for [address] with the locality
+ * (city/town) component dropped: the city name breaks the map load on
+ * the openstreetmap.org page, and without it the map loads (Kristin's
+ * device finding, round 55). The old geocode-based strip (Nominatim
+ * city in {city, town, village, municipality}) never fired for small
+ * places — "5466 Elam Rd, Kinzers, PA 17535" is a hamlet, so Nominatim
+ * returned no city and even the preview card's open left the city in. This strip needs no
+ * network: US addresses are "street, locality, ST ZIP", so the
+ * locality is the second-to-last comma component when the last one
+ * looks like a state + ZIP ("PA 17535"). No locality, or an address
+ * that IS only the locality, comes back unchanged — same guards as
+ * the old strip.
+ */
+internal fun stripLocalityForOsm(address: String): String {
+    val parts = address.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+    if (parts.size < 3) return address
+    if (!STATE_ZIP_REGEX.matches(parts.last())) return address
+    return (parts.dropLast(2) + parts.last()).joinToString(", ")
+}
+
+/** A US state + ZIP tail ("PA 17535", "CA 90210-1234"). */
+private val STATE_ZIP_REGEX = Regex("^[A-Za-z]{2}\\s+\\d{5}(-\\d{4})?$")

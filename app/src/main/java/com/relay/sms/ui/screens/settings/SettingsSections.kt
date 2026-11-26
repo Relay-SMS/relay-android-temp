@@ -141,7 +141,7 @@ enum class SettingsItem(
         SettingsSection.NOTIFICATIONS,
     ),
 
-    // Smart actions — the maps provider for "Open in Maps".
+    // Smart actions — the maps provider for "Get directions".
     SMART_ACTIONS_MAPS_PROVIDER(
         "smartActions.mapsProvider",
         SettingsSection.SMART_ACTIONS,

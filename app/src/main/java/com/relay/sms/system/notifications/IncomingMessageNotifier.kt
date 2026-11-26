@@ -475,8 +475,8 @@ class IncomingMessageNotifier @Inject constructor(
 
     /**
      * Round 53 — the notification's smart-action button for [action]
-     * ("Call" / "Send email" / "Open Maps" / "Add to calendar" / "Track
-     * package"). Unlike the reply / copy-code / mark-read actions this
+     * ("Call" / "Send email" / "Get directions" / "Add to calendar" /
+     * "Track package"). Unlike the reply / copy-code / mark-read actions this
      * one is a direct `PendingIntent.getActivity`: a tap on a
      * notification action is an allowed background-activity-start
      * trigger, so no `BroadcastReceiver` hop is needed. The intent
@@ -490,7 +490,7 @@ class IncomingMessageNotifier @Inject constructor(
         provider: MapsProvider,
         notificationId: Int,
     ): NotificationCompat.Action {
-        val intent = SmartActionIntents.intentFor(action, provider, context)
+        val intent = SmartActionIntents.intentFor(action, provider)
         val pi = PendingIntent.getActivity(
             context,
             notificationId.xor(SMART_ACTION_REQUEST_SALT),

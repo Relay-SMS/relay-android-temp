@@ -34,6 +34,7 @@ import androidx.compose.ui.text.withLink
 import com.relay.sms.R
 import com.relay.sms.domain.smartactions.SmartAction
 import com.relay.sms.domain.smartactions.SmartActionDetector
+import com.relay.sms.domain.smartactions.TrackingCarrier
 import java.time.ZoneId
 
 /**
@@ -358,33 +359,31 @@ internal fun firstPreviewUrl(text: String, messageId: Long = -1L): String? {
 }
 
 /**
- * Round 53 — the first physical address in [text], for the map preview
- * card ([MapPreviewCard]). Reuses the same hits the linkify pass finds
- * ([collectLinkHits] / [LinkHitCache]), so the preview always matches an
- * address the bubble renders clickable. `null` when there is no address
- * or the body exceeds [LINKIFY_INPUT_CAP] (no linkify there either).
- */
-internal fun firstSmartAddress(text: String, messageId: Long = -1L): String? {
-    if (text.isEmpty() || text.length > LINKIFY_INPUT_CAP) return null
-    val hits = if (messageId >= 0L) LinkHitCache.hitsFor(messageId, text) else collectLinkHits(text)
-    val first = hits.firstOrNull { it.kind == HitKind.Address } ?: return null
-    return (first.action as? SmartAction.Address)?.text
-}
-
-/**
  * Round 55 — one smart-action pill under the bubble text, in the OTP
  * pill's style (bordered capsule, icon on the left, label text):
  * [labelRes] is the pill label, [icon] its leading icon. Call pills
  * carry the raw [phoneNumber] (phones come from `Patterns.PHONE`, not
  * the detector, so there is no [SmartAction] for them); every other
  * pill carries its detected [action]. `null` action = no pill.
+ * [labelArg] fills a format label (the tracking pill's
+ * "Track %1$s package" takes the carrier's display name); `null`
+ * renders [labelRes] as-is.
  */
 internal data class SmartActionPillData(
     val labelRes: Int,
     val icon: ImageVector,
     val action: SmartAction? = null,
     val phoneNumber: String? = null,
+    val labelArg: String? = null,
 )
+
+/** The carrier's display name for pill labels ("Track UPS package"). */
+internal fun carrierDisplayName(carrier: TrackingCarrier): String =
+    when (carrier) {
+        TrackingCarrier.UPS -> "UPS"
+        TrackingCarrier.USPS -> "USPS"
+        TrackingCarrier.FEDEX -> "FedEx"
+    }
 
 /**
  * Round 55 — the pills for [text]: one per detected smart action, in
@@ -428,6 +427,11 @@ internal fun smartActionPillsForHits(hits: List<LinkHit>, text: String): List<Sm
                     labelRes = R.string.smart_action_track_package,
                     icon = Icons.Outlined.LocalShipping,
                     action = it,
+                    // Round 56 — the pill names the carrier ("Track UPS
+                    // package"): the format label takes the display name.
+                    labelArg = (it as? SmartAction.Tracking)?.let { tracking ->
+                        carrierDisplayName(tracking.carrier)
+                    },
                 )
             }
             HitKind.DateTime -> hit.action?.let {

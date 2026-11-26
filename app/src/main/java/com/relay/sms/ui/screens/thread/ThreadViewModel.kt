@@ -2746,6 +2746,10 @@ class ThreadViewModel @Inject constructor(
             uris = uris,
             mimeType = attachment?.mimeType,
             text = text,
+            // Round 56 — marque le transfert comme interne : le garde
+            // d'AppRoot (SEC-03) ne doit pas l'effacer, voir
+            // [com.relay.sms.ui.decideSharePendingAction].
+            isForward = true,
         )
         if (!pending.isEmpty) {
             incomingShare.set(pending)
@@ -2775,9 +2779,17 @@ class ThreadViewModel @Inject constructor(
                 return@launch
             }
             val pending = incomingShare.consume() ?: return@launch
-            // 1) Texte → draft si encore vide.
-            if (!pending.text.isNullOrBlank() && _state.value.draft.isBlank()) {
-                updateDraft(pending.text)
+            // 1) Texte → draft. Round 56 — ajouté au brouillon existant
+            // au lieu d'être ignoré : un transfert vers une conversation
+            // qui a déjà un brouillon ne faisait rien du tout.
+            if (!pending.text.isNullOrBlank()) {
+                val existing = _state.value.draft
+                val merged = if (existing.isBlank()) {
+                    pending.text
+                } else {
+                    "$existing\n${pending.text}"
+                }
+                updateDraft(merged)
             }
             // 2) Premier URI → attachement via le pipeline standard.
             val firstUri = pending.uris.firstOrNull() ?: return@launch

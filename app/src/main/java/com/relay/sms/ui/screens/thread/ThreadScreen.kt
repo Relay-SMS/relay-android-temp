@@ -120,7 +120,6 @@ import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalHapticFeedback
-import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
@@ -362,30 +361,27 @@ fun ThreadScreen(
     // multiply dialog instances across hundreds of bubbles in a busy thread.
     var pickingPhoneNumber by remember { mutableStateOf<String?>(null) }
     val onPhoneClick: (String) -> Unit = { pickingPhoneNumber = it }
-    // Round 53 — smart action tapped inside any bubble body / caption (or
-    // the map preview card): perform it with the current maps provider.
-    // The provider is read through `rememberUpdatedState` so this lambda
-    // stays stable (it rides the `itemActions` bundle, rebuilt only when
-    // the view model or the client mode changes) while the provider value
-    // stays fresh. When no app can take the intent, a snackbar says so
-    // instead of failing silently.
+    // Round 53 — smart action tapped inside any bubble body / caption:
+    // perform it with the current maps provider. The provider is read
+    // through `rememberUpdatedState` so this lambda stays stable (it
+    // rides the `itemActions` bundle, rebuilt only when the view model
+    // or the client mode changes) while the provider value stays fresh.
+    // When no app can take the intent, a snackbar says so instead of
+    // failing silently.
     //
     // Round 55 — the first-map-tap gate, declared before the handler so
-    // the handler can call it: a map tap (preview card, its directions
-    // button, or an address span) shows the "Set your map provider"
-    // sheet once, while no explicit provider choice exists. The pending
-    // request waits until the user chooses (save + open with the chosen
-    // provider) or dismisses (mark asked + open with the current
-    // provider). The asked flag rides `rememberUpdatedState` like the
-    // provider, so the stable lambdas stay fresh.
+    // the handler can call it: a map tap (an address pill or span) shows
+    // the "Set your map provider" sheet once, while no explicit provider
+    // choice exists. The pending request waits until the user chooses
+    // (save + open with the chosen provider) or dismisses (mark asked +
+    // open with the current provider). The asked flag rides
+    // `rememberUpdatedState` like the provider, so the stable lambdas
+    // stay fresh.
     val mapsProviderState = rememberUpdatedState(state.mapsProvider)
     val mapsProviderAskedState = rememberUpdatedState(state.mapsProviderAsked)
     var pendingMapOpen by remember { mutableStateOf<MapOpenRequest?>(null) }
-    val uriHandler = LocalUriHandler.current
     fun executeMapOpen(request: MapOpenRequest, provider: MapsProvider): Boolean =
         when (request) {
-            is MapOpenRequest.OpenPage ->
-                runCatching { uriHandler.openUri(request.url) }.isSuccess
             is MapOpenRequest.OpenDirections ->
                 SmartActionIntents.performDirections(context, request.address, provider)
         }
@@ -1399,10 +1395,7 @@ fun ThreadScreen(
         // Client mode C2 — `state.isClientMode` is a key too: the retry
         // gate below must rebuild when the mode flips, or a mode
         // switch mid-thread would keep the old behaviour.
-        // Round 54 — `state.mapsProvider` is a key too: the map
-        // preview card reads the provider from this bundle, so a
-        // provider change must rebuild it.
-        val itemActions = remember(viewModel, state.isClientMode, state.mapsProvider) {
+        val itemActions = remember(viewModel, state.isClientMode) {
             ThreadMessageItemActions(
                 onTogglePlayback = { audio -> viewModel.togglePlayback(audio.localUri, audio.toPlaybackUri()) },
                 onSeekPlayback = viewModel::seekPlaybackTo,
@@ -1443,10 +1436,6 @@ fun ThreadScreen(
                 },
                 onPhoneClick = onPhoneClick,
                 onSmartAction = onSmartAction,
-                // Round 54 — the maps provider for the map preview card.
-                mapsProvider = state.mapsProvider,
-                // Round 55 — the first-map-tap gate for the card.
-                onMapOpen = onMapOpen,
                 // E2E — a key-change notice tap opens the safety-number
                 // sheet for this thread's peer.
                 onE2eNoticeVerify = { e2eVerificationOpen = true },
@@ -4112,23 +4101,6 @@ private class ThreadMessageItemActions(
     /** Round 53 — smart-action tap (email, address, date/time, tracking). */
     val onSmartAction: (SmartAction) -> Unit,
     /**
-     * Round 54 — the maps provider for the map preview card (Apple:
-     * tap-to-load preview; the rest: "Get directions" button). A VALUE,
-     * not a lambda: the provider is read fresh from `state` when the
-     * bundle is rebuilt, so `state.mapsProvider` joins the `remember`
-     * keys at the construction site and a provider change rebuilds the
-     * bundle (rare, user-initiated in Settings). `MapsProvider` is an
-     * enum, so it stays `@Stable`.
-     */
-    val mapsProvider: com.relay.sms.domain.settings.MapsProvider,
-    /**
-     * Round 55 — a tap on the map preview card (the card itself or its
-     * "Get directions" button), gated on the first tap behind the
-     * "Set your map provider" sheet. Returns whether the tap was
-     * consumed (the sheet showing counts as consumed).
-     */
-    val onMapOpen: (MapOpenRequest) -> Boolean,
-    /**
      * E2E — a key-change notice tap: opens the safety-number
      * verification sheet for this thread's peer.
      */
@@ -4339,7 +4311,7 @@ private fun ThreadMessageItem(
             // two — the text bubble is at the Detekt 20-parameter limit).
             // Round 23 — pin only: the star toggle is gone with the menu's
             // "Star" entry.
-            val menuToggles = remember(msg, actions, isPinnedMessage, actions.mapsProvider) {
+            val menuToggles = remember(msg, actions, isPinnedMessage) {
                 BubbleMenuToggles(
                     isPinned = isPinnedMessage,
                     onTogglePin = { actions.onTogglePin(msg) },
@@ -4355,14 +4327,6 @@ private fun ThreadMessageItem(
                     // bubble is at the parameter limit). Not gated in
                     // client mode: it never writes, like the phone tap.
                     onSmartAction = actions.onSmartAction,
-                    // Round 54 — the maps provider for the map preview
-                    // card, same bundle, same reason. It rides the item
-                    // actions bundle from ThreadScreen (which rebuilds
-                    // when the provider changes), not a `rememberUpdatedState`
-                    // — this item is a separate composable from ThreadScreen.
-                    mapsProvider = actions.mapsProvider,
-                    // Round 55 — the first-map-tap gate, same bundle.
-                    onMapOpen = actions.onMapOpen,
                 )
             }
             // Client mode C3 — the gated actions, one decision for the

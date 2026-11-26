@@ -359,7 +359,7 @@ fun ConversationRow(
  * in address order); a member without a photo keeps the initials or grey glyph.
  */
 @Composable
-private fun ConversationAvatar(
+internal fun ConversationAvatar(
     conversation: Conversation,
     contactPhotoUri: String?,
     groupMemberPhotos: List<String?>? = null,

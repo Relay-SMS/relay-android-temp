@@ -6,20 +6,26 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.relay.sms.data.local.datastore.SettingsRepository
 import com.relay.sms.di.IoDispatcher
 import com.relay.sms.domain.model.Conversation
+import com.relay.sms.domain.repository.ContactRepository
 import com.relay.sms.domain.repository.ConversationRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.mapLatest
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import javax.inject.Inject
 
 /**
@@ -36,6 +42,8 @@ import javax.inject.Inject
 @HiltViewModel
 class ForwardPickerViewModel @Inject constructor(
     private val conversationRepo: ConversationRepository,
+    private val contacts: ContactRepository,
+    private val settings: SettingsRepository,
     @IoDispatcher private val io: CoroutineDispatcher,
 ) : ViewModel() {
 
@@ -106,6 +114,70 @@ class ForwardPickerViewModel @Inject constructor(
     ) { query, state -> computeFiltered(state, query) }
         .flowOn(io)
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000L), emptyList())
+
+    /**
+     * Round 56 — contact photos for the sheet's rows, keyed by conversation id.
+     * Same source as the list: the cached `ContactRepository` lookup on IO. A custom
+     * avatar still wins (those rows are skipped here), groups are skipped (their member
+     * photos come from [groupMemberPhotos]), and a denied `READ_CONTACTS` just yields
+     * no photos — initials stay the fallback.
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val contactPhotos: StateFlow<Map<Long, String>> = _state
+        .map { state ->
+            state.conversations
+                .filter { !it.isGroup && it.avatarUri == null }
+                .map { it.id to it.firstAddress?.raw }
+        }
+        .distinctUntilChanged()
+        .mapLatest { keys ->
+            withContext(io) {
+                keys.mapNotNull { (id, phone) ->
+                    val raw = phone ?: return@mapNotNull null
+                    runCatching { contacts.lookupByPhone(raw)?.photoUri }
+                        .getOrNull()?.let { id to it }
+                }.toMap()
+            }
+        }
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000L), emptyMap())
+
+    /**
+     * Round 56 — contact photos of the first two members of each group conversation,
+     * keyed by conversation id. Same shape as [contactPhotos]: a group with a custom
+     * avatar is skipped, and an entry is emitted only when at least one of the two
+     * members has a photo (a member without one leaves a null slot, so the minis keep
+     * their address order).
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    val groupMemberPhotos: StateFlow<Map<Long, List<String?>>> = _state
+        .map { state ->
+            state.conversations
+                .filter { it.isGroup && it.avatarUri == null }
+                .map { it.id to it.addresses.take(2).map { addr -> addr.raw } }
+        }
+        .distinctUntilChanged()
+        .mapLatest { keys ->
+            withContext(io) {
+                keys.mapNotNull { (id, phones) ->
+                    val photos = phones.map { raw ->
+                        runCatching { contacts.lookupByPhone(raw)?.photoUri }.getOrNull()
+                    }
+                    if (photos.any { it != null }) id to photos else null
+                }.toMap()
+            }
+        }
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000L), emptyMap())
+
+    /**
+     * Round 56 — whether avatars show at all, same setting as the list: off hides
+     * the leading avatar in the sheet's rows too.
+     */
+    val showAvatars: StateFlow<Boolean> = settings.state
+        .map { it.conversations.showAvatars }
+        .distinctUntilChanged()
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000L), true)
 
     /**
      * Pure filter: case-insensitive substring on display name OR substring on any stored
