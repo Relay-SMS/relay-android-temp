@@ -112,6 +112,11 @@ fun ComposeScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val snackbarHost = remember { SnackbarHostState() }
+    // Round 55 CI lint fix — the create-failed labels, hoisted like
+    // the no-contacts text below: a `context.getString` in the event
+    // collector fails the build (LocalContextGetResourceValueCall).
+    val createFailedClientOffline = stringResource(R.string.error_send_client_offline)
+    val createFailedGeneric = stringResource(R.string.error_create_conversation_failed)
     // Group picking, entered from the "Create a group" row on the new-message
     // screen (the navigation `groupe` mode is the same picking behaviour,
     // reached from the list). `rememberSaveable` so a rotation does not drop
@@ -145,12 +150,10 @@ fun ComposeScreen(
                 // could not be reached): say so, instead of a
                 // silent nothing.
                 is ComposeViewModel.Event.CreateFailed -> snackbarHost.showError(
-                    context.getString(
-                        when (e.error) {
-                            is AppError.ClientOffline -> R.string.error_send_client_offline
-                            else -> R.string.error_create_conversation_failed
-                        },
-                    ),
+                    when (e.error) {
+                        is AppError.ClientOffline -> createFailedClientOffline
+                        else -> createFailedGeneric
+                    },
                 )
             }
         }

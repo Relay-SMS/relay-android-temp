@@ -244,6 +244,11 @@ fun SettingsScreen(
     val lockDowngradeUnverifiableMsg = stringResource(R.string.settings_lock_downgrade_vault_unverifiable)
     // v1.28.3 — idem : gabarit resolu au niveau composable, formate a l'emission.
     val vaultPurgeLocalFailureFmt = stringResource(R.string.settings_vault_pin_forgot_local_failure)
+    // Round 55 CI lint fix — idem : gabarits resolus au niveau
+    // composable, formates a l'emission (un `ctx.getString` dans le
+    // collecteur d'evenements declencherait LocalContextGetResourceValueCall).
+    val vaultPinForgotDoneFmt = stringResource(R.string.settings_vault_pin_forgot_done)
+    val vaultPinForgotIncompleteFmt = stringResource(R.string.settings_vault_pin_forgot_incomplete)
     // v1.9.0 — scope partagé pour les actions instantanées qui doivent émettre
     // un snack depuis un onClick callback (ex. bouton "Je vais bien" Safety call).
     val rootScope = rememberCoroutineScope()
@@ -303,7 +308,7 @@ fun SettingsScreen(
                 // caractere destructif de l'operation constatable, pas seulement annonce.
                 is SettingsViewModel.Event.VaultPurged -> {
                     snackbarHost.showSnackbar(
-                        ctx.getString(R.string.settings_vault_pin_forgot_done, e.count),
+                        vaultPinForgotDoneFmt.format(e.count),
                     )
                 }
                 // v1.27.11 (revue externe GitLab !38458, constat 2) — la purge a échoué, le PIN
@@ -312,11 +317,7 @@ fun SettingsScreen(
                 // devant un dialogue de PIN qu'il n'attendait plus.
                 is SettingsViewModel.Event.VaultPurgeIncomplete -> {
                     snackbarHost.showError(
-                        ctx.getString(
-                            R.string.settings_vault_pin_forgot_incomplete,
-                            e.deleted,
-                            e.left,
-                        ),
+                        vaultPinForgotIncompleteFmt.format(e.deleted, e.left),
                     )
                 }
                 // v1.28.2 — second echec : celui-la ne se levera pas tout seul. On ouvre la

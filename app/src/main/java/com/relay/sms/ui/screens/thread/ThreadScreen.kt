@@ -846,6 +846,18 @@ fun ThreadScreen(
     // de cette regle est ecrit.
     val partialFmt = stringResource(R.string.send_partial)
     val partialBlockedFmt = stringResource(R.string.send_partial_blocked)
+    // Round 55 CI lint fix — the send-error labels, hoisted like the
+    // partial-send templates above: a `context.getString` in the
+    // event collector below fails the build (LocalContextGetResourceValueCall).
+    val sendErrorRecipientBlocked = stringResource(R.string.error_send_recipient_blocked)
+    val sendErrorOwnNumberMissing = stringResource(R.string.error_send_own_number_missing)
+    val sendErrorClientOffline = stringResource(R.string.error_send_client_offline)
+    val sendErrorClientMedia = stringResource(R.string.error_send_client_media)
+    val sendErrorClientMmsCapReached = stringResource(R.string.snack_thread_attach_cap_reached)
+    val sendErrorClientPhotoPrepare = stringResource(R.string.error_send_client_photo_prepare)
+    val sendErrorMmsRetryUnsupported = stringResource(R.string.error_retry_mms_unsupported)
+    val sendErrorGroupEchoRetryUnsupported = stringResource(R.string.error_retry_group_echo)
+    val sendErrorFailed = stringResource(R.string.error_send_failed)
 
     LaunchedEffect(Unit) {
         viewModel.onConversationOpened()
@@ -871,34 +883,32 @@ fun ThreadScreen(
                 // l'envoi » laisserait croire à une panne passagère, alors que rien ne repartira
                 // tant que l'utilisateur n'aura pas débloqué le numéro qu'il a lui-même bloqué.
                 is ThreadViewModel.Event.SendError -> snackbarHost.showError(
-                    context.getString(
-                        when (e.error) {
-                            is AppError.RecipientBlocked -> R.string.error_send_recipient_blocked
-                            // Group-send own-number fix — the fail-fast for a group send with
-                            // no number on file: the user must set it in Settings → Sending,
-                            // and a generic "Failed to send" would send them retrying a send
-                            // that cannot succeed until they do.
-                            is AppError.OwnNumberMissing -> R.string.error_send_own_number_missing
-                            // Client mode C3/C5 — the linked phone could
-                            // not be reached (offline), or the send was
-                            // a scheduled media send (still unsupported
-                            // — the schedule frame has no attachments
-                            // field): both say so, instead of a generic
-                            // "Failed to send". A media send that
-                            // exceeded the phone's MMS budget says so
-                            // with the phone's own words, and a photo
-                            // that could not be prepared says so too.
-                            is AppError.ClientOffline -> R.string.error_send_client_offline
-                            is AppError.ClientMediaUnsupported -> R.string.error_send_client_media
-                            is AppError.ClientMmsCapReached -> R.string.snack_thread_attach_cap_reached
-                            is AppError.ClientPhotoPrepareFailed -> R.string.error_send_client_photo_prepare
-                            // v1.28.3 (audit global B-1) — la bulle rouge d'un MMS ne se relance
-                            // pas d'ici ; le dire vaut mieux qu'un « Échec » qui fait recommencer.
-                            is AppError.MmsRetryUnsupported -> R.string.error_retry_mms_unsupported
-                            is AppError.GroupEchoRetryUnsupported -> R.string.error_retry_group_echo
-                            else -> R.string.error_send_failed
-                        },
-                    ),
+                    when (e.error) {
+                        is AppError.RecipientBlocked -> sendErrorRecipientBlocked
+                        // Group-send own-number fix — the fail-fast for a group send with
+                        // no number on file: the user must set it in Settings → Sending,
+                        // and a generic "Failed to send" would send them retrying a send
+                        // that cannot succeed until they do.
+                        is AppError.OwnNumberMissing -> sendErrorOwnNumberMissing
+                        // Client mode C3/C5 — the linked phone could
+                        // not be reached (offline), or the send was
+                        // a scheduled media send (still unsupported
+                        // — the schedule frame has no attachments
+                        // field): both say so, instead of a generic
+                        // "Failed to send". A media send that
+                        // exceeded the phone's MMS budget says so
+                        // with the phone's own words, and a photo
+                        // that could not be prepared says so too.
+                        is AppError.ClientOffline -> sendErrorClientOffline
+                        is AppError.ClientMediaUnsupported -> sendErrorClientMedia
+                        is AppError.ClientMmsCapReached -> sendErrorClientMmsCapReached
+                        is AppError.ClientPhotoPrepareFailed -> sendErrorClientPhotoPrepare
+                        // v1.28.3 (audit global B-1) — la bulle rouge d'un MMS ne se relance
+                        // pas d'ici ; le dire vaut mieux qu'un « Échec » qui fait recommencer.
+                        is AppError.MmsRetryUnsupported -> sendErrorMmsRetryUnsupported
+                        is AppError.GroupEchoRetryUnsupported -> sendErrorGroupEchoRetryUnsupported
+                        else -> sendErrorFailed
+                    },
                 )
                 // v1.28.3 (F21) — envoi partiel. Rouge aussi : quelque chose n'est pas arrivé,
                 // et le message est d'autant plus nécessaire que le brouillon, lui, a bien été
