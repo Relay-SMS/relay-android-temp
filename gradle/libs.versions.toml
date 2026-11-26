@@ -55,7 +55,7 @@ coroutines = "1.11.0"
 kotlinx-serialization = "1.12.0"
 
 # SQLCipher
-sqlcipher = "4.19.0"
+sqlcipher = "4.20.0"
 
 # Slice 1 — phone <-> desktop linking over the local network. All four are
 # local open-source libraries with no network use and no telemetry (the
