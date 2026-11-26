@@ -58,6 +58,7 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
@@ -277,9 +278,21 @@ class ConversationsViewModel @Inject constructor(
     private val selectedCategoryFlow = MutableStateFlow<MessageCategory?>(null)
 
     init {
-        // Backfill contact names for conversations that existed before READ_CONTACTS was granted
-        // or that imported with displayName=null. Cheap when there's nothing to do.
+        // Contact-name live refresh — re-resolve every stored
+        // display name on list open (a rename or a newly added
+        // contact made while the process was dead still lands
+        // without a restart; the mirror only writes rows whose
+        // name actually changed, so this is cheap when nothing
+        // moved). The live path is the `MainApplication`
+        // ContentObserver, which runs the same refresh on a
+        // provider change while the app is alive.
         viewModelScope.launch { runCatching { mirror.refreshContactNames() } }
+        // Contact-name live refresh — a provider change while
+        // the list is open re-runs the photo lookups too (a new
+        // contact can bring a photo; the Room row update above
+        // already re-emits the names). See
+        // [observeContactChanges].
+        observeContactChanges()
         // Round 13 — restore the category tab the user last selected: the
         // persisted choice seeds the in-memory flow, so the list reopens
         // on that tab instead of defaulting to All. `firstOrNull` (not
@@ -1231,6 +1244,38 @@ class ConversationsViewModel @Inject constructor(
          * que c'était une fausse alerte et envoie une rassurance.
          */
         const val I_AM_OK_WINDOW_MS: Long = 30L * 60L * 1000L
+
+        /**
+         * Contact-name live refresh — quiet period after a
+         * provider change before the photo lookups re-run. The
+         * `MainApplication` observer already debounces the Room
+         * refresh; this only coalesces the in-memory re-resolution
+         * when several change notifications land together.
+         */
+        const val CONTACT_CHANGE_DEBOUNCE_MS: Long = 300L
+    }
+
+    /**
+     * Contact-name live refresh — watches the provider-change
+     * version ([ContactRepository.observeContactChanges]) and
+     * bumps [contactPhotoTick] on every real change, so the
+     * photo flows re-run their (LRU-cached) lookups: a contact
+     * added while the list is open can bring a photo, and an
+     * edited photo replaces the old one, with no resume and no
+     * restart. The initial version is dropped — it is not a
+     * change — and the debounce coalesces the burst one edit
+     * produces. The names themselves need no bump here: the
+     * mirror refresh writes the Room rows, and [state] re-emits
+     * from them.
+     */
+    @OptIn(FlowPreview::class)
+    private fun observeContactChanges() {
+        viewModelScope.launch {
+            contacts.observeContactChanges()
+                .drop(1)
+                .debounce(CONTACT_CHANGE_DEBOUNCE_MS)
+                .collect { contactPhotoTick.update { it + 1 } }
+        }
     }
 }
 

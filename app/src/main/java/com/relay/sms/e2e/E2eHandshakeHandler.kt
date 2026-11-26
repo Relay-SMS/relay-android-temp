@@ -71,15 +71,23 @@ import com.relay.sms.data.local.db.entity.E2ePeerState as StoredPeerState
  * another channel must not displace the proven one.
  *
  * Anything that is not one of our packets (bad magic, version, type,
- * length) is dropped silently — a random data SMS to this port is not
- * our business. Blocked senders are dropped too, like on the SMS path.
+ * length) is dropped — and the drop is recorded with its reason
+ * (`e2e-decode-failed`), so a packet that arrives but fails
+ * validation is separable in the log from one that never arrived.
+ * Blocked senders are dropped too, like on the SMS path (recorded
+ * as `e2e-blocked-sender`).
  *
- * Error-log rules (§8.3): no keys, no addresses — state transitions
- * and conversation ids only. The handshake events (probe received,
- * bundle sent, bundle rate-limited) are recorded in the error log
- * via [E2eFailureRecorder] too — fixed messages only — so the
- * inbound path stays visible in release builds, where Timber is a
- * no-op (round 42 diagnostic).
+ * Error-log rules (§8.3): no keys, no payload bytes, no message
+ * content — state transitions and conversation ids only. The
+ * handshake events (probe received, bundle sent, bundle
+ * rate-limited) are recorded in the error log via
+ * [E2eFailureRecorder] too — fixed messages only — so the inbound
+ * path stays visible in release builds, where Timber is a no-op
+ * (round 42 diagnostic). The diagnostic events do carry the
+ * sender's address (a phone number already in the user's threads):
+ * without it, a log full of "a probe arrived" cannot say from
+ * whom, which is the whole question when a third phone cannot
+ * complete a handshake. Never a key, a payload byte, or content.
  */
 @Singleton
 class E2eHandshakeHandler @Inject constructor(
@@ -98,6 +106,12 @@ class E2eHandshakeHandler @Inject constructor(
     private val mediaCapability: E2eMediaCapabilityManager,
     // Round 49 — the group session manager (group key-change notices).
     private val groupSessions: E2eGroupSessionManager,
+    // Round 57 — "[Name] is on Relay!" notification, fired when a
+    // bundle records a genuinely new ACTIVATED notice (see
+    // [handleBundle]). Nullable with a null default so the existing
+    // handler tests — which construct the handler by hand — keep
+    // compiling untouched; Hilt always provides the real notifier.
+    private val activatedNotifier: com.relay.sms.system.notifications.E2eActivatedNotifier? = null,
 ) {
 
     /**
@@ -112,7 +126,23 @@ class E2eHandshakeHandler @Inject constructor(
         subId: Int?,
         now: Long = System.currentTimeMillis(),
     ): Boolean {
-        val packet = E2eHandshake.decode(data) ?: return false
+        val packet = when (val result = E2eHandshake.decodeWithReason(data)) {
+            is E2eHandshake.DecodeResult.Packet -> result.packet
+            is E2eHandshake.DecodeResult.Failure -> {
+                // A packet that reached the handler but fails
+                // validation is a diagnostic signal, not silence:
+                // bad magic here (vs. no arrival line at all in the
+                // receiver) separates "the bytes are wrong" from
+                // "the bytes never arrived".
+                recorder.recordEvent(
+                    "e2e-decode-failed",
+                    "Data SMS decode failed from $address: " +
+                        "${result.reason.name.lowercase().replace('_', '-')}; " +
+                        "${data.size} bytes; type ${typeByteLabel(data)}.",
+                )
+                return false
+            }
+        }
         return handlePacket(address, packet, subId, now, HandshakeChannel.DATA_SMS)
     }
 
@@ -131,9 +161,28 @@ class E2eHandshakeHandler @Inject constructor(
         now: Long = System.currentTimeMillis(),
     ): Boolean {
         val bytes = E2eHandshakeSms.parse(text) ?: return false
-        val packet = E2eHandshake.decode(bytes) ?: return false
+        val packet = when (val result = E2eHandshake.decodeWithReason(bytes)) {
+            is E2eHandshake.DecodeResult.Packet -> result.packet
+            is E2eHandshake.DecodeResult.Failure -> {
+                recorder.recordEvent(
+                    "e2e-decode-failed",
+                    "Handshake SMS decode failed from $address: " +
+                        "${result.reason.name.lowercase().replace('_', '-')}; " +
+                        "${bytes.size} bytes; type ${typeByteLabel(bytes)}.",
+                )
+                return false
+            }
+        }
         return handlePacket(address, packet, subId, now, HandshakeChannel.TEXT_SMS)
     }
+
+    /**
+     * The type byte of [bytes] as `0xNN` when the header is
+     * readable, `none` otherwise — for decode-failure diagnostics.
+     * The byte itself, never any payload byte after the header.
+     */
+    private fun typeByteLabel(bytes: ByteArray): String =
+        if (bytes.size >= 6) "0x%02X".format(bytes[5].toInt() and 0xFF) else "none"
 
     /**
      * Shared core of [handleDataSms] and [handleSms]: the blocked
@@ -148,11 +197,29 @@ class E2eHandshakeHandler @Inject constructor(
         now: Long,
         channel: HandshakeChannel,
     ): Boolean {
-        if (runCatching { blockedRepo.isBlocked(address) }.getOrDefault(false)) return false
+        if (runCatching { blockedRepo.isBlocked(address) }.getOrDefault(false)) {
+            recorder.recordEvent(
+                "e2e-blocked-sender",
+                "Handshake packet dropped: sender $address is blocked.",
+            )
+            return false
+        }
+        // The packet type on receipt: the probe / bundle /
+        // capability events below each carry it visibly, so the
+        // log can say which kind of packet arrived, not just
+        // that something did.
+        Timber.i("E2E: handshake packet received (%s) on %s", packetTypeName(packet), channel)
         return when (packet) {
             is E2eHandshake.HandshakePacket.Probe -> handleProbe(address, packet, subId, now, channel)
             is E2eHandshake.HandshakePacket.Bundle -> handleBundle(address, packet, subId, now, channel)
             is E2eHandshake.HandshakePacket.Capability -> {
+                recorder.recordEvent(
+                    "e2e-capability-received",
+                    "Capability declaration received from $address; " +
+                        "media=${packet.mediaCapable}; " +
+                        "groups=${packet.groupCapable}; " +
+                        "group media=${packet.groupMediaCapable}.",
+                )
                 mediaCapability.onDeclarationReceived(
                     address,
                     subId,
@@ -165,6 +232,14 @@ class E2eHandshakeHandler @Inject constructor(
             }
         }
     }
+
+    /** Short name for a decoded packet, for the receipt log line. */
+    private fun packetTypeName(packet: E2eHandshake.HandshakePacket): String =
+        when (packet) {
+            is E2eHandshake.HandshakePacket.Probe -> "probe"
+            is E2eHandshake.HandshakePacket.Bundle -> "bundle"
+            is E2eHandshake.HandshakePacket.Capability -> "capability"
+        }
 
     /**
      * Retries every undecryptable placeholder from a peer against the
@@ -199,8 +274,10 @@ class E2eHandshakeHandler @Inject constructor(
         // entry a received probe is invisible on device. Fires
         // past the client-mode gate (E2eDataSmsGate) and the decode
         // + blocked checks, so it means "a probe reached the
-        // handler". Fixed message only — no keys, no addresses.
-        recorder.recordEvent("e2e-probe-received", "Probe received; replying with a bundle.")
+        // handler". No keys, no payload — the address names the
+        // sender, which is the whole question when a handshake
+        // fails.
+        recorder.recordEvent("e2e-probe-received", "Probe received from $address; replying with a bundle.")
         val peer = peers.getPeer(address)
         val curveB64 = Base64.getEncoder().encodeToString(probe.curveKey)
         val edB64 = Base64.getEncoder().encodeToString(probe.edKey)
@@ -237,7 +314,7 @@ class E2eHandshakeHandler @Inject constructor(
             // every outcome is separable.
             recorder.recordEvent(
                 "e2e-bundle-rate-limited",
-                "Bundle reply rate-limited (one per sender per day).",
+                "Bundle reply rate-limited for $address (one per sender per day).",
             )
             return true
         }
@@ -247,7 +324,17 @@ class E2eHandshakeHandler @Inject constructor(
             // top it up and take a key from the fresh batch.
             account.generateOneTimeKeys()
             account.nextOneTimeKey()
-        } ?: return false
+        } ?: run {
+            // Still empty after the top-up — the pool is exhausted
+            // and no bundle can be built. Timber-only here would
+            // hide it in release builds: the probe arrived, the
+            // rate limit passed, and still no reply went out.
+            recorder.recordEvent(
+                "e2e-onetime-key-exhausted",
+                "No one-time key available for $address after topping up the pool; no bundle sent.",
+            )
+            return false
+        }
         val keys = account.identityKeys()
         val bundle = E2eHandshake.encodeBundle(keys.curve25519, keys.ed25519, oneTimeKey)
         // Round 45 — the bundle reply follows the probe's arrival
@@ -277,7 +364,7 @@ class E2eHandshakeHandler @Inject constructor(
         // back up (and re-save the Account pickle).
         account.generateOneTimeKeys()
         Timber.i("E2E: bundle reply sent")
-        recorder.recordEvent("e2e-bundle-sent", "Bundle reply sent.")
+        recorder.recordEvent("e2e-bundle-sent", "Bundle reply sent to $address.")
         return true
     }
 
@@ -289,6 +376,7 @@ class E2eHandshakeHandler @Inject constructor(
         channel: HandshakeChannel,
     ): Boolean {
         val peer = peers.getPeer(address)
+        val wasEncrypted = peer?.state == StoredPeerState.ENCRYPTED
         val curveB64 = Base64.getEncoder().encodeToString(bundle.curveKey)
         val edB64 = Base64.getEncoder().encodeToString(bundle.edKey)
         // Round 48 — the bundle arrived on this channel, so our
@@ -304,6 +392,11 @@ class E2eHandshakeHandler @Inject constructor(
             sessions.get().currentSessionId(address) != null
         ) {
             Timber.i("E2E: duplicate bundle ignored (first reply wins)")
+            recorder.recordEvent(
+                "e2e-bundle-received",
+                "Bundle received from $address; duplicate ignored (first reply wins); " +
+                    "session created: no; state flipped to ENCRYPTED: no.",
+            )
             return true
         }
         if (keysChanged(peer, curveB64, edB64)) {
@@ -311,11 +404,38 @@ class E2eHandshakeHandler @Inject constructor(
         }
         peers.recordKeys(address, curveB64, edB64, now)
         // The Account must be loaded before creating a session (and a
-        // first E2E use creates it here).
-        accountManager.get().ensureAccount()
+        // first E2E use creates it here). A throw here used to
+        // propagate to the receiver's Timber-only catch — invisible
+        // in release builds, and indistinguishable in the log from
+        // "no bundle ever arrived". Record it visibly instead.
+        val accountError = runCatching { accountManager.get().ensureAccount() }.exceptionOrNull()
+        if (accountError is kotlinx.coroutines.CancellationException) throw accountError
+        if (accountError != null) {
+            recorder.recordEvent(
+                "e2e-bundle-received",
+                "Bundle received from $address; session created: no; " +
+                    "state flipped to ENCRYPTED: no; account load failed.",
+            )
+            recorder.recordEvent(
+                "e2e-account-load-failed",
+                "Account load failed for $address " +
+                    "(${accountError.javaClass.simpleName}); no session created.",
+            )
+            return false
+        }
         val sessionId = runCatching {
             crypto.get().createOutboundSession(bundle.curveKey, bundle.oneTimeKey)
         }.getOrElse {
+            recorder.recordEvent(
+                "e2e-bundle-received",
+                "Bundle received from $address; session created: no; " +
+                    "state flipped to ENCRYPTED: no; session creation failed.",
+            )
+            recorder.recordEvent(
+                "e2e-session-create-failed",
+                "Outbound session creation failed for $address " +
+                    "(${it.javaClass.simpleName}); peer stays ${peer?.state ?: "unknown"}.",
+            )
             Timber.w(it, "E2E: outbound session creation failed")
             return false
         }
@@ -323,8 +443,20 @@ class E2eHandshakeHandler @Inject constructor(
         // as a fallback for late messages (§4.2).
         sessions.get().saveNewSession(address, sessionId, now)
         peers.setState(address, StoredPeerState.ENCRYPTED, now)
+        recorder.recordEvent(
+            "e2e-bundle-received",
+            "Bundle received from $address; session created: yes; " +
+                "state flipped to ENCRYPTED: ${!wasEncrypted}; duplicate: no.",
+        )
         conversationIdForAddress(address)?.let { conversationId ->
-            notices.recordActivated(conversationId, now)
+            // Round 57 — "[Name] is on Relay!": only a genuinely
+            // NEW activation (first establishment, or a
+            // re-establishment after DEACTIVATED) earns the popup —
+            // [E2eNoticeStore.recordActivated] owns that rule and
+            // says so by returning true.
+            if (notices.recordActivated(conversationId, now)) {
+                activatedNotifier?.notifyActivated(address, conversationId)
+            }
         }
         Timber.i("E2E: peer state -> ENCRYPTED (bundle received)")
         retryDecryptFailed(address)

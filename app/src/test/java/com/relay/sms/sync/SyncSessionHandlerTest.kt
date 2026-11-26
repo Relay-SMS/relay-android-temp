@@ -474,6 +474,46 @@ class SyncSessionHandlerTest {
         assertThat(harness.closes).hasSize(1)
     }
 
+    // -- Round 57: maps provider sync ---------------------------------
+
+    @Test fun `an authenticated set_maps_provider reaches the engine`() = runTest {
+        val source = FakeSyncMessageSource()
+        val engineSent = mutableListOf<String>()
+        val engine = SyncEngine(source, this, send = { engineSent += it }, wakelock = NoOpSyncWakelock)
+        val harness = Harness(mapOf(DEVICE_ID to device), engine = engine)
+        try {
+            harness.handler.onText(helloJson())
+            harness.handler.onText(authJson(harness.challengeBytes()))
+
+            harness.handler.onText(
+                """{"type":"set_maps_provider","provider":"google","updated_at":1795000000000}""",
+            )
+            advanceUntilIdle()
+            assertThat(source.mapsProviderSets).containsExactly(
+                MapsProviderSetCall(provider = "google", updatedAt = 1_795_000_000_000L),
+            )
+            val results = engineSent.filter { it.frameType() == "action_result" }
+            assertThat(results).hasSize(1)
+            val result = Json.parseToJsonElement(results.first()).jsonObject
+            assertThat(result["action"]?.jsonPrimitive?.content).isEqualTo("set_maps_provider")
+            assertThat(result["ok"]?.jsonPrimitive?.content).isEqualTo("true")
+            assertThat(harness.closes).isEmpty()
+        } finally {
+            engine.stop()
+            advanceUntilIdle()
+        }
+    }
+
+    @Test fun `an unauthenticated set_maps_provider fails with protocol and closes`() = runTest {
+        val harness = Harness(mapOf(DEVICE_ID to device))
+        harness.handler.onText(
+            """{"type":"set_maps_provider","provider":"google","updated_at":1795000000000}""",
+        )
+        assertThat(harness.lastAuthFailedReason())
+            .isEqualTo(SyncProtocol.AuthFailed.PROTOCOL)
+        assertThat(harness.closes).hasSize(1)
+    }
+
     // -- Round 42: E2E frames -------------------------------------------
 
     @Test fun `an authenticated set_e2e_verified reaches the engine`() = runTest {

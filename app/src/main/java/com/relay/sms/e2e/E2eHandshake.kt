@@ -309,26 +309,95 @@ object E2eHandshake {
     }
 
     /**
-     * Decode a received packet. Returns null for anything that is not one
-     * of our packets (bad magic, version, type, or length) — the receiver
-     * drops those silently, since a random data SMS to this port is not
-     * our business. Never throws on input.
+     * Why a packet failed to decode — the diagnostic half of
+     * [decodeWithReason]. Never carries payload bytes: only the
+     * failure kind, so the handler can record it visibly in the
+     * error log without leaking key material.
      */
-    fun decode(bytes: ByteArray): HandshakePacket? {
-        if (bytes.size < HEADER_SIZE) return null
-        if (!bytes.copyOfRange(0, 4).contentEquals(MAGIC)) return null
-        if (bytes[4] != VERSION) return null
+    enum class DecodeFailureReason {
+        /** Fewer than [HEADER_SIZE] bytes — not even a header. */
+        TOO_SHORT,
+
+        /** First four bytes are not `RLYH`. */
+        BAD_MAGIC,
+
+        /** Version byte is not `0x01`. */
+        BAD_VERSION,
+
+        /** Type byte (flag bit masked out) is not probe / bundle / capability. */
+        UNKNOWN_TYPE,
+
+        /** A known type whose total length is not its packet size. */
+        WRONG_LENGTH,
+    }
+
+    /**
+     * A decode outcome: either a packet, or the reason it is not
+     * one. [decode] delegates to this so existing callers are
+     * unaffected; the handler uses this form so a dropped packet
+     * can be logged with its reason instead of silently vanishing.
+     */
+    sealed interface DecodeResult {
+        /** The bytes decoded to a packet. */
+        data class Packet(val packet: HandshakePacket) : DecodeResult
+
+        /** The bytes are not one of our packets, and why. */
+        data class Failure(val reason: DecodeFailureReason) : DecodeResult
+    }
+
+    /**
+     * Decode a received packet, carrying the failure reason.
+     * Returns [DecodeResult.Packet] for a probe, bundle, or
+     * capability declaration, and [DecodeResult.Failure] for
+     * anything else (bad magic, version, type, or length) — the
+     * receiver drops those, and records the reason. Never throws
+     * on input.
+     */
+    fun decodeWithReason(bytes: ByteArray): DecodeResult {
+        val headerFailure = when {
+            bytes.size < HEADER_SIZE -> DecodeFailureReason.TOO_SHORT
+            !bytes.copyOfRange(0, 4).contentEquals(MAGIC) -> DecodeFailureReason.BAD_MAGIC
+            bytes[4] != VERSION -> DecodeFailureReason.BAD_VERSION
+            else -> null
+        }
+        if (headerFailure != null) return DecodeResult.Failure(headerFailure)
         // Round 47 — bit 7 of the type byte is the manual flag.
         // Mask it out for the type dispatch; the flag rides on the
         // decoded Probe below. The flag is meaningless on a bundle,
         // so a bundle with the bit set still decodes as a bundle
         // (lenient — a future bundle flag must not break decoding).
         val typeByte = bytes[5]
-        return when ((typeByte.toInt() and TYPE_MASK.toInt()).toByte()) {
+        val maskedType = (typeByte.toInt() and TYPE_MASK.toInt()).toByte()
+        val packet = when (maskedType) {
             TYPE_PROBE -> decodeProbe(bytes, isManual(typeByte))
             TYPE_BUNDLE -> decodeBundle(bytes)
             TYPE_CAPABILITY -> decodeCapability(bytes)
             else -> null
+        }
+        return when {
+            packet != null -> DecodeResult.Packet(packet)
+            maskedType != TYPE_PROBE &&
+                maskedType != TYPE_BUNDLE &&
+                maskedType != TYPE_CAPABILITY ->
+                DecodeResult.Failure(DecodeFailureReason.UNKNOWN_TYPE)
+            // A known type whose decoder returned null: the total
+            // length is not that packet's size.
+            else -> DecodeResult.Failure(DecodeFailureReason.WRONG_LENGTH)
+        }
+    }
+
+    /**
+     * Decode a received packet. Returns null for anything that is not one
+     * of our packets (bad magic, version, type, or length) — the receiver
+     * drops those silently, since a random data SMS to this port is not
+     * our business. Never throws on input. Delegates to
+     * [decodeWithReason]; callers that need the failure reason use
+     * that form directly.
+     */
+    fun decode(bytes: ByteArray): HandshakePacket? {
+        return when (val result = decodeWithReason(bytes)) {
+            is DecodeResult.Packet -> result.packet
+            is DecodeResult.Failure -> null
         }
     }
 

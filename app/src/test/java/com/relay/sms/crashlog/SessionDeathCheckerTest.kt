@@ -123,15 +123,16 @@ class SessionDeathCheckerTest {
     }
 
     @Test
-    fun `the entry counts toward the ten-report rotation`() {
+    fun `the entry counts toward the fifty-report rotation`() {
         val reports = store()
-        for (i in 1..10) {
+        for (i in 1..CrashReportStore.MAX_REPORTS) {
             reports.writeReport("report $i", i * 1_000L, "Crash$i")
         }
         SessionDeathChecker(reports, FakeProvider(SessionExitInfo(SessionExitReason.ANR, 11_000L)))
             .check(marker, metadata)
         val listed = reports.listReports()
         assertThat(listed).hasSize(CrashReportStore.MAX_REPORTS)
+        assertThat(listed.map { it.timestampMillis }).doesNotContain(1_000L)
         assertThat(listed.map { it.crashType }).contains(CrashReportFormatter.UNEXPECTED_STOP_TYPE)
     }
 

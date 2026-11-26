@@ -875,6 +875,11 @@ fun SettingsScreen(
                         smartActions = it.smartActions.copy(
                             mapsProvider = provider,
                             mapsProviderAsked = true,
+                            // Round 57 — the sync write marker: a
+                            // local pick stamps "now", so a later
+                            // desktop pick (or an earlier one) wins
+                            // by the marker, not by arrival order.
+                            mapsProviderUpdatedAt = System.currentTimeMillis(),
                         ),
                     )
                 }

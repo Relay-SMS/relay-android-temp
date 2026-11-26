@@ -279,6 +279,7 @@
     <string name="compose_add_to_group">Aggiungi al gruppo</string>
     <string name="compose_add_contact">Aggiungi contatto</string>
     <string name="compose_select_contact">Seleziona contatto</string>
+    <string name="compose_select_note">Seleziona nota</string>
     <string name="compose_name_your_group">Dai un nome al gruppo</string>
     <string name="compose_group_name_placeholder">Nome del gruppo</string>
     <string name="compose_group_members">Membri</string>
@@ -402,6 +403,11 @@
     <string name="appearance_pick_avatar">Scegli dalla galleria</string>
     <string name="appearance_reset_avatar">Usa l\'immagine predefinita</string>
     <string name="appearance_saved">Aspetto aggiornato</string>
+    <!-- Round 57 — contact-photo write-back: a photo picked for a 1:1 contact is also saved to the system contact, so it survives deleting the app. -->
+    <string name="contact_photo_saved">Foto salvata nel tuo contatto</string>
+    <string name="contact_photo_no_contact">Salvata in Relay — non c\'è ancora un contatto per questo numero</string>
+    <string name="contact_photo_save_failed">Salvata in Relay — la foto non è stata salvata nel contatto</string>
+    <string name="contact_photo_needs_permission">Salvata solo in Relay — consenti l\'accesso ai contatti per salvarla anche nel contatto</string>
     <!-- v1.11.0 — Sujet 3 anti-smishing -->
     <string name="settings_smishing_detection">Rilevamento truffe (offline)</string>
     <string name="settings_smishing_detection_desc">Segnala gli SMS in arrivo sospetti (link accorciati, toni di urgenza, numeri a sovrapprezzo, domini che imitano quelli veri). Copre Francia, Germania, Italia, Spagna, Regno Unito e Irlanda. 100% locale, nessun cloud. Può produrre falsi positivi.</string>
@@ -939,6 +945,8 @@
     <string name="notif_track_package_label">Traccia pacco</string>
     <string name="notif_code_copied">Codice copiato</string>
     <string name="notif_preview_hidden_content">Nuovo messaggio</string>
+    <string name="e2e_activated_notif_body">%1$s ora usa Relay!</string>
+    <string name="e2e_activated_notif_body_anonymous">Un contatto ora usa Relay!</string>
 
     <!-- PDF export -->
     <string name="pdf_header_subtitle">Esportato il %1$s • %2$d partecipante/i</string>
@@ -953,6 +961,8 @@
     <string name="error_log_share">Condividi</string>
     <string name="error_log_clear_all">Cancella tutto</string>
     <string name="error_log_copied">Segnalazione copiata</string>
+    <string name="error_log_copy_all">Copia tutto</string>
+    <string name="error_log_copied_all">Tutte le segnalazioni copiate</string>
     <string name="error_log_cleared">Registro errori cancellato</string>
     <string name="error_log_clear_confirm_title">Cancellare il registro errori?</string>
     <string name="error_log_clear_confirm_body">Tutte le segnalazioni di arresto anomalo salvate verranno eliminate. Questa azione non può essere annullata.</string>

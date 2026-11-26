@@ -279,6 +279,7 @@
     <string name="compose_add_to_group">Añadir al grupo</string>
     <string name="compose_add_contact">Añadir contacto</string>
     <string name="compose_select_contact">Seleccionar contacto</string>
+    <string name="compose_select_note">Seleccionar nota</string>
     <string name="compose_name_your_group">Nombra tu grupo</string>
     <string name="compose_group_name_placeholder">Nombre del grupo</string>
     <string name="compose_group_members">Miembros</string>
@@ -402,6 +403,11 @@
     <string name="appearance_pick_avatar">Elegir de la galería</string>
     <string name="appearance_reset_avatar">Usar la imagen predeterminada</string>
     <string name="appearance_saved">Apariencia actualizada</string>
+    <!-- Round 57 — contact-photo write-back: a photo picked for a 1:1 contact is also saved to the system contact, so it survives deleting the app. -->
+    <string name="contact_photo_saved">Foto guardada en tu contacto</string>
+    <string name="contact_photo_no_contact">Guardada en Relay — aún no hay ningún contacto para este número</string>
+    <string name="contact_photo_save_failed">Guardada en Relay — no se pudo guardar la foto en el contacto</string>
+    <string name="contact_photo_needs_permission">Guardada solo en Relay — permite el acceso a los contactos para guardarla también en el contacto</string>
     <!-- v1.11.0 — Sujet 3 anti-smishing -->
     <string name="settings_smishing_detection">Detección de estafas (sin conexión)</string>
     <string name="settings_smishing_detection_desc">Señala los SMS entrantes sospechosos (enlaces acortados, expresiones de urgencia, números de tarificación adicional, dominios que imitan a los verdaderos). Cubre Francia, Alemania, Italia, España, el Reino Unido e Irlanda. 100% local, sin nube. Puede producir falsos positivos.</string>
@@ -939,6 +945,8 @@
     <string name="notif_track_package_label">Rastrear paquete</string>
     <string name="notif_code_copied">Código copiado</string>
     <string name="notif_preview_hidden_content">Mensaje nuevo</string>
+    <string name="e2e_activated_notif_body">¡%1$s ya usa Relay!</string>
+    <string name="e2e_activated_notif_body_anonymous">Un contacto ya usa Relay!</string>
 
     <!-- PDF export -->
     <string name="pdf_header_subtitle">Exportado el %1$s • %2$d participante(s)</string>
@@ -953,6 +961,8 @@
     <string name="error_log_share">Compartir</string>
     <string name="error_log_clear_all">Borrar todo</string>
     <string name="error_log_copied">Informe copiado</string>
+    <string name="error_log_copy_all">Copiar todo</string>
+    <string name="error_log_copied_all">Todos los informes copiados</string>
     <string name="error_log_cleared">Registro de errores borrado</string>
     <string name="error_log_clear_confirm_title">¿Borrar el registro de errores?</string>
     <string name="error_log_clear_confirm_body">Se eliminarán todos los informes de errores guardados. Esta acción no se puede deshacer.</string>

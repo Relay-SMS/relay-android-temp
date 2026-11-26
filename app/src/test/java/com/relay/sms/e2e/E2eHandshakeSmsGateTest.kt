@@ -50,7 +50,8 @@ class E2eHandshakeSmsGateTest {
         mode: DeviceMode,
         reader: TelephonyReader,
         handler: E2eHandshakeHandler,
-    ) = E2eHandshakeSmsGate(reader, FakeSettings(mode), handler)
+        recorder: E2eFailureRecorder = mockk(relaxed = true),
+    ) = E2eHandshakeSmsGate(reader, FakeSettings(mode), handler, recorder)
 
     /**
      * A well-formed handshake SMS body. The handler is mocked, so
@@ -119,6 +120,68 @@ class E2eHandshakeSmsGateTest {
         assertThat(handled).isTrue()
         verify(exactly = 1) { reader.insertInboxSms(ADDRESS, body, NOW, null) }
         coVerify(exactly = 0) { handler.handleSms(any(), any(), any(), any()) }
+    }
+
+    // ──────────────────── Receipt logging ────────────────────
+    // Light-touch only: a handshake SMS records its receipt, a
+    // client-mode swallow records the swallow, and a non-handshake
+    // text records nothing (every normal SMS would spam the log).
+
+    @Test
+    fun `hub mode records the handshake SMS receipt`() = runTest {
+        val reader = mockk<TelephonyReader>()
+        every { reader.insertInboxSms(any(), any(), any(), any()) } returns null
+        val handler = mockk<E2eHandshakeHandler>()
+        coEvery { handler.handleSms(any(), any(), any(), any()) } returns true
+        val recorder = mockk<E2eFailureRecorder>(relaxed = true)
+        val body = handshakeBody()
+
+        val handled = gate(DeviceMode.HUB, reader, handler, recorder)
+            .handle(ADDRESS, body, NOW, null)
+
+        assertThat(handled).isTrue()
+        verify(exactly = 1) {
+            recorder.recordEvent(
+                "e2e-handshake-sms-received",
+                match { it.contains(ADDRESS) },
+            )
+        }
+        verify(exactly = 0) { recorder.recordEvent("e2e-handshake-sms-client-mode", any()) }
+    }
+
+    @Test
+    fun `client mode records the receipt and the swallow`() = runTest {
+        val reader = mockk<TelephonyReader>()
+        every { reader.insertInboxSms(any(), any(), any(), any()) } returns null
+        val handler = mockk<E2eHandshakeHandler>()
+        val recorder = mockk<E2eFailureRecorder>(relaxed = true)
+        val body = handshakeBody()
+
+        val handled = gate(DeviceMode.CLIENT, reader, handler, recorder)
+            .handle(ADDRESS, body, NOW, null)
+
+        assertThat(handled).isTrue()
+        verify(exactly = 1) { recorder.recordEvent("e2e-handshake-sms-received", any()) }
+        verify(exactly = 1) {
+            recorder.recordEvent(
+                "e2e-handshake-sms-client-mode",
+                match { it.contains(ADDRESS) },
+            )
+        }
+        coVerify(exactly = 0) { handler.handleSms(any(), any(), any(), any()) }
+    }
+
+    @Test
+    fun `a non-handshake text records nothing`() = runTest {
+        val reader = mockk<TelephonyReader>()
+        val handler = mockk<E2eHandshakeHandler>()
+        val recorder = mockk<E2eFailureRecorder>(relaxed = true)
+
+        val handled = gate(DeviceMode.HUB, reader, handler, recorder)
+            .handle(ADDRESS, "hello", NOW, null)
+
+        assertThat(handled).isFalse()
+        verify(exactly = 0) { recorder.recordEvent(any(), any()) }
     }
 
     companion object {

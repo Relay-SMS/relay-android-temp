@@ -486,6 +486,7 @@ class SettingsRepository(
                     MapsProvider::valueOf,
                 ),
                 mapsProviderAsked = p[K.mapsProviderAsked] ?: false,
+                mapsProviderUpdatedAt = p[K.mapsProviderUpdatedAt] ?: 0L,
             ),
         )
     }
@@ -631,6 +632,8 @@ class SettingsRepository(
         this[K.mapsProvider] = s.smartActions.mapsProvider.name
         // Round 55 — whether the provider was ever explicitly chosen (see above).
         this[K.mapsProviderAsked] = s.smartActions.mapsProviderAsked
+        // Round 57 — when the provider was last written, epoch millis (the sync marker).
+        this[K.mapsProviderUpdatedAt] = s.smartActions.mapsProviderUpdatedAt
     }
 
     private inline fun <reified E : Enum<E>> enumOr(p: Preferences, key: Preferences.Key<String>, def: E, valueOf: (String) -> E): E =
@@ -886,5 +889,8 @@ class SettingsRepository(
 
         /** Round 55 — whether the maps provider was ever explicitly chosen. */
         val mapsProviderAsked = booleanPreferencesKey("smart.mapsProviderAsked")
+
+        /** Round 57 — when the maps provider was last written, epoch millis (the sync marker). */
+        val mapsProviderUpdatedAt = longPreferencesKey("smart.mapsProviderUpdatedAt")
     }
 }

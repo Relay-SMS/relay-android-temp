@@ -30,6 +30,17 @@ data class SmartActionSettings(
      * because the thread also checks `mapsProvider != SYSTEM_DEFAULT`.
      */
     val mapsProviderAsked: Boolean = false,
+    /**
+     * Round 57 — when the maps provider was last written, epoch
+     * millis: the sync write marker for the maps-provider sync
+     * (SYNC_PROTOCOL.md, "Maps provider sync"). Every local write
+     * of [mapsProvider] stamps `System.currentTimeMillis()` here;
+     * a synced write stamps the marker the frame carried, never
+     * "now" — the marker is what last-write-wins compares across
+     * devices. Persisted (`smart.mapsProviderUpdatedAt`); 0 means
+     * "never written" (the provider is still the default).
+     */
+    val mapsProviderUpdatedAt: Long = 0L,
 )
 
 /**

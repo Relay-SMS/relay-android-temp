@@ -162,14 +162,17 @@ class SyncEngineE2eTest {
             assertThat(types).contains("e2e_safety_numbers")
             assertThat(types).contains("e2e_notices")
             // Both sets ride after the snapshot, next to the
-            // category mutes: sync_complete, category_mutes, then
-            // the E2E sets in order.
+            // category mutes and the maps provider: sync_complete,
+            // category_mutes, maps_provider, then the E2E sets
+            // in order.
             val complete = types.indexOf("sync_complete")
             val mutes = types.indexOf("category_mutes")
+            val maps = types.indexOf("maps_provider")
             val numbers = types.indexOf("e2e_safety_numbers")
             val notices = types.indexOf("e2e_notices")
             assertThat(mutes).isEqualTo(complete + 1)
-            assertThat(numbers).isEqualTo(mutes + 1)
+            assertThat(maps).isEqualTo(mutes + 1)
+            assertThat(numbers).isEqualTo(maps + 1)
             assertThat(notices).isEqualTo(numbers + 1)
 
             val numbersFrame = sent.first { it.frameType() == "e2e_safety_numbers" }.asObject()

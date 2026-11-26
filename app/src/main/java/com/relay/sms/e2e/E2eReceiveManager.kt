@@ -121,6 +121,14 @@ class E2eReceiveManager @Inject constructor(
     // resolution).
     private val groupSessions: E2eGroupSessionManager,
     @ApplicationContext private val context: Context,
+    // Round 57 — "[Name] is on Relay!" notification, fired when the
+    // first encrypted message on a new session records a genuinely
+    // new ACTIVATED notice (see [insertDecryptedText] and
+    // [handleDecryptedReaction]). Nullable with a null default so
+    // the existing manager tests — which construct the manager by
+    // hand — keep compiling untouched; Hilt always provides the
+    // real notifier.
+    private val activatedNotifier: com.relay.sms.system.notifications.E2eActivatedNotifier? = null,
 ) {
     private val processedLock = Any()
     private val processedSets = LinkedHashSet<Pair<String, String>>()
@@ -351,7 +359,12 @@ class E2eReceiveManager @Inject constructor(
         val conversationId = conversationRepo.findMessageForResend(msgId)?.conversationId
             ?: return
         if (newSession) {
-            notices.recordActivated(conversationId, now)
+            // Round 57 — "[Name] is on Relay!": only a genuinely
+            // NEW activation earns the popup (see the bundle path in
+            // E2eHandshakeHandler — same rule, same guard).
+            if (notices.recordActivated(conversationId, now)) {
+                activatedNotifier?.notifyActivated(address, conversationId)
+            }
         }
         notifier.notifyIncoming(
             address = address,
@@ -610,7 +623,11 @@ class E2eReceiveManager @Inject constructor(
         if (group != null) {
             groupSessions.recordGroupActivated(applied.conversationId, now)
         } else if (newSession) {
-            notices.recordActivated(applied.conversationId, now)
+            // Round 57 — "[Name] is on Relay!": only a genuinely
+            // NEW activation earns the popup (see [insertDecryptedText]).
+            if (notices.recordActivated(applied.conversationId, now)) {
+                activatedNotifier?.notifyActivated(address, applied.conversationId)
+            }
         }
         if (decoded.isRemoval) return
         // A removal only clears the badge — nothing to notify about.

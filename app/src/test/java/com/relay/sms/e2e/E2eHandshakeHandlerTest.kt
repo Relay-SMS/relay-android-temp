@@ -53,7 +53,11 @@ class E2eHandshakeHandlerTest {
         const val NOW = 1_800_000_000_000L
     }
 
-    private class Harness {
+    private class Harness(
+        blocked: Set<String> = emptySet(),
+        cryptoOverride: E2eCrypto? = null,
+        accountManagerOverride: dagger.Lazy<E2eAccountManager>? = null,
+    ) {
         val aliceCrypto = FakeE2eCrypto("alice")
         val bobCrypto = FakeE2eCrypto("bob")
         val carolCrypto = FakeE2eCrypto("carol")
@@ -89,15 +93,15 @@ class E2eHandshakeHandlerTest {
         val handler = E2eHandshakeHandler(
             peers = peers,
             sessions = lazyOf(sessions),
-            accountManager = lazyOf(accountManager),
-            crypto = lazyOf(aliceCrypto as E2eCrypto),
+            accountManager = accountManagerOverride ?: lazyOf(accountManager),
+            crypto = lazyOf(cryptoOverride ?: aliceCrypto as E2eCrypto),
             decryptor = decryptor,
             notices = E2eNoticeStore(noticeDao),
             dataSmsSender = sender,
             conversationDao = conversationDao,
             messageDao = messageDao,
             phoneIdentity = phoneIdentity,
-            blockedRepo = FakeBlockedRepo(),
+            blockedRepo = FakeBlockedRepo(blocked),
             recorder = recorder,
             mediaCapability = mediaCapability,
             groupSessions = groupSessions,
@@ -307,8 +311,9 @@ class E2eHandshakeHandlerTest {
     // ──────────────────── Round 42: inbound-path diagnostics ────────────────────
     // The inbound path is Timber-only, and Timber is a no-op in
     // release builds — so the handler records the handshake events
-    // in the error log (fixed messages, no keys, no addresses).
-    // The three tags make every outcome separable: no
+    // in the error log (no keys, no payload — the address names
+    // the sender, which is the whole question when a handshake
+    // fails). The three tags make every outcome separable: no
     // `e2e-probe-received` means the probe never arrived;
     // `e2e-probe-received` + `e2e-bundle-sent` means inbound +
     // reply work; `e2e-bundle-rate-limited` means the path worked
@@ -320,8 +325,16 @@ class E2eHandshakeHandlerTest {
 
         harness.handler.handleDataSms(BOB, harness.probeFrom(harness.bobCrypto), null, NOW)
 
-        verify(exactly = 1) { harness.recorder.recordEvent("e2e-probe-received", any()) }
-        verify(exactly = 1) { harness.recorder.recordEvent("e2e-bundle-sent", any()) }
+        val probeMessage = slot<String>()
+        verify(exactly = 1) {
+            harness.recorder.recordEvent("e2e-probe-received", capture(probeMessage))
+        }
+        assertThat(probeMessage.captured).contains(BOB)
+        val bundleMessage = slot<String>()
+        verify(exactly = 1) {
+            harness.recorder.recordEvent("e2e-bundle-sent", capture(bundleMessage))
+        }
+        assertThat(bundleMessage.captured).contains(BOB)
         verify(exactly = 0) { harness.recorder.recordEvent("e2e-bundle-rate-limited", any()) }
     }
 
@@ -350,12 +363,24 @@ class E2eHandshakeHandlerTest {
     }
 
     @Test
-    fun `a dropped packet records nothing`() = runTest {
+    fun `a dropped packet records the decode failure with its reason`() = runTest {
         val harness = Harness()
 
-        harness.handler.handleDataSms(BOB, "not a handshake".toByteArray(), null, NOW)
+        val handled = harness.handler.handleDataSms(BOB, "not a handshake".toByteArray(), null, NOW)
 
-        verify(exactly = 0) { harness.recorder.recordEvent(any(), any()) }
+        assertThat(handled).isFalse()
+        assertThat(harness.sender.sent).isEmpty()
+        assertThat(harness.peerDao.peers).isEmpty()
+        verify(exactly = 1) {
+            harness.recorder.recordEvent(
+                "e2e-decode-failed",
+                match {
+                    it.contains("bad-magic") && it.contains("15 bytes") && it.contains("type 0x20")
+                },
+            )
+        }
+        verify(exactly = 0) { harness.recorder.recordEvent("e2e-probe-received", any()) }
+        verify(exactly = 0) { harness.recorder.recordEvent("e2e-bundle-received", any()) }
     }
 
     @Test
@@ -761,5 +786,155 @@ class E2eHandshakeHandlerTest {
         // channel (a key-change probe is not proof the new
         // channel delivers).
         assertThat(harness.peerDao.peers[BOB]!!.handshakeChannel).isEqualTo("TEXT_SMS")
+    }
+
+    // ──────────────── Inbound-path diagnostics ────────────────
+    // Every inbound outcome leaves a separable line in the error
+    // log, so the next handshake shows the underlying picture:
+    // arrival (receiver) → decode → blocked → probe / bundle /
+    // capability → session outcome.
+
+    @Test
+    fun `a bundle records bundle-received with session created and state flipped`() = runTest {
+        val harness = Harness()
+
+        val handled = harness.handler.handleDataSms(BOB, harness.bundleFrom(harness.bobCrypto), null, NOW)
+
+        assertThat(handled).isTrue()
+        val message = slot<String>()
+        verify(exactly = 1) {
+            harness.recorder.recordEvent("e2e-bundle-received", capture(message))
+        }
+        assertThat(message.captured).contains(BOB)
+        assertThat(message.captured).contains("session created: yes")
+        assertThat(message.captured).contains("state flipped to ENCRYPTED: true")
+        assertThat(message.captured).contains("duplicate: no")
+    }
+
+    @Test
+    fun `a duplicate bundle records bundle-received as a duplicate ignore`() = runTest {
+        val harness = Harness()
+        val bundle = harness.bundleFrom(harness.bobCrypto)
+        harness.handler.handleDataSms(BOB, bundle, null, NOW)
+
+        val handled = harness.handler.handleDataSms(BOB, bundle, null, NOW)
+
+        assertThat(handled).isTrue()
+        val messages = mutableListOf<String>()
+        verify(exactly = 2) {
+            harness.recorder.recordEvent("e2e-bundle-received", capture(messages))
+        }
+        assertThat(messages).hasSize(2)
+        assertThat(messages.last()).contains("duplicate ignored")
+        assertThat(messages.last()).contains("session created: no")
+        assertThat(messages.last()).contains("state flipped to ENCRYPTED: no")
+    }
+
+    @Test
+    fun `a bad-magic handshake SMS records the decode failure`() = runTest {
+        val harness = Harness()
+        val badMagic = ByteArray(E2eHandshake.PROBE_SIZE)
+        badMagic[0] = 'X'.code.toByte()
+        val text = E2eHandshakeSms.encode(badMagic)
+
+        val handled = harness.handler.handleSms(BOB, text, null, NOW)
+
+        assertThat(handled).isFalse()
+        assertThat(harness.peerDao.peers).isEmpty()
+        verify(exactly = 1) {
+            harness.recorder.recordEvent(
+                "e2e-decode-failed",
+                match {
+                    it.contains("bad-magic") && it.contains("70 bytes") && it.contains("type 0x00")
+                },
+            )
+        }
+    }
+
+    @Test
+    fun `a capability packet records capability-received`() = runTest {
+        val harness = Harness()
+
+        val handled = harness.handler.handleDataSms(
+            BOB,
+            E2eHandshake.encodeCapabilityDeclaration(),
+            3,
+            NOW,
+        )
+
+        assertThat(handled).isTrue()
+        verify(exactly = 1) {
+            harness.recorder.recordEvent(
+                "e2e-capability-received",
+                match { it.contains(BOB) && it.contains("media=true") },
+            )
+        }
+    }
+
+    @Test
+    fun `a packet from a blocked sender records blocked-sender and nothing else`() = runTest {
+        val harness = Harness(blocked = setOf(BOB))
+
+        val handled = harness.handler.handleDataSms(BOB, harness.probeFrom(harness.bobCrypto), null, NOW)
+
+        assertThat(handled).isFalse()
+        assertThat(harness.sender.sent).isEmpty()
+        assertThat(harness.peerDao.peers).isEmpty()
+        verify(exactly = 1) {
+            harness.recorder.recordEvent(
+                "e2e-blocked-sender",
+                match { it.contains(BOB) },
+            )
+        }
+        verify(exactly = 0) { harness.recorder.recordEvent("e2e-probe-received", any()) }
+    }
+
+    @Test
+    fun `a session-creation failure records session-create-failed and no ENCRYPTED flip`() = runTest {
+        val failingCrypto = mockk<E2eCrypto>()
+        every { failingCrypto.createOutboundSession(any(), any()) } throws
+            RuntimeException("no session")
+        val harness = Harness(cryptoOverride = failingCrypto)
+
+        val handled = harness.handler.handleDataSms(BOB, harness.bundleFrom(harness.bobCrypto), null, NOW)
+
+        assertThat(handled).isFalse()
+        assertThat(harness.peers.state(BOB)).isNotEqualTo(E2ePeerState.ENCRYPTED)
+        verify(exactly = 1) {
+            harness.recorder.recordEvent(
+                "e2e-session-create-failed",
+                match { it.contains(BOB) && it.contains("RuntimeException") },
+            )
+        }
+        verify(exactly = 1) {
+            harness.recorder.recordEvent(
+                "e2e-bundle-received",
+                match { it.contains("session created: no") },
+            )
+        }
+    }
+
+    @Test
+    fun `an account-load failure records account-load-failed instead of propagating`() = runTest {
+        val failingAccount = mockk<E2eAccountManager>()
+        coEvery { failingAccount.ensureAccount() } throws RuntimeException("no account")
+        val harness = Harness(accountManagerOverride = lazyOf(failingAccount))
+
+        val handled = harness.handler.handleDataSms(BOB, harness.bundleFrom(harness.bobCrypto), null, NOW)
+
+        assertThat(handled).isFalse()
+        assertThat(harness.peers.state(BOB)).isNotEqualTo(E2ePeerState.ENCRYPTED)
+        verify(exactly = 1) {
+            harness.recorder.recordEvent(
+                "e2e-account-load-failed",
+                match { it.contains(BOB) && it.contains("RuntimeException") },
+            )
+        }
+        verify(exactly = 1) {
+            harness.recorder.recordEvent(
+                "e2e-bundle-received",
+                match { it.contains("session created: no") },
+            )
+        }
     }
 }

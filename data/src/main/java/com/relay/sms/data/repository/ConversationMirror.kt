@@ -1423,20 +1423,67 @@ class ConversationMirror @Inject constructor(
     }
 
     /**
-     * One-shot pass that walks every conversation with a missing display name and resolves it via
-     * the contacts provider. Called from [ConversationsViewModel] at screen init so newly granted
-     * READ_CONTACTS permission immediately updates the list — no reinstall needed.
+     * Contact-name live refresh — re-resolves the stored display
+     * name of EVERY conversation (not just the missing ones) from
+     * the contacts provider, and writes back only the rows whose
+     * name actually changed, so the Room flows (`observeAll` /
+     * `observeOne`) re-emit and the list, the thread header and
+     * the desktop sync pick the new name up with no restart.
+     *
+     * Two cases the old missing-only pass could never fix:
+     *  - a RENAMED contact: the row kept the old name forever
+     *    (every `ensure*` path only fills a null name);
+     *  - a NEWLY ADDED contact for a number already in a
+     *    conversation: the row had no name to fill until the next
+     *    process start (this pass ran only at list init).
+     * Groups recompute their joined member names ([nomDeGroupe]),
+     * so renaming one member renames the group title too; a
+     * user-chosen group name (`custom_name`) is a different column
+     * and is never touched — the title rule prefers it anyway.
+     *
+     * [clearMissing] also clears a stored name when the provider
+     * now answers "no contact" (the contact was deleted): only
+     * the application-scoped trigger passes it, because only it
+     * knows the local provider is authoritative — a linked
+     * device's names come from the hub, so its list-init call
+     * leaves a stale name alone rather than erasing a hub name
+     * for a number its own contacts lack. A clear additionally
+     * requires READ_CONTACTS ([ContactRepository
+     * .hasContactsPermission]): a denied permission also reads
+     * as "no contact", and clearing on that would erase correct
+     * names (the same fail-closed rule as the thread's stale-name
+     * heal). Renames and fills need no such gate — a denied
+     * permission simply resolves nothing, so nothing is written.
      */
-    suspend fun refreshContactNames() = withContext(io) {
+    suspend fun refreshContactNames(clearMissing: Boolean = false) = withContext(io) {
         displayNameCache.evictAll()
-        val missing = conversationDao.findMissingDisplayName()
-        if (missing.isEmpty()) return@withContext
+        val canClear = clearMissing && contacts.hasContactsPermission()
+        val conversations = conversationDao.listAllIncludingArchived()
+        if (conversations.isEmpty()) return@withContext
         database.withTransaction {
-            for (conv in missing) {
-                val firstAddr = PhoneAddress.list(conv.addressesCsv).firstOrNull()?.raw ?: continue
-                val name = resolveDisplayName(firstAddr) ?: continue
-                conversationDao.setDisplayName(conv.id, name)
+            for (conv in conversations) {
+                val expected = expectedDisplayName(conv)
+                if (expected == conv.displayName) continue
+                if (expected == null && !canClear) continue
+                conversationDao.setDisplayName(conv.id, expected)
             }
+        }
+    }
+
+    /**
+     * The display name a conversation should carry right now: the
+     * contact name for a 1:1 thread, the joined member names for
+     * a group ([nomDeGroupe]), null when no member is a known
+     * contact. The lookup is the same strict one the receive
+     * paths use ([resolveDisplayName] / [numbersMatchStrict]) —
+     * only WHEN it runs changes, never HOW it matches.
+     */
+    private suspend fun expectedDisplayName(conv: ConversationEntity): String? {
+        val addresses = PhoneAddress.list(conv.addressesCsv)
+        return if (addresses.size == 1) {
+            resolveDisplayName(addresses.first().raw)
+        } else {
+            nomDeGroupe(addresses)
         }
     }
 

@@ -32,6 +32,7 @@ import com.relay.sms.data.blocking.BlockedNumbersImporter
 import com.relay.sms.data.contacts.ContactsReader
 import com.relay.sms.data.local.datastore.SettingsRepository
 import com.relay.sms.data.local.db.dao.ConversationDao
+import com.relay.sms.data.repository.ConversationMirror
 import com.relay.sms.data.sync.TelephonySyncManager
 import com.relay.sms.di.ApplicationScope
 import com.relay.sms.domain.safetycall.SafetyCallNotice
@@ -48,8 +49,11 @@ import com.relay.sms.system.scheduler.SafetyCallAlarmScheduler
 import com.relay.sms.system.scheduler.SafetyCallWorker
 import com.relay.sms.system.scheduler.TelephonySyncWorker
 import com.relay.sms.system.service.KeepAliveService
+import com.relay.sms.system.sync.ContactPhotoWriteBack
 import dagger.hilt.android.HiltAndroidApp
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -97,6 +101,38 @@ class MainApplication : Application(), Configuration.Provider {
      * build the server graph when the server is off.
      */
     @Inject lateinit var syncServerLazy: dagger.Lazy<SyncServer>
+
+    /**
+     * Contact-name live refresh — the mirror that owns the
+     * stored display names. `dagger.Lazy` (the established
+     * pattern, and the eager-injection guard allows `Lazy`
+     * unconditionally): resolving it provisions `AppDatabase`,
+     * which must never happen on the main thread at startup —
+     * the debounced job below resolves it off the main thread,
+     * only after a real provider change.
+     */
+    @Inject lateinit var conversationMirrorLazy: dagger.Lazy<ConversationMirror>
+
+    /**
+     * Photo write-back trigger — the write-back itself lives in
+     * [ContactPhotoWriteBack] (a parallel workstream's class:
+     * it scans Relay's stored contact photos and writes one to
+     * a system contact that now exists but has no photo, never
+     * clobbering an existing system photo). This application
+     * only owns the TRIGGER: `dagger.Lazy` like the mirror
+     * above, so a provider change never builds the write-back
+     * graph on the main thread — the debounced job below
+     * resolves it off the main thread, after the name refresh.
+     */
+    @Inject lateinit var contactPhotoWriteBackLazy: dagger.Lazy<ContactPhotoWriteBack>
+
+    /**
+     * Contact-name live refresh — the pending debounced refresh
+     * job (see [scheduleContactNameRefresh]). Main-thread
+     * confined: only the ContentObserver callback (main looper)
+     * touches it.
+     */
+    private var contactNameRefreshJob: Job? = null
 
     /**
      * v1.28.12 — le rôle d'application SMS par défaut, relu à chaque réconciliation du Safety
@@ -794,14 +830,16 @@ class MainApplication : Application(), Configuration.Provider {
 
     /**
      * Slice 5 — one contacts-provider change: invalidate the local
-     * name cache (fixes the phone's own stale names, too), then —
-     * only when the server toggle is on — nudge the server to
-     * re-check and push the live delta. Failures are logged, never
-     * thrown: a contact edit must never crash the app.
+     * name cache (fixes the phone's own stale names, too), refresh
+     * the stored display names (see [scheduleContactNameRefresh]),
+     * then — only when the server toggle is on — nudge the server
+     * to re-check and push the live delta. Failures are logged,
+     * never thrown: a contact edit must never crash the app.
      */
     private fun onContactsChanged() {
         runCatching { contactsReaderLazy.get().invalidate() }
             .onFailure { Timber.w(it, "ContactsReader.invalidate failed") }
+        scheduleContactNameRefresh()
         appScope.launch {
             runCatching {
                 // Client mode — the server never runs on a linked
@@ -814,6 +852,65 @@ class MainApplication : Application(), Configuration.Provider {
                 }
             }.onFailure { Timber.w(it, "SyncServer.notifyContactsChanged failed") }
         }
+    }
+
+    /**
+     * Contact-name live refresh — debounced re-resolution of the
+     * stored display names after a provider change.
+     *
+     * One contact edit fires the observer several times (a raw
+     * contact row, a data row, the aggregate row), so the refresh
+     * waits [CONTACT_NAME_REFRESH_DEBOUNCE_MS] after the LAST
+     * notification before running — a burst of edits costs one
+     * pass over the conversations, and the pass itself only
+     * writes the rows whose name actually changed, so the Room
+     * flows re-emit just the affected list rows and thread
+     * headers. The work runs on [appScope] (off the main thread;
+     * the lookup is a provider query per distinct address) and
+     * is fail-soft: a refresh failure logs, never crashes, and
+     * the next provider change retries.
+     *
+     * Hub only: a linked device's names come from the hub (its
+     * server notify above pushes the renamed conversation down),
+     * so a local refresh there could erase a hub name for a
+     * number its own contacts lack. An unknown mode (settings
+     * not hydrated yet) refreshes — the hub is the common case,
+     * and the refresh is permission-gated for clears anyway.
+     *
+     * After the name refresh, the same debounced job triggers
+     * the photo write-back ([ContactPhotoWriteBack
+     * .writeBackPendingPhotos]): a newly added contact is
+     * exactly when a stored Relay photo may newly have a system
+     * contact to land on. It runs in its own fail-soft block so
+     * a write-back failure can never lose the name refresh (or
+     * vice versa), and it is not hub-gated — the write-back
+     * itself only writes where the system contact has no photo,
+     * so there is nothing to clobber on either mode.
+     */
+    private fun scheduleContactNameRefresh() {
+        contactNameRefreshJob?.cancel()
+        contactNameRefreshJob = appScope.launch {
+            delay(CONTACT_NAME_REFRESH_DEBOUNCE_MS)
+            runCatching {
+                if (settingsRepository.hydratedOrNull()?.mode != DeviceMode.CLIENT) {
+                    conversationMirrorLazy.get().refreshContactNames(clearMissing = true)
+                }
+            }.onFailure { Timber.w(it, "MainApplication: contact-name refresh failed") }
+            runCatching {
+                contactPhotoWriteBackLazy.get().writeBackPendingPhotos()
+            }.onFailure { Timber.w(it, "MainApplication: contact photo write-back failed") }
+        }
+    }
+
+    private companion object {
+        /**
+         * Contact-name live refresh — quiet period after the last
+         * provider notification before the stored names are
+         * re-resolved. Short enough to feel instant after one
+         * edit, long enough to coalesce the multi-row burst a
+         * single contact save produces.
+         */
+        const val CONTACT_NAME_REFRESH_DEBOUNCE_MS = 500L
     }
 }
 

@@ -272,6 +272,7 @@
     <string name="compose_add_to_group">Ajouter au groupe</string>
     <string name="compose_add_contact">Ajouter un contact</string>
     <string name="compose_select_contact">Sélectionner un contact</string>
+    <string name="compose_select_note">Sélectionner une note</string>
     <string name="compose_name_your_group">Nommez votre groupe</string>
     <string name="compose_group_name_placeholder">Nom du groupe</string>
     <string name="compose_group_members">Membres</string>
@@ -393,6 +394,11 @@
     <string name="appearance_pick_avatar">Choisir depuis la galerie</string>
     <string name="appearance_reset_avatar">Utiliser l\'avatar par défaut</string>
     <string name="appearance_saved">Apparence mise à jour</string>
+    <!-- Round 57 — contact-photo write-back: a photo picked for a 1:1 contact is also saved to the system contact, so it survives deleting the app. -->
+    <string name="contact_photo_saved">Photo enregistrée dans votre contact</string>
+    <string name="contact_photo_no_contact">Enregistrée dans Relay — aucun contact pour ce numéro pour l\'instant</string>
+    <string name="contact_photo_save_failed">Enregistrée dans Relay — la photo n\'a pas pu être enregistrée dans le contact</string>
+    <string name="contact_photo_needs_permission">Enregistrée dans Relay seulement — autorisez l\'accès aux contacts pour l\'enregistrer aussi dans le contact</string>
     <!-- v1.11.0 — Sujet 3 anti-smishing -->
     <string name="settings_smishing_detection">Détection d\'arnaque (hors-ligne)</string>
     <string name="settings_smishing_detection_desc">Signale les SMS entrants suspects (URL raccourcies, mots d\'urgence, numéros surtaxés, domaines usurpés). Couvre la France, l\'Allemagne, l\'Italie, l\'Espagne, le Royaume-Uni et l\'Irlande. 100 % local, aucun cloud. Peut produire des faux positifs.</string>
@@ -926,6 +932,8 @@
     <string name="notif_track_package_label">Suivre le colis</string>
     <string name="notif_code_copied">Code copié</string>
     <string name="notif_preview_hidden_content">Nouveau message</string>
+    <string name="e2e_activated_notif_body">%1$s utilise désormais Relay !</string>
+    <string name="e2e_activated_notif_body_anonymous">Un contact utilise désormais Relay !</string>
 
     <string name="pdf_header_subtitle">Exporté le %1$s • %2$d participant(s)</string>
     <string name="pdf_footer">Page %1$d — Relay</string>
@@ -938,6 +946,8 @@
     <string name="error_log_share">Partager</string>
     <string name="error_log_clear_all">Tout effacer</string>
     <string name="error_log_copied">Rapport copié</string>
+    <string name="error_log_copy_all">Tout copier</string>
+    <string name="error_log_copied_all">Tous les rapports copiés</string>
     <string name="error_log_cleared">Journal d\'erreurs effacé</string>
     <string name="error_log_clear_confirm_title">Effacer le journal d\'erreurs ?</string>
     <string name="error_log_clear_confirm_body">Tous les rapports de plantage enregistrés seront supprimés. Cette action est irréversible.</string>

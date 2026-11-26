@@ -27,8 +27,18 @@ class CrashReportStore(private val reportsDir: File) {
         /** Directory under `filesDir` holding the reports. */
         const val DIR_NAME: String = "crash-reports"
 
-        /** Reports kept; older ones are deleted on write (rotation). */
-        const val MAX_REPORTS: Int = 10
+        /**
+         * Reports kept; older ones are deleted on write (rotation).
+         *
+         * 50, not 10: a single handshake now produces ~6–10 error-log
+         * events (arrival, probe, bundle, capability, …), so a 10-cap
+         * rotation would evict the first half of one handshake while
+         * the second half was still being written — the log must hold
+         * at least one full handshake plus recent crash reports for
+         * the diagnosis to be readable. Reports are small text files
+         * (a few KB each), so 50 costs negligible storage.
+         */
+        const val MAX_REPORTS: Int = 50
     }
 
     /**

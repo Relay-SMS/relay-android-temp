@@ -9,10 +9,26 @@
 package com.relay.sms.domain.repository
 
 import com.relay.sms.domain.model.Contact
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flowOf
 import java.io.InputStream
 
 interface ContactRepository {
     suspend fun lookupByPhone(rawPhone: String): Contact?
+
+    /**
+     * Contact-name live refresh — the provider-change version
+     * ([com.relay.sms.data.contacts.ContactsReader.changes]):
+     * 0 at start, +1 on every cache invalidation (a provider
+     * change the `MainApplication` ContentObserver saw, or a
+     * photo write). The list and thread ViewModels collect it
+     * (dropping the initial value) and re-run the resolutions
+     * no Room row covers — list photos, group sender names —
+     * when it moves. Default `flowOf(0L)`: fakes and paths
+     * without a live provider never emit a change, so existing
+     * callers keep compiling untouched.
+     */
+    fun observeContactChanges(): Flow<Long> = flowOf(0L)
 
     /**
      * Round 44 — whether READ_CONTACTS is granted right now. The

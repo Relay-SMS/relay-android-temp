@@ -24,6 +24,7 @@ import com.relay.sms.data.voice.VoiceRecorder
 import com.relay.sms.domain.model.Conversation
 import com.relay.sms.domain.model.Message
 import com.relay.sms.domain.model.MessageWindowSpec
+import com.relay.sms.domain.repository.ContactPhotoWriteResult
 import com.relay.sms.domain.repository.ConversationRepository
 import com.relay.sms.domain.repository.SetReactionResult
 import com.relay.sms.domain.settings.AppSettings
@@ -44,6 +45,7 @@ import com.relay.sms.e2e.PlainReason
 import com.relay.sms.sync.client.ClientSendManagerEntryPoint
 import com.relay.sms.sync.client.ClientSyncEngineEntryPoint
 import com.relay.sms.system.notifications.ActiveConversationTracker
+import com.relay.sms.system.sync.ContactPhotoWriteBack
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.FlowPreview
@@ -59,6 +61,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
@@ -640,6 +643,15 @@ class ThreadViewModel @Inject constructor(
 
         /** Launch the system dialer pre-filled with the conversation's phone number. */
         data class OpenDialer(val rawNumber: String) : Event
+
+        /**
+         * A locally picked avatar needs WRITE_CONTACTS to also land
+         * on the system contact: the screen asks (accompanist) and
+         * reports back via [ThreadViewModel.retryPendingPhotoWriteBack]
+         * / [ThreadViewModel.onContactsWriteDenied]. The Relay-local
+         * avatar is already saved either way.
+         */
+        data object RequestContactsWritePhoto : Event
     }
 
     private val _state = MutableStateFlow(UiState())
@@ -670,6 +682,52 @@ class ThreadViewModel @Inject constructor(
     /** Re-resolves [UiState.contactPhotoUri] (call on resume / permission grant). */
     fun refreshContactPhoto() {
         contactPhotoTick.update { it + 1 }
+    }
+
+    /**
+     * Round 57 — contact-photo write-back: a 1:1 avatar picked here
+     * also lands on the system contact (same helper as the sync
+     * path and the pending-photos scan, [ContactPhotoWriteBack]),
+     * so it survives deleting the app. Built from the injected
+     * deps — the constructor is at Detekt's 20-parameter ceiling,
+     * like [recentReactionsStore] above.
+     */
+    private val photoWriteBack: ContactPhotoWriteBack by lazy {
+        ContactPhotoWriteBack(repo, contactRepo, context, io)
+    }
+
+    /** A photo write-back waiting on the WRITE_CONTACTS answer (raw address to avatar URI). */
+    private var pendingPhotoWriteBack: Pair<String, String>? = null
+
+    /**
+     * Contact-name live refresh — watches the provider-change
+     * version ([contactRepo.observeContactChanges]) while the
+     * thread is open. The header name itself needs no work here:
+     * the mirror refresh writes the Room row and `convFlow`
+     * re-emits it. What the row does NOT cover is the in-memory
+     * state: the header photo (re-resolved through
+     * [refreshContactPhoto], like a resume) and the cached group
+     * sender names ([UiState.memberNames]), which
+     * [resoudreNomsDesExpediteurs] only ever ADDED to — a renamed
+     * sender kept the old name on every bubble until a new message
+     * arrived. Clearing the map and re-resolving from the loaded
+     * window re-reads the current names with no new message and
+     * no reopen. The initial version is dropped — it is not a
+     * change — and the debounce coalesces the burst one edit
+     * produces.
+     */
+    @OptIn(FlowPreview::class)
+    private fun observeContactChanges() {
+        viewModelScope.launch {
+            contactRepo.observeContactChanges()
+                .drop(1)
+                .debounce(CONTACT_CHANGE_DEBOUNCE_MS)
+                .collect {
+                    refreshContactPhoto()
+                    _state.update { it.copy(memberNames = emptyMap()) }
+                    resoudreNomsDesExpediteurs(_state.value.messages)
+                }
+        }
     }
 
     /**
@@ -730,6 +788,10 @@ class ThreadViewModel @Inject constructor(
     }
 
     init {
+        // Contact-name live refresh — a provider change while the
+        // thread is open re-resolves the header photo and the
+        // cached group sender names (see [observeContactChanges]).
+        observeContactChanges()
         // v1.12.0 — propage `isPanicDecoy` dans le state pour gater
         // l'overflow item "Déplacer vers le coffre" côté UI.
         viewModelScope.launch {
@@ -1343,6 +1405,9 @@ class ThreadViewModel @Inject constructor(
                     smartActions = it.smartActions.copy(
                         mapsProvider = provider,
                         mapsProviderAsked = true,
+                        // Round 57 — the sync write marker, like the
+                        // Settings pick: a local choice stamps "now".
+                        mapsProviderUpdatedAt = System.currentTimeMillis(),
                     ),
                 )
             }
@@ -2268,9 +2333,77 @@ class ThreadViewModel @Inject constructor(
 
     fun setAppearance(bubbleColorArgb: Int?, avatarUri: String?) {
         viewModelScope.launch {
+            val previous = _state.value.conversation
             toggleConvState.setAppearance(conversationId, bubbleColorArgb, avatarUri)
+            // Round 57 — a NEW avatar on a 1:1 thread also lands on
+            // the system contact (so it survives deleting the app).
+            // The appearance dialog passes the avatar through
+            // untouched when only the colour changes, so an
+            // unchanged URI writes nothing back; groups have no
+            // single contact, and client mode defers the write to
+            // the V2 `set_contact_photo` frame.
+            val newAvatarUri = avatarUri?.takeIf { it != previous?.avatarUri }
+            val address = previous?.takeIf { !it.isGroup }?.firstAddress?.raw
+            if (newAvatarUri != null && address != null && !_state.value.isClientMode) {
+                writeBackAvatarPhoto(address, newAvatarUri)
+            } else {
+                _events.tryEmit(
+                    Event.ShowSnackbar(context.getString(com.relay.sms.R.string.appearance_saved)),
+                )
+            }
+        }
+    }
+
+    /**
+     * Round 57 — one local avatar's write-back, after the
+     * Relay-local save: the photo lands on the system contact
+     * ([ContactPhotoWriteResult.Ok]), or the Relay-local avatar
+     * stands and the snackbar says why (no contact for the
+     * number, the photo could not be saved). A missing
+     * WRITE_CONTACTS grant parks the write and asks the screen
+     * to request it — the grant retries, a denial keeps
+     * Relay-local and says so.
+     */
+    private suspend fun writeBackAvatarPhoto(address: String, avatarUri: String) {
+        when (photoWriteBack.writeBackPhoto(address, avatarUri)) {
+            ContactPhotoWriteResult.Ok -> {
+                refreshContactPhoto()
+                _events.tryEmit(
+                    Event.ShowSnackbar(context.getString(com.relay.sms.R.string.contact_photo_saved)),
+                )
+            }
+            ContactPhotoWriteResult.NotFound -> _events.tryEmit(
+                Event.ShowSnackbar(context.getString(com.relay.sms.R.string.contact_photo_no_contact)),
+            )
+            ContactPhotoWriteResult.NoPermission -> {
+                pendingPhotoWriteBack = address to avatarUri
+                _events.tryEmit(Event.RequestContactsWritePhoto)
+            }
+            ContactPhotoWriteResult.Failed -> _events.tryEmit(
+                Event.ShowSnackbar(
+                    message = context.getString(com.relay.sms.R.string.contact_photo_save_failed),
+                    isError = true,
+                ),
+            )
+        }
+    }
+
+    /** WRITE_CONTACTS was just granted: retry the photo write-back that waited on it. */
+    fun retryPendingPhotoWriteBack() {
+        val pending = pendingPhotoWriteBack ?: return
+        pendingPhotoWriteBack = null
+        viewModelScope.launch { writeBackAvatarPhoto(pending.first, pending.second) }
+    }
+
+    /** WRITE_CONTACTS was denied: the Relay-local avatar stands; say so, once. */
+    fun onContactsWriteDenied() {
+        if (pendingPhotoWriteBack == null) return
+        pendingPhotoWriteBack = null
+        viewModelScope.launch {
             _events.tryEmit(
-                Event.ShowSnackbar(context.getString(com.relay.sms.R.string.appearance_saved)),
+                Event.ShowSnackbar(
+                    context.getString(com.relay.sms.R.string.contact_photo_needs_permission),
+                ),
             )
         }
     }
@@ -2898,6 +3031,16 @@ class ThreadViewModel @Inject constructor(
          * pause in typing instead of one per keystroke.
          */
         const val THREAD_SEARCH_DEBOUNCE_MS: Long = 200L
+
+        /**
+         * Contact-name live refresh — quiet period after a
+         * provider change before the header photo and the cached
+         * group sender names re-resolve. The `MainApplication`
+         * observer already debounces the Room refresh; this only
+         * coalesces the in-memory re-resolution when several
+         * change notifications land together.
+         */
+        const val CONTACT_CHANGE_DEBOUNCE_MS: Long = 300L
 
         /**
          * Feedback round 6 — delay before marking the conversation read after

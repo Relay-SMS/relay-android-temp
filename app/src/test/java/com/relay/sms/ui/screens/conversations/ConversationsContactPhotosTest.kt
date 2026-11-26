@@ -27,6 +27,7 @@ import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
@@ -141,6 +142,30 @@ class ConversationsContactPhotosTest {
                 scope.advanceUntilIdle()
                 assertThat(contacts.lookupCalls).isEqualTo(2)
                 expectNoEvents()
+            }
+        }
+    }
+
+    @Test
+    fun `a provider change re-runs the photo lookup without a resume`() {
+        runTest(dispatcher) {
+            val scope = this
+            val contacts = FakeContacts(photoUri = null)
+            val conversations = MutableStateFlow(listOf(conversation()))
+            val vm = viewModel(contacts, conversations, backgroundScope)
+            vm.contactPhotos.test {
+                assertThat(awaitItem()).isEqualTo(emptyMap<Long, String>())
+                scope.advanceUntilIdle()
+                assertThat(contacts.lookupCalls).isEqualTo(1)
+
+                // The contact is created on the phone while the list
+                // is open (the provider now answers a photo URI where
+                // it answered none): the change signal — not a
+                // resume — re-runs the lookup, and the photo appears.
+                contacts.photoUri = PHOTO_URI
+                contacts.changes.value = 1L
+                scope.advanceUntilIdle()
+                assertThat(awaitItem()).isEqualTo(mapOf(CONVERSATION_ID to PHOTO_URI))
             }
         }
     }
@@ -340,6 +365,11 @@ class ConversationsContactPhotosTest {
         var photosByPhone: Map<String, String?>? = null,
     ) : ContactRepository {
         var lookupCalls = 0
+
+        /** Contact-name live refresh — the provider-change version the test bumps. */
+        val changes = MutableStateFlow(0L)
+
+        override fun observeContactChanges(): Flow<Long> = changes
 
         override suspend fun lookupByPhone(rawPhone: String): Contact? {
             lookupCalls++

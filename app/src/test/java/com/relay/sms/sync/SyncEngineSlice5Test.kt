@@ -54,6 +54,9 @@ class SyncEngineSlice5Test {
                 // after the snapshot (empty here: the fake mutes
                 // nothing).
                 "category_mutes",
+                // Round 57 — the maps-provider state rides right
+                // after the category mutes.
+                "maps_provider",
             ).inOrder()
 
             val started = sent.first { it.frameType() == "sync_started" }.asObject()
@@ -188,6 +191,9 @@ class SyncEngineSlice5Test {
                 // after the snapshot (a contacts failure never fails
                 // message sync, and it never fails this either).
                 "category_mutes",
+                // Round 57 — the maps-provider state rides right
+                // after the category mutes.
+                "maps_provider",
             ).inOrder()
             val started = sent.first { it.frameType() == "sync_started" }.asObject()
             assertThat(started.containsKey("total_contacts")).isFalse()

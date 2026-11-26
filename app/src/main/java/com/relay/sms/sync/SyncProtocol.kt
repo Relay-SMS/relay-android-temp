@@ -83,6 +83,14 @@ import kotlinx.serialization.serializer
  * `retry_e2e_probe`) in the same envelope; the answers reuse
  * `action_result` (with the address echoed, like
  * `set_contact_photo`). The protocol version stays 1.
+ *
+ * Round 57 adds the maps-provider sync types (`maps_provider`,
+ * `set_maps_provider`) in the same envelope — the first synced
+ * setting with a last-write-wins rule (SYNC_PROTOCOL.md, "Maps
+ * provider sync"): each side carries its value plus a write
+ * marker (`updated_at`), the phone wins on first sync and on a
+ * tie, and a stale write is refused with `action_result`
+ * `ok: false` code `stale`. The protocol version stays 1.
  */
 object SyncProtocol {
 
@@ -636,6 +644,16 @@ object SyncProtocol {
              * is total.
              */
             const val DISCOVERY_OFF = "discovery_off"
+
+            /**
+             * Round 57 — `set_maps_provider`: the write's marker
+             * is not newer than the phone's stored one, so the
+             * phone kept its own value. Not an error the user can
+             * act on — the desktop reverts silently to the last
+             * phone-confirmed value (the broadcast carries the
+             * newer value anyway), never with a dialog.
+             */
+            const val STALE = "stale"
         }
     }
 
@@ -1198,6 +1216,66 @@ object SyncProtocol {
         @SerialName("muted") val muted: Boolean,
     )
 
+    // -- Round 57: maps provider sync (SYNC_PROTOCOL.md, Maps provider sync) --
+
+    /**
+     * The maps-provider wire alphabet — the desktop's values, not
+     * the phone enum's names: the desktop already stores these
+     * (`parseMapsProvider`), so the wire reuses them instead of
+     * inventing a second spelling. Explicit, never
+     * `name.lowercase()`: the wire alphabet is fixed, and an
+     * unknown string is refused at apply time, never a crash.
+     */
+    object MapsProviderWire {
+        /** A plain `geo:` intent — Android resolves it. */
+        const val SYSTEM = "system"
+
+        /** The Google Maps app when installed, otherwise the web version. */
+        const val GOOGLE = "google"
+
+        /** Apple Maps on the web — there is no Apple Maps app for Android. */
+        const val APPLE = "apple"
+
+        /** An OpenStreetMap app when installed, otherwise openstreetmap.org. */
+        const val OSM = "osm"
+    }
+
+    /**
+     * Server → client: the phone's maps-provider choice plus its
+     * write marker. [provider] is a [MapsProviderWire] string;
+     * [updatedAt] is the epoch-millis marker of the last write of
+     * that value (0 = never written, still the default). Sent after
+     * every snapshot (right after `sync_complete`, next to
+     * `category_mutes`) and whenever the choice changes on the
+     * phone — the desktop applies it when the marker is newer than
+     * its own, or equal (the phone wins ties), and pushes its own
+     * newer value back when its marker is newer.
+     */
+    @Serializable
+    data class MapsProvider(
+        @SerialName("provider") val provider: String,
+        @SerialName("updated_at") val updatedAt: Long,
+    )
+
+    /**
+     * Client → server: set the maps provider on the phone.
+     * [provider] is a [MapsProviderWire] string; [updatedAt] is
+     * REQUIRED (like `set_muted`'s `value` — a missing marker is
+     * malformed, never an undated write). The phone applies it
+     * only when the marker is strictly newer than its stored one
+     * (ties stay with the phone) and answers with `action_result`;
+     * a stale marker answers `ok: false` code `stale`, an unknown
+     * provider `ok: false` code `invalid_request`. A successful
+     * apply goes through AppSettings, so every session's collector
+     * sees the change and broadcasts the updated value back via
+     * `maps_provider`.
+     */
+    @Serializable
+    data class SetMapsProvider(
+        @SerialName("provider") val provider: String,
+        @SerialName("updated_at") val updatedAt: Long,
+    )
+
     // -- Round 36 phase 2: notes sync (SYNC_PROTOCOL.md, Notes sync) --
 
     /** Server → client: one batch of the note snapshot (100 per batch). */
@@ -1515,7 +1593,18 @@ object SyncProtocol {
         data class SetPin(val value: SyncProtocol.SetPin) : Parsed
         data class SetArchived(val value: SyncProtocol.SetArchived) : Parsed
         data class SetMuted(val value: SyncProtocol.SetMuted) : Parsed
-        data class SetCategoryMuted(val value: SyncProtocol.SetCategoryMuted) : Parsed
+
+        /**
+         * Settings commands (round 57): grouped under one sealed
+         * sub-interface so the session handler dispatches them
+         * through a single arm (the main dispatch sits at the
+         * Detekt complexity cap (40)) — the same shape as the
+         * live-calls commands and the E2E commands. The
+         * `set_category_muted` frame predates the grouping.
+         */
+        sealed interface SettingsCommand : Parsed
+        data class SetCategoryMuted(val value: SyncProtocol.SetCategoryMuted) : SettingsCommand
+        data class SetMapsProvider(val value: SyncProtocol.SetMapsProvider) : SettingsCommand
         data class SetBlocked(val value: SyncProtocol.SetBlocked) : Parsed
         data class SetReaction(val value: SyncProtocol.SetReaction) : Parsed
         data class SetPinnedMessage(val value: SyncProtocol.SetPinnedMessage) : Parsed
@@ -1595,18 +1684,17 @@ object SyncProtocol {
      * The second half of [parse]: the Slice 3 write-back actions, the
      * Slice 4 attachment frames, the Phase 2 schedule frames, the
      * Slice 5 contact frames, the create-conversation frame, the
-     * round-3 contact-photo frame, the live-calls dial and end-call
-     * frames, and the category-mute frame. The note frames live in
-     * [parseNoteFrames] — one more `when` arm here would push this
-     * function over the Detekt complexity cap (40). A well-formed
-     * message of an unknown type comes back as [Parsed.Unknown],
-     * like in [parse].
+     * round-3 contact-photo frame, and the live-calls dial and end-call
+     * frames. The settings frames live in [parseSettingsFrames] and
+     * the note frames in [parseNoteFrames] — one more `when` arm here
+     * would push this function over the Detekt complexity cap (40).
+     * A well-formed message of an unknown type comes back as
+     * [Parsed.Unknown], like in [parse].
      */
     private fun parseRemaining(type: String, obj: JsonObject): Parsed = when (type) {
         "set_pin" -> decode<SetPin>(obj)?.let(Parsed::SetPin) ?: Parsed.Malformed
         "set_archived" -> decode<SetArchived>(obj)?.let(Parsed::SetArchived) ?: Parsed.Malformed
         "set_muted" -> decode<SetMuted>(obj)?.let(Parsed::SetMuted) ?: Parsed.Malformed
-        "set_category_muted" -> decode<SetCategoryMuted>(obj)?.let(Parsed::SetCategoryMuted) ?: Parsed.Malformed
         "set_blocked" -> decode<SetBlocked>(obj)?.let(Parsed::SetBlocked) ?: Parsed.Malformed
         "set_reaction" -> decode<SetReaction>(obj)?.let(Parsed::SetReaction) ?: Parsed.Malformed
         "set_pinned_message" -> decode<SetPinnedMessage>(obj)?.let(Parsed::SetPinnedMessage) ?: Parsed.Malformed
@@ -1621,6 +1709,18 @@ object SyncProtocol {
         "set_contact_photo" -> decode<SetContactPhoto>(obj)?.let(Parsed::SetContactPhoto) ?: Parsed.Malformed
         "dial_request" -> decode<DialRequest>(obj)?.let(Parsed::DialRequest) ?: Parsed.Malformed
         "end_call_request" -> decode<EndCallRequest>(obj)?.let(Parsed::EndCallRequest) ?: Parsed.Malformed
+        else -> parseSettingsFrames(type, obj)
+    }
+
+    /**
+     * The settings frames: the category-mute frame and the round-57
+     * maps-provider frame. Split out of [parseRemaining] the same
+     * way as the note frames — one more `when` arm there would push
+     * it over the Detekt complexity cap (40).
+     */
+    private fun parseSettingsFrames(type: String, obj: JsonObject): Parsed = when (type) {
+        "set_category_muted" -> decode<SetCategoryMuted>(obj)?.let(Parsed::SetCategoryMuted) ?: Parsed.Malformed
+        "set_maps_provider" -> decode<SetMapsProvider>(obj)?.let(Parsed::SetMapsProvider) ?: Parsed.Malformed
         else -> parseNoteFrames(type, obj)
     }
 
@@ -1690,6 +1790,9 @@ object SyncProtocol {
 
     fun encodeCategoryMutes(value: CategoryMutes): String =
         withType(value, "category_mutes").toString()
+
+    fun encodeMapsProvider(value: MapsProvider): String =
+        withType(value, "maps_provider").toString()
 
     fun encodeMessageSent(value: MessageSent): String = withType(value, "message_sent").toString()
 

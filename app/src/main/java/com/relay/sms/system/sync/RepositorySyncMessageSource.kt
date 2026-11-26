@@ -33,6 +33,7 @@ import com.relay.sms.domain.repository.SetReactionResult
 import com.relay.sms.domain.sender.DefaultSmsAppChecker
 import com.relay.sms.domain.settings.AppSettings
 import com.relay.sms.domain.settings.AppSettingsSource
+import com.relay.sms.domain.settings.MapsProvider
 import com.relay.sms.domain.usecase.BlockNumberUseCase
 import com.relay.sms.domain.usecase.DeleteScheduledMessageUseCase
 import com.relay.sms.domain.usecase.EnvoyerMessageUseCase
@@ -51,6 +52,7 @@ import com.relay.sms.sync.AvatarOpenResult
 import com.relay.sms.sync.CancelResult
 import com.relay.sms.sync.ContactReadiness
 import com.relay.sms.sync.CreateConversationResult
+import com.relay.sms.sync.MapsProviderState
 import com.relay.sms.sync.MessageState
 import com.relay.sms.sync.Readiness
 import com.relay.sms.sync.ScheduleResult
@@ -153,6 +155,15 @@ import com.relay.sms.domain.model.MessageState as DomainMessageState
  * lowercase wire strings — explicit `when` mappings, never
  * `name.lowercase()` (locale). An unknown wire category is
  * refused with `invalid_request`, never a crash.
+ *
+ * Round 57 adds [observeMapsProvider], [mapsProvider] and
+ * [setMapsProvider]: the phone's own AppSettings holds the maps
+ * choice + its write marker, the glue only maps the domain enum
+ * to the wire strings — explicit `when` mappings, same rule.
+ * Unlike the mutes, the apply is last-write-wins: a write whose
+ * marker is not strictly newer than the stored one is refused
+ * with `stale`, and a successful apply stamps the RECEIVED
+ * marker, never "now".
  *
  * E2E adds the `encrypted` / `decrypt_failed` wire flags (design
  * §9.1): messages carry their stored flags, and a 1:1 conversation
@@ -1289,6 +1300,75 @@ class RepositorySyncMessageSource @Inject constructor(
         "promotional" -> MessageCategory.PROMOTIONAL
         "transactions" -> MessageCategory.TRANSACTIONS
         "other" -> MessageCategory.OTHER
+        else -> null
+    }
+
+    // -- Round 57: maps provider sync ------------------------------
+
+    override fun observeMapsProvider(): Flow<MapsProviderState> =
+        settings.flow.map {
+            MapsProviderState(
+                provider = it.smartActions.mapsProvider.toWire(),
+                updatedAt = it.smartActions.mapsProviderUpdatedAt,
+            )
+        }
+
+    override suspend fun mapsProvider(): MapsProviderState? =
+        settings.hydratedOrNull()?.smartActions?.let {
+            MapsProviderState(
+                provider = it.mapsProvider.toWire(),
+                updatedAt = it.mapsProviderUpdatedAt,
+            )
+        }
+
+    override suspend fun setMapsProvider(provider: String, updatedAt: Long): ActionResult {
+        val parsed = provider.toMapsProvider()
+            ?: return ActionResult(
+                ok = false,
+                code = SyncProtocol.MessageFailed.INVALID_REQUEST,
+                message = "Unknown maps provider.",
+            )
+        // Strictly newer wins; a tie stays with the phone — the
+        // desktop reverts to the last phone-confirmed value. An
+        // unhydrated read has no marker (0), so any real write
+        // applies.
+        val currentMarker = settings.hydratedOrNull()?.smartActions?.mapsProviderUpdatedAt ?: 0L
+        if (updatedAt <= currentMarker) {
+            return ActionResult(
+                ok = false,
+                code = SyncProtocol.MessageFailed.STALE,
+                message = "Your phone already has a newer maps choice.",
+            )
+        }
+        settings.update { current ->
+            current.copy(
+                smartActions = current.smartActions.copy(
+                    mapsProvider = parsed,
+                    // The RECEIVED marker, never "now": the marker
+                    // is what last-write-wins compares across
+                    // devices, and the broadcast carries it back to
+                    // the writer.
+                    mapsProviderUpdatedAt = updatedAt,
+                ),
+            )
+        }
+        return ActionResult(ok = true)
+    }
+
+    /** The provider as a wire string (the `maps_provider` alphabet). */
+    private fun MapsProvider.toWire(): String = when (this) {
+        MapsProvider.SYSTEM_DEFAULT -> SyncProtocol.MapsProviderWire.SYSTEM
+        MapsProvider.GOOGLE_MAPS -> SyncProtocol.MapsProviderWire.GOOGLE
+        MapsProvider.APPLE_MAPS -> SyncProtocol.MapsProviderWire.APPLE
+        MapsProvider.OPENSTREETMAP -> SyncProtocol.MapsProviderWire.OSM
+    }
+
+    /** Parses a wire provider; unknown strings are null (refused, never a crash). */
+    private fun String.toMapsProvider(): MapsProvider? = when (this) {
+        SyncProtocol.MapsProviderWire.SYSTEM -> MapsProvider.SYSTEM_DEFAULT
+        SyncProtocol.MapsProviderWire.GOOGLE -> MapsProvider.GOOGLE_MAPS
+        SyncProtocol.MapsProviderWire.APPLE -> MapsProvider.APPLE_MAPS
+        SyncProtocol.MapsProviderWire.OSM -> MapsProvider.OPENSTREETMAP
         else -> null
     }
 

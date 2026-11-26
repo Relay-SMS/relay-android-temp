@@ -277,6 +277,7 @@
     <string name="compose_add_to_group">Add to the group</string>
     <string name="compose_add_contact">Add contact</string>
     <string name="compose_select_contact">Select contact</string>
+    <string name="compose_select_note">Select note</string>
     <string name="compose_name_your_group">Name your group</string>
     <string name="compose_group_name_placeholder">Group name</string>
     <string name="compose_group_members">Members</string>
@@ -400,6 +401,11 @@
     <string name="appearance_pick_avatar">Choose from gallery</string>
     <string name="appearance_reset_avatar">Use default avatar</string>
     <string name="appearance_saved">Appearance updated</string>
+    <!-- Round 57 — contact-photo write-back: a photo picked for a 1:1 contact is also saved to the system contact, so it survives deleting the app. -->
+    <string name="contact_photo_saved">Photo saved to your contact</string>
+    <string name="contact_photo_no_contact">Saved in Relay — there\'s no contact for this number yet</string>
+    <string name="contact_photo_save_failed">Saved in Relay — the photo couldn\'t be saved to the contact</string>
+    <string name="contact_photo_needs_permission">Saved in Relay only — allow contact access to also save it to the contact</string>
     <!-- v1.11.0 — Sujet 3 anti-smishing -->
     <string name="settings_smishing_detection">Scam detection (offline)</string>
     <string name="settings_smishing_detection_desc">Flags suspicious incoming SMS (shortened URLs, urgency wording, premium-rate numbers, lookalike domains). It covers France, Germany, Italy, Spain, the United Kingdom and Ireland. 100% local, no cloud. May produce false positives.</string>
@@ -935,6 +941,8 @@
     <string name="notif_track_package_label">Track package</string>
     <string name="notif_code_copied">Code copied</string>
     <string name="notif_preview_hidden_content">New message</string>
+    <string name="e2e_activated_notif_body">%1$s is on Relay!</string>
+    <string name="e2e_activated_notif_body_anonymous">A contact is on Relay!</string>
 
     <!-- PDF export -->
     <string name="pdf_header_subtitle">Exported %1$s • %2$d participant(s)</string>
@@ -949,6 +957,8 @@
     <string name="error_log_share">Share</string>
     <string name="error_log_clear_all">Clear all</string>
     <string name="error_log_copied">Report copied</string>
+    <string name="error_log_copy_all">Copy all</string>
+    <string name="error_log_copied_all">All reports copied</string>
     <string name="error_log_cleared">Error log cleared</string>
     <string name="error_log_clear_confirm_title">Clear the error log?</string>
     <string name="error_log_clear_confirm_body">All saved crash reports will be deleted. This cannot be undone.</string>

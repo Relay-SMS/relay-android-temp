@@ -164,6 +164,100 @@ class E2eHandshakeTest {
         assertThat(E2eHandshake.decode("hello".toByteArray())).isNull()
     }
 
+    // ──────────────────── decodeWithReason ────────────────────
+    // The reason-carrying decode: same verdicts as decode(), plus
+    // the failure kind, so the handler can log WHY a packet was
+    // dropped instead of dropping it silently.
+
+    @Test
+    fun `decodeWithReason returns the packet for a valid probe and bundle`() {
+        val probe = E2eHandshake.decodeWithReason(E2eHandshake.encodeProbe(curveKey, edKey))
+        assertThat(probe).isInstanceOf(E2eHandshake.DecodeResult.Packet::class.java)
+        val decodedProbe = (probe as E2eHandshake.DecodeResult.Packet).packet
+        assertThat(decodedProbe).isInstanceOf(HandshakePacket.Probe::class.java)
+        val bundle = E2eHandshake.decodeWithReason(
+            E2eHandshake.encodeBundle(curveKey, edKey, oneTimeKey),
+        )
+        assertThat(bundle).isInstanceOf(E2eHandshake.DecodeResult.Packet::class.java)
+        assertThat((bundle as E2eHandshake.DecodeResult.Packet).packet)
+            .isInstanceOf(HandshakePacket.Bundle::class.java)
+    }
+
+    @Test
+    fun `decodeWithReason names too-short input`() {
+        assertThat(E2eHandshake.decodeWithReason(byteArrayOf()))
+            .isEqualTo(
+                E2eHandshake.DecodeResult.Failure(
+                    E2eHandshake.DecodeFailureReason.TOO_SHORT,
+                ),
+            )
+        assertThat(E2eHandshake.decodeWithReason(byteArrayOf(0x52, 0x4C, 0x59, 0x48, 0x01)))
+            .isEqualTo(
+                E2eHandshake.DecodeResult.Failure(
+                    E2eHandshake.DecodeFailureReason.TOO_SHORT,
+                ),
+            )
+    }
+
+    @Test
+    fun `decodeWithReason names bad magic`() {
+        val bytes = E2eHandshake.encodeProbe(curveKey, edKey)
+        bytes[0] = 'X'.code.toByte()
+
+        assertThat(E2eHandshake.decodeWithReason(bytes))
+            .isEqualTo(
+                E2eHandshake.DecodeResult.Failure(
+                    E2eHandshake.DecodeFailureReason.BAD_MAGIC,
+                ),
+            )
+    }
+
+    @Test
+    fun `decodeWithReason names a bad version`() {
+        val bytes = E2eHandshake.encodeProbe(curveKey, edKey)
+        bytes[4] = 0x02
+
+        assertThat(E2eHandshake.decodeWithReason(bytes))
+            .isEqualTo(
+                E2eHandshake.DecodeResult.Failure(
+                    E2eHandshake.DecodeFailureReason.BAD_VERSION,
+                ),
+            )
+    }
+
+    @Test
+    fun `decodeWithReason names an unknown type`() {
+        val bytes = E2eHandshake.encodeProbe(curveKey, edKey)
+        bytes[5] = 0x04
+
+        assertThat(E2eHandshake.decodeWithReason(bytes))
+            .isEqualTo(
+                E2eHandshake.DecodeResult.Failure(
+                    E2eHandshake.DecodeFailureReason.UNKNOWN_TYPE,
+                ),
+            )
+    }
+
+    @Test
+    fun `decodeWithReason names a wrong length for a known type`() {
+        val shortProbe = E2eHandshake.encodeProbe(curveKey, edKey).copyOfRange(0, 69)
+        assertThat(E2eHandshake.decodeWithReason(shortProbe))
+            .isEqualTo(
+                E2eHandshake.DecodeResult.Failure(
+                    E2eHandshake.DecodeFailureReason.WRONG_LENGTH,
+                ),
+            )
+        // A probe-length packet with the bundle type is neither packet.
+        val mistyped = E2eHandshake.encodeProbe(curveKey, edKey)
+        mistyped[5] = 0x02
+        assertThat(E2eHandshake.decodeWithReason(mistyped))
+            .isEqualTo(
+                E2eHandshake.DecodeResult.Failure(
+                    E2eHandshake.DecodeFailureReason.WRONG_LENGTH,
+                ),
+            )
+    }
+
     @Test
     fun `encode rejects keys that are not 32 bytes`() {
         val short = ByteArray(31)

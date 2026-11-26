@@ -98,7 +98,7 @@ Slice 2 — no bytes cross the channel yet.
 | Server → client | `e2e_safety_numbers` | `{"type":"e2e_safety_numbers","peers":[{"address":"+33612345678","state":"encrypted","safety_number":"12345 67890 …","verified":false}]}` |
 | Server → client | `e2e_notices` | `{"type":"e2e_notices","notices":[{"id":"12","conversation_id":"123","kind":"activated","date":1793000000000},{"id":"13","conversation_id":"124","kind":"group_key_changed","subject":"+33612345678","date":1793000001000}]}` |
 | Client → server | `set_e2e_verified` | `{"type":"set_e2e_verified","address":"+33612345678","verified":true}` |
-| Client → server | `retry_e2e_probe` | `{"type":"retry_e2e_probe","address":"+33612345678"}` |
+| Client → server | `retry_e2e_probe` | `{"type":"retry_e2e_probe","address":"+33612345678","method":"standard"}` |
 | Server → client | `message_new` | `{"type":"message_new","message":MESSAGE}` |
 | Server → client | `message_updated` | `{"type":"message_updated","message_id":"789","conversation_id":"123","status":"delivered","reaction":"❤️"}` |
 | Server → client | `conversation_updated` | `{"type":"conversation_updated","conversation":CONVERSATION}` |
@@ -944,6 +944,101 @@ Android clients ignore `category_mutes` for now (an unknown
 server frame is dropped, never an error) — applying the hub's
 set on a linked tablet is a later round.
 
+## Maps provider sync (round 57, protocol version 1)
+
+The maps-provider choice — which maps app opens for an address —
+syncs between the phone and every linked device, in both
+directions. It is the first synced setting with a
+last-write-wins rule (category mutes are phone-wins-always, so
+they carry no marker). Same JSON envelope, same `type` field,
+same rules. No protocol bump: every addition is additive, and a
+round-56 desktop talking to a round-57 phone receives
+`maps_provider` frames it does not know and ignores them; a
+round-57 desktop talking to a round-56 phone never receives the
+frame and keeps its local choice (mixed-version behavior,
+documented, not an error state).
+
+| Direction | Message | Shape |
+|---|---|---|
+| Server → client | `maps_provider` | `{"type":"maps_provider","provider":"google","updated_at":1795000000000}` |
+| Client → server | `set_maps_provider` | `{"type":"set_maps_provider","provider":"google","updated_at":1795000000000}` |
+
+`provider` is one of `"system"` (a plain `geo:` intent),
+`"google"`, `"apple"`, `"osm"` — the desktop's values, which the
+phone maps to its `MapsProvider` enum (`SYSTEM_DEFAULT`,
+`GOOGLE_MAPS`, `APPLE_MAPS`, `OPENSTREETMAP`); an unknown string
+is refused with `action_result` `ok: false`
+`invalid_request`, never a crash. `updated_at` is the write
+marker: epoch millis of the last write of that value (0 = never
+written, still the default). The marker is carried on BOTH
+frames, and it is the whole conflict rule:
+
+- **First sync: the phone wins.** The desktop has no marker yet
+  (0), so any phone marker — including 0, the never-written
+  default — wins, and the desktop adopts the phone's value. The
+  phone is the hub and the source of truth for the first sync.
+- **After that: the newer write wins.** A side applies an
+  incoming value only when its marker is newer than its own
+  stored one. The phone applies a `set_maps_provider` only when
+  the marker is STRICTLY newer — a tie stays with the phone —
+  and answers a stale marker with `action_result` `ok: false`
+  code `stale` (the desktop reverts silently to the last
+  phone-confirmed value; a stale write is a normal race outcome
+  of last-write-wins, not an error the user can act on, so it
+  never shows a dialog). The desktop applies a `maps_provider`
+  when the marker is newer OR equal — equal means the phone's
+  value, since the phone wins ties — and ignores an older one.
+- **A successful apply stamps the RECEIVED marker, never
+  "now".** The phone stores the marker the frame carried, and
+  the desktop stores the marker the frame carried; the marker is
+  what the two sides compare, so re-stamping it would break the
+  comparison (a phone re-stamp behind the desktop's clock would
+  make the desktop re-push the same value forever). A local
+  pick on either side stamps `now` at write time.
+- **No value is ever clobbered by a stale one.** The phone
+  never sends a default on an unreadable settings read (the
+  `maps_provider` frame is skipped for that sync, like
+  `category_mutes` on a null read), and the desktop never
+  adopts an older marker — so a snapshot taken before a
+  phone-side change, or a write that lost the race, cannot
+  overwrite the newer choice.
+
+The phone sends `maps_provider` after every snapshot —
+immediately after `sync_complete`, next to `category_mutes` —
+and whenever the choice changes on the phone (a pick in
+Settings, or through the first-map-tap sheet, or a
+`set_maps_provider` from any linked device: the apply goes
+through AppSettings, so every session's collector sees the
+change and broadcasts the updated value back — the desktop's
+confirmation is the broadcast, not the ack). A desktop write
+that never reaches the phone (offline at pick time) stays
+pending locally: the next `maps_provider` frame — which
+arrives after every sync — resolves it by the markers (newer
+local marker → the desktop pushes its value; newer phone
+marker → the desktop adopts the phone's). There is no queue
+and no offline refusal for this setting: the pick stays
+applied locally and converges on the next connect.
+
+Clock skew: the markers are wall-clock millis from two
+different devices, so a write stamped inside the skew window
+can lose to an older write from the faster clock. Devices
+sync their clocks (NTP), so the window is seconds in
+practice, and the next write on either side converges the
+value — acceptable for a maps preference, which has no
+charged side effects. Ties are broken deterministically
+(phone wins), so the two sides can never diverge
+permanently: equal markers with different values resolve to
+the phone's value on both sides.
+
+`set_maps_provider` before auth is a protocol violation, like
+any other post-auth frame. `updated_at` is REQUIRED on the
+write frame (like `set_muted`'s `value`): a missing marker is
+malformed, never an undated write.
+
+Android clients ignore `maps_provider` for now (an unknown
+server frame is dropped, never an error) — applying the hub's
+choice on a linked tablet is a later round.
+
 ## E2E safety numbers + notices (round 42, protocol version 1)
 
 The phone syncs its end-to-end encryption state — the safety
@@ -961,7 +1056,7 @@ addition is additive.
 | Server → client | `e2e_safety_numbers` | `{"type":"e2e_safety_numbers","peers":[{"address":"+33612345678","state":"encrypted","safety_number":"12345 67890 …","verified":false}]}` |
 | Server → client | `e2e_notices` | `{"type":"e2e_notices","notices":[{"id":"12","conversation_id":"123","kind":"activated","date":1793000000000},{"id":"13","conversation_id":"124","kind":"group_key_changed","subject":"+33612345678","date":1793000001000}]}` |
 | Client → server | `set_e2e_verified` | `{"type":"set_e2e_verified","address":"+33612345678","verified":true}` |
-| Client → server | `retry_e2e_probe` | `{"type":"retry_e2e_probe","address":"+33612345678"}` |
+| Client → server | `retry_e2e_probe` | `{"type":"retry_e2e_probe","address":"+33612345678","method":"standard"}` |
 
 `e2e_safety_numbers` carries the FULL set of E2E peers — every
 address with a peer row — as `peers` entries: `address` (the
@@ -1024,11 +1119,28 @@ device link.
 `retry_e2e_probe` runs the manual probe for one peer — the same
 one-probe-now path as the phone's Details panel "Retry
 encryption" (the budget and discovery-toggle gates are lifted;
-the address, blocked, and ENCRYPTED gates still apply). The
-phone answers with `action_result` (`action:
-"retry_e2e_probe"`, the `address` echoed): `ok: false`
-`unknown_conversation` when no 1:1 conversation exists for the
-address, `send_failed` when the probe could not go out. A
+the address, blocked, and ENCRYPTED gates still apply).
+`method` picks the transport (desktop encryption-box update):
+`"standard"` sends the probe as a data SMS (the phone's "Retry
+encryption"), `"alternate"` as one `RLYH:` text (the phone's
+"Retry another way"); absent means `"standard"` (old desktops
+send no method), and an unknown value is treated as
+`"standard"` too. The phone answers with `action_result`
+(`action: "retry_e2e_probe"`, the `address` echoed): `ok: true`
+when the probe went out, `ok: false` with a code per refusal —
+`unknown_conversation` (no 1:1 conversation for the address),
+`not_one_to_one`, `invalid_address`, `blocked`,
+`already_encrypted`, `send_failed` (the probe could not go
+out). `rate_limited` / `discovery_off` exist in the code set
+but are unreachable from a manual retry: the budget and the
+discovery toggle are lifted there, so a manual retry can never
+be REFUSED for budget reasons — but it still CONSUMES budget,
+and a successful answer carries `budget_exhausted: true` when
+the probe spent the last slot: automatic checks for that
+contact are then paused until the window elapses, and the user
+should hear about the reset (Settings → Advanced → "Reset
+encryption timing"). The `message` is user-facing — the
+desktop shows it verbatim in its dialog. A
 `set_e2e_verified` / `retry_e2e_probe` before auth is a protocol
 violation, like any other post-auth frame.
 
@@ -1282,7 +1394,8 @@ contact sync (names + avatars, snapshot + live delta), and create
 conversation adds starting a conversation from the desktop, and round 3
 adds setting a contact's photo from the desktop, and live calls add
 call signaling (incoming-call + call-state frames) and dialing from
-the desktop, all in the same envelope; the protocol version stays 1
+the desktop, and round 57 adds the maps-provider sync (last-write-wins,
+first sync phone-wins), all in the same envelope; the protocol version stays 1
 until a breaking change needs it. Still out of scope: deleting from
 the desktop.
 

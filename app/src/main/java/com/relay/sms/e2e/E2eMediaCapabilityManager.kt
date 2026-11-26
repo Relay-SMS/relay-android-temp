@@ -82,12 +82,29 @@ import javax.inject.Singleton
  * All methods never throw: a diagnostics-grade failure (a dead
  * database, a failing sender) returns `false` instead of breaking
  * the handshake or the thread-open path that called it.
+ *
+ * Round 57 — declaration traffic is visible in the error log
+ * ([E2eFailureRecorder.recordEvent]): a send under
+ * `e2e-capability-sent` (with the channel and the address), a
+ * blocked-peer refusal under `e2e-capability-blocked` (with the
+ * address), and a radio refusal on every attempted channel under
+ * `e2e-capability-send-failed` (with the address). A received
+ * declaration is recorded ONCE, by [E2eHandshakeHandler] under
+ * `e2e-capability-received` (with the address and the flags) —
+ * this manager does not record receipt itself, so one incoming
+ * packet leaves one entry. The sender also records each accepted
+ * send (`e2e-sms-accepted`) and each synchronous refusal (under
+ * the kind's failure tag), so a declaration leaves two traces at
+ * different layers. The already-announced / not-ENCRYPTED no-ops
+ * record nothing: every thread-open on an announced peer would
+ * otherwise spam the 10-report rotation.
  */
 @Singleton
 class E2eMediaCapabilityManager @Inject constructor(
     private val peers: E2ePeerRepository,
     private val dataSmsSender: E2eDataSmsSender,
     private val blockedRepo: BlockedNumberRepository,
+    private val recorder: E2eFailureRecorder,
 ) {
 
     /**
@@ -178,6 +195,10 @@ class E2eMediaCapabilityManager @Inject constructor(
                 "E2E: peer declared capabilities (media=$mediaCapable, groups=$groupCapable, " +
                     "groupMedia=$groupMediaCapable)",
             )
+            // No receipt event here: [E2eHandshakeHandler] already
+            // recorded this packet under `e2e-capability-received`
+            // (with the address and the flags) before calling us —
+            // one incoming packet, one entry.
             val announced = peers.isMediaAnnounced(address) && peers.isGroupAnnounced(address) &&
                 peers.groupMediaCapability(address).announced
             if (peers.state(address) == E2ePeerState.ENCRYPTED && !announced) {
@@ -195,29 +216,67 @@ class E2eMediaCapabilityManager @Inject constructor(
      * peers get nothing.
      */
     private suspend fun announce(address: String, subId: Int?, now: Long): Boolean {
-        if (runCatching { blockedRepo.isBlocked(address) }.getOrDefault(false)) return false
+        if (runCatching { blockedRepo.isBlocked(address) }.getOrDefault(false)) {
+            recorder.recordEvent(
+                CAPABILITY_BLOCKED_TAG,
+                "Capability declaration refused for $address: number is blocked.",
+            )
+            return false
+        }
         val packet = E2eHandshake.encodeCapabilityDeclaration()
+        // Which channels accepted the declaration, for the log
+        // line: the no-proven-channel branch attempts BOTH, so
+        // both names can appear even when only one was accepted.
+        val acceptedChannels = mutableListOf<String>()
         val sent = when (peers.handshakeChannel(address)) {
-            HandshakeChannel.DATA_SMS -> sendData(address, subId, packet)
-            HandshakeChannel.TEXT_SMS -> sendText(address, subId, packet)
+            HandshakeChannel.DATA_SMS -> sendData(address, subId, packet).also {
+                if (it) acceptedChannels += HandshakeChannel.DATA_SMS.name
+            }
+            HandshakeChannel.TEXT_SMS -> sendText(address, subId, packet).also {
+                if (it) acceptedChannels += HandshakeChannel.TEXT_SMS.name
+            }
             // No proven channel (a pre-round-48 handshake): both
             // channels, unconditionally — a data send the radio
             // accepts may still be dropped downstream, so the
             // text send is not skipped when the data send is
             // accepted. Announced when either is accepted.
-            // `or`, not `||`: the infix form evaluates BOTH
-            // sides — short-circuiting here would drop the text
-            // send exactly when the data send was accepted, which
-            // is the case the both-channels rule exists for.
-            null -> sendData(address, subId, packet) or sendText(address, subId, packet)
+            null -> {
+                val dataSent = sendData(address, subId, packet)
+                val textSent = sendText(address, subId, packet)
+                if (dataSent) acceptedChannels += HandshakeChannel.DATA_SMS.name
+                if (textSent) acceptedChannels += HandshakeChannel.TEXT_SMS.name
+                dataSent || textSent
+            }
         }
         if (sent) {
             peers.setMediaAnnounced(address, true, now)
             peers.setGroupAnnounced(address, true, now)
             peers.setGroupMediaCapability(address, announced = true, now = now)
             Timber.i("E2E: capability declaration sent")
+            recorder.recordEvent(
+                CAPABILITY_SENT_TAG,
+                "Capability declaration sent to $address " +
+                    "(channel=${acceptedChannels.joinToString("+")}).",
+            )
+        } else {
+            recorder.recordEvent(
+                CAPABILITY_SEND_FAILED_TAG,
+                "Capability declaration refused by radio for $address " +
+                    "on every attempted channel.",
+            )
         }
         return sent
+    }
+
+    private companion object {
+        /** Error-log tag for a sent capability declaration. */
+        const val CAPABILITY_SENT_TAG = "e2e-capability-sent"
+
+        /** Error-log tag for a blocked-peer declaration refusal. */
+        const val CAPABILITY_BLOCKED_TAG = "e2e-capability-blocked"
+
+        /** Error-log tag for a radio-refused declaration (all channels). */
+        const val CAPABILITY_SEND_FAILED_TAG = "e2e-capability-send-failed"
     }
 
     private fun sendData(address: String, subId: Int?, packet: ByteArray): Boolean =

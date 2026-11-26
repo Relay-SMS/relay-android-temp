@@ -27,6 +27,9 @@ internal class FakeSyncMessageSource : SyncMessageSource {
 
     /** Live muted-category set (wire strings); the engine collects this. */
     val mutedCategoriesFlow = MutableSharedFlow<Set<String>>(replay = 1)
+
+    /** Live maps-provider state (wire provider + marker); the engine collects this. */
+    val mapsProviderFlow = MutableSharedFlow<MapsProviderState>(replay = 1)
     val messagesByConversation = mutableMapOf<Long, MutableList<SyncedMessage>>()
     val statesFlow = MutableStateFlow<Map<Long, MessageState>>(emptyMap())
     var maxId: Long = 0L
@@ -37,6 +40,7 @@ internal class FakeSyncMessageSource : SyncMessageSource {
     init {
         conversationsFlow.tryEmit(emptyList())
         mutedCategoriesFlow.tryEmit(emptySet())
+        mapsProviderFlow.tryEmit(MapsProviderState(provider = "system", updatedAt = 0L))
     }
 
     override suspend fun conversations(): List<SyncedConversation> {
@@ -349,6 +353,37 @@ internal class FakeSyncMessageSource : SyncMessageSource {
         return categoryMuteResult
     }
 
+    // -- Round 57: maps provider sync --------------------------------
+    // Same shape as the category-mute surface: the flow is the live
+    // settings feed (a SharedFlow, so a test can re-emit an EQUAL
+    // state and prove the engine dedupes it), the one-shot is
+    // independently configurable (null = unreadable settings), and
+    // a successful apply updates the flow — mirroring the real glue,
+    // including its last-write-wins rule, so an engine test can
+    // watch the broadcast a `set_maps_provider` triggers.
+
+    /** What [mapsProvider] answers; null simulates unreadable settings. */
+    var mapsProviderSnapshot: MapsProviderState? = MapsProviderState(provider = "system", updatedAt = 0L)
+
+    override fun observeMapsProvider(): Flow<MapsProviderState> = mapsProviderFlow
+
+    override suspend fun mapsProvider(): MapsProviderState? = mapsProviderSnapshot
+
+    val mapsProviderSets = mutableListOf<MapsProviderSetCall>()
+    var mapsProviderResult: ActionResult = ActionResult(ok = true)
+
+    override suspend fun setMapsProvider(provider: String, updatedAt: Long): ActionResult {
+        mapsProviderSets += MapsProviderSetCall(provider, updatedAt)
+        if (mapsProviderResult.ok) {
+            val current = mapsProviderFlow.replayCache.firstOrNull()
+                ?: MapsProviderState(provider = "system", updatedAt = 0L)
+            if (updatedAt > current.updatedAt) {
+                mapsProviderFlow.tryEmit(MapsProviderState(provider, updatedAt))
+            }
+        }
+        return mapsProviderResult
+    }
+
     /** Adds [message] to its conversation's store and advances the max id. */
     fun store(message: SyncedMessage) {
         val list = messagesByConversation.getOrPut(message.conversationId.toLong()) { mutableListOf() }
@@ -434,6 +469,12 @@ internal data class UploadChunkCall(
 internal data class CategoryMuteCall(
     val category: String,
     val muted: Boolean,
+)
+
+/** One recorded `setMapsProvider` call on the fake. */
+internal data class MapsProviderSetCall(
+    val provider: String,
+    val updatedAt: Long,
 )
 
 /** One recorded action call on the fake. */

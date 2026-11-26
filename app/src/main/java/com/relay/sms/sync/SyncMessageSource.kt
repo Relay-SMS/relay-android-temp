@@ -58,6 +58,15 @@ import java.io.InputStream
  * to the lowercase wire strings — the sync package never sees the
  * enum itself.
  *
+ * Round 57 adds the maps-provider surface below
+ * ([observeMapsProvider], [mapsProvider], [setMapsProvider]),
+ * same argument: the phone's own AppSettings holds the choice +
+ * its write marker, the glue only maps the domain enum to the
+ * wire strings ([SyncProtocol.MapsProviderWire]) — the sync
+ * package never sees the enum itself. Unlike the mutes, this is
+ * NOT phone-wins-always: each side carries a write marker and
+ * the newer write wins (ties stay with the phone).
+ *
  * The function count is the one-seam decision, not bloat: splitting
  * this interface would mean a second implementation, a second Hilt
  * binding, and a second seam to re-implement on a port, for no
@@ -364,7 +373,61 @@ interface SyncMessageSource {
      * broadcasts the updated set back via `category_mutes`.
      */
     suspend fun setCategoryMuted(category: String, muted: Boolean): ActionResult
+
+    // -- Round 57: maps provider sync --------------------------------
+
+    /**
+     * Live maps-provider state — the `maps_provider` payload.
+     * [provider] is a [SyncProtocol.MapsProviderWire] string;
+     * [updatedAt] is the epoch-millis marker of the last write of
+     * that value (0 = never written). Re-emitted whenever the
+     * smart-actions settings change (and on unrelated settings
+     * writes — the engine dedupes).
+     */
+    fun observeMapsProvider(): Flow<MapsProviderState>
+
+    /**
+     * One-shot snapshot of the maps-provider state — or null when
+     * the settings can't be read (the engine then skips the
+     * `maps_provider` frame after the snapshot; the collector
+     * sends the state on the next change instead). Never a default
+     * on failure: a default would wrongly overwrite the desktop's
+     * newer choice.
+     */
+    suspend fun mapsProvider(): MapsProviderState?
+
+    /**
+     * Sets the maps provider from the desktop ([provider] is a
+     * [SyncProtocol.MapsProviderWire] string, [updatedAt] the
+     * write marker the frame carried). Applies ONLY when the
+     * marker is strictly newer than the phone's stored one — a
+     * stale marker answers `ok: false` with code `stale` and the
+     * phone keeps its own value; an unknown provider answers
+     * `ok: false` with `invalid_request`. A successful apply goes
+     * through AppSettings and stamps the RECEIVED marker (never
+     * "now"), so every session's collector sees the change and
+     * broadcasts the updated value back via `maps_provider`.
+     */
+    suspend fun setMapsProvider(provider: String, updatedAt: Long): ActionResult
 }
+
+/**
+ * Round 57 — one side's maps-provider choice plus its write
+ * marker: the `maps_provider` payload, and the state
+ * [SyncMessageSource.observeMapsProvider] /
+ * [SyncMessageSource.mapsProvider] carry. [provider] is a
+ * [SyncProtocol.MapsProviderWire] string; [updatedAt] is the
+ * epoch-millis marker of the last write of that value (0 = never
+ * written, still the default). A data class (not two values) so
+ * the engine's `distinctUntilChanged` dedupes on the pair: a
+ * provider change without a marker change — impossible through
+ * the writers, which always stamp both — would otherwise
+ * re-broadcast.
+ */
+data class MapsProviderState(
+    val provider: String,
+    val updatedAt: Long,
+)
 
 /**
  * Slice 3 — what a send did: the `message_sent` / `message_failed`

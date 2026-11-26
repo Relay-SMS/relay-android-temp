@@ -82,7 +82,9 @@ fun ErrorLogScreen(
     val scope = rememberCoroutineScope()
     var showClearConfirm by remember { mutableStateOf(false) }
     val copiedText = stringResource(R.string.error_log_copied)
+    val copiedAllText = stringResource(R.string.error_log_copied_all)
     val clearedText = stringResource(R.string.error_log_cleared)
+    val unexpectedStopTitle = stringResource(R.string.error_log_unexpected_stop)
 
     // A report may have landed while the process was dead; re-read
     // on entry so the list is never one crash behind.
@@ -125,7 +127,16 @@ fun ErrorLogScreen(
             ErrorLogList(
                 reports = reports,
                 onSelect = { viewModel.select(it) },
+                onCopyAll = {
+                    viewModel.copyAll(unexpectedStopTitle) { text ->
+                        scope.launch {
+                            context.copyToClipboardSensitive("error-log", text)
+                            snackbarHost.showSnackbar(copiedAllText)
+                        }
+                    }
+                },
                 onClearAll = { showClearConfirm = true },
+                unexpectedStopTitle = unexpectedStopTitle,
                 modifier = Modifier.padding(padding),
             )
         }
@@ -156,18 +167,19 @@ fun ErrorLogScreen(
     }
 }
 
-/** The list state: privacy note, report rows, Clear all. */
+/** The list state: privacy note, report rows, Copy all / Clear all. */
 @Composable
 private fun ErrorLogList(
     reports: List<CrashReportSummary>,
     onSelect: (CrashReportSummary) -> Unit,
+    onCopyAll: () -> Unit,
     onClearAll: () -> Unit,
+    unexpectedStopTitle: String,
     modifier: Modifier = Modifier,
 ) {
     // An "unexpected stop" entry (a session that died without a
     // crash) shows a readable title instead of its stable
     // crash-type identifier, which only exists to name the file.
-    val unexpectedStopTitle = stringResource(R.string.error_log_unexpected_stop)
     Column(
         modifier = modifier
             .fillMaxSize()
@@ -204,11 +216,19 @@ private fun ErrorLogList(
                     }
                 }
             }
-            RelayDestructiveButton(
-                text = stringResource(R.string.error_log_clear_all),
-                onClick = onClearAll,
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.padding(start = 16.dp, top = 16.dp),
-            )
+            ) {
+                RelayTextButton(
+                    text = stringResource(R.string.error_log_copy_all),
+                    onClick = onCopyAll,
+                )
+                RelayDestructiveButton(
+                    text = stringResource(R.string.error_log_clear_all),
+                    onClick = onClearAll,
+                )
+            }
         }
     }
 }

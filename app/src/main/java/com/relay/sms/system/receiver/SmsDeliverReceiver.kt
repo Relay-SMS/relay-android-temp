@@ -20,6 +20,7 @@ import com.relay.sms.di.ApplicationScope
 import com.relay.sms.domain.reaction.IncomingReactionDecoder
 import com.relay.sms.domain.repository.ConversationRepository
 import com.relay.sms.domain.settings.AppSettingsSource
+import com.relay.sms.e2e.E2eFailureRecorder
 import com.relay.sms.e2e.E2eHandshakeHandler
 import com.relay.sms.e2e.E2eHandshakeSmsGate
 import com.relay.sms.e2e.E2eReceiveManager
@@ -92,6 +93,14 @@ class SmsDeliverReceiver : BroadcastReceiver() {
      */
     @Inject lateinit var settingsLazy: dagger.Lazy<AppSettingsSource>
 
+    /**
+     * E2E diagnostics — the handshake-SMS branch records its
+     * receipt (`e2e-handshake-sms-received`) and its client-mode
+     * swallow (`e2e-handshake-sms-client-mode`) in the error log.
+     * Resolved lazily like the rest.
+     */
+    @Inject lateinit var failureRecorderLazy: dagger.Lazy<E2eFailureRecorder>
+
     @Inject @ApplicationScope lateinit var scope: CoroutineScope
 
     @Inject
@@ -162,6 +171,7 @@ class SmsDeliverReceiver : BroadcastReceiver() {
                         e2eReceiveManager = e2eReceiveManagerLazy.get(),
                         handshakeHandler = handshakeHandlerLazy.get(),
                         settings = settingsLazy.get(),
+                        failureRecorder = failureRecorderLazy.get(),
                     )
                 }
                 val telephonyReader = deps.telephonyReader
@@ -437,8 +447,12 @@ class SmsDeliverReceiver : BroadcastReceiver() {
         ts: Long,
         subId: Int?,
     ): Boolean =
-        E2eHandshakeSmsGate(deps.telephonyReader, deps.settings, deps.handshakeHandler)
-            .handle(address, body, ts, subId)
+        E2eHandshakeSmsGate(
+            deps.telephonyReader,
+            deps.settings,
+            deps.handshakeHandler,
+            deps.failureRecorder,
+        ).handle(address, body, ts, subId)
 }
 
 /** Carrier so the collaborators are resolved in a single hop onto the IO dispatcher. */
@@ -455,4 +469,7 @@ private class Collaborators(
     val handshakeHandler: E2eHandshakeHandler,
     // E2E (round 45) — the client-mode gate for the handshake branch.
     val settings: AppSettingsSource,
+    // E2E diagnostics — the handshake-SMS receipt / client-mode
+    // swallow log lines (see E2eHandshakeSmsGate).
+    val failureRecorder: E2eFailureRecorder,
 )

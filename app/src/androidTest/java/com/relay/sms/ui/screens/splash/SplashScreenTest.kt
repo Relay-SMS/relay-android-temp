@@ -1,8 +1,8 @@
 package com.relay.sms.ui.screens.splash
 
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.click
 import androidx.compose.ui.test.junit4.createComposeRule
-import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onRoot
@@ -38,6 +38,16 @@ import org.junit.Test
  *
  * Contrôle négatif fait le 2026-09-12 : sur le `SplashScreen` d'avant le réarmement, le test
  * échoue sur la seconde attente (`splashShown` ne repasse jamais à `true`).
+ *
+ * Round 57 — le logo statique est remplacé par une animation Lottie jouée une
+ * fois, et le nom + la tagline n'entrent qu'une fois le logo terminé
+ * (slide-up + fade). Deux tests couvrent le nouveau comportement là où il
+ * est assertable : une tape pendant l'animation ferme le splash, et l'état
+ * final (logo + nom + tagline) est rendu une fois la séquence terminée.
+ * Le timing lui-même (l'entrée texte attend la fin du logo) n'est pas
+ * observable en sémantique — alpha et translationY n'y figurent pas — et se
+ * vérifie sur appareil ; `waitForIdle` attend toutefois réellement la fin de
+ * la séquence (les animations planifient des frames jusqu'à leur terme).
  */
 class SplashScreenTest {
 
@@ -116,5 +126,44 @@ class SplashScreenTest {
         compose.onRoot().performTouchInput { click() }
         compose.waitForIdle()
         assertThat(finished).isEqualTo(1)
+    }
+
+    @Test
+    fun uneTapePendantLAnimationFermeLeSplash() {
+        val settings = FakeSettings(AppSettings())
+        val viewModel = SplashViewModel(settings)
+        var finished = 0
+        compose.setContent {
+            SplashScreen(onFinished = { finished++ }, viewModel = viewModel)
+        }
+
+        // Tape immédiate : la composition Lottie charge encore (ou le logo
+        // est en cours de lecture) — le splash doit partir quand même, sans
+        // attendre la fin de l'animation ni l'entrée du texte.
+        compose.onRoot().performTouchInput { click() }
+        compose.waitUntil(WAIT_MS) { settings.state.value.advanced.splashShown }
+        assertThat(finished).isEqualTo(1)
+        compose.waitForIdle()
+        compose.onAllNodesWithTag(SPLASH_TEST_TAG).assertCountEquals(0)
+    }
+
+    @Test
+    fun leLogoEtLesTextesSontAffichesApresLaFinDeLAnimation() {
+        val settings = FakeSettings(AppSettings())
+        val viewModel = SplashViewModel(settings)
+        var finished = 0
+        compose.setContent {
+            SplashScreen(onFinished = { finished++ }, viewModel = viewModel)
+        }
+
+        // `waitForIdle` ne revient que quand plus aucune frame n'est planifiée,
+        // donc après la séquence complète : logo 1,6 s + entrée texte 0,8 s
+        // + hint 3 s. Le splash est toujours là (pas d'auto-dismiss) et
+        // l'état final est rendu.
+        compose.waitForIdle()
+        assertThat(finished).isEqualTo(0)
+        compose.onNodeWithTag(SPLASH_LOGO_TAG).assertExists()
+        compose.onNodeWithTag(SPLASH_APP_NAME_TAG).assertExists()
+        compose.onNodeWithTag(SPLASH_TAGLINE_TAG).assertExists()
     }
 }

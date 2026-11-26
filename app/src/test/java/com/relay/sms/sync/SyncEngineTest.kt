@@ -56,6 +56,9 @@ class SyncEngineTest {
                 // after the snapshot (empty here: the fake mutes
                 // nothing).
                 "category_mutes",
+                // Round 57 — the maps-provider state rides right
+                // after the category mutes.
+                "maps_provider",
             ).inOrder()
 
             val started = sent.first { it.frameType() == "sync_started" }.asObject()
@@ -155,6 +158,9 @@ class SyncEngineTest {
                 // Category mutes — the full muted set rides right
                 // after the snapshot, in both modes.
                 "category_mutes",
+                // Round 57 — the maps-provider state rides right
+                // after the category mutes, in both modes.
+                "maps_provider",
             ).inOrder()
             val started = sent.first { it.frameType() == "sync_started" }.asObject()
             assertThat(started["mode"]?.jsonPrimitive?.content).isEqualTo("new_only")

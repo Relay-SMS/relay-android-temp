@@ -24,12 +24,30 @@ import javax.inject.Inject
  * never left the phone; RESULT_OK means it did, and a later loss
  * is the carrier's (or the peer's receiver).
  *
- * RESULT_OK records nothing — a send that left the phone needs no
- * trace. Any other code records under the kind's failure tag
- * (`e2e-probe-send` / `e2e-bundle-send`, the same tags the
- * synchronous send failure uses) with the result-code name. No
- * address in the log line (design §8.3): the port + the code are
- * enough.
+ * RESULT_OK records an event (`e2e-sms-sent-ok`, kind + the
+ * code name + the address) — a send the radio accepted and then
+ * silently rejected is the exact gap this closes: before,
+ * RESULT_OK was silent, so an accepted-then-rejected send looked
+ * exactly like a peer without Relay. Any other code records
+ * under the kind's failure tag (`e2e-probe-send` /
+ * `e2e-bundle-send`, the same tags the synchronous send failure
+ * uses) with the result-code name and the address. The address
+ * rides the sent intent ([E2eSentIntentFactory] puts it there,
+ * [E2eDataSmsSentReceiver] reads it back) — round 57
+ * consistency: every per-sender event carries the sender's
+ * address, a phone number already in the user's threads. A null
+ * address (an intent built before round 57, or a missing extra)
+ * records the verdict without one instead of dropping it.
+ * Never a key, a payload byte, or message content.
+ *
+ * Channel wording: the sent intent is shared by the data and
+ * text sends, and the kind does not carry the channel — tagging
+ * the channel would mean changing the intent factory and the
+ * receiver, which this handler does not own. So both wordings
+ * say "Handshake SMS" and the port is labelled as the data-SMS
+ * port (it is meaningless for a text send); the sender-side
+ * acceptance event (`e2e-sms-accepted`, see
+ * [E2eDataSmsSenderImpl]) is the place the channel is recorded.
  *
  * Pure decision logic (the [E2eFailureRecorder] is the only
  * dependency) so it is testable on plain JVM — the receiver stays
@@ -40,15 +58,29 @@ class E2eDataSmsSentHandler @Inject constructor(
     private val recorder: E2eFailureRecorder,
 ) {
 
-    fun handle(resultCode: Int, kind: DataSmsKind) {
-        if (resultCode == Activity.RESULT_OK) return
+    fun handle(resultCode: Int, kind: DataSmsKind, address: String? = null) {
+        if (resultCode == Activity.RESULT_OK) {
+            val to = address?.let { " to $it" } ?: ""
+            recorder.recordEvent(
+                SENT_OK_TAG,
+                "Handshake SMS sent$to (kind=${kind.name}): RESULT_OK.",
+            )
+            return
+        }
         val name = resultName(resultCode)
+        val forAddress = address?.let { " for $it" } ?: ""
         recorder.record(
             kind.failureTag,
             E2eCryptoException(
-                "Data SMS send rejected by radio (port=${E2eHandshake.E2E_DATA_SMS_PORT}): $name",
+                "Handshake SMS send rejected by radio$forAddress " +
+                    "(data-SMS port=${E2eHandshake.E2E_DATA_SMS_PORT}): $name",
             ),
         )
+    }
+
+    private companion object {
+        /** Error-log tag for the radio's RESULT_OK verdict. */
+        const val SENT_OK_TAG = "e2e-sms-sent-ok"
     }
 
     private fun resultName(resultCode: Int): String = when (resultCode) {

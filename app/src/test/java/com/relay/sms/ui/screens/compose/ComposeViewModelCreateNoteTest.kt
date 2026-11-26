@@ -19,8 +19,10 @@ import com.relay.sms.domain.repository.ConversationRepository
 import com.relay.sms.domain.repository.NoteRepository
 import io.mockk.coEvery
 import io.mockk.coVerify
+import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.resetMain
@@ -57,6 +59,10 @@ class ComposeViewModelCreateNoteTest {
 
     private fun harness(): Harness {
         val noteRepo = mockk<NoteRepository>()
+        // The ViewModel reads the notes flow at construction (the
+        // "Select note" picker section), so the strict mock needs
+        // an answer for it before any test body runs.
+        every { noteRepo.observeAllNotes() } returns MutableStateFlow(emptyList())
         val vm = ComposeViewModel(
             SavedStateHandle(),
             mockk<ContactRepository>(relaxed = true),
@@ -115,6 +121,7 @@ class ComposeViewModelCreateNoteTest {
 
     @Test fun `createNote in client mode goes through the create_note frame`() = runTest(dispatcher) {
         val noteRepo = mockk<NoteRepository>()
+        every { noteRepo.observeAllNotes() } returns MutableStateFlow(emptyList())
         val clientActions = mockk<ClientActionGateway>()
         coEvery { clientActions.isClientMode() } returns true
         coEvery { clientActions.createNote("Groceries") } returns Outcome.Success(42L)
@@ -139,6 +146,7 @@ class ComposeViewModelCreateNoteTest {
 
     @Test fun `a refused client-mode create emits CreateFailed`() = runTest(dispatcher) {
         val noteRepo = mockk<NoteRepository>()
+        every { noteRepo.observeAllNotes() } returns MutableStateFlow(emptyList())
         val clientActions = mockk<ClientActionGateway>()
         coEvery { clientActions.isClientMode() } returns true
         coEvery { clientActions.createNote("Groceries") } returns

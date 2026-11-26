@@ -24,8 +24,8 @@ import com.relay.sms.domain.otp.OtpCodeDetector
  * 1. **OTP** — [OtpCodeDetector] finds a login code in the body.
  * 2. **Transactions** — bank / payment / delivery / appointment content.
  * 3. **Promotional** — marketing, deals or political content, a cold sales
- *    pitch from a stranger, or a sender that is a short code or an
- *    alphanumeric label.
+ *    pitch from a stranger, or a sender that is a short code, a
+ *    toll-free number, or an alphanumeric label.
  * 4. **Personal** — a contact, a group, or a regular phone number. A number
  *    that is not in contacts yet is still a real person, so a new friend is
  *    never hidden in an off-screen tab.
@@ -52,6 +52,13 @@ object MessageClassifier {
 
     private const val SHORT_CODE_MAX_DIGITS = 6
     private const val REGULAR_NUMBER_MIN_DIGITS = 7
+
+    /**
+     * Round 57 — the NANP toll-free area codes. A 10-digit number
+     * (with or without the leading 1) in one of these is a business
+     * / campaign line, not a person — see [isShortCodeOrTollFree].
+     */
+    private val TOLL_FREE_AREA_CODES = setOf("800", "833", "844", "855", "866", "877", "888")
 
     /** Round 18 — distinct service nouns for the list pitch (see [isColdSalesPitch]). */
     private const val MIN_LIST_PITCH_SERVICES = 2
@@ -155,6 +162,9 @@ object MessageClassifier {
      * together with a party word is Promotional too — see [isPoliticalVote].
      * The "Stop to End" / "Stop2End" opt-out footer ("stop2end",
      * "stop to end") is a promo signal real personal messages don't carry.
+     * Round 57 — the one-word footer ("stoptoend", the reported
+     * "StopToEnd") joins it: folding keeps it one word, so the
+     * spaced keyword never matches it.
      * Bare "campagne" (FR) / "campagna" (IT) are out — both also mean
      * "countryside" ("à la campagne"); only "campagne électorale" /
      * "campagna elettorale" count. Bare "campana" (ES) is out too (a bell);
@@ -166,7 +176,7 @@ object MessageClassifier {
     private val PROMOTIONAL_KEYWORDS = listOf(
         // EN
         "unsubscribe", "opt out", "reply stop", "to opt out", "stop2end",
-        "stop to end", "limited time",
+        "stop to end", "stoptoend", "limited time",
         "special offer", "exclusive offer", "limited offer", "offer ends",
         "offer expires", "discount code", "promo code", "percent off",
         "sale ends", "flash sale", "clearance sale", "big sale",
@@ -420,7 +430,7 @@ object MessageClassifier {
             containsAny(paddedBody, TRANSACTION_KEYWORDS) -> MessageCategory.TRANSACTIONS
             containsAny(paddedBody, PROMOTIONAL_KEYWORDS) ||
                 isStrangerOnlyPromo(paddedBody, body, isContact, isGroup) ||
-                isShortCode(digits) || isAlphanumericSender(sender) -> MessageCategory.PROMOTIONAL
+                isShortCodeOrTollFree(digits) || isAlphanumericSender(sender) -> MessageCategory.PROMOTIONAL
             isContact || isGroup || isRegularNumber(digits) -> MessageCategory.PERSONAL
             else -> MessageCategory.OTHER
         }
@@ -655,9 +665,29 @@ object MessageClassifier {
         return normalized.filter { it.isDigit() }.takeIf { it.isNotEmpty() }
     }
 
-    private fun isShortCode(digits: String?): Boolean {
+    /**
+     * Round 57 — a sender that is not a real person: a short code
+     * (≤ [SHORT_CODE_MAX_DIGITS] digits) or a 10-digit NANP
+     * toll-free number (area code 800/833/844/855/866/877/888,
+     * with or without the leading 1). A toll-free line is a
+     * business / campaign line — the reported Medicare-advantage
+     * sample ("Washington is threatening Medicare Advantage…
+     * StopToEnd", +1 (833) 330-2134) files Promotional on the
+     * sender alone, ungated like a short code: a saved toll-free
+     * business line is still not a person. The area code is only
+     * read on 10- and 11-digit NANP shapes — a shorter number has
+     * no area code, and a longer one is not NANP.
+     */
+    private fun isShortCodeOrTollFree(digits: String?): Boolean {
         val digitsValue = digits ?: return false
-        return digitsValue.length <= SHORT_CODE_MAX_DIGITS
+        if (digitsValue.length <= SHORT_CODE_MAX_DIGITS) return true
+        val areaCode = when {
+            digitsValue.length == 10 -> digitsValue.substring(0, 3)
+            digitsValue.length == 11 && digitsValue.startsWith("1") ->
+                digitsValue.substring(1, 4)
+            else -> return false
+        }
+        return areaCode in TOLL_FREE_AREA_CODES
     }
 
     private fun isRegularNumber(digits: String?): Boolean {

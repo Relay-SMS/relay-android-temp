@@ -151,7 +151,15 @@ class E2eDataSmsSenderImpl @Inject constructor(
         port: Int,
         data: ByteArray,
         kind: DataSmsKind,
-    ): Boolean = send(address, subId, kind, "Data SMS send failed (port=$port)") { manager, destination, sentIntent ->
+    ): Boolean = send(
+        address,
+        subId,
+        kind,
+        "Data SMS send failed (port=$port)",
+        HandshakeChannel.DATA_SMS,
+        data.size,
+        port,
+    ) { manager, destination, sentIntent ->
         manager.sendDataMessage(
             destination,
             // scAddress: null — let the radio pick the service centre.
@@ -173,7 +181,15 @@ class E2eDataSmsSenderImpl @Inject constructor(
         subId: Int?,
         text: String,
         kind: DataSmsKind,
-    ): Boolean = send(address, subId, kind, "Text SMS send failed") { manager, destination, sentIntent ->
+    ): Boolean = send(
+        address,
+        subId,
+        kind,
+        "Text SMS send failed",
+        HandshakeChannel.TEXT_SMS,
+        text.length,
+        null,
+    ) { manager, destination, sentIntent ->
         manager.sendTextMessage(
             destination,
             // scAddress: null — let the radio pick the service centre.
@@ -194,9 +210,22 @@ class E2eDataSmsSenderImpl @Inject constructor(
      *
      * Round 43 — the sent intent, so a radio that silently rejects
      * the send leaves a trace (the verdict lands in
-     * E2eDataSmsSentReceiver; RESULT_OK records nothing). The
-     * Boolean return is unchanged: true = no synchronous throw. A
-     * null factory result falls back to fire-and-forget.
+     * E2eDataSmsSentReceiver; RESULT_OK now records too — see
+     * [E2eDataSmsSentHandler]). The Boolean return is unchanged:
+     * true = no synchronous throw. A null factory result falls
+     * back to fire-and-forget.
+     *
+     * Radio acceptance is recorded as an event
+     * (`e2e-sms-accepted`, kind + channel + byte/char length +
+     * port for data, and the destination address — round 57
+     * consistency: every per-sender event carries the sender's
+     * address, a phone number already in the user's threads) —
+     * a different layer from the handler-side
+     * `e2e-bundle-sent` event ([E2eHandshakeHandler] records that
+     * one after this call returns true, and only for bundles), so
+     * the names stay distinct. The synchronous-failure recording
+     * is unchanged (sanitized, no address — the raw exception's
+     * message may carry the destination on some builds).
      *
      * [failureLabel] is the fixed, PII-free wording for the failure
      * (data vs text): a failed text send must not read as a data
@@ -208,6 +237,9 @@ class E2eDataSmsSenderImpl @Inject constructor(
         subId: Int?,
         kind: DataSmsKind,
         failureLabel: String,
+        channel: HandshakeChannel,
+        length: Int,
+        port: Int?,
         radioSend: (manager: SmsManager, destination: String, sentIntent: PendingIntent?) -> Unit,
     ): Boolean {
         return try {
@@ -215,7 +247,11 @@ class E2eDataSmsSenderImpl @Inject constructor(
             // E.164 normalization (same as the message text path): a
             // foreign SIM texting a national number must still route.
             val wireDestination = wireFormatter.toWireFormat(address, subId)
-            radioSend(manager, wireDestination, sentIntentFactory.sentIntent(kind))
+            radioSend(manager, wireDestination, sentIntentFactory.sentIntent(kind, address))
+            recorder.recordEvent(
+                ACCEPTED_TAG,
+                acceptanceMessage(kind, channel, length, port, address),
+            )
             true
         } catch (t: Exception) {
             Timber.w(t, "E2E: %s", failureLabel)
@@ -235,6 +271,31 @@ class E2eDataSmsSenderImpl @Inject constructor(
             )
             false
         }
+    }
+
+    private companion object {
+        /** Error-log tag for every radio-accepted handshake send. */
+        const val ACCEPTED_TAG = "e2e-sms-accepted"
+    }
+
+    /**
+     * The acceptance-event message: kind + channel + length, and
+     * the port for data SMS (a text send has none) — and the
+     * destination address, so the event names the peer (round 57
+     * consistency: every per-sender event carries the address).
+     * Fixed text otherwise — no payload.
+     */
+    private fun acceptanceMessage(
+        kind: DataSmsKind,
+        channel: HandshakeChannel,
+        length: Int,
+        port: Int?,
+        address: String,
+    ): String = when (channel) {
+        HandshakeChannel.DATA_SMS ->
+            "Data SMS accepted by radio to $address (kind=${kind.name}, port=$port, bytes=$length)."
+        HandshakeChannel.TEXT_SMS ->
+            "Text SMS accepted by radio to $address (kind=${kind.name}, chars=$length)."
     }
 
     /**

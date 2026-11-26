@@ -22,6 +22,10 @@ import com.relay.sms.domain.model.Contact
 import com.relay.sms.domain.model.PhoneAddress
 import com.relay.sms.domain.repository.ContactPhotoWriteResult
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import timber.log.Timber
 import java.io.InputStream
 import javax.inject.Inject
@@ -67,6 +71,24 @@ class ContactsReader @Inject constructor(
     private val resolver: ContentResolver get() = context.contentResolver
     private val cache = LruCache<String, Contact>(CONTACT_CACHE_MAX)
     private val negativeCache = LruCache<String, Boolean>(NEGATIVE_CACHE_MAX)
+
+    /**
+     * Contact-name live refresh — a version counter bumped on
+     * every [invalidate] (i.e. on every provider change the
+     * `MainApplication` ContentObserver sees, and on a photo
+     * write). The ViewModels collect it through
+     * [com.relay.sms.domain.repository.ContactRepository
+     * .observeContactChanges] and re-run their in-memory
+     * resolutions (list photos, thread member names) when it
+     * moves — the Room display-name rows themselves are
+     * refreshed by [com.relay.sms.data.repository
+     * .ConversationMirror.refreshContactNames] and re-emit
+     * through the repository flows. Bumping here, next to the
+     * evict, keeps the two invalidations in one place: a caller
+     * that evicts the cache can never forget the signal.
+     */
+    private val _changes = MutableStateFlow(0L)
+    val changes: StateFlow<Long> get() = _changes.asStateFlow()
 
     /**
      * The contact behind [rawPhone], or null when no contact owns
@@ -346,6 +368,7 @@ class ContactsReader @Inject constructor(
     fun invalidate() {
         cache.evictAll()
         negativeCache.evictAll()
+        _changes.update { it + 1 }
     }
 
     /**

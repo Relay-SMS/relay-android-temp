@@ -83,6 +83,16 @@ import java.util.concurrent.ConcurrentHashMap
  * on the desktop like any other (the desktop notifies only from
  * `message_new`).
  *
+ * Round 57 adds the maps-provider sync: the `set_maps_provider`
+ * handler ([onSetMapsProvider]) — through [runAction], like the
+ * other flag actions, but WITHOUT an echo (one setting, one
+ * in-flight write at most, so there is nothing to attribute) —
+ * plus a live collector ([collectMapsProvider]) that pushes the
+ * choice + marker whenever either changes on the phone, and the
+ * same state after every snapshot in [runStream]. Unlike the
+ * mutes this is last-write-wins, not phone-wins-always: the
+ * apply rule lives in the source ([SyncMessageSource]).
+ *
  * Slice 5 adds the contact-sync handlers ([onContactsRequest],
  * [onAvatarRequest]) in the same shape, plus the contact snapshot
  * inside [runStream] (read once before `sync_started`, streamed
@@ -184,6 +194,7 @@ class SyncEngine(
         scope.launch { collectConversations() }
         scope.launch { collectMessageStates() }
         scope.launch { collectCategoryMutes() }
+        scope.launch { collectMapsProvider() }
         scope.launch { collectE2eSafetyNumbers() }
         scope.launch { collectE2eNotices() }
         scope.launch { collectMediaKeyArrivals() }
@@ -294,6 +305,22 @@ class SyncEngine(
         scope.launch {
             runAction("set_category_muted", null, null, request.category) {
                 source.setCategoryMuted(request.category, request.muted)
+            }
+        }
+    }
+
+    /**
+     * Round 57 — handles a `set_maps_provider`, answered with
+     * `action_result` (no echo: one setting, one in-flight write
+     * at most). The source applies it only when the marker is
+     * strictly newer than the phone's stored one; a stale marker
+     * answers `ok: false` code `stale`, and the desktop reverts
+     * to the last phone-confirmed value.
+     */
+    fun onSetMapsProvider(request: SyncProtocol.SetMapsProvider) {
+        scope.launch {
+            runAction("set_maps_provider", null, null) {
+                source.setMapsProvider(request.provider, request.updatedAt)
             }
         }
     }
@@ -709,6 +736,21 @@ class SyncEngine(
         source.mutedCategories()?.let {
             send(SyncProtocol.encodeCategoryMutes(SyncProtocol.CategoryMutes(it.sorted())))
         }
+        // Round 57 — maps provider: the choice + marker ride right
+        // after the snapshot, next to the category mutes, so a
+        // fresh connection learns it without waiting for a change —
+        // and a first sync adopts the phone's value (the desktop
+        // has no marker yet, so any phone marker wins). A null
+        // read (settings unreadable) skips the frame — a default
+        // would wrongly overwrite the desktop's newer choice — and
+        // the collector sends the state on the next change.
+        source.mapsProvider()?.let {
+            send(
+                SyncProtocol.encodeMapsProvider(
+                    SyncProtocol.MapsProvider(provider = it.provider, updatedAt = it.updatedAt),
+                ),
+            )
+        }
         // Round 42 — the E2E sets ride right after the snapshot,
         // next to the category mutes, so a fresh connection learns
         // the safety numbers, verified flags and in-thread notices
@@ -1107,6 +1149,27 @@ class SyncEngine(
     private suspend fun collectCategoryMutes() {
         source.observeMutedCategories().drop(1).distinctUntilChanged().collect { muted ->
             send(SyncProtocol.encodeCategoryMutes(SyncProtocol.CategoryMutes(muted.sorted())))
+        }
+    }
+
+    /**
+     * Round 57 — maps-provider collector: the first emission is
+     * the baseline — silent (the snapshot sends the state itself)
+     * — and every later change pushes a `maps_provider` with the
+     * choice + marker, so the desktop applies it when the marker
+     * is newer (or equal — the phone wins ties) and pushes its
+     * own newer value back when its marker is newer.
+     * `distinctUntilChanged` swallows the re-emissions an unrelated
+     * settings write causes upstream (the flow re-emits on every
+     * write, muted or not).
+     */
+    private suspend fun collectMapsProvider() {
+        source.observeMapsProvider().drop(1).distinctUntilChanged().collect { state ->
+            send(
+                SyncProtocol.encodeMapsProvider(
+                    SyncProtocol.MapsProvider(provider = state.provider, updatedAt = state.updatedAt),
+                ),
+            )
         }
     }
 

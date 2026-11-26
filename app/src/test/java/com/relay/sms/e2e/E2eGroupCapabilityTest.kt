@@ -11,6 +11,8 @@ import com.google.common.truth.Truth.assertThat
 import com.relay.sms.data.local.db.entity.E2ePeerEntity
 import com.relay.sms.data.local.db.entity.E2ePeerState
 import com.relay.sms.e2e.E2eHandshake.HandshakePacket
+import io.mockk.mockk
+import io.mockk.verify
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Test
 
@@ -38,10 +40,12 @@ class E2eGroupCapabilityTest {
         val sender: RecordingDataSmsSender = RecordingDataSmsSender(),
     ) {
         val peers = E2ePeerRepository(peerDao)
+        val recorder: E2eFailureRecorder = mockk(relaxed = true)
         val manager = E2eMediaCapabilityManager(
             peers = peers,
             dataSmsSender = sender,
             blockedRepo = FakeBlockedRepo(),
+            recorder = recorder,
         )
 
         fun seedPeer(
@@ -156,6 +160,12 @@ class E2eGroupCapabilityTest {
         assertThat(harness.peerDao.peers[BOB]!!.mediaAnnounced).isTrue()
         assertThat(harness.peerDao.peers[BOB]!!.groupAnnounced).isTrue()
         assertThat(harness.peerDao.peers[BOB]!!.groupMediaAnnounced).isTrue()
+        verify(exactly = 1) {
+            harness.recorder.recordEvent(
+                "e2e-capability-sent",
+                "Capability declaration sent to $BOB (channel=DATA_SMS).",
+            )
+        }
     }
 
     @Test
@@ -169,5 +179,24 @@ class E2eGroupCapabilityTest {
         assertThat(harness.peerDao.peers[BOB]!!.mediaAnnounced).isFalse()
         assertThat(harness.peerDao.peers[BOB]!!.groupAnnounced).isFalse()
         assertThat(harness.peerDao.peers[BOB]!!.groupMediaAnnounced).isFalse()
+        verify(exactly = 1) {
+            harness.recorder.recordEvent(
+                "e2e-capability-send-failed",
+                "Capability declaration refused by radio for $BOB on every attempted channel.",
+            )
+        }
+    }
+
+    @Test
+    fun `onDeclarationReceived records the received flags`() = runTest {
+        val harness = Harness()
+        harness.seedPeer()
+
+        harness.manager.onDeclarationReceived(BOB, SUB_ID, NOW, mediaCapable = true, groupCapable = true)
+
+        assertThat(harness.peerDao.peers[BOB]!!.groupCapable).isTrue()
+        // The receipt itself is recorded once, by the handler —
+        // the manager writes only the announce-back send.
+        verify(exactly = 0) { harness.recorder.recordEvent("e2e-capability-received", any()) }
     }
 }

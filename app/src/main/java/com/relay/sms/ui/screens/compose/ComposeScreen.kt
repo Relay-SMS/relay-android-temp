@@ -106,6 +106,9 @@ fun ComposeScreen(
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val filtered by viewModel.filtered.collectAsStateWithLifecycle()
+    // Round 57 — the existing notes for the "Select note" section
+    // (share destinations, and a shortcut to open a note).
+    val notes by viewModel.notes.collectAsStateWithLifecycle()
     // Client mode C3 — the create-contact row is hidden on a linked
     // device (no contact frames until C4).
     val isClientMode by viewModel.isClientMode.collectAsStateWithLifecycle()
@@ -333,6 +336,30 @@ fun ComposeScreen(
                                         }
                                     }
                                 },
+                            )
+                        }
+                    }
+                    // Round 57 — "Select note": the existing notes as
+                    // share destinations, between the action rows above
+                    // and the "Select contact" list below. Each row
+                    // opens its note thread — the pending share, if
+                    // any, is picked up there by the note thread
+                    // (text into the draft, image through the
+                    // note-attachment path). Hidden while picking
+                    // group members: a note tap opens a thread, it
+                    // does not pick a recipient. The `note-` key
+                    // prefix keeps note ids from colliding with
+                    // contact ids in this list.
+                    if (!picking && notes.isNotEmpty()) {
+                        item(key = "select-note-label") {
+                            ComposeSectionLabel(stringResource(R.string.compose_select_note))
+                        }
+                        items(notes, key = { "note-${it.id}" }) { note ->
+                            ContactActionRow(
+                                title = note.title,
+                                subtitle = note.lastMessagePreview,
+                                icon = painterResource(R.drawable.ic_note),
+                                onClick = { onNoteCreated(note.id) },
                             )
                         }
                     }

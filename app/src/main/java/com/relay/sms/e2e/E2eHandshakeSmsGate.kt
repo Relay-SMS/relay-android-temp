@@ -50,11 +50,18 @@ import timber.log.Timber
  * A failure inside the handler is logged, not rethrown (except
  * `CancellationException`), so one bad handshake SMS cannot kill
  * the receiver — the sender's retry re-sends the probe.
+ *
+ * Light-touch receipt logging via [E2eFailureRecorder]: a
+ * handshake SMS that reaches this branch records
+ * `e2e-handshake-sms-received`, and a client-mode swallow records
+ * `e2e-handshake-sms-client-mode`. Non-handshake SMS are never
+ * logged here — every normal SMS would spam the log.
  */
 class E2eHandshakeSmsGate(
     private val telephonyReader: TelephonyReader,
     private val settings: AppSettingsSource,
     private val handler: E2eHandshakeHandler,
+    private val recorder: E2eFailureRecorder,
 ) {
     suspend fun handle(
         address: String,
@@ -63,8 +70,18 @@ class E2eHandshakeSmsGate(
         subId: Int?,
     ): Boolean {
         if (!E2eHandshakeSms.isHandshakeSms(body)) return false
+        recorder.recordEvent(
+            "e2e-handshake-sms-received",
+            "Handshake SMS received from $address.",
+        )
         telephonyReader.insertInboxSms(address, body, ts, subId)
-        if ((settings.hydratedOrNull() ?: AppSettings()).mode == DeviceMode.CLIENT) return true
+        if ((settings.hydratedOrNull() ?: AppSettings()).mode == DeviceMode.CLIENT) {
+            recorder.recordEvent(
+                "e2e-handshake-sms-client-mode",
+                "Handshake SMS from $address swallowed in client mode; no identity provisioned.",
+            )
+            return true
+        }
         try {
             // Round 46 — no `ts` here: `now` defaults to processing
             // time (see the class KDoc). The carrier timestamp dates

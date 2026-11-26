@@ -13,12 +13,14 @@ import com.relay.sms.domain.settings.AppSettings
 import com.relay.sms.domain.settings.AppSettingsSource
 import com.relay.sms.domain.settings.DeviceMode
 import com.relay.sms.e2e.E2eDataSmsGate
+import com.relay.sms.e2e.E2eFailureRecorder
 import com.relay.sms.e2e.E2eHandshakeHandler
 import com.relay.sms.e2e.ParsedDataSms
 import dagger.Lazy
 import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.mockk
+import io.mockk.verify
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -59,10 +61,15 @@ class E2eDataSmsReceiverTest {
         override suspend fun update(transform: (AppSettings) -> AppSettings) = Unit
     }
 
-    private fun gate(mode: DeviceMode?, handler: E2eHandshakeHandler) = E2eDataSmsGate(
+    private fun gate(
+        mode: DeviceMode?,
+        handler: E2eHandshakeHandler,
+        recorder: E2eFailureRecorder = mockk(relaxed = true),
+    ) = E2eDataSmsGate(
         Lazy { FakeSettings(mode) },
         Lazy { handler },
         Dispatchers.Unconfined,
+        Lazy { recorder },
     )
 
     @Test
@@ -114,5 +121,125 @@ class E2eDataSmsReceiverTest {
 
         assertThat(handled).isFalse()
         coVerify(exactly = 0) { handler.handleDataSms(any(), any(), any(), any()) }
+    }
+
+    // ──────────────────── Gate drops are recorded ────────────────────
+    // Every drop carries a fixed reason word in the error log, so
+    // an arrival line in the receiver with no handling narrows to
+    // exactly one of these.
+
+    @Test
+    fun `a wrong action records the drop with its reason`() = runTest {
+        val handler = mockk<E2eHandshakeHandler>()
+        val recorder = mockk<E2eFailureRecorder>(relaxed = true)
+
+        val handled = gate(null, handler, recorder).handle(
+            "android.intent.action.SMS_RECEIVED",
+            null,
+        ) { error("the packet must not be parsed for this action") }
+
+        assertThat(handled).isFalse()
+        verify(exactly = 1) {
+            recorder.recordEvent(
+                "e2e-data-sms-dropped",
+                match { it.contains("wrong-action") },
+            )
+        }
+        coVerify(exactly = 0) { handler.handleDataSms(any(), any(), any(), any()) }
+    }
+
+    @Test
+    fun `client mode records the drop with its reason`() = runTest {
+        val handler = mockk<E2eHandshakeHandler>()
+        val recorder = mockk<E2eFailureRecorder>(relaxed = true)
+
+        val handled = gate(DeviceMode.CLIENT, handler, recorder).handle(
+            Telephony.Sms.Intents.DATA_SMS_RECEIVED_ACTION,
+            null,
+        ) { error("the packet must not be parsed in client mode") }
+
+        assertThat(handled).isFalse()
+        verify(exactly = 1) {
+            recorder.recordEvent(
+                "e2e-data-sms-dropped",
+                match { it.contains("client-mode") },
+            )
+        }
+        coVerify(exactly = 0) { handler.handleDataSms(any(), any(), any(), any()) }
+    }
+
+    @Test
+    fun `a missing message records the drop with its reason`() = runTest {
+        val handler = mockk<E2eHandshakeHandler>()
+        val recorder = mockk<E2eFailureRecorder>(relaxed = true)
+
+        val handled = gate(DeviceMode.HUB, handler, recorder).handle(
+            Telephony.Sms.Intents.DATA_SMS_RECEIVED_ACTION,
+            null,
+        ) { null }
+
+        assertThat(handled).isFalse()
+        verify(exactly = 1) {
+            recorder.recordEvent(
+                "e2e-data-sms-dropped",
+                match { it.contains("no-message") },
+            )
+        }
+        coVerify(exactly = 0) { handler.handleDataSms(any(), any(), any(), any()) }
+    }
+
+    @Test
+    fun `a null address records the drop with its reason`() = runTest {
+        val handler = mockk<E2eHandshakeHandler>()
+        val recorder = mockk<E2eFailureRecorder>(relaxed = true)
+
+        val handled = gate(DeviceMode.HUB, handler, recorder).handle(
+            Telephony.Sms.Intents.DATA_SMS_RECEIVED_ACTION,
+            null,
+        ) { ParsedDataSms(null, byteArrayOf(9, 8, 7)) }
+
+        assertThat(handled).isFalse()
+        verify(exactly = 1) {
+            recorder.recordEvent(
+                "e2e-data-sms-dropped",
+                match { it.contains("null-address") },
+            )
+        }
+        coVerify(exactly = 0) { handler.handleDataSms(any(), any(), any(), any()) }
+    }
+
+    @Test
+    fun `null data records the drop with its reason`() = runTest {
+        val handler = mockk<E2eHandshakeHandler>()
+        val recorder = mockk<E2eFailureRecorder>(relaxed = true)
+
+        val handled = gate(DeviceMode.HUB, handler, recorder).handle(
+            Telephony.Sms.Intents.DATA_SMS_RECEIVED_ACTION,
+            null,
+        ) { ParsedDataSms("+33612345678", null) }
+
+        assertThat(handled).isFalse()
+        verify(exactly = 1) {
+            recorder.recordEvent(
+                "e2e-data-sms-dropped",
+                match { it.contains("null-data") },
+            )
+        }
+        coVerify(exactly = 0) { handler.handleDataSms(any(), any(), any(), any()) }
+    }
+
+    @Test
+    fun `a handled packet records no drop`() = runTest {
+        val handler = mockk<E2eHandshakeHandler>()
+        coEvery { handler.handleDataSms(any(), any(), any(), any()) } returns true
+        val recorder = mockk<E2eFailureRecorder>(relaxed = true)
+
+        val handled = gate(DeviceMode.HUB, handler, recorder).handle(
+            Telephony.Sms.Intents.DATA_SMS_RECEIVED_ACTION,
+            3,
+        ) { ParsedDataSms("+33612345678", byteArrayOf(9, 8, 7)) }
+
+        assertThat(handled).isTrue()
+        verify(exactly = 0) { recorder.recordEvent("e2e-data-sms-dropped", any()) }
     }
 }

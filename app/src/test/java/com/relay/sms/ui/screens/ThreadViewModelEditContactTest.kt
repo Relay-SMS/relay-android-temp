@@ -13,6 +13,8 @@ import com.google.common.truth.Truth.assertThat
 import com.relay.sms.data.local.datastore.SettingsRepository
 import com.relay.sms.domain.model.Contact
 import com.relay.sms.domain.model.Conversation
+import com.relay.sms.domain.model.Message
+import com.relay.sms.domain.model.MessageWindow
 import com.relay.sms.domain.model.PhoneAddress
 import com.relay.sms.domain.repository.ContactPhotoWriteResult
 import com.relay.sms.domain.repository.ContactRepository
@@ -23,6 +25,7 @@ import com.relay.sms.ui.screens.thread.ThreadViewModel
 import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.flowOf
@@ -254,28 +257,47 @@ class ThreadViewModelEditContactTest {
             assertThat(vm.state.value.contactPhotoLargeUri).isEqualTo("content://thumb")
         }
 
+    /**
+     * Contact-name live refresh — a renamed group sender updates
+     * the cached bubble name with no new message and no reopen:
+     * the provider change clears `memberNames` and re-resolves
+     * it from the loaded window. Without the clear, the old name
+     * stuck until the next message from that sender arrived.
+     */
+    @Test
+    fun `a renamed sender updates the cached group member name without a new message`() =
+        runTest(dispatcher) {
+            val contacts = MutableFakeContacts(name = "Bob")
+            val vm = threadViewModel(
+                contacts,
+                conversation = groupConversation(),
+                messages = listOf(incomingMessage(from = BOB_PHONE)),
+            )
+
+            testScheduler.advanceUntilIdle()
+            assertThat(vm.state.value.memberNames).isEqualTo(mapOf(BOB_PHONE to "Bob"))
+
+            contacts.name = "Bobby"
+            contacts.changes.value = 1L
+            testScheduler.advanceUntilIdle()
+            assertThat(vm.state.value.memberNames).isEqualTo(mapOf(BOB_PHONE to "Bobby"))
+        }
+
     private fun threadViewModel(
         contacts: ContactRepository,
         context: Context = mockk(relaxed = true),
+        conversation: Conversation = oneToOneConversation(),
+        messages: List<Message> = emptyList(),
     ): ThreadViewModel {
-        val conversation = Conversation(
-            id = 7L,
-            threadId = null,
-            addresses = listOf(PhoneAddress.of("+33612345678")),
-            displayName = null,
-            lastMessageAt = 0L,
-            lastMessagePreview = null,
-            unreadCount = 0,
-            pinned = false,
-            archived = false,
-            muted = false,
-            inVault = false,
-            draft = null,
-        )
         val repo: ConversationRepository = mockk(relaxed = true) {
             every { observeOne(any()) } returns flowOf(conversation)
             every { observeVaultHidden(any()) } returns flowOf(false)
-            every { observeMessagesWindow(any(), any()) } returns emptyFlow()
+            every { observeMessagesWindow(any(), any()) } returns
+                if (messages.isEmpty()) {
+                    emptyFlow()
+                } else {
+                    flowOf(MessageWindow(messages = messages, totalCount = messages.size))
+                }
         }
         val settings: SettingsRepository = mockk(relaxed = true) {
             every { state } returns MutableStateFlow(AppSettings())
@@ -306,5 +328,87 @@ class ThreadViewModelEditContactTest {
             io = dispatcher,
             appLock = appLock,
         )
+    }
+
+    private fun oneToOneConversation() = Conversation(
+        id = 7L,
+        threadId = null,
+        addresses = listOf(PhoneAddress.of(ALICE_PHONE)),
+        displayName = null,
+        lastMessageAt = 0L,
+        lastMessagePreview = null,
+        unreadCount = 0,
+        pinned = false,
+        archived = false,
+        muted = false,
+        inVault = false,
+        draft = null,
+    )
+
+    private fun groupConversation() = Conversation(
+        id = 7L,
+        threadId = null,
+        addresses = listOf(PhoneAddress.of(ALICE_PHONE), PhoneAddress.of(BOB_PHONE)),
+        displayName = "Alice, Bob",
+        lastMessageAt = 0L,
+        lastMessagePreview = null,
+        unreadCount = 0,
+        pinned = false,
+        archived = false,
+        muted = false,
+        inVault = false,
+        draft = null,
+    )
+
+    private fun incomingMessage(
+        id: Long = 1L,
+        from: String,
+        body: String = "hello",
+    ) = Message(
+        id = id,
+        conversationId = 7L,
+        address = from,
+        body = body,
+        type = Message.Type.SMS,
+        direction = Message.Direction.INCOMING,
+        date = 1_700_000_000_000L,
+        dateSent = null,
+        read = true,
+        starred = false,
+        status = Message.Status.SENT,
+        errorCode = null,
+        attachmentsCount = 0,
+        subId = null,
+        scheduledAt = null,
+    )
+
+    /** Fake contact repo whose name can change mid-test, with a change signal. */
+    private class MutableFakeContacts(var name: String) : ContactRepository {
+        val changes = MutableStateFlow(0L)
+
+        override fun observeContactChanges(): Flow<Long> = changes
+
+        override suspend fun lookupByPhone(rawPhone: String): Contact? =
+            if (rawPhone == BOB_PHONE) {
+                Contact(77L, name, listOf(PhoneAddress.of(rawPhone)), null)
+            } else {
+                null
+            }
+
+        override suspend fun listAll(): List<Contact> = emptyList()
+
+        override suspend fun listAllDetailed(): List<Contact> = emptyList()
+
+        override suspend fun openPhotoStream(address: String): java.io.InputStream? = null
+
+        override suspend fun setContactPhoto(
+            address: String,
+            photoBytes: ByteArray,
+        ): ContactPhotoWriteResult = ContactPhotoWriteResult.NotFound
+    }
+
+    private companion object {
+        private const val ALICE_PHONE = "+33612345678"
+        private const val BOB_PHONE = "+33698765432"
     }
 }

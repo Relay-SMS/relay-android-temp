@@ -27,8 +27,9 @@ import org.junit.jupiter.api.Test
  * recorded in the local error log (tag `e2e-probe-send` for a
  * probe, `e2e-bundle-send` for a bundle reply) with the
  * exception's class only — never its message, so a destination
- * address can never leak into the log — and a successful send
- * records nothing.
+ * address can never leak into the log — and a send the radio
+ * accepts records an `e2e-sms-accepted` event (kind + channel +
+ * byte/char length + port for data, and the destination address).
  *
  * Round 43 — the send also carries a sent intent (built by
  * [E2eSentIntentFactory], mocked here — `PendingIntent` is an
@@ -57,7 +58,7 @@ class E2eDataSmsSenderTest {
         recorder = mockk(relaxed = true)
         manager = mockk(relaxed = true)
         sentIntentFactory = mockk {
-            every { sentIntent(any()) } returns mockk<PendingIntent>()
+            every { sentIntent(any(), any()) } returns mockk<PendingIntent>()
         }
         every { SmsManager.getDefault() } returns manager
         sender = E2eDataSmsSenderImpl(mockk<Context>(), wireFormatter, recorder, sentIntentFactory)
@@ -115,16 +116,41 @@ class E2eDataSmsSenderTest {
     }
 
     @Test
-    fun `successful send returns true and records nothing`() {
+    fun `successful send returns true and records the acceptance event`() {
         val sent = sender.sendDataMessage(
             ADDRESS,
             null,
             E2eHandshake.E2E_DATA_SMS_PORT,
-            byteArrayOf(1),
+            byteArrayOf(1, 2, 3),
         )
 
         assertThat(sent).isTrue()
+        val message = slot<String>()
+        verify(exactly = 1) { recorder.recordEvent("e2e-sms-accepted", capture(message)) }
+        assertThat(message.captured).contains("Data SMS accepted by radio")
+        assertThat(message.captured).contains("kind=PROBE")
+        assertThat(message.captured).contains("port=47832")
+        assertThat(message.captured).contains("bytes=3")
+        assertThat(message.captured).contains(ADDRESS)
+        assertThat(message.captured).doesNotContain(WIRE_NUMBER)
         verify(exactly = 0) { recorder.record(any(), any()) }
+    }
+
+    @Test
+    fun `a bundle acceptance event carries the bundle kind`() {
+        val sent = sender.sendDataMessage(
+            ADDRESS,
+            null,
+            E2eHandshake.E2E_DATA_SMS_PORT,
+            byteArrayOf(1, 2, 3),
+            kind = DataSmsKind.BUNDLE,
+        )
+
+        assertThat(sent).isTrue()
+        val message = slot<String>()
+        verify(exactly = 1) { recorder.recordEvent("e2e-sms-accepted", capture(message)) }
+        assertThat(message.captured).contains("kind=BUNDLE")
+        assertThat(message.captured).contains("bytes=3")
     }
 
     @Test
@@ -172,7 +198,7 @@ class E2eDataSmsSenderTest {
     @Test
     fun `the sent intent is passed to the radio`() {
         val pendingIntent = mockk<PendingIntent>()
-        every { sentIntentFactory.sentIntent(any()) } returns pendingIntent
+        every { sentIntentFactory.sentIntent(any(), any()) } returns pendingIntent
 
         val sent = sender.sendDataMessage(
             ADDRESS,
@@ -192,7 +218,7 @@ class E2eDataSmsSenderTest {
 
     @Test
     fun `a null sent intent still sends fire-and-forget`() {
-        every { sentIntentFactory.sentIntent(any()) } returns null
+        every { sentIntentFactory.sentIntent(any(), any()) } returns null
 
         val sent = sender.sendDataMessage(
             ADDRESS,
@@ -208,7 +234,7 @@ class E2eDataSmsSenderTest {
     }
 
     @Test
-    fun `the sent intent carries the send kind`() {
+    fun `the sent intent carries the send kind and the address`() {
         sender.sendDataMessage(
             ADDRESS,
             null,
@@ -217,7 +243,7 @@ class E2eDataSmsSenderTest {
             kind = DataSmsKind.BUNDLE,
         )
 
-        verify(exactly = 1) { sentIntentFactory.sentIntent(DataSmsKind.BUNDLE) }
+        verify(exactly = 1) { sentIntentFactory.sentIntent(DataSmsKind.BUNDLE, ADDRESS) }
     }
 
     // ──────────────────── Regular-SMS path (round 45) ────────────────────
@@ -225,7 +251,7 @@ class E2eDataSmsSenderTest {
     @Test
     fun `a text send passes the wire destination, the text and the sent intent`() {
         val pendingIntent = mockk<PendingIntent>()
-        every { sentIntentFactory.sentIntent(any()) } returns pendingIntent
+        every { sentIntentFactory.sentIntent(any(), any()) } returns pendingIntent
 
         val sent = sender.sendTextMessage(ADDRESS, null, TEXT)
 
@@ -247,6 +273,21 @@ class E2eDataSmsSenderTest {
         assertThat(sentSlot.captured).isSameInstanceAs(pendingIntent)
         verify(exactly = 0) { recorder.record(any(), any()) }
         verify(exactly = 0) { manager.sendDataMessage(any(), any(), any(), any(), any(), any()) }
+    }
+
+    @Test
+    fun `a successful text send records the acceptance event with the char length`() {
+        val sent = sender.sendTextMessage(ADDRESS, null, TEXT)
+
+        assertThat(sent).isTrue()
+        val message = slot<String>()
+        verify(exactly = 1) { recorder.recordEvent("e2e-sms-accepted", capture(message)) }
+        assertThat(message.captured).contains("Text SMS accepted by radio")
+        assertThat(message.captured).contains("kind=PROBE")
+        assertThat(message.captured).contains("chars=${TEXT.length}")
+        assertThat(message.captured).doesNotContain("port=")
+        assertThat(message.captured).contains(ADDRESS)
+        verify(exactly = 0) { recorder.record(any(), any()) }
     }
 
     @Test
@@ -290,7 +331,7 @@ class E2eDataSmsSenderTest {
 
     @Test
     fun `a null sent intent still sends the text fire-and-forget`() {
-        every { sentIntentFactory.sentIntent(any()) } returns null
+        every { sentIntentFactory.sentIntent(any(), any()) } returns null
 
         val sent = sender.sendTextMessage(ADDRESS, null, TEXT)
 
@@ -301,10 +342,10 @@ class E2eDataSmsSenderTest {
     }
 
     @Test
-    fun `the text sent intent carries the send kind`() {
+    fun `the text sent intent carries the send kind and the address`() {
         sender.sendTextMessage(ADDRESS, null, TEXT, kind = DataSmsKind.BUNDLE)
 
-        verify(exactly = 1) { sentIntentFactory.sentIntent(DataSmsKind.BUNDLE) }
+        verify(exactly = 1) { sentIntentFactory.sentIntent(DataSmsKind.BUNDLE, ADDRESS) }
     }
 
     private companion object {

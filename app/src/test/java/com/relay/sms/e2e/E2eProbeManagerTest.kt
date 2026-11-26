@@ -1000,7 +1000,7 @@ class E2eProbeManagerTest {
     }
 
     @Test
-    fun `an automatic probe gate records nothing`() = runTest {
+    fun `an automatic probe gate records the reason and the trigger`() = runTest {
         val harness = Harness(scope = this)
         coEvery { harness.conversationDao.findById(11L) } returns
             harness.conversationWith(ALICE)
@@ -1015,8 +1015,134 @@ class E2eProbeManagerTest {
         testScheduler.advanceUntilIdle()
 
         assertThat(harness.sender.sent).isEmpty()
-        verify(exactly = 0) { harness.recorder.recordEvent(any(), any()) }
+        verify(exactly = 1) {
+            harness.recorder.recordEvent(
+                "e2e-probe-gated",
+                "Automatic probe refused for $ALICE: probe budget exhausted (trigger=thread-open).",
+            )
+        }
         verify(exactly = 0) { harness.recorder.record(any(), any()) }
+    }
+
+    @Test
+    fun `an automatic probe send records the attempt, the channel and the trigger`() = runTest {
+        val harness = Harness(scope = this)
+        coEvery { harness.conversationDao.findById(11L) } returns
+            harness.conversationWith(ALICE)
+
+        harness.manager.onThreadOpened(11L)
+        testScheduler.advanceUntilIdle()
+
+        assertThat(harness.sender.sent).hasSize(1)
+        verify(exactly = 1) {
+            harness.recorder.recordEvent(
+                "e2e-probe-sent",
+                "Automatic probe sent to $ALICE (attempt=1, channel=DATA_SMS, trigger=thread-open).",
+            )
+        }
+        verify(exactly = 0) { harness.recorder.record(any(), any()) }
+    }
+
+    @Test
+    fun `probeForSend records the send trigger`() = runTest {
+        val harness = Harness(scope = this)
+
+        harness.manager.probeForSend(ALICE, 3)
+        testScheduler.advanceUntilIdle()
+
+        assertThat(harness.sender.sent).hasSize(1)
+        verify(exactly = 1) {
+            harness.recorder.recordEvent(
+                "e2e-probe-sent",
+                "Automatic probe sent to $ALICE (attempt=1, channel=DATA_SMS, trigger=send).",
+            )
+        }
+    }
+
+    @Test
+    fun `a decrypt-failure re-probe records its trigger`() = runTest {
+        val harness = Harness(scope = this)
+        harness.seedPeer(state = E2ePeerState.ENCRYPTED)
+
+        harness.manager.reprobeAfterDecryptFailure(ALICE, null)
+        testScheduler.advanceUntilIdle()
+
+        assertThat(harness.sender.sent).hasSize(1)
+        verify(exactly = 1) {
+            harness.recorder.recordEvent(
+                "e2e-probe-sent",
+                "Automatic probe sent to $ALICE (attempt=1, channel=DATA_SMS, " +
+                    "trigger=decrypt-failure re-probe).",
+            )
+        }
+    }
+
+    @Test
+    fun `an automatic gate without a trigger records the reason alone`() = runTest {
+        val harness = Harness(scope = this, blocked = FakeBlockedRepo(setOf(ALICE)))
+
+        val result = harness.manager.probeAddressDetailed(ALICE, null, now = NOW)
+
+        assertThat(result).isEqualTo(ProbeResult.Gated(ProbeGate.Blocked))
+        verify(exactly = 1) {
+            harness.recorder.recordEvent(
+                "e2e-probe-gated",
+                "Automatic probe refused for $ALICE: number is blocked.",
+            )
+        }
+    }
+
+    @Test
+    fun `a third automatic attempt records the exhausted budget`() = runTest {
+        val harness = Harness(scope = this)
+        harness.seedPeer(
+            state = E2ePeerState.PROBING,
+            attempts = 2,
+            windowStartedAt = NOW - 2 * MS_PER_DAY,
+            lastProbeAt = NOW - 2 * MS_PER_DAY,
+        )
+
+        val result = harness.manager.probeAddressDetailed(ALICE, null, now = NOW)
+
+        assertThat(result).isEqualTo(ProbeResult.Sent(budgetExhausted = true))
+        verify(exactly = 1) {
+            harness.recorder.recordEvent(
+                "e2e-probe-sent",
+                "Automatic probe sent to $ALICE (attempt=3, channel=DATA_SMS, budget exhausted).",
+            )
+        }
+    }
+
+    @Test
+    fun `a manual gate never records an automatic event`() = runTest {
+        val harness = Harness(scope = this, blocked = FakeBlockedRepo(setOf(ALICE)))
+        coEvery { harness.conversationDao.findById(11L) } returns
+            harness.conversationWith(ALICE)
+
+        val result = harness.manager.retryProbeDetailed(11L)
+
+        assertThat(result).isEqualTo(ProbeResult.Gated(ProbeGate.Blocked))
+        verify(exactly = 1) {
+            harness.recorder.recordEvent(
+                "e2e-manual-retry",
+                "Manual retry refused: number is blocked.",
+            )
+        }
+        verify(exactly = 0) { harness.recorder.recordEvent("e2e-probe-gated", any()) }
+        verify(exactly = 0) { harness.recorder.recordEvent("e2e-probe-sent", any()) }
+    }
+
+    @Test
+    fun `a failed automatic send records nothing at the probe layer`() = runTest {
+        val harness = Harness(scope = this)
+        harness.sender.result = false
+
+        val result = harness.manager.probeAddressDetailed(ALICE, null, now = NOW)
+
+        assertThat(result).isEqualTo(ProbeResult.SendFailed)
+        // The sender recorded the radio refusal under the kind's
+        // failure tag; the probe layer adds no second entry.
+        verify(exactly = 0) { harness.recorder.recordEvent(any(), any()) }
     }
 
     // ──────────────────────────── Round 48: media capability ────────────────────────────

@@ -40,7 +40,10 @@ import java.util.Base64
  * add the dial frame (`dial_request`) and the end-call frame
  * (`end_call_request`), dispatched the same way.
  * Category mutes add the `set_category_muted` frame, dispatched
- * the same way. Round 36 phase 2 adds the note frames
+ * the same way. Round 57 adds the maps-provider frame
+ * (`set_maps_provider`); the two settings frames share one
+ * dispatch arm (`SettingsCommand`, see [dispatchSettings]).
+ * Round 36 phase 2 adds the note frames
  * (`create_note`, `save_note_message`, `edit_note_message`,
  * `rename_note`, `delete_note`, `delete_note_message`,
  * `set_note_pin`, `set_note_archived`, `note_messages_request`),
@@ -95,7 +98,9 @@ class SyncSessionHandler(
             is SyncProtocol.Parsed.SetPin -> onSetPin(parsed.value)
             is SyncProtocol.Parsed.SetArchived -> onSetArchived(parsed.value)
             is SyncProtocol.Parsed.SetMuted -> onSetMuted(parsed.value)
-            is SyncProtocol.Parsed.SetCategoryMuted -> onSetCategoryMuted(parsed.value)
+            // Settings commands share one arm — the sub-interface
+            // keeps this dispatch under the Detekt complexity cap (40).
+            is SyncProtocol.Parsed.SettingsCommand -> dispatchSettings(parsed)
             is SyncProtocol.Parsed.SetBlocked -> onSetBlocked(parsed.value)
             is SyncProtocol.Parsed.SetReaction -> onSetReaction(parsed.value)
             is SyncProtocol.Parsed.SetPinnedMessage -> onSetPinnedMessage(parsed.value)
@@ -133,6 +138,14 @@ class SyncSessionHandler(
         when (parsed) {
             is SyncProtocol.Parsed.SetE2eVerified -> onSetE2eVerified(parsed.value)
             is SyncProtocol.Parsed.RetryE2eProbe -> onRetryE2eProbe(parsed.value)
+        }
+    }
+
+    /** Settings command dispatch (round 57): one arm in [onText], split out here. */
+    private suspend fun dispatchSettings(parsed: SyncProtocol.Parsed.SettingsCommand) {
+        when (parsed) {
+            is SyncProtocol.Parsed.SetCategoryMuted -> onSetCategoryMuted(parsed.value)
+            is SyncProtocol.Parsed.SetMapsProvider -> onSetMapsProvider(parsed.value)
         }
     }
 
@@ -279,6 +292,16 @@ class SyncSessionHandler(
      */
     private suspend fun onSetCategoryMuted(request: SyncProtocol.SetCategoryMuted) {
         withEngine { it.onSetCategoryMuted(request) }
+    }
+
+    /**
+     * Round 57 — maps provider: the write frame needs auth too:
+     * an unauthenticated frame is a protocol violation, like an
+     * unauthenticated send. The engine runs it in its own job,
+     * never on the frame loop.
+     */
+    private suspend fun onSetMapsProvider(request: SyncProtocol.SetMapsProvider) {
+        withEngine { it.onSetMapsProvider(request) }
     }
 
     private suspend fun onSetBlocked(request: SyncProtocol.SetBlocked) {

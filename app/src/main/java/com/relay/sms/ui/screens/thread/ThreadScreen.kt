@@ -222,7 +222,7 @@ import kotlin.math.max
 // deux conventions décimales pour la même taille, sur deux écrans voisins. Les deux passent
 // désormais par le formateur de la plateforme, qui suit la langue de l'application.
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalPermissionsApi::class)
 @Composable
 fun ThreadScreen(
     conversationId: Long,
@@ -861,6 +861,15 @@ fun ThreadScreen(
     // lambda above is NOT flagged — only direct-argument lambdas are.
     val noAppLabel = stringResource(R.string.smart_action_no_app)
 
+    // Round 57 — WRITE_CONTACTS for a locally picked avatar: the
+    // ViewModel asks via Event.RequestContactsWritePhoto (the
+    // Relay-local avatar is already saved); a grant retries the
+    // write-back, a denial keeps Relay-local and says so. Asked
+    // here, at pick time — never at launch.
+    val contactsWritePermission = rememberPermissionState(Manifest.permission.WRITE_CONTACTS) { granted ->
+        if (granted) viewModel.retryPendingPhotoWriteBack() else viewModel.onContactsWriteDenied()
+    }
+
     LaunchedEffect(Unit) {
         viewModel.onConversationOpened()
         viewModel.events.collect { e ->
@@ -870,6 +879,8 @@ fun ThreadScreen(
                 is ThreadViewModel.Event.ShowSnackbar -> snackbarHost.showSnackbar(
                     RelaySnackbarVisuals(message = e.message, isError = e.isError),
                 )
+                is ThreadViewModel.Event.RequestContactsWritePhoto ->
+                    contactsWritePermission.launchPermissionRequest()
                 is ThreadViewModel.Event.PdfReady -> {
                     val shareIntent = Intent(Intent.ACTION_SEND).apply {
                         type = "application/pdf"

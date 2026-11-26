@@ -24,6 +24,7 @@ import com.relay.sms.domain.model.NoteMessage
 import com.relay.sms.domain.notes.NoteAttachmentResolver
 import com.relay.sms.domain.pdf.PdfExportResult
 import com.relay.sms.domain.usecase.ExportNotePdfUseCase
+import com.relay.sms.system.share.IncomingShareHolder
 import com.relay.sms.ui.components.AttachmentKind
 import io.mockk.Runs
 import io.mockk.coEvery
@@ -51,8 +52,9 @@ import java.util.UUID
  * Notes — the note thread ViewModel: saving (text / with staged
  * attachments / empty), deleting an entry, draft persistence,
  * load-older paging, rename / bubble color, PDF export, note
- * deletion, voice staging, playback failure, save-a-copy, and the
- * details-panel attachment pairing.
+ * deletion, voice staging, playback failure, save-a-copy, the
+ * details-panel attachment pairing, and share-into-note
+ * consumption (text → draft, first URI → staged attachment).
  *
  * Not covered here: the playback SUCCESS path calls
  * `Uri.fromFile` (an Android stub that throws on plain JVM), and
@@ -137,7 +139,11 @@ class NoteThreadViewModelTest {
         val contentResolver: ContentResolver,
     )
 
-    private fun harness(initialNote: Note? = note()): Harness {
+    private fun harness(
+        initialNote: Note? = note(),
+        incomingShare: IncomingShareHolder? = null,
+        sharedImageUri: Uri? = null,
+    ): Harness {
         val repo = FakeNoteRepository(initialNote)
         val resolver = mockk<NoteAttachmentResolver>(relaxed = true)
         val exportPdf = mockk<ExportNotePdfUseCase>()
@@ -150,6 +156,9 @@ class NoteThreadViewModelTest {
         every { context.cacheDir } returns tempDir
         every { context.contentResolver } returns contentResolver
         every { context.getString(any()) } returns "stub"
+        // A share is consumed in init, so its URI must be stubbed
+        // before the ViewModel is constructed.
+        if (sharedImageUri != null) stubImageUri(contentResolver, sharedImageUri)
         val vm = NoteThreadViewModel(
             savedStateHandle = SavedStateHandle(mapOf("noteId" to NOTE_ID)),
             noteRepo = repo,
@@ -159,13 +168,17 @@ class NoteThreadViewModelTest {
             playbackController = playbackController,
             context = context,
             io = dispatcher,
+            incomingShare = incomingShare,
         )
         return Harness(vm, repo, resolver, exportPdf, voiceRecorder, playbackController, context, contentResolver)
     }
 
-    /** Stages one fake image pick through the real `onAttachmentPicked` path. */
-    private fun Harness.stageImage(bytes: ByteArray = byteArrayOf(1, 2, 3, 4)): Uri {
-        val uri = mockk<Uri>()
+    /** Stubs a fake image pick for [uri] (the resolver side of staging). */
+    private fun stubImageUri(
+        contentResolver: ContentResolver,
+        uri: Uri,
+        bytes: ByteArray = byteArrayOf(1, 2, 3, 4),
+    ) {
         val cursor = mockk<Cursor>()
         every { cursor.moveToFirst() } returns true
         every { cursor.isNull(0) } returns false
@@ -175,6 +188,12 @@ class NoteThreadViewModelTest {
         every { contentResolver.query(uri, any(), null, null, null) } returns cursor
         every { contentResolver.getType(uri) } returns "image/jpeg"
         every { contentResolver.openInputStream(uri) } returns ByteArrayInputStream(bytes)
+    }
+
+    /** Stages one fake image pick through the real `onAttachmentPicked` path. */
+    private fun Harness.stageImage(bytes: ByteArray = byteArrayOf(1, 2, 3, 4)): Uri {
+        val uri = mockk<Uri>()
+        stubImageUri(contentResolver, uri, bytes)
         vm.onAttachmentPicked(uri, AttachmentKind.PHOTO)
         return uri
     }
@@ -438,6 +457,48 @@ class NoteThreadViewModelTest {
         assertThat(paired[0].messageDate).isEqualTo(200L)
         assertThat(paired[0].messageBody).isEqualTo("new")
         assertThat(paired[1].messageDate).isEqualTo(100L)
+    }
+
+    @Test fun `a pending share pre-fills the draft with its text`() = runTest(dispatcher) {
+        val holder = IncomingShareHolder()
+        holder.set(
+            IncomingShareHolder.Pending(
+                uris = emptyList(),
+                mimeType = "text/plain",
+                text = "Shared from the browser",
+            ),
+        )
+        val h = harness(incomingShare = holder)
+        advanceUntilIdle()
+
+        assertThat(h.vm.state.value.draft).isEqualTo("Shared from the browser")
+        assertThat(h.repo.setDraftCalls.last()).isEqualTo(NOTE_ID to "Shared from the browser")
+        // Consumed once: the holder is empty afterwards.
+        assertThat(holder.pending.value).isNull()
+    }
+
+    @Test fun `a pending share stages its first URI as an attachment`() = runTest(dispatcher) {
+        val holder = IncomingShareHolder()
+        val uri = mockk<Uri>()
+        holder.set(
+            IncomingShareHolder.Pending(
+                uris = listOf(uri, mockk<Uri>()),
+                mimeType = "image/jpeg",
+                text = "Look at this",
+            ),
+        )
+        val h = harness(incomingShare = holder, sharedImageUri = uri)
+        advanceUntilIdle()
+
+        assertThat(h.vm.state.value.draft).isEqualTo("Look at this")
+        // Only the first URI stages; later URIs of a multi-share
+        // are ignored this release.
+        assertThat(h.vm.state.value.pendingAttachments).hasSize(1)
+        val staged = h.vm.state.value.pendingAttachments[0]
+        assertThat(staged.mimeType).isEqualTo("image/jpeg")
+        assertThat(staged.fileName).isEqualTo("photo.jpg")
+        assertThat(File(staged.path).exists()).isTrue()
+        assertThat(holder.pending.value).isNull()
     }
 
     companion object {

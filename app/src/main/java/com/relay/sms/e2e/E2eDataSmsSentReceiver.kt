@@ -30,7 +30,9 @@ import javax.inject.Inject
  *
  * The kind extra names the [DataSmsKind]; a missing or unknown
  * value falls back to PROBE (the sender's default kind) rather
- * than dropping the verdict.
+ * than dropping the verdict. The address extra names the peer
+ * the send went to (round 57); a missing value passes null and
+ * the handler records the verdict without an address.
  */
 @AndroidEntryPoint
 class E2eDataSmsSentReceiver : BroadcastReceiver() {
@@ -43,11 +45,12 @@ class E2eDataSmsSentReceiver : BroadcastReceiver() {
         val kind = runCatching {
             DataSmsKind.valueOf(intent.getStringExtra(EXTRA_KIND) ?: "")
         }.getOrDefault(DataSmsKind.PROBE)
-        handler.handle(resultCode, kind)
+        handler.handle(resultCode, kind, intent.getStringExtra(EXTRA_ADDRESS))
     }
 
     companion object {
         const val ACTION_DATA_SMS_SENT = "com.relay.sms.e2e.DATA_SMS_SENT"
         const val EXTRA_KIND = "e2e_data_sms_kind"
+        const val EXTRA_ADDRESS = "e2e_data_sms_address"
     }
 }

@@ -10,6 +10,9 @@ package com.relay.sms.e2e
 import com.google.common.truth.Truth.assertThat
 import com.relay.sms.data.local.db.entity.E2ePeerEntity
 import com.relay.sms.data.local.db.entity.E2ePeerState
+import io.mockk.mockk
+import io.mockk.slot
+import io.mockk.verify
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Test
 
@@ -40,10 +43,12 @@ class E2eMediaCapabilityManagerTest {
         blocked: Set<String> = emptySet(),
     ) {
         val peers = E2ePeerRepository(peerDao)
+        val recorder: E2eFailureRecorder = mockk(relaxed = true)
         val manager = E2eMediaCapabilityManager(
             peers = peers,
             dataSmsSender = sender,
             blockedRepo = FakeBlockedRepo(blocked),
+            recorder = recorder,
         )
 
         fun seedPeer(
@@ -86,6 +91,10 @@ class E2eMediaCapabilityManagerTest {
         assertThat(harness.sender.sent[0].data.size).isEqualTo(70)
         assertThat(harness.peerDao.peers[BOB]!!.mediaAnnounced).isTrue()
         assertThat(harness.peerDao.peers[BOB]!!.groupAnnounced).isTrue()
+        val message = slot<String>()
+        verify(exactly = 1) { harness.recorder.recordEvent("e2e-capability-sent", capture(message)) }
+        assertThat(message.captured).contains("channel=DATA_SMS")
+        assertThat(message.captured).contains("to $BOB")
     }
 
     @Test
@@ -101,6 +110,10 @@ class E2eMediaCapabilityManagerTest {
         assertThat(harness.sender.sentTexts[0].kind).isEqualTo(DataSmsKind.CAPABILITY)
         assertThat(harness.sender.sentTexts[0].text).startsWith("RLYH:")
         assertThat(harness.peerDao.peers[BOB]!!.mediaAnnounced).isTrue()
+        val message = slot<String>()
+        verify(exactly = 1) { harness.recorder.recordEvent("e2e-capability-sent", capture(message)) }
+        assertThat(message.captured).contains("channel=TEXT_SMS")
+        assertThat(message.captured).contains("to $BOB")
     }
 
     @Test
@@ -118,6 +131,10 @@ class E2eMediaCapabilityManagerTest {
         assertThat(harness.sender.sent).hasSize(1)
         assertThat(harness.sender.sentTexts).hasSize(1)
         assertThat(harness.peerDao.peers[BOB]!!.mediaAnnounced).isTrue()
+        val message = slot<String>()
+        verify(exactly = 1) { harness.recorder.recordEvent("e2e-capability-sent", capture(message)) }
+        assertThat(message.captured).contains("channel=DATA_SMS+TEXT_SMS")
+        assertThat(message.captured).contains("to $BOB")
     }
 
     @Test
@@ -130,6 +147,9 @@ class E2eMediaCapabilityManagerTest {
         assertThat(sent).isFalse()
         assertThat(harness.sender.sent).isEmpty()
         assertThat(harness.sender.sentTexts).isEmpty()
+        // A no-op records nothing: every thread-open on an
+        // announced peer would otherwise spam the log.
+        verify(exactly = 0) { harness.recorder.recordEvent(any(), any()) }
     }
 
     @Test
@@ -196,6 +216,13 @@ class E2eMediaCapabilityManagerTest {
         assertThat(harness.sender.sent).isEmpty()
         assertThat(harness.sender.sentTexts).isEmpty()
         assertThat(harness.peerDao.peers[BOB]!!.mediaAnnounced).isFalse()
+        verify(exactly = 1) {
+            harness.recorder.recordEvent(
+                "e2e-capability-blocked",
+                "Capability declaration refused for $BOB: number is blocked.",
+            )
+        }
+        verify(exactly = 0) { harness.recorder.recordEvent("e2e-capability-sent", any()) }
     }
 
     @Test
@@ -207,6 +234,13 @@ class E2eMediaCapabilityManagerTest {
 
         assertThat(sent).isFalse()
         assertThat(harness.peerDao.peers[BOB]!!.mediaAnnounced).isFalse()
+        verify(exactly = 1) {
+            harness.recorder.recordEvent(
+                "e2e-capability-send-failed",
+                "Capability declaration refused by radio for $BOB on every attempted channel.",
+            )
+        }
+        verify(exactly = 0) { harness.recorder.recordEvent("e2e-capability-sent", any()) }
     }
 
     @Test
@@ -246,6 +280,14 @@ class E2eMediaCapabilityManagerTest {
         assertThat(harness.peerDao.peers[BOB]!!.mediaAnnounced).isTrue()
         assertThat(harness.peerDao.peers[BOB]!!.groupAnnounced).isTrue()
         assertThat(harness.peerDao.peers[BOB]!!.groupMediaAnnounced).isTrue()
+        // The receipt itself is recorded once, by the handler —
+        // the manager writes only the announce-back send.
+        verify(exactly = 0) { harness.recorder.recordEvent("e2e-capability-received", any()) }
+        val sentMessage = slot<String>()
+        verify(exactly = 1) {
+            harness.recorder.recordEvent("e2e-capability-sent", capture(sentMessage))
+        }
+        assertThat(sentMessage.captured).contains("channel=TEXT_SMS")
     }
 
     @Test
@@ -265,6 +307,9 @@ class E2eMediaCapabilityManagerTest {
         assertThat(harness.peerDao.peers[BOB]!!.mediaCapable).isTrue()
         assertThat(harness.peerDao.peers[BOB]!!.groupCapable).isTrue()
         assertThat(harness.peerDao.peers[BOB]!!.groupMediaCapable).isTrue()
+        // The receipt itself is recorded once, by the handler —
+        // the manager writes only the announce-back send.
+        verify(exactly = 0) { harness.recorder.recordEvent("e2e-capability-received", any()) }
     }
 
     @Test

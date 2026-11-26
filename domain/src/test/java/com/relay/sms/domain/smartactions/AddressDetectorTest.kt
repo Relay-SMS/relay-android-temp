@@ -13,8 +13,8 @@ import org.junit.jupiter.api.Test
 /**
  * Positive and negative cases for [AddressDetector]. The negative cases
  * are the point: "5 minutes walk down Main Street" is a sentence, not an
- * address — the capitalised-first-word gate exists for it, and the tests
- * pin the gate.
+ * address — the tail gate for a lowercase first word exists for it, and
+ * the tests pin the gate.
  */
 class AddressDetectorTest {
 
@@ -74,9 +74,31 @@ class AddressDetectorTest {
         assertThat(firstAddress("5 minutes walk down Main Street")).isNull()
     }
 
-    @Test fun `lowercase street name is missed by design`() {
-        // The capitalised-first-word gate: a lowercase address is the
-        // accepted cost of keeping sentences out (see the detector KDoc).
+    @Test fun `lowercase sentence shaped like an address is not one`() {
+        assertThat(firstAddress("5 minutes walk down main street")).isNull()
+    }
+
+    @Test fun `address detects in any case with a city state zip tail`() {
+        // The detected text keeps the case the user wrote, so the
+        // directions query is verbatim.
+        assertThat(firstAddress("5466 Elam Rd, Kinzers, PA 17535"))
+            .isEqualTo("5466 Elam Rd, Kinzers, PA 17535")
+        assertThat(firstAddress("5466 elam rd, kinzers, pa 17535"))
+            .isEqualTo("5466 elam rd, kinzers, pa 17535")
+        assertThat(firstAddress("5466 Elam Rd, kinzers, PA 17535"))
+            .isEqualTo("5466 Elam Rd, kinzers, PA 17535")
+        assertThat(firstAddress("5466 ELAM RD, KINZERS, PA 17535"))
+            .isEqualTo("5466 ELAM RD, KINZERS, PA 17535")
+    }
+
+    @Test fun `lowercase street name with a unit detects`() {
+        assertThat(firstAddress("123 main st, apt 4")).isEqualTo("123 main st, apt 4")
+    }
+
+    @Test fun `lowercase street name without a tail is still missed`() {
+        // The tail gate: a lowercase address with no unit or tail is
+        // the accepted cost of keeping sentences out (see the detector
+        // KDoc).
         assertThat(firstAddress("meet at 123 main st")).isNull()
     }
 

@@ -55,16 +55,16 @@ class CrashReportStoreTest {
     }
 
     @Test
-    fun `rotation keeps the ten newest and deletes the oldest`() {
+    fun `rotation keeps the fifty newest and deletes the oldest`() {
         val reports = store()
-        for (i in 1..12) {
+        for (i in 1..(CrashReportStore.MAX_REPORTS + 2)) {
             reports.writeReport("report $i", i * 1_000L, "Crash$i")
         }
         val listed = reports.listReports()
         assertThat(listed).hasSize(CrashReportStore.MAX_REPORTS)
         assertThat(listed.map { it.timestampMillis }).doesNotContain(1_000L)
         assertThat(listed.map { it.timestampMillis }).doesNotContain(2_000L)
-        assertThat(listed.map { it.timestampMillis }).contains(12_000L)
+        assertThat(listed.map { it.timestampMillis }).contains((CrashReportStore.MAX_REPORTS + 2) * 1_000L)
     }
 
     @Test

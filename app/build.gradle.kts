@@ -364,6 +364,11 @@ dependencies {
     // runtime dependency, so without this line CI fails to compile.
     implementation(libs.androidsvg)
 
+    // Lottie — animated splash logo (round 57). Direct: SplashScreen
+    // imports com.airbnb.lottie.compose. The lottie-compose AAR pulls in
+    // only the lottie runtime + Compose UI (already on the classpath).
+    implementation(libs.lottie.compose)
+
     // Accompanist
     implementation(libs.accompanist.permissions)
 

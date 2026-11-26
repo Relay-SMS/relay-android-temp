@@ -14,6 +14,7 @@ import com.relay.sms.domain.model.Contact
 import com.relay.sms.domain.repository.ContactPhotoWriteResult
 import com.relay.sms.domain.repository.ContactRepository
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
 import java.io.InputStream
 import javax.inject.Inject
@@ -28,6 +29,8 @@ class ContactRepositoryImpl @Inject constructor(
     override suspend fun lookupByPhone(rawPhone: String): Contact? = withContext(io) {
         reader.lookupByPhone(rawPhone)
     }
+
+    override fun observeContactChanges(): Flow<Long> = reader.changes
 
     override suspend fun hasContactsPermission(): Boolean = withContext(io) {
         reader.hasContactsPermission()

@@ -73,9 +73,14 @@ import com.relay.sms.data.local.db.entity.E2ePeerState as StoredPeerState
  * ([probeConversationDetailed]) and records every non-[Sent]
  * outcome in the error log under `e2e-manual-retry`, gated or
  * failed, with the reason — fixed messages, no addresses. Success
- * records nothing (the state flip to PROBING is the signal), and
- * automatic probes never record (they use the Boolean cores and
- * gate constantly).
+ * records nothing (the state flip to PROBING is the signal).
+ * Automatic probes record too (round 57): every automatic gate
+ * refusal under `e2e-probe-gated` (with the gate reason, the
+ * trigger, and the address) and every automatic send under
+ * `e2e-probe-sent` (with the attempt count, the channel, the
+ * trigger, and the address) — see [recordAutomaticResult]. A
+ * failed automatic send records nothing here: the sender already
+ * recorded the radio refusal under the kind's failure tag.
  *
  * Round 42 — the peer row is keyed by the NORMALIZED address (see
  * [E2ePeerRepository]): the probe used to write under the raw
@@ -195,6 +200,27 @@ enum class ProbeGate(val label: String) {
     DiscoveryOff("discovery is off"),
 }
 
+/**
+ * What triggered an automatic probe. [label] is the fixed,
+ * PII-free wording recorded in the error log alongside the
+ * outcome (see [E2eProbeManager.recordAutomaticResult]).
+ * Manual retries carry no trigger: they record under
+ * `e2e-manual-retry` instead, with no automatic event.
+ */
+enum class ProbeTrigger(val label: String) {
+    /** Opening a 1:1 thread ([E2eProbeManager.onThreadOpened]). */
+    THREAD_OPEN("thread-open"),
+
+    /** Sending a 1:1 message ([E2eProbeManager.probeForSend]). */
+    SEND("send"),
+
+    /** An undecryptable message ([E2eProbeManager.reprobeAfterDecryptFailure]). */
+    DECRYPT_FAILURE("decrypt-failure re-probe"),
+
+    /** A plain SMS from an ENCRYPTED peer ([E2eProbeManager.reprobeAfterPeerLeft]). */
+    PEER_LEFT("peer-left re-probe"),
+}
+
 @Singleton
 class E2eProbeManager @Inject constructor(
     private val conversationDao: ConversationDao,
@@ -212,6 +238,12 @@ class E2eProbeManager @Inject constructor(
     private companion object {
         /** Error-log tag for manual-retry failures (round 42). */
         const val MANUAL_RETRY_TAG = "e2e-manual-retry"
+
+        /** Error-log tag for automatic gate refusals (round 57). */
+        const val AUTO_GATED_TAG = "e2e-probe-gated"
+
+        /** Error-log tag for automatic probe sends (round 57). */
+        const val AUTO_SENT_TAG = "e2e-probe-sent"
     }
 
     /**
@@ -221,7 +253,7 @@ class E2eProbeManager @Inject constructor(
      */
     fun onThreadOpened(conversationId: Long) {
         scope.launch {
-            runCatching { probeConversation(conversationId) }
+            runCatching { probeConversation(conversationId, trigger = ProbeTrigger.THREAD_OPEN) }
                 .onFailure { Timber.w(it, "E2E: probe on thread open failed") }
         }
     }
@@ -233,7 +265,7 @@ class E2eProbeManager @Inject constructor(
      */
     fun probeForSend(address: String, subId: Int?) {
         scope.launch {
-            runCatching { probeAddress(address, subId) }
+            runCatching { probeAddress(address, subId, trigger = ProbeTrigger.SEND) }
                 .onFailure { Timber.w(it, "E2E: probe on send failed") }
         }
     }
@@ -245,8 +277,9 @@ class E2eProbeManager @Inject constructor(
      */
     fun reprobeAfterDecryptFailure(address: String, subId: Int?) {
         scope.launch {
-            runCatching { probeAddress(address, subId, allowEncrypted = true) }
-                .onFailure { Timber.w(it, "E2E: re-probe after decrypt failure failed") }
+            runCatching {
+                probeAddress(address, subId, allowEncrypted = true, trigger = ProbeTrigger.DECRYPT_FAILURE)
+            }.onFailure { Timber.w(it, "E2E: re-probe after decrypt failure failed") }
         }
     }
 
@@ -259,7 +292,7 @@ class E2eProbeManager @Inject constructor(
      */
     fun reprobeAfterPeerLeft(address: String, subId: Int?) {
         scope.launch {
-            runCatching { probeAddress(address, subId) }
+            runCatching { probeAddress(address, subId, trigger = ProbeTrigger.PEER_LEFT) }
                 .onFailure { Timber.w(it, "E2E: re-probe after peer left failed") }
         }
     }
@@ -331,10 +364,11 @@ class E2eProbeManager @Inject constructor(
     /**
      * Records a manual retry that did not send (round 42). Success
      * records nothing — the state flip to PROBING is the signal —
-     * and automatic probes never reach this (they use the Boolean
-     * cores). Fixed messages only, no addresses; the recorder's
-     * per-process dedupe collapses repeated failed taps into one
-     * entry, which is all the diagnosis needs.
+     * and automatic probes never reach this (they use
+     * [recordAutomaticResult] instead). Fixed messages only, no
+     * addresses; the recorder's per-process dedupe collapses
+     * repeated failed taps into one entry, which is all the
+     * diagnosis needs.
      */
     private fun recordManualResult(result: ProbeResult) {
         when (result) {
@@ -351,6 +385,52 @@ class E2eProbeManager @Inject constructor(
     }
 
     /**
+     * Records a NON-manual probe outcome (round 57): every
+     * automatic gate refusal under `e2e-probe-gated` (with the
+     * gate reason, the trigger, and the address) and every
+     * automatic send under `e2e-probe-sent` (with the attempt
+     * count, the channel, the trigger, and the address). A failed
+     * send records nothing here — the sender already recorded the
+     * radio refusal under the kind's failure tag. Events are
+     * never deduped, so each attempt leaves its own entry.
+     * [address] is null only where no single address exists (a
+     * missing conversation, or one that is not 1:1) — those
+     * refusals record without one. Callers pass the result only
+     * when `manual` is false: manual outcomes record under
+     * `e2e-manual-retry` instead ([recordManualResult]) and must
+     * never double-record.
+     */
+    private fun recordAutomaticResult(
+        result: ProbeResult,
+        trigger: ProbeTrigger?,
+        channel: HandshakeChannel? = null,
+        attempts: Int = 0,
+        address: String? = null,
+    ) {
+        when (result) {
+            is ProbeResult.Sent -> {
+                val detail = listOfNotNull(
+                    "attempt=$attempts",
+                    channel?.let { "channel=${it.name}" },
+                    trigger?.let { "trigger=${it.label}" },
+                    "budget exhausted".takeIf { result.budgetExhausted },
+                ).joinToString(", ")
+                val to = address?.let { " to $it" } ?: ""
+                recorder.recordEvent(AUTO_SENT_TAG, "Automatic probe sent$to ($detail).")
+            }
+            is ProbeResult.Gated -> {
+                val triggerText = trigger?.let { " (trigger=${it.label})" } ?: ""
+                val forAddress = address?.let { " for $it" } ?: ""
+                recorder.recordEvent(
+                    AUTO_GATED_TAG,
+                    "Automatic probe refused$forAddress: ${result.reason.label}$triggerText.",
+                )
+            }
+            ProbeResult.SendFailed -> Unit
+        }
+    }
+
+    /**
      * Probes the single address of a conversation, if probeable.
      * Returns `true` when a probe data SMS went out. [manual] lifts
      * the budget and discovery-toggle gates for an explicit user
@@ -360,8 +440,9 @@ class E2eProbeManager @Inject constructor(
         conversationId: Long,
         now: Long = System.currentTimeMillis(),
         manual: Boolean = false,
+        trigger: ProbeTrigger? = null,
     ): Boolean =
-        probeConversationDetailed(conversationId, now, manual) is ProbeResult.Sent
+        probeConversationDetailed(conversationId, now, manual, trigger = trigger) is ProbeResult.Sent
 
     /**
      * Detailed core of [probeConversation]: resolves the conversation
@@ -369,25 +450,43 @@ class E2eProbeManager @Inject constructor(
      * [ProbeGate.NoConversation] / [ProbeGate.NotOneToOne] when the
      * conversation is missing or not 1:1. [channel] picks the
      * transport (round 45): data SMS by default, regular SMS for the
-     * "Send via SMS" manual retry.
+     * "Send via SMS" manual retry. [trigger] names the automatic
+     * entry point for the error log (round 57); manual callers
+     * leave it null and record under `e2e-manual-retry` instead.
      */
     suspend fun probeConversationDetailed(
         conversationId: Long,
         now: Long = System.currentTimeMillis(),
         manual: Boolean = false,
         channel: HandshakeChannel = HandshakeChannel.DATA_SMS,
+        trigger: ProbeTrigger? = null,
     ): ProbeResult {
         val conversation = conversationDao.findById(conversationId)
-            ?: return ProbeResult.Gated(ProbeGate.NoConversation)
+        if (conversation == null) {
+            val result = ProbeResult.Gated(ProbeGate.NoConversation)
+            if (!manual) recordAutomaticResult(result, trigger)
+            return result
+        }
         val addresses = PhoneAddress.list(conversation.addressesCsv).map { it.raw }
-        if (addresses.size != 1) return ProbeResult.Gated(ProbeGate.NotOneToOne)
+        if (addresses.size != 1) {
+            val result = ProbeResult.Gated(ProbeGate.NotOneToOne)
+            if (!manual) recordAutomaticResult(result, trigger)
+            return result
+        }
         val address = addresses.first()
         // The probe leaves on the same subscription the thread's sends
         // use (design §11.1): the default SMS subscription from
         // settings, `null` (system default) when unreadable.
         val subId = runCatching { settings.hydratedOrNull()?.sending?.defaultSubId }
             .getOrNull()
-        return probeAddressDetailed(address, subId, now = now, manual = manual, channel = channel)
+        return probeAddressDetailed(
+            address,
+            subId,
+            now = now,
+            manual = manual,
+            channel = channel,
+            trigger = trigger,
+        )
     }
 
     /**
@@ -403,16 +502,18 @@ class E2eProbeManager @Inject constructor(
         allowEncrypted: Boolean = false,
         manual: Boolean = false,
         now: Long = System.currentTimeMillis(),
+        trigger: ProbeTrigger? = null,
     ): Boolean =
-        probeAddressDetailed(address, subId, allowEncrypted, manual, now) is ProbeResult.Sent
+        probeAddressDetailed(address, subId, allowEncrypted, manual, now, trigger = trigger) is ProbeResult.Sent
 
     /**
      * Detailed core of [probeAddress]: the same probe, with the
      * outcome instead of a Boolean. The manual path ([retryProbe],
      * [retryProbeViaSms]) records the non-[ProbeResult.Sent]
-     * outcomes in the error log; the automatic triggers use the
-     * Boolean [probeAddress] and record nothing (automatic probes
-     * gate constantly). [channel] picks the transport (round 45):
+     * outcomes in the error log; the automatic triggers record
+     * their gated and sent outcomes too (round 57 — see
+     * [recordAutomaticResult]), with the [trigger] naming the
+     * entry point. [channel] picks the transport (round 45):
      * data SMS by default, regular SMS for the "Send via SMS"
      * manual retry — the gates, the budget accounting, and the
      * round-44 PROBING rule are identical on both channels.
@@ -424,6 +525,7 @@ class E2eProbeManager @Inject constructor(
         manual: Boolean = false,
         now: Long = System.currentTimeMillis(),
         channel: HandshakeChannel = HandshakeChannel.DATA_SMS,
+        trigger: ProbeTrigger? = null,
     ): ProbeResult = probeMutex.withLock {
         val state = peers.state(address)
         val gate = gateFor(address, state, allowEncrypted, manual, now)
@@ -439,7 +541,9 @@ class E2eProbeManager @Inject constructor(
             if (gate == ProbeGate.AlreadyEncrypted && !manual) {
                 mediaCapability.announceIfNeeded(address, subId, now)
             }
-            return@withLock ProbeResult.Gated(gate)
+            val result = ProbeResult.Gated(gate)
+            if (!manual) recordAutomaticResult(result, trigger, address = address)
+            return@withLock result
         }
         // Lazy account creation: the first probe sent (or received) is
         // the first E2E use, and the identity is created here — users
@@ -463,7 +567,9 @@ class E2eProbeManager @Inject constructor(
             )
         }
         // A failed send must not consume budget: record only after the
-        // radio accepted the probe.
+        // radio accepted the probe. No probe-manager event here:
+        // the sender already recorded the radio refusal under the
+        // kind's failure tag.
         if (!sent) return@withLock ProbeResult.SendFailed
         peers.recordProbeSent(address, now)
         // The 3rd unanswered attempt exhausts the budget: the peer
@@ -489,7 +595,9 @@ class E2eProbeManager @Inject constructor(
             peers.setState(address, StoredPeerState.NOT_RELAY, now)
         }
         Timber.i("E2E: probe sent (state=%s, attempts=%d)", state, attempts)
-        ProbeResult.Sent(budgetExhausted = budgetExhausted)
+        val result = ProbeResult.Sent(budgetExhausted = budgetExhausted)
+        if (!manual) recordAutomaticResult(result, trigger, channel, attempts, address = address)
+        result
     }
 
     /**

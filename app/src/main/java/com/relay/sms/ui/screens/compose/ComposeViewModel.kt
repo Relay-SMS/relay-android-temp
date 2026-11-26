@@ -26,6 +26,7 @@ import com.relay.sms.domain.clientmode.ClientActionGateway
 import com.relay.sms.domain.clientmode.NoOpClientActionGateway
 import com.relay.sms.domain.model.Contact
 import com.relay.sms.domain.model.NOTE_TITLE_MAX_LENGTH
+import com.relay.sms.domain.model.Note
 import com.relay.sms.domain.model.PhoneAddress
 import com.relay.sms.domain.repository.ContactRepository
 import com.relay.sms.domain.repository.ConversationRepository
@@ -107,6 +108,17 @@ class ComposeViewModel @Inject constructor(
         /** Client mode C3 — the hub refused the create (or could not be reached). */
         data class CreateFailed(val error: AppError) : Event
     }
+
+    /**
+     * Notes — the existing notes for the "Select note" section of
+     * the compose picker (round 57): share destinations, and a
+     * shortcut to open a note. Archived notes are not destinations
+     * — the main list hides them the same way.
+     */
+    val notes: StateFlow<List<Note>> = noteRepo.observeAllNotes()
+        .map { list -> list.filterNot { it.archived } }
+        .flowOn(io)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000L), emptyList())
 
     /**
      * Client mode C3 — the compose screen hides the create-contact

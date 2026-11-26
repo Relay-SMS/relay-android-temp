@@ -43,9 +43,11 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import timber.log.Timber
 import java.io.File
 import javax.inject.Inject
@@ -93,6 +95,14 @@ class NoteThreadViewModel @Inject constructor(
     @IoDispatcher private val io: CoroutineDispatcher,
     /** Round 36 phase 2 — the client-mode send seam (a no-op in hub mode). */
     private val sendGateway: ClientSendGateway = NoOpClientSendGateway,
+    /**
+     * Round 57 — the pending share, for share-into-note (see
+     * [consumeIncomingShareIfAny]). Nullable with a null default
+     * so the existing note-thread tests — which construct the
+     * ViewModel by hand — keep compiling untouched; Hilt always
+     * provides the real holder.
+     */
+    private val incomingShare: com.relay.sms.system.share.IncomingShareHolder? = null,
 ) : ViewModel() {
 
     val noteId: Long = savedStateHandle.get<Long>("noteId") ?: -1L
@@ -244,6 +254,10 @@ class NoteThreadViewModel @Inject constructor(
                 _state.update { it.copy(noteDownloads = states) }
             }
         }
+        // Round 57 — share-into-note: a share posted while the user
+        // picked this note (new or existing) is consumed once the
+        // note hydrates, below.
+        consumeIncomingShareIfAny()
     }
 
     /** Widens the tail window by one page (the "load older" row). */
@@ -257,6 +271,70 @@ class NoteThreadViewModel @Inject constructor(
         draftRevision++
         _state.update { it.copy(draft = text) }
         viewModelScope.launch { noteRepo.setDraft(noteId, text.ifBlank { null }) }
+    }
+
+    /**
+     * Round 57 — share-into-note: consumes a pending share posted
+     * to [com.relay.sms.system.share.IncomingShareHolder] while
+     * the user picked this note — a NEW note (the share waited in
+     * the holder through the naming step) or an EXISTING one (the
+     * "Select note" row on the compose screen). Mirrors
+     * [com.relay.sms.ui.screens.thread.ThreadViewModel]'s
+     * `consumeIncomingShareIfAny`:
+     *
+     *  - the shared TEXT pre-fills the draft (merged with any
+     *    existing draft, like the thread does);
+     *  - the first shared URI stages through the standard
+     *    [onAttachmentPicked] path — so [save] carries it through
+     *    the encrypted envelope ([noteRepo.addAttachment]), never
+     *    as a bare URI.
+     *
+     * Before this, a share into a new note lost the image: the
+     * note thread never read the holder, and the pending sat there
+     * until its TTL expired. A note opened with no pending share
+     * consumes nothing. Waits for hydration (bounded, 5 s) so
+     * [onAttachmentPicked] does not early-return on a null note
+     * and void the share — the same Z3 race the thread guards.
+     */
+    private fun consumeIncomingShareIfAny() {
+        val holder = incomingShare ?: return
+        viewModelScope.launch {
+            // Bounded wait: if the note never hydrates (deleted
+            // concurrently), abandon rather than leak the holder.
+            val hydrated = withTimeoutOrNull(5_000L) {
+                _state.first { it.note != null }
+            }
+            if (hydrated == null) {
+                Timber.w("consumeIncomingShareIfAny: note never hydrated, share ignored")
+                return@launch
+            }
+            val pending = holder.consume() ?: return@launch
+            // 1) Text → draft. Round 56 parity with the thread:
+            // added to an existing draft instead of ignored.
+            if (!pending.text.isNullOrBlank()) {
+                val existing = _state.value.draft
+                val merged = if (existing.isBlank()) {
+                    pending.text
+                } else {
+                    "$existing\n${pending.text}"
+                }
+                updateDraft(merged)
+            }
+            // 2) First URI → staged attachment via the standard
+            // pipeline (same kind mapping as the thread; later URIs
+            // of a multi-share are ignored this release, as there).
+            val firstUri = pending.uris.firstOrNull() ?: return@launch
+            val kind = when {
+                pending.mimeType?.startsWith("image/") == true ->
+                    AttachmentKind.PHOTO
+                pending.mimeType?.startsWith("video/") == true ->
+                    AttachmentKind.VIDEO
+                pending.mimeType == "text/x-vcard" || pending.mimeType == "text/vcard" ->
+                    AttachmentKind.CONTACT
+                else -> AttachmentKind.FILE
+            }
+            onAttachmentPicked(firstUri, kind)
+        }
     }
 
     /**

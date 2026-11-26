@@ -164,6 +164,33 @@ class SmartActionIntentsTest {
         )
     }
 
+    @Test fun `osm strip drops a lowercase locality before a lowercase state and zip`() {
+        assertThat(stripLocalityForOsm("5466 elam rd, kinzers, pa 17535"))
+            .isEqualTo("5466 elam rd, pa 17535")
+    }
+
+    @Test fun `osm directions url carries the stripped lowercase query`() {
+        assertThat(
+            SmartActionIntents.mapsDirectionsUrl(
+                "5466 elam rd, kinzers, pa 17535",
+                MapsProvider.OPENSTREETMAP,
+            ),
+        ).isEqualTo(
+            "https://www.openstreetmap.org/directions?to=5466%20elam%20rd%2C%20pa%2017535",
+        )
+    }
+
+    @Test fun `other providers keep the full lowercase address as written`() {
+        assertThat(
+            SmartActionIntents.mapsDirectionsUrl(
+                "5466 elam rd, kinzers, pa 17535",
+                MapsProvider.GOOGLE_MAPS,
+            ),
+        ).isEqualTo(
+            "https://www.google.com/maps/dir/?api=1&destination=5466%20elam%20rd%2C%20kinzers%2C%20pa%2017535",
+        )
+    }
+
     @Test fun `other providers directions urls keep the full address`() {
         assertThat(
             SmartActionIntents.mapsDirectionsUrl(
