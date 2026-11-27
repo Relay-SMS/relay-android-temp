@@ -53,5 +53,8 @@ private fun ProbeGate.noticeRes(): Int = when (this) {
     // discovery toggle are lifted there) — defensive only, so
     // the mapping stays total.
     ProbeGate.BudgetExhausted -> R.string.e2e_retry_rate_limited
+    // Round 59 — same: the 24-hour spacing is lifted for a
+    // manual retry, so this never fires from one either.
+    ProbeGate.ProbeTooSoon -> R.string.e2e_retry_rate_limited
     ProbeGate.DiscoveryOff -> R.string.e2e_retry_discovery_off
 }

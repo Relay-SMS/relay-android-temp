@@ -203,6 +203,15 @@ enum class ProbeGate(val label: String) {
     /** The probe budget is exhausted (automatic probes only — a manual retry lifts it). */
     BudgetExhausted("probe budget exhausted"),
 
+    /**
+     * Round 59 — the last probe was less than 24 hours ago
+     * (automatic probes only — a manual retry lifts it). Split
+     * out of [BudgetExhausted]: the two refusals used to share
+     * one reason, so the error log said "probe budget exhausted"
+     * when the budget was not spent.
+     */
+    ProbeTooSoon("probe sent too recently"),
+
     /** The discovery toggle is off (automatic probes only — a manual retry lifts it). */
     DiscoveryOff("discovery is off"),
 }
@@ -762,8 +771,7 @@ class E2eProbeManager @Inject constructor(
             manual -> null
             !(settings.hydratedOrNull()?.encryption?.autoDiscoverRelayContacts ?: true) ->
                 ProbeGate.DiscoveryOff
-            !peers.canProbe(address, now) -> ProbeGate.BudgetExhausted
-            else -> null
+            else -> peers.canProbeReason(address, now)
         }
     }
 }

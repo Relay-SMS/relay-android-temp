@@ -373,18 +373,29 @@ class E2ePeerRepository @Inject constructor(
     }
 
     /**
-     * Whether the probe BUDGET allows another probe now: the window has elapsed (or
-     * never started), the attempt count is under the cap, and 24 hours have passed
-     * since the last probe. State eligibility is the caller's decision (see the
-     * class KDoc).
+     * Why the probe BUDGET refuses another probe now, or null when
+     * it allows one: [ProbeGate.BudgetExhausted] when the attempt
+     * cap is spent inside the window, [ProbeGate.ProbeTooSoon]
+     * when the last probe was less than 24 hours ago. Round 59 —
+     * split out of the old `canProbe` Boolean: the two refusals
+     * used to share one reason, so the error log said "probe
+     * budget exhausted" when the budget was not spent. The Boolean
+     * wrapper is gone with it (its only caller moved to this
+     * reason, and the class sits at Detekt's TooManyFunctions
+     * ceiling). State eligibility is the caller's decision (see
+     * the class KDoc).
      */
-    suspend fun canProbe(address: String, now: Long = System.currentTimeMillis()): Boolean {
-        val peer = peerDao.findByAddress(canonicalAddress(address)) ?: return true
+    suspend fun canProbeReason(address: String, now: Long = System.currentTimeMillis()): ProbeGate? {
+        val peer = peerDao.findByAddress(canonicalAddress(address)) ?: return null
         val windowStart = peer.windowStartedAt
-        if (windowStart == null || now - windowStart >= PROBE_WINDOW_MS) return true
-        if (peer.probeAttempts >= MAX_PROBE_ATTEMPTS) return false
+        if (windowStart == null || now - windowStart >= PROBE_WINDOW_MS) return null
+        if (peer.probeAttempts >= MAX_PROBE_ATTEMPTS) return ProbeGate.BudgetExhausted
         val lastProbe = peer.lastProbeAt
-        return lastProbe == null || now - lastProbe >= PROBE_MIN_INTERVAL_MS
+        return if (lastProbe == null || now - lastProbe >= PROBE_MIN_INTERVAL_MS) {
+            null
+        } else {
+            ProbeGate.ProbeTooSoon
+        }
     }
 
     /**

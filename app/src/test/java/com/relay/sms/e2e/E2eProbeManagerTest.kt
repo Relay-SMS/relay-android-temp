@@ -1089,6 +1089,31 @@ class E2eProbeManagerTest {
     }
 
     @Test
+    fun `an automatic probe gate records the too-soon reason`() = runTest {
+        val harness = Harness(scope = this)
+        coEvery { harness.conversationDao.findById(11L) } returns
+            harness.conversationWith(ALICE)
+        harness.seedPeer(
+            state = E2ePeerState.UNKNOWN,
+            attempts = 1,
+            windowStartedAt = NOW - 2 * MS_PER_DAY,
+            lastProbeAt = NOW - 60 * 60 * 1000L,
+        )
+
+        harness.manager.onThreadOpened(11L)
+        testScheduler.advanceUntilIdle()
+
+        assertThat(harness.sender.sent).isEmpty()
+        verify(exactly = 1) {
+            harness.recorder.recordEvent(
+                "e2e-probe-gated",
+                "Automatic probe refused for $ALICE: probe sent too recently (trigger=thread-open).",
+            )
+        }
+        verify(exactly = 0) { harness.recorder.record(any(), any()) }
+    }
+
+    @Test
     fun `an automatic probe send records the attempt, the channel and the trigger`() = runTest {
         val harness = Harness(scope = this)
         coEvery { harness.conversationDao.findById(11L) } returns

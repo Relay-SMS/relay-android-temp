@@ -8,22 +8,8 @@
 package com.relay.sms.e2e
 
 import com.google.common.truth.Truth.assertThat
-import com.relay.sms.data.local.db.dao.ConversationDao
-import com.relay.sms.data.local.db.dao.MessageDao
-import com.relay.sms.data.local.db.entity.ConversationEntity
-import com.relay.sms.data.local.db.entity.E2eNoticeKind
-import com.relay.sms.data.local.db.entity.E2ePeerEntity
 import com.relay.sms.data.local.db.entity.E2ePeerState
-import com.relay.sms.data.local.db.entity.MessageEntity
-import com.relay.sms.data.sms.PhoneIdentity
-import com.relay.sms.domain.model.MessageDirection
-import com.relay.sms.domain.model.MessageType
 import com.relay.sms.domain.purge.MS_PER_DAY
-import io.mockk.Runs
-import io.mockk.coEvery
-import io.mockk.coVerify
-import io.mockk.every
-import io.mockk.just
 import io.mockk.mockk
 import io.mockk.slot
 import io.mockk.verify
@@ -33,124 +19,30 @@ import java.util.Base64
 
 /**
  * The handshake handler (design §2.3–§2.4, §4.4): probes, bundle
- * replies, bundle receipt, first-reply-wins, key changes, and the kept
- * ciphertext retry.
+ * replies, the bundle rate limit, the manual-probe bypass, and the
+ * handshake over regular SMS (round 45) — plus the round-58
+ * automatic-fallback arming.
  *
  * Two [FakeE2eCrypto] parties ("alice" = us, "bob" = the peer) with a
  * third ("carol") for key changes. The stores are the real ones over
  * in-memory fake DAOs — the handler's state transitions are the thing
  * under test, and they must compose with the real repository/store
- * behavior.
+ * behavior. The harness lives in [E2eHandshakeHandlerHarness]
+ * (round 59 split); the session half of this suite is
+ * [E2eHandshakeHandlerSessionTest].
  *
  * Every test ends with a void assertion — JUnit silently skips a `@Test`
  * whose `runTest` body returns a value.
  */
 class E2eHandshakeHandlerTest {
 
-    private companion object {
-        const val BOB = "+33612345678"
-        const val CONV_ID = 11L
-        const val NOW = 1_800_000_000_000L
-    }
-
-    private class Harness(
-        blocked: Set<String> = emptySet(),
-        cryptoOverride: E2eCrypto? = null,
-        accountManagerOverride: dagger.Lazy<E2eAccountManager>? = null,
-        autoFallback: E2eAutoFallback? = null,
-    ) {
-        val aliceCrypto = FakeE2eCrypto("alice")
-        val bobCrypto = FakeE2eCrypto("bob")
-        val carolCrypto = FakeE2eCrypto("carol")
-
-        val peerDao = FakeE2ePeerDao()
-        val sessionDao = FakeE2eSessionDao()
-        val accountDao = FakeE2eAccountDao()
-        val noticeDao = FakeE2eNoticeDao()
-        val sender = RecordingDataSmsSender()
-
-        val conversationDao = mockk<ConversationDao>()
-        val messageDao = mockk<MessageDao>()
-        val phoneIdentity = mockk<PhoneIdentity>()
-        val recorder = mockk<E2eFailureRecorder>(relaxed = true)
-
-        // Round 48 — relaxed: the declaration is best-effort and
-        // invisible to the existing assertions.
-        val mediaCapability = mockk<E2eMediaCapabilityManager>(relaxed = true)
-
-        // Round 49 — relaxed: the group key-change notices are
-        // covered by the group manager tests, not here.
-        val groupSessions = mockk<E2eGroupSessionManager>(relaxed = true)
-
-        val peers = E2ePeerRepository(peerDao)
-        val sessions = E2eSessionStore(sessionDao, aliceCrypto, fakeKeyManager())
-        val accountManager = E2eAccountManager(accountDao, aliceCrypto, fakeKeyManager())
-        val decryptor = E2eSessionDecryptor(
-            lazyOf(aliceCrypto as E2eCrypto),
-            lazyOf(sessions),
-            lazyOf(accountManager),
-        )
-
-        val handler = E2eHandshakeHandler(
-            peers = peers,
-            sessions = lazyOf(sessions),
-            accountManager = accountManagerOverride ?: lazyOf(accountManager),
-            crypto = lazyOf(cryptoOverride ?: aliceCrypto as E2eCrypto),
-            decryptor = decryptor,
-            notices = E2eNoticeStore(noticeDao),
-            dataSmsSender = sender,
-            conversationDao = conversationDao,
-            messageDao = messageDao,
-            phoneIdentity = phoneIdentity,
-            blockedRepo = FakeBlockedRepo(blocked),
-            recorder = recorder,
-            mediaCapability = mediaCapability,
-            groupSessions = groupSessions,
-            autoFallback = autoFallback,
-        )
-
-        init {
-            // Default: the conversation exists (exact-match path), no
-            // kept ciphertext, the identity fallback finds nothing.
-            val conv = mockk<ConversationEntity>()
-            every { conv.id } returns CONV_ID
-            coEvery { conversationDao.findByAddressesCsv(any()) } returns conv
-            coEvery { conversationDao.snapshotOneToOneConversations() } returns emptyList()
-            coEvery { phoneIdentity.snapshot() } returns PhoneIdentity.Snapshot("FR")
-            coEvery { messageDao.findDecryptFailed(any()) } returns emptyList()
-            coEvery { messageDao.update(any()) } just Runs
-            coEvery { messageDao.refreshConversationPreview(any()) } just Runs
-        }
-
-        /** A probe from [crypto]'s identity (as if it sent one). */
-        fun probeFrom(crypto: FakeE2eCrypto, manual: Boolean = false): ByteArray {
-            val keys = crypto.identityKeys()
-            return E2eHandshake.encodeProbe(keys.curve25519, keys.ed25519, manual = manual)
-        }
-
-        /** A bundle from [crypto]: its identity keys + one one-time key. */
-        fun bundleFrom(crypto: FakeE2eCrypto): ByteArray {
-            val keys = crypto.identityKeys()
-            val otk = crypto.nextOneTimeKey() ?: error("no one-time key left")
-            return E2eHandshake.encodeBundle(keys.curve25519, keys.ed25519, otk)
-        }
-
-        /** A probe from [crypto]'s identity, as a regular SMS (round 45). */
-        fun probeSmsFrom(crypto: FakeE2eCrypto, manual: Boolean = false): String =
-            E2eHandshakeSms.encode(probeFrom(crypto, manual))
-
-        /** A bundle from [crypto], as a regular SMS (round 45). */
-        fun bundleSmsFrom(crypto: FakeE2eCrypto): String =
-            E2eHandshakeSms.encode(bundleFrom(crypto))
-    }
-
     // ──────────────────────────── Probe → bundle reply ────────────────────────────
 
     @Test
     fun `a probe records the keys and earns a bundle reply`() = runTest {
-        val harness = Harness()
+        val harness = E2eHandshakeHandlerHarness()
 
-        val handled = harness.handler.handleDataSms(BOB, harness.probeFrom(harness.bobCrypto), 3, NOW)
+        val handled = harness.handler.handleDataSms(HANDLER_BOB, harness.probeFrom(harness.bobCrypto), 3, HANDLER_NOW)
 
         assertThat(handled).isTrue()
         // One bundle reply, on the handshake port, carrying OUR keys.
@@ -158,14 +50,14 @@ class E2eHandshakeHandlerTest {
         // A data-SMS probe earns a data-SMS reply — never a text.
         assertThat(harness.sender.sentTexts).isEmpty()
         val reply = harness.sender.sent.single()
-        assertThat(reply.address).isEqualTo(BOB)
+        assertThat(reply.address).isEqualTo(HANDLER_BOB)
         assertThat(reply.subId).isEqualTo(3)
         assertThat(reply.port).isEqualTo(E2eHandshake.E2E_DATA_SMS_PORT)
         val bundle = E2eHandshake.decode(reply.data) as E2eHandshake.HandshakePacket.Bundle
         assertThat(bundle.curveKey).isEqualTo(harness.aliceCrypto.identityKeys().curve25519)
         assertThat(bundle.edKey).isEqualTo(harness.aliceCrypto.identityKeys().ed25519)
         // The peer row: PROBING, bob's keys on file, reply timestamped.
-        val peer = harness.peerDao.peers[BOB]
+        val peer = harness.peerDao.peers[HANDLER_BOB]
         assertThat(peer?.state).isEqualTo(E2ePeerState.PROBING)
         val b64 = Base64.getEncoder()
         assertThat(peer?.theirCurveKey).isEqualTo(
@@ -174,28 +66,28 @@ class E2eHandshakeHandlerTest {
         assertThat(peer?.theirEdKey).isEqualTo(
             b64.encodeToString(harness.bobCrypto.identityKeys().ed25519),
         )
-        assertThat(peer?.lastBundleReplyAt).isEqualTo(NOW)
+        assertThat(peer?.lastBundleReplyAt).isEqualTo(HANDLER_NOW)
     }
 
     @Test
     fun `a bundle reply arms the automatic fallback check`() = runTest {
         val autoFallback = mockk<E2eAutoFallback>(relaxed = true)
-        val harness = Harness(autoFallback = autoFallback)
+        val harness = E2eHandshakeHandlerHarness(autoFallback = autoFallback)
 
-        val handled = harness.handler.handleDataSms(BOB, harness.probeFrom(harness.bobCrypto), 3, NOW)
+        val handled = harness.handler.handleDataSms(HANDLER_BOB, harness.probeFrom(harness.bobCrypto), 3, HANDLER_NOW)
 
         assertThat(handled).isTrue()
         assertThat(harness.sender.sent).hasSize(1)
-        verify(exactly = 1) { autoFallback.schedule(BOB) }
+        verify(exactly = 1) { autoFallback.schedule(HANDLER_BOB) }
     }
 
     @Test
     fun `a failed bundle reply does not arm the automatic fallback check`() = runTest {
         val autoFallback = mockk<E2eAutoFallback>(relaxed = true)
-        val harness = Harness(autoFallback = autoFallback)
+        val harness = E2eHandshakeHandlerHarness(autoFallback = autoFallback)
         harness.sender.result = false
 
-        val handled = harness.handler.handleDataSms(BOB, harness.probeFrom(harness.bobCrypto), 3, NOW)
+        val handled = harness.handler.handleDataSms(HANDLER_BOB, harness.probeFrom(harness.bobCrypto), 3, HANDLER_NOW)
 
         assertThat(handled).isFalse()
         verify(exactly = 0) { autoFallback.schedule(any()) }
@@ -203,10 +95,15 @@ class E2eHandshakeHandlerTest {
 
     @Test
     fun `a second probe the same day earns no second bundle`() = runTest {
-        val harness = Harness()
-        harness.handler.handleDataSms(BOB, harness.probeFrom(harness.bobCrypto), null, NOW)
+        val harness = E2eHandshakeHandlerHarness()
+        harness.handler.handleDataSms(HANDLER_BOB, harness.probeFrom(harness.bobCrypto), null, HANDLER_NOW)
 
-        val handled = harness.handler.handleDataSms(BOB, harness.probeFrom(harness.bobCrypto), null, NOW)
+        val handled = harness.handler.handleDataSms(
+            HANDLER_BOB,
+            harness.probeFrom(harness.bobCrypto),
+            null,
+            HANDLER_NOW,
+        )
 
         assertThat(handled).isTrue()
         assertThat(harness.sender.sent).hasSize(1)
@@ -214,14 +111,14 @@ class E2eHandshakeHandlerTest {
 
     @Test
     fun `a probe the next day earns a bundle again`() = runTest {
-        val harness = Harness()
-        harness.handler.handleDataSms(BOB, harness.probeFrom(harness.bobCrypto), null, NOW)
+        val harness = E2eHandshakeHandlerHarness()
+        harness.handler.handleDataSms(HANDLER_BOB, harness.probeFrom(harness.bobCrypto), null, HANDLER_NOW)
 
         harness.handler.handleDataSms(
-            BOB,
+            HANDLER_BOB,
             harness.probeFrom(harness.bobCrypto),
             null,
-            NOW + MS_PER_DAY + 1,
+            HANDLER_NOW + MS_PER_DAY + 1,
         )
 
         assertThat(harness.sender.sent).hasSize(2)
@@ -229,18 +126,23 @@ class E2eHandshakeHandlerTest {
 
     @Test
     fun `a failed bundle send does not consume the day's reply`() = runTest {
-        val harness = Harness()
+        val harness = E2eHandshakeHandlerHarness()
         harness.sender.result = false
 
-        val handled = harness.handler.handleDataSms(BOB, harness.probeFrom(harness.bobCrypto), null, NOW)
+        val handled = harness.handler.handleDataSms(
+            HANDLER_BOB,
+            harness.probeFrom(harness.bobCrypto),
+            null,
+            HANDLER_NOW,
+        )
 
         assertThat(handled).isFalse()
-        assertThat(harness.peerDao.peers[BOB]?.lastBundleReplyAt).isNull()
+        assertThat(harness.peerDao.peers[HANDLER_BOB]?.lastBundleReplyAt).isNull()
         // The keys are still recorded: only the reply is gated.
-        assertThat(harness.peerDao.peers[BOB]?.theirCurveKey).isNotNull()
+        assertThat(harness.peerDao.peers[HANDLER_BOB]?.theirCurveKey).isNotNull()
         // And a retry the same day may still send.
         harness.sender.result = true
-        harness.handler.handleDataSms(BOB, harness.probeFrom(harness.bobCrypto), null, NOW)
+        harness.handler.handleDataSms(HANDLER_BOB, harness.probeFrom(harness.bobCrypto), null, HANDLER_NOW)
         assertThat(harness.sender.sent).hasSize(2)
     }
 
@@ -255,14 +157,14 @@ class E2eHandshakeHandlerTest {
 
     @Test
     fun `a manual probe bypasses the bundle rate limit`() = runTest {
-        val harness = Harness()
-        harness.handler.handleDataSms(BOB, harness.probeFrom(harness.bobCrypto), null, NOW)
+        val harness = E2eHandshakeHandlerHarness()
+        harness.handler.handleDataSms(HANDLER_BOB, harness.probeFrom(harness.bobCrypto), null, HANDLER_NOW)
 
         val handled = harness.handler.handleDataSms(
-            BOB,
+            HANDLER_BOB,
             harness.probeFrom(harness.bobCrypto, manual = true),
             null,
-            NOW,
+            HANDLER_NOW,
         )
 
         assertThat(handled).isTrue()
@@ -275,35 +177,40 @@ class E2eHandshakeHandlerTest {
 
     @Test
     fun `an automatic probe after a manual bundle is still rate-limited`() = runTest {
-        val harness = Harness()
-        harness.handler.handleDataSms(BOB, harness.probeFrom(harness.bobCrypto), null, NOW)
+        val harness = E2eHandshakeHandlerHarness()
+        harness.handler.handleDataSms(HANDLER_BOB, harness.probeFrom(harness.bobCrypto), null, HANDLER_NOW)
         harness.handler.handleDataSms(
-            BOB,
+            HANDLER_BOB,
             harness.probeFrom(harness.bobCrypto, manual = true),
             null,
-            NOW,
+            HANDLER_NOW,
         )
 
-        val handled = harness.handler.handleDataSms(BOB, harness.probeFrom(harness.bobCrypto), null, NOW)
+        val handled = harness.handler.handleDataSms(
+            HANDLER_BOB,
+            harness.probeFrom(harness.bobCrypto),
+            null,
+            HANDLER_NOW,
+        )
 
         assertThat(handled).isTrue()
         // The manual bundle consumed the day's reply: the automatic
         // probe earns nothing.
         assertThat(harness.sender.sent).hasSize(2)
-        assertThat(harness.peerDao.peers[BOB]?.lastBundleReplyAt).isEqualTo(NOW)
+        assertThat(harness.peerDao.peers[HANDLER_BOB]?.lastBundleReplyAt).isEqualTo(HANDLER_NOW)
         verify(exactly = 1) { harness.recorder.recordEvent("e2e-bundle-rate-limited", any()) }
     }
 
     @Test
     fun `a manual SMS probe bypasses the bundle rate limit`() = runTest {
-        val harness = Harness()
-        harness.handler.handleSms(BOB, harness.probeSmsFrom(harness.bobCrypto), null, NOW)
+        val harness = E2eHandshakeHandlerHarness()
+        harness.handler.handleSms(HANDLER_BOB, harness.probeSmsFrom(harness.bobCrypto), null, HANDLER_NOW)
 
         val handled = harness.handler.handleSms(
-            BOB,
+            HANDLER_BOB,
             harness.probeSmsFrom(harness.bobCrypto, manual = true),
             null,
-            NOW,
+            HANDLER_NOW,
         )
 
         assertThat(handled).isTrue()
@@ -317,21 +224,21 @@ class E2eHandshakeHandlerTest {
 
     @Test
     fun `a manual probe from a peer with no prior bundle still works`() = runTest {
-        val harness = Harness()
+        val harness = E2eHandshakeHandlerHarness()
 
         val handled = harness.handler.handleDataSms(
-            BOB,
+            HANDLER_BOB,
             harness.probeFrom(harness.bobCrypto, manual = true),
             null,
-            NOW,
+            HANDLER_NOW,
         )
 
         assertThat(handled).isTrue()
         assertThat(harness.sender.sent).hasSize(1)
-        val peer = harness.peerDao.peers[BOB]
+        val peer = harness.peerDao.peers[HANDLER_BOB]
         assertThat(peer?.state).isEqualTo(E2ePeerState.PROBING)
         assertThat(peer?.theirCurveKey).isNotNull()
-        assertThat(peer?.lastBundleReplyAt).isEqualTo(NOW)
+        assertThat(peer?.lastBundleReplyAt).isEqualTo(HANDLER_NOW)
     }
 
     // ──────────────────── Round 42: inbound-path diagnostics ────────────────────
@@ -347,29 +254,29 @@ class E2eHandshakeHandlerTest {
 
     @Test
     fun `a probe records probe-received and bundle-sent`() = runTest {
-        val harness = Harness()
+        val harness = E2eHandshakeHandlerHarness()
 
-        harness.handler.handleDataSms(BOB, harness.probeFrom(harness.bobCrypto), null, NOW)
+        harness.handler.handleDataSms(HANDLER_BOB, harness.probeFrom(harness.bobCrypto), null, HANDLER_NOW)
 
         val probeMessage = slot<String>()
         verify(exactly = 1) {
             harness.recorder.recordEvent("e2e-probe-received", capture(probeMessage))
         }
-        assertThat(probeMessage.captured).contains(BOB)
+        assertThat(probeMessage.captured).contains(HANDLER_BOB)
         val bundleMessage = slot<String>()
         verify(exactly = 1) {
             harness.recorder.recordEvent("e2e-bundle-sent", capture(bundleMessage))
         }
-        assertThat(bundleMessage.captured).contains(BOB)
+        assertThat(bundleMessage.captured).contains(HANDLER_BOB)
         verify(exactly = 0) { harness.recorder.recordEvent("e2e-bundle-rate-limited", any()) }
     }
 
     @Test
     fun `a rate-limited probe records rate-limited and no second bundle-sent`() = runTest {
-        val harness = Harness()
-        harness.handler.handleDataSms(BOB, harness.probeFrom(harness.bobCrypto), null, NOW)
+        val harness = E2eHandshakeHandlerHarness()
+        harness.handler.handleDataSms(HANDLER_BOB, harness.probeFrom(harness.bobCrypto), null, HANDLER_NOW)
 
-        harness.handler.handleDataSms(BOB, harness.probeFrom(harness.bobCrypto), null, NOW)
+        harness.handler.handleDataSms(HANDLER_BOB, harness.probeFrom(harness.bobCrypto), null, HANDLER_NOW)
 
         verify(exactly = 2) { harness.recorder.recordEvent("e2e-probe-received", any()) }
         verify(exactly = 1) { harness.recorder.recordEvent("e2e-bundle-sent", any()) }
@@ -378,10 +285,10 @@ class E2eHandshakeHandlerTest {
 
     @Test
     fun `a failed bundle send records probe-received but no bundle-sent`() = runTest {
-        val harness = Harness()
+        val harness = E2eHandshakeHandlerHarness()
         harness.sender.result = false
 
-        harness.handler.handleDataSms(BOB, harness.probeFrom(harness.bobCrypto), null, NOW)
+        harness.handler.handleDataSms(HANDLER_BOB, harness.probeFrom(harness.bobCrypto), null, HANDLER_NOW)
 
         verify(exactly = 1) { harness.recorder.recordEvent("e2e-probe-received", any()) }
         verify(exactly = 0) { harness.recorder.recordEvent("e2e-bundle-sent", any()) }
@@ -390,9 +297,9 @@ class E2eHandshakeHandlerTest {
 
     @Test
     fun `a dropped packet records the decode failure with its reason`() = runTest {
-        val harness = Harness()
+        val harness = E2eHandshakeHandlerHarness()
 
-        val handled = harness.handler.handleDataSms(BOB, "not a handshake".toByteArray(), null, NOW)
+        val handled = harness.handler.handleDataSms(HANDLER_BOB, "not a handshake".toByteArray(), null, HANDLER_NOW)
 
         assertThat(handled).isFalse()
         assertThat(harness.sender.sent).isEmpty()
@@ -411,9 +318,9 @@ class E2eHandshakeHandlerTest {
 
     @Test
     fun `the bundle reply send passes the BUNDLE kind`() = runTest {
-        val harness = Harness()
+        val harness = E2eHandshakeHandlerHarness()
 
-        harness.handler.handleDataSms(BOB, harness.probeFrom(harness.bobCrypto), null, NOW)
+        harness.handler.handleDataSms(HANDLER_BOB, harness.probeFrom(harness.bobCrypto), null, HANDLER_NOW)
 
         assertThat(harness.sender.sent).hasSize(1)
         assertThat(harness.sender.sent.single().kind).isEqualTo(DataSmsKind.BUNDLE)
@@ -423,16 +330,16 @@ class E2eHandshakeHandlerTest {
 
     @Test
     fun `an SMS probe earns a bundle reply by text, not by data SMS`() = runTest {
-        val harness = Harness()
+        val harness = E2eHandshakeHandlerHarness()
 
-        val handled = harness.handler.handleSms(BOB, harness.probeSmsFrom(harness.bobCrypto), 3, NOW)
+        val handled = harness.handler.handleSms(HANDLER_BOB, harness.probeSmsFrom(harness.bobCrypto), 3, HANDLER_NOW)
 
         assertThat(handled).isTrue()
         // One bundle reply, as a regular SMS carrying OUR keys.
         assertThat(harness.sender.sentTexts).hasSize(1)
         assertThat(harness.sender.sent).isEmpty()
         val reply = harness.sender.sentTexts.single()
-        assertThat(reply.address).isEqualTo(BOB)
+        assertThat(reply.address).isEqualTo(HANDLER_BOB)
         assertThat(reply.subId).isEqualTo(3)
         assertThat(reply.kind).isEqualTo(DataSmsKind.BUNDLE)
         assertThat(reply.text).startsWith("RLYH:")
@@ -441,9 +348,9 @@ class E2eHandshakeHandlerTest {
         assertThat(bundle.curveKey).isEqualTo(harness.aliceCrypto.identityKeys().curve25519)
         assertThat(bundle.edKey).isEqualTo(harness.aliceCrypto.identityKeys().ed25519)
         // The peer row: PROBING, bob's keys on file, reply timestamped.
-        val peer = harness.peerDao.peers[BOB]
+        val peer = harness.peerDao.peers[HANDLER_BOB]
         assertThat(peer?.state).isEqualTo(E2ePeerState.PROBING)
-        assertThat(peer?.lastBundleReplyAt).isEqualTo(NOW)
+        assertThat(peer?.lastBundleReplyAt).isEqualTo(HANDLER_NOW)
         // Same diagnostic tags as the data path — the channel is not logged.
         verify(exactly = 1) { harness.recorder.recordEvent("e2e-probe-received", any()) }
         verify(exactly = 1) { harness.recorder.recordEvent("e2e-bundle-sent", any()) }
@@ -452,28 +359,33 @@ class E2eHandshakeHandlerTest {
 
     @Test
     fun `an SMS bundle creates the session and flips the peer to ENCRYPTED`() = runTest {
-        val harness = Harness()
+        val harness = E2eHandshakeHandlerHarness()
 
-        val handled = harness.handler.handleSms(BOB, harness.bundleSmsFrom(harness.bobCrypto), null, NOW)
+        val handled = harness.handler.handleSms(
+            HANDLER_BOB,
+            harness.bundleSmsFrom(harness.bobCrypto),
+            null,
+            HANDLER_NOW,
+        )
 
         assertThat(handled).isTrue()
-        assertThat(harness.peers.state(BOB)).isEqualTo(E2ePeerState.ENCRYPTED)
+        assertThat(harness.peers.state(HANDLER_BOB)).isEqualTo(E2ePeerState.ENCRYPTED)
         assertThat(harness.sender.sent).isEmpty()
         assertThat(harness.sender.sentTexts).isEmpty()
     }
 
     @Test
     fun `a non-handshake text is ignored`() = runTest {
-        val harness = Harness()
+        val harness = E2eHandshakeHandlerHarness()
 
-        val plain = harness.handler.handleSms(BOB, "hello", null, NOW)
+        val plain = harness.handler.handleSms(HANDLER_BOB, "hello", null, HANDLER_NOW)
         val fragment = harness.handler.handleSms(
-            BOB,
+            HANDLER_BOB,
             "RLY1:abc123:01/01:AQEB3q2+7w==",
             null,
-            NOW,
+            HANDLER_NOW,
         )
-        val badMagic = harness.handler.handleSms(BOB, "RLYH:!!!", null, NOW)
+        val badMagic = harness.handler.handleSms(HANDLER_BOB, "RLYH:!!!", null, HANDLER_NOW)
 
         assertThat(plain).isFalse()
         assertThat(fragment).isFalse()
@@ -486,10 +398,10 @@ class E2eHandshakeHandlerTest {
 
     @Test
     fun `a second SMS probe the same day earns no second bundle text`() = runTest {
-        val harness = Harness()
-        harness.handler.handleSms(BOB, harness.probeSmsFrom(harness.bobCrypto), null, NOW)
+        val harness = E2eHandshakeHandlerHarness()
+        harness.handler.handleSms(HANDLER_BOB, harness.probeSmsFrom(harness.bobCrypto), null, HANDLER_NOW)
 
-        val handled = harness.handler.handleSms(BOB, harness.probeSmsFrom(harness.bobCrypto), null, NOW)
+        val handled = harness.handler.handleSms(HANDLER_BOB, harness.probeSmsFrom(harness.bobCrypto), null, HANDLER_NOW)
 
         assertThat(handled).isTrue()
         assertThat(harness.sender.sentTexts).hasSize(1)
@@ -499,468 +411,22 @@ class E2eHandshakeHandlerTest {
 
     @Test
     fun `a failed text bundle send does not consume the day's reply`() = runTest {
-        val harness = Harness()
+        val harness = E2eHandshakeHandlerHarness()
         harness.sender.result = false
 
-        val failed = harness.handler.handleSms(BOB, harness.probeSmsFrom(harness.bobCrypto), null, NOW)
+        val failed = harness.handler.handleSms(HANDLER_BOB, harness.probeSmsFrom(harness.bobCrypto), null, HANDLER_NOW)
 
         assertThat(failed).isFalse()
-        assertThat(harness.peerDao.peers[BOB]?.lastBundleReplyAt).isNull()
+        assertThat(harness.peerDao.peers[HANDLER_BOB]?.lastBundleReplyAt).isNull()
         // The keys are still recorded: only the reply is gated.
-        assertThat(harness.peerDao.peers[BOB]?.theirCurveKey).isNotNull()
+        assertThat(harness.peerDao.peers[HANDLER_BOB]?.theirCurveKey).isNotNull()
         // And a retry the same day may still send (the fake records
         // the failed attempt too, so the retry is the second entry).
         harness.sender.result = true
-        val retried = harness.handler.handleSms(BOB, harness.probeSmsFrom(harness.bobCrypto), null, NOW)
+        val retried = harness.handler.handleSms(HANDLER_BOB, harness.probeSmsFrom(harness.bobCrypto), null, HANDLER_NOW)
 
         assertThat(retried).isTrue()
         assertThat(harness.sender.sentTexts).hasSize(2)
-        assertThat(harness.peerDao.peers[BOB]?.lastBundleReplyAt).isEqualTo(NOW)
-    }
-
-    // ──────────────────────────── Bundle → ENCRYPTED ────────────────────────────
-
-    @Test
-    fun `a bundle creates the session and flips the peer to ENCRYPTED`() = runTest {
-        val harness = Harness()
-
-        val handled = harness.handler.handleDataSms(BOB, harness.bundleFrom(harness.bobCrypto), null, NOW)
-
-        assertThat(handled).isTrue()
-        val peer = harness.peerDao.peers[BOB]
-        assertThat(peer?.state).isEqualTo(E2ePeerState.ENCRYPTED)
-        assertThat(peer?.theirCurveKey).isNotNull()
-        // A current session exists, and it can encrypt to bob.
-        val sessionId = harness.sessions.currentSessionId(BOB)
-        assertThat(sessionId).isNotNull()
-        val encrypted = harness.aliceCrypto.encrypt(sessionId!!, "hi bob".toByteArray(Charsets.UTF_8))
-        assertThat(encrypted.type).isEqualTo(OlmMessageType.PRE_KEY)
-        // The one-time ACTIVATED notice, in bob's thread.
-        assertThat(harness.noticeDao.notices).hasSize(1)
-        assertThat(harness.noticeDao.notices.single().conversationId).isEqualTo(CONV_ID)
-        assertThat(harness.noticeDao.notices.single().kind).isEqualTo(E2eNoticeKind.ACTIVATED)
-    }
-
-    @Test
-    fun `first reply wins - a duplicate bundle is ignored`() = runTest {
-        val harness = Harness()
-        val bundle = harness.bundleFrom(harness.bobCrypto)
-        harness.handler.handleDataSms(BOB, bundle, null, NOW)
-        val firstSessionId = harness.sessions.currentSessionId(BOB)
-
-        val handled = harness.handler.handleDataSms(BOB, bundle, null, NOW)
-
-        assertThat(handled).isTrue()
-        // No second session, no second notice, same current session.
-        assertThat(harness.sessionDao.sessions).hasSize(1)
-        assertThat(harness.sessions.currentSessionId(BOB)).isEqualTo(firstSessionId)
-        assertThat(harness.noticeDao.notices).hasSize(1)
-    }
-
-    @Test
-    fun `a bundle after a deactivation records a second ACTIVATED notice`() = runTest {
-        val harness = Harness()
-        // First establishment: one ACTIVATED notice.
-        harness.handler.handleDataSms(BOB, harness.bundleFrom(harness.bobCrypto), null, NOW)
-        assertThat(harness.noticeDao.notices.filter { it.kind == E2eNoticeKind.ACTIVATED })
-            .hasSize(1)
-        // The peer-left fallback tore the session down (state + notice).
-        harness.peers.setState(BOB, E2ePeerState.UNKNOWN, NOW + 1000)
-        E2eNoticeStore(harness.noticeDao)
-            .record(CONV_ID, E2eNoticeKind.DEACTIVATED, NOW + 1000)
-        // The old session is gone (round 46: sessions stored under the
-        // pre-canonical key are unreachable), so the re-probe's bundle
-        // is NOT a duplicate — it re-establishes. Handing a key out
-        // empties the pool (vodozemac marks the whole unpublished batch
-        // published), so top it up before taking a second key.
-        harness.sessionDao.deleteByAddress(BOB)
-        harness.bobCrypto.generateOneTimeKeys()
-
-        harness.handler.handleDataSms(BOB, harness.bundleFrom(harness.bobCrypto), null, NOW + 2000)
-
-        assertThat(harness.peerDao.peers[BOB]?.state).isEqualTo(E2ePeerState.ENCRYPTED)
-        assertThat(harness.noticeDao.notices.filter { it.kind == E2eNoticeKind.ACTIVATED })
-            .hasSize(2)
-        assertThat(harness.noticeDao.notices.map { it.kind }).containsExactly(
-            E2eNoticeKind.ACTIVATED,
-            E2eNoticeKind.DEACTIVATED,
-            E2eNoticeKind.ACTIVATED,
-        ).inOrder()
-    }
-
-    @Test
-    fun `a bundle with no conversation still encrypts, without a notice`() = runTest {
-        val harness = Harness()
-        coEvery { harness.conversationDao.findByAddressesCsv(any()) } returns null
-
-        val handled = harness.handler.handleDataSms(BOB, harness.bundleFrom(harness.bobCrypto), null, NOW)
-
-        assertThat(handled).isTrue()
-        assertThat(harness.peerDao.peers[BOB]?.state).isEqualTo(E2ePeerState.ENCRYPTED)
-        assertThat(harness.noticeDao.notices).isEmpty()
-    }
-
-    @Test
-    fun `a non-handshake packet is dropped silently`() = runTest {
-        val harness = Harness()
-
-        val handled = harness.handler.handleDataSms(BOB, "not a handshake".toByteArray(), null, NOW)
-
-        assertThat(handled).isFalse()
-        assertThat(harness.sender.sent).isEmpty()
-        assertThat(harness.peerDao.peers).isEmpty()
-    }
-
-    // ──────────────────────────── Key change ────────────────────────────
-
-    @Test
-    fun `a probe with different keys clears verified and records KEY_CHANGED_VERIFIED`() = runTest {
-        val harness = Harness()
-        harness.handler.handleDataSms(BOB, harness.bundleFrom(harness.bobCrypto), null, NOW)
-        harness.peers.setVerified(BOB, true, NOW)
-        harness.noticeDao.notices.clear()
-
-        harness.handler.handleDataSms(BOB, harness.probeFrom(harness.carolCrypto), null, NOW)
-
-        val peer = harness.peerDao.peers[BOB]
-        assertThat(peer?.verified).isFalse()
-        // The state stays ENCRYPTED: messages keep flowing (TOFU + notice).
-        assertThat(peer?.state).isEqualTo(E2ePeerState.ENCRYPTED)
-        // Carol's keys are now on file, and the notice names the change.
-        val b64 = Base64.getEncoder()
-        assertThat(peer?.theirCurveKey).isEqualTo(
-            b64.encodeToString(harness.carolCrypto.identityKeys().curve25519),
-        )
-        assertThat(harness.noticeDao.notices).hasSize(1)
-        assertThat(harness.noticeDao.notices.single().kind)
-            .isEqualTo(E2eNoticeKind.KEY_CHANGED_VERIFIED)
-    }
-
-    @Test
-    fun `a key change also notifies the group session manager`() = runTest {
-        val harness = Harness()
-        harness.handler.handleDataSms(BOB, harness.bundleFrom(harness.bobCrypto), null, NOW)
-        harness.peers.setVerified(BOB, true, NOW)
-
-        harness.handler.handleDataSms(BOB, harness.probeFrom(harness.carolCrypto), null, NOW)
-
-        // The group half of the key change: GROUP_KEY_CHANGED
-        // notices in every group where the member held a sender
-        // key (the manager's own tests cover the notice itself).
-        coVerify { harness.groupSessions.onPeerKeyChanged(BOB, true, NOW) }
-    }
-
-    @Test
-    fun `a bundle with different keys re-establishes and keeps the old session as fallback`() = runTest {
-        val harness = Harness()
-        harness.handler.handleDataSms(BOB, harness.bundleFrom(harness.bobCrypto), null, NOW)
-        val oldSessionId = harness.sessions.currentSessionId(BOB)
-
-        harness.handler.handleDataSms(BOB, harness.bundleFrom(harness.carolCrypto), null, NOW)
-
-        // Two sessions: the new one current, the old one a fallback.
-        assertThat(harness.sessionDao.sessions).hasSize(2)
-        val current = harness.sessions.currentSessionId(BOB)
-        assertThat(current).isNotEqualTo(oldSessionId)
-        assertThat(harness.sessionDao.sessionsForPeer(BOB).map { it.sessionId })
-            .contains(oldSessionId)
-        assertThat(harness.peerDao.peers[BOB]?.state).isEqualTo(E2ePeerState.ENCRYPTED)
-        // Unverified before, so the plain KEY_CHANGED notice — and no second
-        // ACTIVATED: the thread already shows the encryption as active (no
-        // DEACTIVATED since the first ACTIVATED), so recordActivated skips.
-        // (The notice list is NOT cleared between bundles: the store dedupes
-        // against the stored ACTIVATED record, and clearing it would fake a
-        // duplicate.)
-        assertThat(harness.noticeDao.notices.filter { it.kind == E2eNoticeKind.KEY_CHANGED })
-            .hasSize(1)
-        assertThat(harness.noticeDao.notices.filter { it.kind == E2eNoticeKind.ACTIVATED })
-            .hasSize(1)
-    }
-
-    // ──────────────────────────── Kept ciphertext retry ────────────────────────────
-
-    @Test
-    fun `a bundle retries kept ciphertext and restores the message`() = runTest {
-        val harness = Harness()
-        // Bob's pre-key message to alice, kept because an earlier
-        // decrypt attempt failed (the row is seeded directly — the
-        // retry plumbing, not the original failure, is under test).
-        val aliceOtk = harness.aliceCrypto.nextOneTimeKey()!!
-        val bobSession = harness.bobCrypto.createOutboundSession(
-            harness.aliceCrypto.identityKeys().curve25519,
-            aliceOtk,
-        )
-        val encrypted = harness.bobCrypto.encrypt(bobSession, "kept secret".toByteArray(Charsets.UTF_8))
-        val base64 = Base64.getEncoder().encodeToString(
-            E2eWireFormat.encodePayload(encrypted, E2eWireFormat.PayloadType.TEXT),
-        )
-        val kept = MessageEntity(
-            id = 99L,
-            conversationId = CONV_ID,
-            telephonyUri = null,
-            address = BOB,
-            body = "",
-            type = MessageType.SMS,
-            direction = MessageDirection.INCOMING,
-            date = NOW,
-            dateSent = null,
-            encrypted = true,
-            decryptFailed = true,
-            ciphertext = base64,
-        )
-        coEvery { harness.messageDao.findDecryptFailed(BOB) } returns listOf(kept)
-        val updated = slot<MessageEntity>()
-        coEvery { harness.messageDao.update(capture(updated)) } just Runs
-
-        harness.handler.handleDataSms(BOB, harness.bundleFrom(harness.bobCrypto), null, NOW)
-
-        // The placeholder became the readable message.
-        assertThat(updated.isCaptured).isTrue()
-        assertThat(updated.captured.body).isEqualTo("kept secret")
-        assertThat(updated.captured.decryptFailed).isFalse()
-        assertThat(updated.captured.ciphertext).isNull()
-        coVerify(exactly = 1) { harness.messageDao.refreshConversationPreview(CONV_ID) }
-    }
-
-    @Test
-    fun `kept ciphertext that still cannot decrypt stays a placeholder`() = runTest {
-        val harness = Harness()
-        val kept = MessageEntity(
-            id = 99L,
-            conversationId = CONV_ID,
-            telephonyUri = null,
-            address = BOB,
-            body = "",
-            type = MessageType.SMS,
-            direction = MessageDirection.INCOMING,
-            date = NOW,
-            dateSent = null,
-            encrypted = true,
-            decryptFailed = true,
-            ciphertext = Base64.getEncoder().encodeToString("garbage, not a payload".toByteArray()),
-        )
-        coEvery { harness.messageDao.findDecryptFailed(BOB) } returns listOf(kept)
-
-        harness.handler.handleDataSms(BOB, harness.bundleFrom(harness.bobCrypto), null, NOW)
-
-        coVerify(exactly = 0) { harness.messageDao.update(any()) }
-        coVerify(exactly = 0) { harness.messageDao.refreshConversationPreview(any()) }
-    }
-
-    // ──────────────── Round 48/49: capability declaration ────────────────
-
-    @Test
-    fun `a capability packet by data SMS is handled and delegated, with no bundle reply`() = runTest {
-        val harness = Harness()
-
-        val handled = harness.handler.handleDataSms(BOB, E2eHandshake.encodeCapabilityDeclaration(), 3, NOW)
-
-        assertThat(handled).isTrue()
-        coVerify { harness.mediaCapability.onDeclarationReceived(BOB, 3, NOW, true, true, true) }
-        // A declaration earns no bundle reply — it is not a probe.
-        assertThat(harness.sender.sent).isEmpty()
-        assertThat(harness.sender.sentTexts).isEmpty()
-    }
-
-    @Test
-    fun `a capability packet by text SMS is handled and delegated`() = runTest {
-        val harness = Harness()
-        val text = E2eHandshakeSms.encode(E2eHandshake.encodeCapabilityDeclaration())
-
-        val handled = harness.handler.handleSms(BOB, text, null, NOW)
-
-        assertThat(handled).isTrue()
-        coVerify { harness.mediaCapability.onDeclarationReceived(BOB, null, NOW, true, true, true) }
-        assertThat(harness.sender.sent).isEmpty()
-        assertThat(harness.sender.sentTexts).isEmpty()
-    }
-
-    @Test
-    fun `a bundle receipt records the channel and announces our capability`() = runTest {
-        val harness = Harness()
-
-        harness.handler.handleDataSms(BOB, harness.bundleFrom(harness.bobCrypto), null, NOW)
-
-        // The bundle arrived on data SMS, so our probe reached them
-        // on it: the channel is proven for our declaration.
-        assertThat(harness.peerDao.peers[BOB]!!.handshakeChannel).isEqualTo("DATA_SMS")
-        coVerify { harness.mediaCapability.announceNow(BOB, null, NOW) }
-    }
-
-    @Test
-    fun `a probe receipt records the channel while not yet ENCRYPTED`() = runTest {
-        val harness = Harness()
-
-        harness.handler.handleDataSms(BOB, harness.probeFrom(harness.bobCrypto), null, NOW)
-
-        assertThat(harness.peerDao.peers[BOB]!!.handshakeChannel).isEqualTo("DATA_SMS")
-    }
-
-    @Test
-    fun `a probe from an already-ENCRYPTED peer does not overwrite the recorded channel`() = runTest {
-        val harness = Harness()
-        harness.peerDao.peers[BOB] = E2ePeerEntity(
-            address = BOB,
-            state = E2ePeerState.ENCRYPTED,
-            handshakeChannel = "TEXT_SMS",
-            updatedAt = NOW,
-        )
-
-        harness.handler.handleDataSms(BOB, harness.probeFrom(harness.bobCrypto), null, NOW)
-
-        // The proven channel survives a later exchange on another
-        // channel (a key-change probe is not proof the new
-        // channel delivers).
-        assertThat(harness.peerDao.peers[BOB]!!.handshakeChannel).isEqualTo("TEXT_SMS")
-    }
-
-    // ──────────────── Inbound-path diagnostics ────────────────
-    // Every inbound outcome leaves a separable line in the error
-    // log, so the next handshake shows the underlying picture:
-    // arrival (receiver) → decode → blocked → probe / bundle /
-    // capability → session outcome.
-
-    @Test
-    fun `a bundle records bundle-received with session created and state flipped`() = runTest {
-        val harness = Harness()
-
-        val handled = harness.handler.handleDataSms(BOB, harness.bundleFrom(harness.bobCrypto), null, NOW)
-
-        assertThat(handled).isTrue()
-        val message = slot<String>()
-        verify(exactly = 1) {
-            harness.recorder.recordEvent("e2e-bundle-received", capture(message))
-        }
-        assertThat(message.captured).contains(BOB)
-        assertThat(message.captured).contains("session created: yes")
-        assertThat(message.captured).contains("state flipped to ENCRYPTED: true")
-        assertThat(message.captured).contains("duplicate: no")
-    }
-
-    @Test
-    fun `a duplicate bundle records bundle-received as a duplicate ignore`() = runTest {
-        val harness = Harness()
-        val bundle = harness.bundleFrom(harness.bobCrypto)
-        harness.handler.handleDataSms(BOB, bundle, null, NOW)
-
-        val handled = harness.handler.handleDataSms(BOB, bundle, null, NOW)
-
-        assertThat(handled).isTrue()
-        val messages = mutableListOf<String>()
-        verify(exactly = 2) {
-            harness.recorder.recordEvent("e2e-bundle-received", capture(messages))
-        }
-        assertThat(messages).hasSize(2)
-        assertThat(messages.last()).contains("duplicate ignored")
-        assertThat(messages.last()).contains("session created: no")
-        assertThat(messages.last()).contains("state flipped to ENCRYPTED: no")
-    }
-
-    @Test
-    fun `a bad-magic handshake SMS records the decode failure`() = runTest {
-        val harness = Harness()
-        val badMagic = ByteArray(E2eHandshake.PROBE_SIZE)
-        badMagic[0] = 'X'.code.toByte()
-        val text = E2eHandshakeSms.encode(badMagic)
-
-        val handled = harness.handler.handleSms(BOB, text, null, NOW)
-
-        assertThat(handled).isFalse()
-        assertThat(harness.peerDao.peers).isEmpty()
-        verify(exactly = 1) {
-            harness.recorder.recordEvent(
-                "e2e-decode-failed",
-                match {
-                    it.contains("bad-magic") && it.contains("70 bytes") && it.contains("type 0x00")
-                },
-            )
-        }
-    }
-
-    @Test
-    fun `a capability packet records capability-received`() = runTest {
-        val harness = Harness()
-
-        val handled = harness.handler.handleDataSms(
-            BOB,
-            E2eHandshake.encodeCapabilityDeclaration(),
-            3,
-            NOW,
-        )
-
-        assertThat(handled).isTrue()
-        verify(exactly = 1) {
-            harness.recorder.recordEvent(
-                "e2e-capability-received",
-                match { it.contains(BOB) && it.contains("media=true") },
-            )
-        }
-    }
-
-    @Test
-    fun `a packet from a blocked sender records blocked-sender and nothing else`() = runTest {
-        val harness = Harness(blocked = setOf(BOB))
-
-        val handled = harness.handler.handleDataSms(BOB, harness.probeFrom(harness.bobCrypto), null, NOW)
-
-        assertThat(handled).isFalse()
-        assertThat(harness.sender.sent).isEmpty()
-        assertThat(harness.peerDao.peers).isEmpty()
-        verify(exactly = 1) {
-            harness.recorder.recordEvent(
-                "e2e-blocked-sender",
-                match { it.contains(BOB) },
-            )
-        }
-        verify(exactly = 0) { harness.recorder.recordEvent("e2e-probe-received", any()) }
-    }
-
-    @Test
-    fun `a session-creation failure records session-create-failed and no ENCRYPTED flip`() = runTest {
-        val failingCrypto = mockk<E2eCrypto>()
-        every { failingCrypto.createOutboundSession(any(), any()) } throws
-            RuntimeException("no session")
-        val harness = Harness(cryptoOverride = failingCrypto)
-
-        val handled = harness.handler.handleDataSms(BOB, harness.bundleFrom(harness.bobCrypto), null, NOW)
-
-        assertThat(handled).isFalse()
-        assertThat(harness.peers.state(BOB)).isNotEqualTo(E2ePeerState.ENCRYPTED)
-        verify(exactly = 1) {
-            harness.recorder.recordEvent(
-                "e2e-session-create-failed",
-                match { it.contains(BOB) && it.contains("RuntimeException") },
-            )
-        }
-        verify(exactly = 1) {
-            harness.recorder.recordEvent(
-                "e2e-bundle-received",
-                match { it.contains("session created: no") },
-            )
-        }
-    }
-
-    @Test
-    fun `an account-load failure records account-load-failed instead of propagating`() = runTest {
-        val failingAccount = mockk<E2eAccountManager>()
-        coEvery { failingAccount.ensureAccount() } throws RuntimeException("no account")
-        val harness = Harness(accountManagerOverride = lazyOf(failingAccount))
-
-        val handled = harness.handler.handleDataSms(BOB, harness.bundleFrom(harness.bobCrypto), null, NOW)
-
-        assertThat(handled).isFalse()
-        assertThat(harness.peers.state(BOB)).isNotEqualTo(E2ePeerState.ENCRYPTED)
-        verify(exactly = 1) {
-            harness.recorder.recordEvent(
-                "e2e-account-load-failed",
-                match { it.contains(BOB) && it.contains("RuntimeException") },
-            )
-        }
-        verify(exactly = 1) {
-            harness.recorder.recordEvent(
-                "e2e-bundle-received",
-                match { it.contains("session created: no") },
-            )
-        }
+        assertThat(harness.peerDao.peers[HANDLER_BOB]?.lastBundleReplyAt).isEqualTo(HANDLER_NOW)
     }
 }

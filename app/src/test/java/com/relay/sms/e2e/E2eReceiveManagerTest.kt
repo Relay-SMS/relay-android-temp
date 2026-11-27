@@ -16,6 +16,9 @@ import com.relay.sms.data.local.db.entity.E2ePeerState
 import com.relay.sms.data.repository.ConversationMirror
 import com.relay.sms.domain.model.Message
 import com.relay.sms.domain.repository.ConversationRepository
+import com.relay.sms.domain.settings.AppSettings
+import com.relay.sms.domain.settings.AppSettingsSource
+import com.relay.sms.domain.settings.DeviceMode
 import com.relay.sms.system.notifications.IncomingMessageNotifier
 import io.mockk.Runs
 import io.mockk.coEvery
@@ -78,6 +81,11 @@ class E2eReceiveManagerTest {
 
     private class Harness(
         cryptoOverride: E2eCrypto? = null,
+        // Round 59 — the client-mode fragment gate: the settings
+        // decide the mode, the recorder takes the drop line. Both
+        // default to null (hub behavior, no log), like the manager.
+        settings: AppSettingsSource? = null,
+        recorder: E2eFailureRecorder? = null,
     ) {
         val aliceCrypto = FakeE2eCrypto("alice")
         val bobCrypto = FakeE2eCrypto("bob")
@@ -134,6 +142,8 @@ class E2eReceiveManagerTest {
             mediaKeys = mediaKeys,
             groupSessions = groupSessions,
             context = context,
+            settings = settings,
+            recorder = recorder,
         )
 
         private var nextMsgId = 100L
@@ -293,6 +303,54 @@ class E2eReceiveManagerTest {
         // No new session, no new notice, no retry.
         assertThat(harness.noticeDao.notices).isEmpty()
         coVerify(exactly = 1) { harness.handshakeHandler.retryDecryptFailed(BOB) }
+    }
+
+    // ──────── Round 59: client-mode fragment gate ────────
+
+    @Test
+    fun `a fragment in client mode is dropped before any state changes`() = runTest {
+        val settings = mockk<AppSettingsSource>()
+        coEvery { settings.hydratedOrNull() } returns AppSettings(mode = DeviceMode.CLIENT)
+        val recorder = mockk<E2eFailureRecorder>(relaxed = true)
+        val harness = Harness(settings = settings, recorder = recorder)
+
+        harness.feed(harness.bobFragments("hello alice"))
+
+        // Nothing stored, nothing inserted, no session, no notice, no notify.
+        assertThat(harness.fragmentDao.fragments).isEmpty()
+        coVerify(exactly = 0) {
+            harness.mirror.upsertIncomingSms(any(), any(), any(), any(), any(), any())
+        }
+        assertThat(harness.peerDao.peers[BOB]).isNull()
+        assertThat(harness.noticeDao.notices).isEmpty()
+        coVerify(exactly = 0) { harness.notifier.notifyIncoming(any(), any(), any(), any()) }
+        verify(exactly = 1) {
+            recorder.recordEvent(
+                "e2e-fragment-client-mode",
+                "RLY1 fragment from $BOB swallowed in client mode; no identity provisioned.",
+            )
+        }
+    }
+
+    @Test
+    fun `a fragment in hub mode still decrypts when settings are present`() = runTest {
+        val settings = mockk<AppSettingsSource>()
+        coEvery { settings.hydratedOrNull() } returns AppSettings(mode = DeviceMode.HUB)
+        val harness = Harness(settings = settings)
+
+        harness.feed(harness.bobFragments("hello alice"))
+
+        coVerify(exactly = 1) {
+            harness.mirror.upsertIncomingSms(
+                address = BOB,
+                body = "hello alice",
+                date = NOW,
+                telephonyUri = "content://sms/1",
+                subId = 3,
+                encrypted = true,
+            )
+        }
+        assertThat(harness.peerDao.peers[BOB]?.state).isEqualTo(E2ePeerState.ENCRYPTED)
     }
 
     @Test

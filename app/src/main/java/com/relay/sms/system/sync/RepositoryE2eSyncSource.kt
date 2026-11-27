@@ -286,6 +286,14 @@ private fun ProbeResult.toActionResult(): ActionResult = when (this) {
             message = "Too many encryption attempts for this contact. " +
                 "Reset the timing in Settings → Advanced on your phone.",
         )
+        // Round 59 — the too-soon refusal shares the rate-limited
+        // code (its own message names the 24-hour spacing).
+        // Unreachable from a manual retry (see the KDoc above).
+        ProbeGate.ProbeTooSoon -> ActionResult(
+            ok = false,
+            code = SyncProtocol.MessageFailed.RATE_LIMITED,
+            message = "The last encryption check for this contact was less than 24 hours ago.",
+        )
         // Unreachable from a manual retry (see the KDoc above).
         ProbeGate.DiscoveryOff -> ActionResult(
             ok = false,

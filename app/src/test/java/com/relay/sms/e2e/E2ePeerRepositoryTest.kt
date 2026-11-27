@@ -86,7 +86,7 @@ class E2ePeerRepositoryTest {
     @Test
     fun `canProbe is true with no row and after the window elapses`() = runTest {
         val fresh = E2ePeerRepository(daoReturning(null))
-        assertThat(fresh.canProbe(address, now)).isTrue()
+        assertThat(fresh.canProbeReason(address, now)).isNull()
 
         val expired = E2ePeerRepository(
             daoReturning(
@@ -98,7 +98,7 @@ class E2ePeerRepositoryTest {
                 ),
             ),
         )
-        assertThat(expired.canProbe(address, now)).isTrue()
+        assertThat(expired.canProbeReason(address, now)).isNull()
     }
 
     @Test
@@ -114,7 +114,7 @@ class E2ePeerRepositoryTest {
             ),
         )
 
-        assertThat(repository.canProbe(address, now)).isFalse()
+        assertThat(repository.canProbeReason(address, now)).isEqualTo(ProbeGate.BudgetExhausted)
     }
 
     @Test
@@ -128,7 +128,7 @@ class E2ePeerRepositoryTest {
                 ),
             ),
         )
-        assertThat(tooSoon.canProbe(address, now)).isFalse()
+        assertThat(tooSoon.canProbeReason(address, now)).isEqualTo(ProbeGate.ProbeTooSoon)
 
         val spaced = E2ePeerRepository(
             daoReturning(
@@ -139,7 +139,7 @@ class E2ePeerRepositoryTest {
                 ),
             ),
         )
-        assertThat(spaced.canProbe(address, now)).isTrue()
+        assertThat(spaced.canProbeReason(address, now)).isNull()
     }
 
     @Test

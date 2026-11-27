@@ -50,6 +50,7 @@ class E2eRetryNoticeTest {
             ProbeGate.Blocked to R.string.e2e_retry_blocked,
             ProbeGate.AlreadyEncrypted to R.string.e2e_retry_already_encrypted,
             ProbeGate.BudgetExhausted to R.string.e2e_retry_rate_limited,
+            ProbeGate.ProbeTooSoon to R.string.e2e_retry_rate_limited,
             ProbeGate.DiscoveryOff to R.string.e2e_retry_discovery_off,
         )
         for ((gate, res) in cases) {

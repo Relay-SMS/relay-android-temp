@@ -602,6 +602,16 @@ class RepositoryE2eSyncSourceTest {
         assertThat(result.code).isEqualTo(SyncProtocol.MessageFailed.RATE_LIMITED)
     }
 
+    @Test fun `retryProbe maps a too-soon probe to rate_limited`() = runTest {
+        // Round 59 — the 24-hour spacing is lifted for a manual
+        // retry too, so this is unreachable from one as well; the
+        // mapping is total anyway.
+        val result = retryProbeResultFor(ProbeResult.Gated(ProbeGate.ProbeTooSoon))
+
+        assertThat(result.ok).isFalse()
+        assertThat(result.code).isEqualTo(SyncProtocol.MessageFailed.RATE_LIMITED)
+    }
+
     @Test fun `retryProbe maps a switched-off discovery to discovery_off`() = runTest {
         // Unreachable from a manual retry (the toggle is lifted
         // there) — the mapping is total anyway.

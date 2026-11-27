@@ -15,6 +15,9 @@ import com.relay.sms.data.local.db.entity.E2eNoticeKind
 import com.relay.sms.data.repository.ConversationMirror
 import com.relay.sms.domain.reaction.IncomingReactionDecoder
 import com.relay.sms.domain.repository.ConversationRepository
+import com.relay.sms.domain.settings.AppSettings
+import com.relay.sms.domain.settings.AppSettingsSource
+import com.relay.sms.domain.settings.DeviceMode
 import com.relay.sms.system.notifications.IncomingMessageNotifier
 import dagger.hilt.android.qualifiers.ApplicationContext
 import timber.log.Timber
@@ -129,6 +132,14 @@ class E2eReceiveManager @Inject constructor(
     // hand — keep compiling untouched; Hilt always provides the
     // real notifier.
     private val activatedNotifier: com.relay.sms.system.notifications.E2eActivatedNotifier? = null,
+    // Round 59 — the client-mode gate for the RLY1: fragment path
+    // (the handshake-SMS branch got its gate in round 45; this
+    // path never did). Nullable with null defaults, same reason
+    // as [activatedNotifier]; Hilt always provides the real
+    // settings + recorder. A null settings fails OPEN (hub
+    // behavior), like the other gates' unreadable-store path.
+    private val settings: AppSettingsSource? = null,
+    private val recorder: E2eFailureRecorder? = null,
 ) {
     private val processedLock = Any()
     private val processedSets = LinkedHashSet<Pair<String, String>>()
@@ -145,6 +156,42 @@ class E2eReceiveManager @Inject constructor(
         dateMs: Long,
         subId: Int?,
         now: Long = System.currentTimeMillis(),
+    ) {
+        // Round 59 — client mode drops RLY1: fragments before any
+        // state changes: a linked device must never hold an E2E
+        // identity, and the default-SMS role can linger after a
+        // switch to client mode, so SMS_DELIVER still fires and
+        // fragments still arrive. Same gate shape as
+        // [E2eHandshakeSmsGate] and [E2eDataSmsGate]
+        // (`hydratedOrNull`, never `state.value` — a cold process
+        // has not hydrated yet and the default would read as hub
+        // mode). The receiver already wrote the fragment SMS to
+        // the inbox, like the handshake branch — only the handling
+        // is swallowed. Recorded, not silent: a drop the receiver
+        // never sees is otherwise invisible in release builds.
+        if ((settings?.hydratedOrNull() ?: AppSettings()).mode == DeviceMode.CLIENT) {
+            recorder?.recordEvent(
+                "e2e-fragment-client-mode",
+                "RLY1 fragment from $address swallowed in client mode; no identity provisioned.",
+            )
+            return
+        }
+        handleFragmentHub(address, fragment, telephonyUri, dateMs, subId, now)
+    }
+
+    /**
+     * The hub-mode half of [handleFragment]: stores, reassembles,
+     * decrypts and inserts one fragment set. Split out in round 59
+     * so the client-mode gate above keeps [handleFragment] under
+     * Detekt's ReturnCount limit (the gate is the fifth return).
+     */
+    private suspend fun handleFragmentHub(
+        address: String,
+        fragment: E2eWireFormat.Fragment,
+        telephonyUri: String?,
+        dateMs: Long,
+        subId: Int?,
+        now: Long,
     ) {
         // The fragment store is 0-based; the wire format is 1-based.
         fragments.insert(address, fragment.messageId, fragment.index - 1, fragment.total, fragment.chunk, now)
