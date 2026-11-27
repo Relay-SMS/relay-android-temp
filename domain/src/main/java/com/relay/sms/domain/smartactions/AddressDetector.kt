@@ -86,9 +86,20 @@ object AddressDetector {
      * or a bare ZIP (", 62701"). The city name is lazy — it stops at the
      * first comma that a state + ZIP follows. City and state match in
      * any case ("kinzers, pa 17535" extends like "Kinzers, PA 17535").
+     *
+     * Round 60 — the commas are OPTIONAL (desktop parity): the
+     * desktop tail regex (`ADDRESS_TAIL_REGEX`) takes the city and
+     * the state with or without commas, so "5466 elam rd kinzers
+     * pa 17535" detects there — while this regex demanded both
+     * commas, the tail never extended, and the lowercase gate
+     * dropped the address, so mobile showed no "Get directions"
+     * pill for a comma-less lowercase address. A capitalised
+     * address still detected (just without its tail); only the
+     * lowercase form vanished outright. The bare-ZIP alternative
+     * keeps its comma (the desktop has no bare-ZIP tail at all).
      */
     private val ZIP_TAIL_REGEX = Regex(
-        """,\s*(?:[A-Za-z][A-Za-z .'\-]{1,40}?,\s*)?[A-Za-z]{2}\s+\d{5}(?:-\d{4})?|,\s*\d{5}(?:-\d{4})?""",
+        """\s*,?\s*(?:[A-Za-z][A-Za-z .'\-]{1,40}?\s*,?\s+)?[A-Za-z]{2}\s+\d{5}(?:-\d{4})?|,\s*\d{5}(?:-\d{4})?""",
     )
 
     /** Every street address in [text], in order, or an empty list. */

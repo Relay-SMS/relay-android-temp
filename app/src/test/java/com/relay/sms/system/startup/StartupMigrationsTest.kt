@@ -17,6 +17,7 @@ import com.relay.sms.data.local.db.dao.ConversationDao
 import com.relay.sms.data.local.db.dao.MessageDao
 import com.relay.sms.data.repository.ConversationMirror
 import com.relay.sms.data.repository.GroupConversationRepair
+import com.relay.sms.data.repository.MissingMmsRepair
 import com.relay.sms.domain.settings.AppSettings
 import io.mockk.clearMocks
 import io.mockk.coEvery
@@ -54,6 +55,7 @@ class StartupMigrationsTest {
     private val mirror = mockk<ConversationMirror>()
     private val stickyCategories = mockk<StickyCategoryStore>(relaxed = true)
     private val groupRepair = mockk<GroupConversationRepair>()
+    private val missingMmsRepair = mockk<MissingMmsRepair>()
 
     /**
      * 🔴 v1.27.2 — SANS CECI, LES COMPTES DE MOCK S ACCUMULENT ENTRE LES TESTS.
@@ -68,9 +70,19 @@ class StartupMigrationsTest {
      */
     @BeforeEach
     fun resetMocks() {
-        clearMocks(messageDao, conversationDao, attachmentDao, mirror, stickyCategories, groupRepair, answers = false)
+        clearMocks(
+            messageDao,
+            conversationDao,
+            attachmentDao,
+            mirror,
+            stickyCategories,
+            groupRepair,
+            missingMmsRepair,
+            answers = false,
+        )
         coEvery { attachmentDao.findByLocalUriPrefix(any()) } returns emptyList()
         coEvery { groupRepair.repair() } returns GroupConversationRepair.Result(0, 0, true)
+        coEvery { missingMmsRepair.repair() } returns MissingMmsRepair.Result(0, true)
     }
 
     private fun context(): Context = mockk {
@@ -99,6 +111,7 @@ class StartupMigrationsTest {
         conversationMirror = dagger.Lazy { mirror },
         stickyCategories = dagger.Lazy { stickyCategories },
         groupRepair = dagger.Lazy { groupRepair },
+        missingMmsRepair = dagger.Lazy { missingMmsRepair },
         context = context(),
         io = Dispatchers.Unconfined,
     )
@@ -397,5 +410,62 @@ class StartupMigrationsTest {
 
         coVerify(exactly = 1) { groupRepair.repair() }
         assertThat(state.first().advanced.groupConversationsRepairedV26).isTrue()
+    }
+
+    // ──────── Round 60 — missing-MMS repair ────────
+
+    private fun importedSettings(): AppSettings = AppSettings().copy(
+        advanced = AppSettings().advanced.copy(mmsImportCompleted = true),
+    )
+
+    @Test
+    fun missingMmsRepairRunsOnce_andRecordsItsFlagOnACompletePass() = runTest {
+        coEvery { mirror.dedupeSameNumberConversations() } returns false
+        coEvery { missingMmsRepair.repair() } returns MissingMmsRepair.Result(3, true)
+        val (settings, state) = fakeSettings(importedSettings())
+
+        migrations(settings).run()
+
+        coVerify(exactly = 1) { missingMmsRepair.repair() }
+        assertThat(state.first().advanced.missingMmsRepairedV60).isTrue()
+    }
+
+    @Test
+    fun missingMmsRepairIncomplete_doesNotRecordItsFlag_soItRetriesNextColdStart() = runTest {
+        coEvery { mirror.dedupeSameNumberConversations() } returns false
+        coEvery { missingMmsRepair.repair() } returns MissingMmsRepair.Result(0, false)
+        val (settings, state) = fakeSettings(importedSettings())
+
+        migrations(settings).run()
+
+        coVerify(exactly = 1) { missingMmsRepair.repair() }
+        assertThat(state.first().advanced.missingMmsRepairedV60).isFalse()
+    }
+
+    @Test
+    fun missingMmsRepairSkippedBeforeImport_soAnEmptyDatabaseNeverConsumesItsFlag() = runTest {
+        coEvery { mirror.dedupeSameNumberConversations() } returns false
+        // AppSettings() has mmsImportCompleted = false: a fresh
+        // install whose database is empty.
+        val (settings, state) = fakeSettings(AppSettings())
+
+        migrations(settings).run()
+
+        coVerify(exactly = 0) { missingMmsRepair.repair() }
+        assertThat(state.first().advanced.missingMmsRepairedV60).isFalse()
+    }
+
+    @Test
+    fun missingMmsRepairAlreadyDone_isNotReRun() = runTest {
+        coEvery { mirror.dedupeSameNumberConversations() } returns false
+        val (settings, _) = fakeSettings(
+            importedSettings().copy(
+                advanced = importedSettings().advanced.copy(missingMmsRepairedV60 = true),
+            ),
+        )
+
+        migrations(settings).run()
+
+        coVerify(exactly = 0) { missingMmsRepair.repair() }
     }
 }

@@ -76,6 +76,11 @@ import javax.inject.Singleton
  *    by [schedule] whenever a bundle reply is sent (in
  *    [E2eHandshakeHandler.handleProbe]) or a bundle arrives
  *    without a session (in [E2eHandshakeHandler.handleBundle]).
+ *    Round 60 — also armed whenever a probe goes out (in
+ *    [E2eProbeManager.probeAddressDetailed]): a probe send
+ *    re-arms the 10-second timer, so a worker armed before the
+ *    probe cannot wake and skip as "not stalled yet" — the
+ *    round-58 known limitation below is closed by this arming.
  *    The work is unique per peer with `REPLACE`, so the latest
  *    handshake activity re-arms the 10-second timer, and the worker
  *    re-reads the peer row at run time and re-checks the gate
@@ -89,11 +94,15 @@ import javax.inject.Singleton
  *    reply will arm a worker for them) and the worker-skipped
  *    case below. Thread-open only, never send.
  *
- * Known limitation: a data-SMS probe sent AFTER a worker was
- * armed does not re-arm it (only bundle replies do, to avoid
- * touching the shared probe core) — so a worker can wake and
- * skip as "not stalled yet" if a probe went out in the meantime.
- * The thread-open check is the backstop for that case.
+ * Known limitation (round 58, CLOSED in round 60): a data-SMS
+ * probe sent AFTER a worker was armed did not re-arm it (only
+ * bundle replies did, to avoid touching the shared probe core) —
+ * so a worker could wake and skip as "not stalled yet" if a probe
+ * went out in the meantime. Round 60 arms the worker on every
+ * probe send ([E2eProbeManager.probeAddressDetailed]), so the
+ * latest handshake activity — probe or bundle — re-arms the
+ * timer. The thread-open check remains as the backstop for a pair
+ * already stalled when the app updates.
  *
  * `autoDiscoverRelayContacts` is RESPECTED (the fallback does not
  * fire while discovery is off). It is an automatic outbound

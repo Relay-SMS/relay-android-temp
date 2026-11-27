@@ -616,9 +616,13 @@ private fun DetailsPanelContent(
                     }
                 }
                 DetailsMediaTab.Files -> {
-                    // A 0-byte file has no bytes to open — hidden,
-                    // like the desktop Files tab.
-                    val fileRows = files?.filter { it.sizeBytes > 0 }
+                    // Round 60 — no size filter: a fresh-install
+                    // re-import hardcodes sizeBytes 0 (see
+                    // ConversationMirror), so the filter hid every
+                    // re-imported file and the tab read empty.
+                    // DetailsFileRow already guards its size line
+                    // with `sizeBytes > 0`, so no "0 B" shows.
+                    val fileRows = files
                     when {
                         fileRows == null -> Unit
                         fileRows.isEmpty() -> item(key = "empty-files") {
@@ -831,12 +835,14 @@ private fun NoteDetailsPanelContent(
                     }
                 }
                 DetailsMediaTab.Files -> {
-                    // A 0-byte file has no bytes to open — hidden,
-                    // like the desktop Files tab. Files are the
-                    // attachments that are neither image nor video
-                    // (the `observeFilesForConversation` rule).
+                    // Round 60 — no size filter (see the conversation
+                    // tab above): note attachments re-imported with
+                    // sizeBytes 0 were hidden and the tab read empty.
+                    // Files are the attachments that are neither image
+                    // nor video (the `observeFilesForConversation`
+                    // rule).
                     val fileRows = attachments.filter {
-                        !it.isImage && !it.isVideo && it.sizeBytes > 0
+                        !it.isImage && !it.isVideo
                     }
                     if (fileRows.isEmpty()) {
                         item(key = "empty-files") {

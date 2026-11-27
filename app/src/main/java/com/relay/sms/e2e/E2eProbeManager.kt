@@ -126,6 +126,15 @@ import com.relay.sms.data.local.db.entity.E2ePeerState as StoredPeerState
  * never announce (the tap is about the key exchange, and the
  * panel only offers it for non-ENCRYPTED peers).
  *
+ * Round 60 — the automatic re-probe schedule (design §2.4): a
+ * probe that goes out unanswered is re-probed from its OWN allowance
+ * (4 retries in the first hour, at 5/15/30/50 minutes), not the
+ * 30-day budget — the worker ([E2eProbeRetryWorker]) fires at each
+ * due time, and any trigger that finds the normal gate refusing for
+ * spacing or budget sends a due retry instead of gating. The same
+ * probe send also arms the fallback worker now (round 58's worker
+ * was armed only on bundle receipt, never when WE probed).
+ *
  * Desktop encryption-box update — the manual retry is now
  * result-aware on both surfaces: [retryProbeDetailed] runs the
  * detailed core and returns the outcome (the fire-and-forget
@@ -238,6 +247,16 @@ enum class ProbeTrigger(val label: String) {
 
     /** A plain SMS from an ENCRYPTED peer ([E2eProbeManager.reprobeAfterPeerLeft]). */
     PEER_LEFT("peer-left re-probe"),
+
+    /**
+     * Round 60 — an automatic re-probe of an unanswered handshake
+     * ([E2eProbeManager.retryUnansweredHandshake], design §2.4):
+     * the same probe, sent from the retry allowance instead of the
+     * 30-day budget. The trigger names the retry in the error log,
+     * whatever entry point noticed it was due (worker, thread-open,
+     * send).
+     */
+    RETRY("retry"),
 }
 
 @Singleton
@@ -258,6 +277,11 @@ class E2eProbeManager @Inject constructor(
     // — keep compiling untouched; Hilt always provides the real
     // fallback.
     private val autoFallback: E2eAutoFallback? = null,
+    // Round 60 — the automatic re-probe schedule
+    // ([E2eProbeRetryPolicy]): armed after a probe send (see
+    // [probeAddressDetailed]). Same nullable-default precedent as
+    // [autoFallback]; Hilt always provides the real scheduler.
+    private val retryScheduler: E2eProbeRetryScheduler? = null,
     // Round 58 — group-thread probing ([probeGroupMembers]) needs
     // our own number to exclude it from the member list (settings
     // first, SIM fallback — the same order as
@@ -438,6 +462,29 @@ class E2eProbeManager @Inject constructor(
             runCatching { probeAddress(address, subId, trigger = ProbeTrigger.PEER_LEFT) }
                 .onFailure { Timber.w(it, "E2E: re-probe after peer left failed") }
         }
+    }
+
+    /**
+     * Round 60 — the automatic re-probe entry point (design §2.4),
+     * called by [E2eProbeRetryWorker] at the next retry's due time.
+     * Delegates to the detailed core with the [ProbeTrigger.RETRY]
+     * trigger: the core's normal gate refuses a probe sent minutes
+     * ago (24-hour spacing), and the retry branch sends it from
+     * the retry allowance instead — so this returns true exactly
+     * when a re-probe went out. Returns false when no retry is due
+     * (handshake completed, window elapsed, retries spent, or any
+     * other gate refusing) or the radio refused the send. The
+     * worker re-arms for the next retry when one is due; the
+     * thread-open / send triggers are the backstop when it cannot
+     * run. Suspend — the worker is already a background coroutine.
+     */
+    suspend fun retryUnansweredHandshake(
+        address: String,
+        now: Long = System.currentTimeMillis(),
+    ): Boolean {
+        val subId = runCatching { settings.hydratedOrNull()?.sending?.defaultSubId }
+            .getOrNull()
+        return probeAddressDetailed(address, subId, now = now, trigger = ProbeTrigger.RETRY) is ProbeResult.Sent
     }
 
     /**
@@ -672,7 +719,23 @@ class E2eProbeManager @Inject constructor(
     ): ProbeResult = probeMutex.withLock {
         val state = peers.state(address)
         val gate = gateFor(address, state, allowEncrypted, manual, now)
-        if (gate != null) {
+        // Round 60 — a gate refusing only for spacing or budget is
+        // not the end of the story: a re-probe may still be due
+        // from the retry allowance (same probe, own allowance). The
+        // address, blocked, ENCRYPTED, and discovery gates all run
+        // before the budget check in [gateFor], so reaching this
+        // branch means they already passed; the retry policy adds
+        // its own conditions (still PROBING, inside the first-hour
+        // window, retries left, due). A manual retry never takes
+        // this branch — it bypasses the budget outright.
+        val retryPeer =
+            if (!manual && (gate == ProbeGate.ProbeTooSoon || gate == ProbeGate.BudgetExhausted)) {
+                peers.getPeer(address)
+            } else {
+                null
+            }
+        val isRetry = retryPeer != null && E2eProbeRetryPolicy.canRetry(retryPeer, now)
+        if (gate != null && !isRetry) {
             // Round 48 — an ENCRYPTED peer refuses the probe, but
             // the trigger is still a contact point: send our
             // media-capability declaration when we have not
@@ -714,7 +777,15 @@ class E2eProbeManager @Inject constructor(
         // the sender already recorded the radio refusal under the
         // kind's failure tag.
         if (!sent) return@withLock ProbeResult.SendFailed
-        peers.recordProbeSent(address, now)
+        if (isRetry) {
+            // Round 60 — the retry allowance, not the 30-day budget:
+            // the attempt count and the window are untouched, and the
+            // peer stays PROBING (no NOT_RELAY flip — a retry is not
+            // a budget attempt).
+            peers.recordRetryProbeSent(address, now)
+        } else {
+            peers.recordProbeSent(address, now)
+        }
         // The 3rd unanswered attempt exhausts the budget: the peer
         // becomes NOT_RELAY until the window elapses (state machine
         // `onProbeSent`). Re-read: the repository owns the counting.
@@ -726,20 +797,53 @@ class E2eProbeManager @Inject constructor(
         // consumes budget (recordProbeSent bumped the attempts
         // above); only the immediate state flip is skipped, and the
         // NOT_RELAY conclusion still applies to automatic probes.
-        val attempts = peers.getPeer(address)?.probeAttempts ?: 0
+        val peerAfterSend = peers.getPeer(address)
+        val attempts = peerAfterSend?.probeAttempts ?: 0
+        val retryAttempts = peerAfterSend?.retryAttempts ?: 0
         // Desktop encryption-box update — the send that spends
         // the last budget slot: automatic checks for this contact
         // are paused until the window elapses, and the caller
         // (phone snackbar, desktop dialog) tells the user about
         // the reset. The flag rides on the result for manual AND
-        // automatic sends; automatic callers ignore it.
-        val budgetExhausted = attempts >= E2ePeerRepository.MAX_PROBE_ATTEMPTS
+        // automatic sends; automatic callers ignore it. A retry
+        // never spends a budget slot, so it never sets the flag.
+        val budgetExhausted = !isRetry && attempts >= E2ePeerRepository.MAX_PROBE_ATTEMPTS
         if (!manual && budgetExhausted) {
             peers.setState(address, StoredPeerState.NOT_RELAY, now)
         }
+        // Round 60 — arm the automatic fallback's 10-second check
+        // on every probe send, not only on bundle receipt: the
+        // worker re-checks the evidence gate at run time, so arming
+        // is safe, and a stalled handshake that HAS evidence is
+        // rescued ~10 seconds after OUR probe instead of waiting
+        // for a bundle that may never arrive. Best-effort: a
+        // scheduling failure must not fail a probe that already
+        // went out (the thread-open backstop covers a lost arm).
+        runCatching { autoFallback?.schedule(address) }
+            .onFailure { Timber.w(it, "E2E: fallback arm failed") }
+        // Round 60 — arm the next re-probe when one is due: after
+        // a fresh probe the first retry is due in 5 minutes; after
+        // a retry, the next one in the window. Never armed when the
+        // budget is spent (a NOT_RELAY peer gets no retries) — and
+        // the policy re-checks at run time, so a stale arm (a newer
+        // probe superseded it) is a harmless skip. Best-effort,
+        // like the fallback arm above.
+        if (!budgetExhausted) {
+            val delay = peerAfterSend?.let { E2eProbeRetryPolicy.delayUntilNextRetry(it, now) }
+            if (delay != null) {
+                runCatching { retryScheduler?.schedule(address, delay) }
+                    .onFailure { Timber.w(it, "E2E: probe-retry arm failed") }
+            }
+        }
         Timber.i("E2E: probe sent (state=%s, attempts=%d)", state, attempts)
         val result = ProbeResult.Sent(budgetExhausted = budgetExhausted)
-        if (!manual) recordAutomaticResult(result, trigger, channel, attempts, address = address)
+        if (!manual) {
+            if (isRetry) {
+                recordAutomaticResult(result, ProbeTrigger.RETRY, channel, retryAttempts, address = address)
+            } else {
+                recordAutomaticResult(result, trigger, channel, attempts, address = address)
+            }
+        }
         result
     }
 

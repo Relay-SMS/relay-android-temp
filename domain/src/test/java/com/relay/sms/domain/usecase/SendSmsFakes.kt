@@ -97,6 +97,12 @@ internal class NoopMirror : OutgoingMessageMirror {
         val statut: MessageStatus,
         // E2E — whether the mirrored row carries the encrypted flag.
         val encrypted: Boolean = false,
+        // Round 60 (r) — the mirror body override passed to the
+        // mirror (`null` = mirror the wire body as-is). An encrypted
+        // group send passes `""` for its per-member rows: the real
+        // mirror stores them as hidden tracking sentinels, never
+        // as visible 1:1 messages.
+        val corpsMiroir: String? = null,
     )
 
     val lignes = mutableListOf<LigneEcrite>()
@@ -115,7 +121,7 @@ internal class NoopMirror : OutgoingMessageMirror {
         clientMessageId: String?,
         encrypted: Boolean,
     ): Long {
-        lignes += LigneEcrite(address, telephonyUri, initialStatus, encrypted)
+        lignes += LigneEcrite(address, telephonyUri, initialStatus, encrypted, localMirrorBody)
         cles += clientMessageId
         return prochainId++
     }

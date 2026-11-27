@@ -137,6 +137,28 @@ internal class FakeE2ePeerDao : E2ePeerDao {
                 windowStartedAt = windowStartedAt,
                 lastProbeAt = lastProbeAt,
                 updatedAt = updatedAt,
+                // Round 60 — mirrors the DAO's UPDATE: every probe
+                // opens a fresh one-hour retry window.
+                retryAttempts = 0,
+                retryWindowStartedAt = lastProbeAt,
+            )
+        }
+    }
+
+    // Round 60 — retry-allowance column: a re-probe bumps only the
+    // retry count (and moves the last-probe time); the 30-day
+    // budget is untouched.
+    override suspend fun recordRetryProbe(
+        address: String,
+        retryAttempts: Int,
+        lastProbeAt: Long,
+        updatedAt: Long,
+    ) {
+        peers[address]?.let {
+            peers[address] = it.copy(
+                retryAttempts = retryAttempts,
+                lastProbeAt = lastProbeAt,
+                updatedAt = updatedAt,
             )
         }
     }
@@ -212,6 +234,10 @@ internal class FakeE2ePeerDao : E2ePeerDao {
                 // Round 58 — mirrors the DAO's UPDATE: the
                 // automatic fallback's own cap clears too.
                 lastAutoFallbackAt = null,
+                // Round 60 — mirrors the DAO's UPDATE: the retry
+                // allowance clears too.
+                retryAttempts = 0,
+                retryWindowStartedAt = null,
                 state = if (peer.state == E2ePeerState.ENCRYPTED) {
                     E2ePeerState.ENCRYPTED
                 } else {

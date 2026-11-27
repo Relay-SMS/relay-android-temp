@@ -21,6 +21,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material3.MaterialTheme
@@ -290,7 +291,15 @@ fun SplashScreen(
             verticalArrangement = Arrangement.Center,
             modifier = Modifier
                 .fillMaxSize()
-                .padding(horizontal = 32.dp),
+                .padding(horizontal = 32.dp)
+                // Round 60 — the logo + title + tagline group sits
+                // ~11 dp too low (Kristin's screenshot, 389x865:
+                // visible group 299..587, centre 443, screen centre
+                // 432.5). The whole centred group shifts up by
+                // [GROUP_SHIFT_UP_DP]; the "Tap anywhere" hint is a
+                // sibling pinned to the bottom (48 dp) and does not
+                // move. The gaps inside the group are untouched.
+                .offset(y = -GROUP_SHIFT_UP_DP.dp),
         ) {
             // Round 57 — la marque animée remplace l'image statique
             // `ic_splash_logo` (le vecteur reste le foreground de l'icône
@@ -361,6 +370,9 @@ internal const val SPLASH_APP_NAME_TAG = "splash_app_name"
 internal const val SPLASH_TAGLINE_TAG = "splash_tagline"
 private const val TAGLINE_ANIM_MS = 800
 private const val TAGLINE_SLIDE_UP_DP = 12f
+
+/** Round 60 — the centred group's upward shift (see the Column above). */
+private const val GROUP_SHIFT_UP_DP = 11f
 private const val HINT_DELAY_MS = 2500L
 private const val HINT_ANIM_MS = 500
 private const val HINT_FINAL_ALPHA = 0.6f

@@ -23,6 +23,10 @@ import com.relay.sms.domain.model.Note
 import com.relay.sms.domain.model.NoteMessage
 import com.relay.sms.domain.notes.NoteAttachmentResolver
 import com.relay.sms.domain.pdf.PdfExportResult
+import com.relay.sms.domain.settings.AppSettings
+import com.relay.sms.domain.settings.AppSettingsSource
+import com.relay.sms.domain.settings.MapsProvider
+import com.relay.sms.domain.settings.SmartActionSettings
 import com.relay.sms.domain.usecase.ExportNotePdfUseCase
 import com.relay.sms.system.share.IncomingShareHolder
 import com.relay.sms.ui.components.AttachmentKind
@@ -32,8 +36,10 @@ import io.mockk.every
 import io.mockk.just
 import io.mockk.mockk
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.resetMain
@@ -139,10 +145,24 @@ class NoteThreadViewModelTest {
         val contentResolver: ContentResolver,
     )
 
+    /** A settings source holding one value, emitting writes to both flows. */
+    private class FakeAppSettingsSource(initial: AppSettings) : AppSettingsSource {
+        private val _state = MutableStateFlow(initial)
+        override val flow: Flow<AppSettings> = _state
+        override val state: StateFlow<AppSettings> = _state
+
+        override suspend fun hydratedOrNull(): AppSettings? = _state.value
+
+        override suspend fun update(transform: (AppSettings) -> AppSettings) {
+            _state.value = transform(_state.value)
+        }
+    }
+
     private fun harness(
         initialNote: Note? = note(),
         incomingShare: IncomingShareHolder? = null,
         sharedImageUri: Uri? = null,
+        settings: AppSettingsSource? = null,
     ): Harness {
         val repo = FakeNoteRepository(initialNote)
         val resolver = mockk<NoteAttachmentResolver>(relaxed = true)
@@ -169,6 +189,7 @@ class NoteThreadViewModelTest {
             context = context,
             io = dispatcher,
             incomingShare = incomingShare,
+            settings = settings,
         )
         return Harness(vm, repo, resolver, exportPdf, voiceRecorder, playbackController, context, contentResolver)
     }
@@ -500,6 +521,94 @@ class NoteThreadViewModelTest {
         assertThat(File(staged.path).exists()).isTrue()
         assertThat(holder.pending.value).isNull()
     }
+
+    // ──────────────────── Round 60 — forward + pin + maps provider ────────────────────
+
+    @Test fun `toggleNotePin flips the note pin`() = runTest(dispatcher) {
+        val h = harness()
+        advanceUntilIdle()
+        assertThat(h.vm.state.value.note?.pinned).isFalse()
+
+        h.vm.toggleNotePin()
+        advanceUntilIdle()
+
+        assertThat(h.vm.state.value.note?.pinned).isTrue()
+        h.vm.toggleNotePin()
+        advanceUntilIdle()
+        assertThat(h.vm.state.value.note?.pinned).isFalse()
+    }
+
+    @Test fun `stageForward posts a text-only forward payload`() = runTest(dispatcher) {
+        val holder = IncomingShareHolder()
+        val h = harness(incomingShare = holder)
+        advanceUntilIdle()
+
+        h.vm.stageForward(message(id = 1L, body = "hello"))
+
+        val pending = holder.pending.value
+        assertThat(pending).isNotNull()
+        assertThat(pending!!.text).isEqualTo("hello")
+        assertThat(pending.isForward).isTrue()
+        assertThat(pending.uris).isEmpty()
+    }
+
+    @Test fun `stageForward ignores a text-less entry`() = runTest(dispatcher) {
+        val holder = IncomingShareHolder()
+        val h = harness(incomingShare = holder)
+        advanceUntilIdle()
+
+        h.vm.stageForward(
+            message(id = 1L, body = "", attachments = listOf(attachment())),
+        )
+
+        assertThat(holder.pending.value).isNull()
+    }
+
+    @Test fun `maps provider flows from settings into state`() = runTest(dispatcher) {
+        val settings = FakeAppSettingsSource(
+            AppSettings(
+                smartActions = SmartActionSettings(
+                    mapsProvider = MapsProvider.GOOGLE_MAPS,
+                    mapsProviderAsked = true,
+                ),
+            ),
+        )
+        val h = harness(settings = settings)
+        advanceUntilIdle()
+
+        assertThat(h.vm.state.value.mapsProvider).isEqualTo(MapsProvider.GOOGLE_MAPS)
+        assertThat(h.vm.state.value.mapsProviderAsked).isTrue()
+    }
+
+    @Test fun `setMapsProvider saves the provider and marks it asked`() = runTest(dispatcher) {
+        val settings = FakeAppSettingsSource(AppSettings())
+        val h = harness(settings = settings)
+        advanceUntilIdle()
+
+        h.vm.setMapsProvider(MapsProvider.GOOGLE_MAPS)
+        advanceUntilIdle()
+
+        val saved = settings.state.value.smartActions
+        assertThat(saved.mapsProvider).isEqualTo(MapsProvider.GOOGLE_MAPS)
+        assertThat(saved.mapsProviderAsked).isTrue()
+        assertThat(saved.mapsProviderUpdatedAt).isGreaterThan(0L)
+        assertThat(h.vm.state.value.mapsProvider).isEqualTo(MapsProvider.GOOGLE_MAPS)
+    }
+
+    @Test fun `markMapsProviderAsked marks asked without changing the provider`() =
+        runTest(dispatcher) {
+            val settings = FakeAppSettingsSource(AppSettings())
+            val h = harness(settings = settings)
+            advanceUntilIdle()
+
+            h.vm.markMapsProviderAsked()
+            advanceUntilIdle()
+
+            val saved = settings.state.value.smartActions
+            assertThat(saved.mapsProvider).isEqualTo(MapsProvider.SYSTEM_DEFAULT)
+            assertThat(saved.mapsProviderAsked).isTrue()
+            assertThat(h.vm.state.value.mapsProviderAsked).isTrue()
+        }
 
     companion object {
         private const val NOTE_ID: Long = 1L

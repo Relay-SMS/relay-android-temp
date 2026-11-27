@@ -33,6 +33,7 @@ import com.relay.sms.domain.model.toDisplayMessage
 import com.relay.sms.domain.notes.NoteAttachmentResolver
 import com.relay.sms.sync.client.ClientDownloadState
 import com.relay.sms.ui.components.AudioMessageBubble
+import com.relay.sms.ui.components.BubbleMenuToggles
 import com.relay.sms.ui.components.BurstPosition
 import com.relay.sms.ui.components.MessageBubble
 import com.relay.sms.ui.screens.thread.isLastOfSenderRun
@@ -48,11 +49,13 @@ import com.relay.sms.ui.theme.RelayText
  *
  *   - a lone audio attachment → [AudioMessageBubble] (delete only);
  *   - any other attachment → [NoteMediaAttachmentBubble] (delete +
- *     copy when there is a caption);
- *   - text only → [MessageBubble] (delete + copy + translate).
+ *     copy when there is a caption, forward + pin since round 60);
+ *   - text only → [MessageBubble] (delete + copy + translate,
+ *     forward + pin since round 60).
  *
- * No reply, no reactions, no forward, no pin toggles — the note
- * thread has none of those in v1 (§5.5). The mapped message never
+ * No reply and no reactions — the note thread has none of those
+ * (no peer to reply to, no reaction store for entries). The mapped
+ * message never
  * leaves this renderer: it is never passed into an SMS path.
  *
  * Timestamps follow the thread's rule ([isLastOfSenderRun]: one per
@@ -88,6 +91,21 @@ fun NoteMessageItem(
     onTranslate: (() -> Unit)?,
     /** Round 36 phase 2 — null when the entry is not a text-only entry with text. */
     onEdit: (() -> Unit)? = null,
+    /**
+     * Round 60 (h)/(i) — null when the entry has no text (forward
+     * is text-only: a note attachment points at an encrypted file,
+     * so staging it would forward ciphertext).
+     */
+    onForward: (() -> Unit)? = null,
+    /**
+     * Round 60 (h)/(i)/(k) — the bubble menu toggles: the note's
+     * pin state + handler, and the smart-action handler that makes
+     * the pills and spans in the entry work. Null = no pin entry
+     * and no smart actions (the pre-round-60 behaviour).
+     */
+    toggles: BubbleMenuToggles? = null,
+    /** Round 60 (k) — a tapped phone number opens the call dialog. */
+    onPhoneClick: (String) -> Unit = {},
     /** Round 36 phase 2 — client mode: the note download states, keyed by local attachment id. */
     downloadStates: Map<Long, ClientDownloadState> = emptyMap(),
     /** Round 36 phase 2 — client mode: requests one note attachment's bytes, by local id. */
@@ -126,6 +144,8 @@ fun NoteMessageItem(
                 customBubbleColorArgb = customBubbleColorArgb,
                 onDelete = onDelete,
                 onCopy = onCopy,
+                onForward = onForward,
+                toggles = toggles,
                 downloadStates = downloadStates,
                 onRequestDownload = onRequestDownload,
             )
@@ -139,6 +159,9 @@ fun NoteMessageItem(
                 onTranslate = onTranslate,
                 onCopy = onCopy,
                 onEdit = onEdit,
+                onForward = onForward,
+                toggles = toggles,
+                onPhoneClick = onPhoneClick,
                 customBubbleColorArgb = customBubbleColorArgb,
             )
         }

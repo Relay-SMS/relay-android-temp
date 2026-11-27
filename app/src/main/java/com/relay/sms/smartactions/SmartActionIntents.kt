@@ -226,13 +226,94 @@ object SmartActionIntents {
  * looks like a state + ZIP ("PA 17535"). No locality, or an address
  * that IS only the locality, comes back unchanged — same guards as
  * the old strip.
+ *
+ * Round 60 — the strip assumed the canonical comma shape, but the
+ * detector's tail commas are optional (AddressDetector), so a
+ * detected span can carry the city with no comma before it ("5466
+ * Elam Rd Kinzers, PA 17535") or no comma before the state ("5466
+ * Elam Rd, Kinzers PA 17535") — and the round-56 strip returned
+ * both unchanged, city and all. Both comma-less shapes strip now,
+ * mirroring the desktop's `stripLocalityForOsm` (smartActions.ts)
+ * exactly: a locality glued to the state + ZIP loses its city
+ * words, and a city glued to the street loses everything after the
+ * street suffix (a street component that itself ends in street +
+ * city keeps the street). Known edge, shared with desktop: a
+ * directional after the suffix ("123 Main St North") reads as the
+ * locality and is dropped too — OSM-only, and street + ZIP still
+ * geocodes.
  */
 internal fun stripLocalityForOsm(address: String): String {
     val parts = address.split(",").map { it.trim() }.filter { it.isNotEmpty() }
-    if (parts.size < 3) return address
-    if (!STATE_ZIP_REGEX.matches(parts.last())) return address
-    return (parts.dropLast(2) + parts.last()).joinToString(", ")
+    if (parts.isEmpty()) return address
+    val last = parts.last()
+    return if (STATE_ZIP_REGEX.matches(last)) {
+        // The last component IS the state + ZIP ("..., PA 17535").
+        stripStateZipTail(parts, last, address)
+    } else {
+        // The last component carries the locality with the state +
+        // ZIP ("..., Kinzers PA 17535" — no comma before the state).
+        val glued = CITY_STATE_ZIP_REGEX.find(last)
+        if (glued != null && parts.size >= 2) {
+            (parts.dropLast(1) + "${glued.groupValues[2]} ${glued.groupValues[3]}")
+                .joinToString(", ")
+        } else {
+            address
+        }
+    }
+}
+
+/**
+ * The state + ZIP tail of [stripLocalityForOsm]: drop the locality
+ * component, keeping a street glued to it. [address] is the
+ * unchanged fallback (a lone locality, or a street with no city).
+ */
+private fun stripStateZipTail(parts: List<String>, last: String, address: String): String {
+    if (parts.size < 2) return address
+    if (parts.size == 2) {
+        // "Kinzers, PA 17535" is only the locality — unchanged. A
+        // street with the city glued on ("5466 Elam Rd Kinzers, PA
+        // 17535") keeps just the street.
+        val street = STREET_SUFFIX_TAIL_REGEX.find(parts[0])
+        return if (street != null) "${street.groupValues[1]}, $last" else address
+    }
+    val before = parts[parts.size - 2]
+    val street = STREET_SUFFIX_TAIL_REGEX.find(before)
+    return if (street != null) {
+        // The second-to-last component is street + city ("Apt 4,
+        // 5466 Elam Rd Kinzers, PA 17535"): keep the street, drop
+        // the city — dropping the whole component would lose the
+        // street too.
+        (parts.dropLast(2) + street.groupValues[1] + last).joinToString(", ")
+    } else {
+        (parts.dropLast(2) + last).joinToString(", ")
+    }
 }
 
 /** A US state + ZIP tail ("PA 17535", "CA 90210-1234"). */
 private val STATE_ZIP_REGEX = Regex("^[A-Za-z]{2}\\s+\\d{5}(-\\d{4})?$")
+
+/**
+ * A locality glued to a state + ZIP in one comma component
+ * ("Kinzers PA 17535" — no comma before the state). Group 1 is the
+ * locality words, group 2 the state, group 3 the ZIP.
+ */
+private val CITY_STATE_ZIP_REGEX =
+    Regex("^(.+?)\\s+([A-Za-z]{2})\\s+(\\d{5}(?:-\\d{4})?)$")
+
+/**
+ * A street suffix followed by trailing words ("5466 Elam Rd
+ * Kinzers") — the city glued to the street with no comma between
+ * them. The suffix list mirrors the detector's (AddressDetector,
+ * same words); group 1 is the street up to and including the
+ * suffix.
+ */
+private val STREET_SUFFIX_TAIL_REGEX = Regex(
+    "^(.*\\b(?:${STREET_SUFFIXES})\\b\\.?)(?:\\s+)(.+)$",
+    RegexOption.IGNORE_CASE,
+)
+
+/** The street suffixes the detector recognises (see AddressDetector). */
+private const val STREET_SUFFIXES =
+    "street|avenue|boulevard|terrace|highway|parkway|circle|square|trail|alley|" +
+        "road|lane|drive|court|place|st|ave|blvd|rd|ln|dr|ct|pl|way|ter|hwy|" +
+        "cir|trl|pkwy|aly|sq"

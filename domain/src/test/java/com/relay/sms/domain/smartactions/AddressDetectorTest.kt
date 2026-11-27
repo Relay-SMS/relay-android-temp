@@ -95,6 +95,28 @@ class AddressDetectorTest {
         assertThat(firstAddress("123 main st, apt 4")).isEqualTo("123 main st, apt 4")
     }
 
+    @Test fun `lowercase address with a comma-less tail detects`() {
+        // Round 60 — desktop parity: the tail's commas are optional,
+        // so a lowercase address whose tail drops a comma still
+        // extends past the lowercase gate (before, the tail never
+        // extended and the address vanished outright).
+        assertThat(firstAddress("5466 elam rd kinzers pa 17535"))
+            .isEqualTo("5466 elam rd kinzers pa 17535")
+        assertThat(firstAddress("5466 elam rd, kinzers pa 17535"))
+            .isEqualTo("5466 elam rd, kinzers pa 17535")
+        assertThat(firstAddress("5466 elam rd kinzers, pa 17535"))
+            .isEqualTo("5466 elam rd kinzers, pa 17535")
+        assertThat(firstAddress("123 main st springfield il 62701"))
+            .isEqualTo("123 main st springfield il 62701")
+    }
+
+    @Test fun `capitalised address keeps a comma-less tail`() {
+        // The same tail without commas, capitalised: before round 60
+        // it detected but stopped at the street ("5466 Elam Rd").
+        assertThat(firstAddress("5466 Elam Rd kinzers pa 17535"))
+            .isEqualTo("5466 Elam Rd kinzers pa 17535")
+    }
+
     @Test fun `lowercase street name without a tail is still missed`() {
         // The tail gate: a lowercase address with no unit or tail is
         // the accepted cost of keeping sentences out (see the detector

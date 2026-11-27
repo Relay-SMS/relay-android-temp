@@ -190,12 +190,21 @@ interface E2ePeerDao {
      * Records a probe send: the attempt count, the window the attempt belongs to, and
      * the send time. The caller ([com.relay.sms.e2e.E2ePeerRepository]) computes
      * the new values — including the window reset when 30 days have elapsed.
+     *
+     * Round 60 — every probe also opens a fresh one-hour retry
+     * window: `retry_attempts` resets to 0 and
+     * `retry_window_started_at` restarts at the probe time (the
+     * retry window is anchored per probe round, so a new attempt
+     * 24 hours later earns its own retries). A retry itself never
+     * calls this — it calls [recordRetryProbe], which leaves the
+     * window and the 30-day budget untouched.
      */
     @Query(
         """
         UPDATE e2e_peers
            SET probe_attempts = :attempts, window_started_at = :windowStartedAt,
-               last_probe_at = :lastProbeAt, updated_at = :updatedAt
+               last_probe_at = :lastProbeAt, updated_at = :updatedAt,
+               retry_attempts = 0, retry_window_started_at = :lastProbeAt
          WHERE address = :address
         """,
     )
@@ -203,6 +212,33 @@ interface E2ePeerDao {
         address: String,
         attempts: Int,
         windowStartedAt: Long,
+        lastProbeAt: Long,
+        updatedAt: Long,
+    )
+
+    /**
+     * Round 60 — records a re-probe send inside the retry window
+     * (design §2.4): the retry count and the send time only. The
+     * 30-day budget ([E2ePeerRepository] attempts / window) is
+     * untouched — a retry must not burn the budget — and the retry
+     * window start is untouched (the window is anchored at the
+     * probe that opened it). `last_probe_at` moves, so the
+     * fallback's stall anchor and the 24-hour spacing both read
+     * the latest handshake activity. The caller checks the retry
+     * gate first (the retry policy reads the stored count and
+     * window start); this only persists the send.
+     */
+    @Query(
+        """
+        UPDATE e2e_peers
+           SET retry_attempts = :retryAttempts,
+               last_probe_at = :lastProbeAt, updated_at = :updatedAt
+         WHERE address = :address
+        """,
+    )
+    suspend fun recordRetryProbe(
+        address: String,
+        retryAttempts: Int,
         lastProbeAt: Long,
         updatedAt: Long,
     )
@@ -259,6 +295,7 @@ interface E2ePeerDao {
            SET probe_attempts = 0, window_started_at = NULL,
                last_probe_at = NULL, last_bundle_reply_at = NULL,
                last_auto_fallback_at = NULL,
+               retry_attempts = 0, retry_window_started_at = NULL,
                state = CASE WHEN state = 'ENCRYPTED' THEN 'ENCRYPTED' ELSE 'UNKNOWN' END,
                updated_at = :updatedAt
         """,

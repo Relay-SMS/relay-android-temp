@@ -1546,4 +1546,43 @@ class MigrationTest {
             assertThat(c.getLong(0)).isEqualTo(2000L)
         }
     }
+
+    @Test
+    fun migrate27To28_addsRetryColumns_defaultsOnExistingRows() {
+        helper.createDatabase(TEST_DB, 27).use { db ->
+            db.execSQL(
+                "INSERT INTO e2e_peers (address, state, updated_at) " +
+                    "VALUES ('6108423232', 'PROBING', 1000)",
+            )
+        }
+
+        val db = helper.runMigrationsAndValidate(TEST_DB, 28, true, Migrations.MIGRATION_27_28)
+
+        // La ligne existante survit ; ses colonnes de retry
+        // projettent les défauts (zéro retry consommé, pas de
+        // fenêtre — la prochaine sonde en ouvre une neuve), donc
+        // le plafond de retry part non consommé.
+        db.query(
+            "SELECT retry_attempts, retry_window_started_at FROM e2e_peers " +
+                "WHERE address = '6108423232'",
+        ).use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getInt(0)).isEqualTo(0)
+            assertThat(c.isNull(1)).isTrue()
+        }
+
+        // Les nouvelles colonnes s'écrivent et se relisent.
+        db.execSQL(
+            "UPDATE e2e_peers SET retry_attempts = 2, retry_window_started_at = 3000 " +
+                "WHERE address = '6108423232'",
+        )
+        db.query(
+            "SELECT retry_attempts, retry_window_started_at FROM e2e_peers " +
+                "WHERE address = '6108423232'",
+        ).use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getInt(0)).isEqualTo(2)
+            assertThat(c.getLong(1)).isEqualTo(3000L)
+        }
+    }
 }

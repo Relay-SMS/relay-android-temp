@@ -317,6 +317,50 @@ class ConversationMirrorRound50Test {
         assertThat(touched.map { it.lastMessagePreview }).contains("🎤 voice.3gp")
     }
 
+    /**
+     * Round 60 (c-phone) — the import stores the part's real size
+     * from the reader instead of a hardcoded 0, so re-imported
+     * files show their size. A part whose size could not be read
+     * (0) still stores 0, exactly like before.
+     */
+    @Test
+    fun `mms import stores the reader part size instead of zero`() = runTest {
+        stubNewConversation()
+        coEvery { conversationDao.findById(CONV_ID) } returns convEntity()
+        coEvery { messageDao.insert(any()) } returns 55L
+        coEvery { attachmentDao.insertAll(any()) } just Runs
+
+        mirror().bulkImportMmsFromTelephony(
+            listOf(
+                mmsRow(
+                    telephonyId = 101L,
+                    address = ALICE,
+                    body = "",
+                    date = 1000L,
+                    attachments = listOf(
+                        TelephonyReader.MmsPartImport(
+                            partId = 77L,
+                            contentType = "audio/3gpp",
+                            filename = "voice.3gp",
+                            sizeBytes = 12_345L,
+                        ),
+                        TelephonyReader.MmsPartImport(
+                            partId = 78L,
+                            contentType = "image/jpeg",
+                            filename = "photo.jpg",
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        val insertedAtts = slot<List<AttachmentEntity>>()
+        coVerify { attachmentDao.insertAll(capture(insertedAtts)) }
+        assertThat(insertedAtts.captured).hasSize(2)
+        assertThat(insertedAtts.captured[0].sizeBytes).isEqualTo(12_345L)
+        assertThat(insertedAtts.captured[1].sizeBytes).isEqualTo(0L)
+    }
+
     // ──────────────────── Part 1 — SMS group threads ────────────────────
 
     @Test

@@ -16,6 +16,7 @@ import com.relay.sms.data.local.db.dao.ConversationDao
 import com.relay.sms.data.local.db.dao.MessageDao
 import com.relay.sms.data.repository.ConversationMirror
 import com.relay.sms.data.repository.GroupConversationRepair
+import com.relay.sms.data.repository.MissingMmsRepair
 import com.relay.sms.di.IoDispatcher
 import com.relay.sms.domain.settings.AdvancedSettings
 import dagger.Lazy
@@ -60,6 +61,7 @@ class StartupMigrations @Inject constructor(
     private val conversationMirror: Lazy<ConversationMirror>,
     private val stickyCategories: Lazy<StickyCategoryStore>,
     private val groupRepair: Lazy<GroupConversationRepair>,
+    private val missingMmsRepair: Lazy<MissingMmsRepair>,
     @ApplicationContext private val context: Context,
     @IoDispatcher private val io: CoroutineDispatcher,
 ) {
@@ -145,6 +147,15 @@ class StartupMigrations @Inject constructor(
         // cold start); an exception here must not block startup.
         runCatching { repairGroupConversations(advanced) }
             .onFailure { Timber.w(it, "group conversation repair failed") }
+
+        // Round 60 — one-shot repair of MMS the import dropped for
+        // having no parts yet (voice messages). Same placement
+        // (BEFORE the short-circuit) for the same reason: the
+        // installs it targets already have every old flag set. The
+        // flag is set only after a complete pass; an exception here
+        // must not block startup.
+        runCatching { repairMissingMms(advanced) }
+            .onFailure { Timber.w(it, "missing MMS repair failed") }
 
         // Global short-circuit: an up-to-date install does no migration work and never opens the
         // database. This is the whole point of the consolidation.
@@ -298,6 +309,34 @@ class StartupMigrations @Inject constructor(
                 result.repaired,
                 result.merged,
                 result.corrected,
+                result.complete,
+            )
+        }
+    }
+
+    /**
+     * Round 60 — re-imports MMS the import dropped because they
+     * had no parts yet when it ran (see [MissingMmsRepair]). The
+     * flag is set only when the pass completed: a provider read
+     * failure leaves it unset so the pass retries at the next cold
+     * start. Gated on `mmsImportCompleted`: on a fresh install the
+     * database is empty, the pass would "complete" having repaired
+     * nothing, and the flag would then never re-run it — the same
+     * empty-database trap as the group repair's V24 flag.
+     */
+    private suspend fun repairMissingMms(advanced: AdvancedSettings) {
+        if (advanced.missingMmsRepairedV60) return
+        if (!advanced.mmsImportCompleted) return
+        val result = missingMmsRepair.get().repair()
+        if (result.complete) {
+            settings.update { s ->
+                s.copy(advanced = s.advanced.copy(missingMmsRepairedV60 = true))
+            }
+        }
+        if (result.repaired > 0) {
+            Timber.i(
+                "missing MMS repair: %d message(s) re-imported (complete=%b)",
+                result.repaired,
                 result.complete,
             )
         }

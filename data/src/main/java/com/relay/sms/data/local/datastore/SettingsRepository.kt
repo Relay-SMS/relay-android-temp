@@ -477,6 +477,7 @@ class SettingsRepository(
                 stickyCategoryBackfilledV22 = p[K.stickyCategoryBackfilledV22] ?: false,
                 stickyCategoryBackfilledPostImport = p[K.stickyCategoryBackfilledPostImport] ?: false,
                 groupConversationsRepairedV26 = p[K.groupConversationsRepairedV26] ?: false,
+                missingMmsRepairedV60 = p[K.missingMmsRepairedV60] ?: false,
             ),
             smartActions = SmartActionSettings(
                 mapsProvider = enumOr(
@@ -627,6 +628,7 @@ class SettingsRepository(
         this[K.stickyCategoryBackfilledV22] = s.advanced.stickyCategoryBackfilledV22
         this[K.stickyCategoryBackfilledPostImport] = s.advanced.stickyCategoryBackfilledPostImport
         this[K.groupConversationsRepairedV26] = s.advanced.groupConversationsRepairedV26
+        this[K.missingMmsRepairedV60] = s.advanced.missingMmsRepairedV60
 
         // Round 53 — the maps provider for "Open in Maps", persisted by enum name.
         this[K.mapsProvider] = s.smartActions.mapsProvider.name
@@ -883,6 +885,10 @@ class SettingsRepository(
         /** Round 50 — reparation one-shot des conversations de groupe mal classees. Round 52: V25. Member-ID fix: V26. */
         val groupConversationsRepairedV26 =
             booleanPreferencesKey("advanced.groupConversationsRepairedV26")
+
+        /** Round 60 — one-shot repair of MMS the import dropped for having no parts yet. */
+        val missingMmsRepairedV60 =
+            booleanPreferencesKey("advanced.missingMmsRepairedV60")
 
         /** Round 53 — the maps provider for "Open in Maps" (smart actions). */
         val mapsProvider = stringPreferencesKey("smart.mapsProvider")

@@ -49,6 +49,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -78,15 +79,23 @@ import com.relay.sms.R
 import com.relay.sms.domain.model.Attachment
 import com.relay.sms.domain.model.Note
 import com.relay.sms.domain.model.NoteMessage
+import com.relay.sms.domain.settings.MapsProvider
+import com.relay.sms.domain.smartactions.SmartAction
+import com.relay.sms.smartactions.SmartActionIntents
 import com.relay.sms.ui.components.AppearanceDialog
 import com.relay.sms.ui.components.AttachmentKind
 import com.relay.sms.ui.components.AttachmentPickerSheet
+import com.relay.sms.ui.components.BubbleMenuToggles
 import com.relay.sms.ui.components.EmojiPickerButton
 import com.relay.sms.ui.components.EmojiPickerPanel
 import com.relay.sms.ui.components.EmojiPickerTab
 import com.relay.sms.ui.components.EmojiPickerTabStore
+import com.relay.sms.ui.components.ForwardMessageSheet
+import com.relay.sms.ui.components.MapOpenRequest
+import com.relay.sms.ui.components.MapProviderSheet
 import com.relay.sms.ui.components.PendingAttachmentChipData
 import com.relay.sms.ui.components.PendingAttachmentsBar
+import com.relay.sms.ui.components.PhoneActionsDialog
 import com.relay.sms.ui.components.RelayAvatar
 import com.relay.sms.ui.components.RelayDestructiveButton
 import com.relay.sms.ui.components.RelayDialog
@@ -94,12 +103,14 @@ import com.relay.sms.ui.components.RelayEmptyState
 import com.relay.sms.ui.components.RelaySnackbarHost
 import com.relay.sms.ui.components.RelaySnackbarVisuals
 import com.relay.sms.ui.components.RelayTextButton
+import com.relay.sms.ui.components.shouldShowMapProviderSheet
 import com.relay.sms.ui.components.stickerSendUri
 import com.relay.sms.ui.screens.details.NoteDetailsPanel
 import com.relay.sms.ui.security.copyToClipboardSensitive
 import com.relay.sms.ui.theme.RelayText
 import com.relay.sms.ui.util.daySeparatorLabel
 import com.relay.sms.ui.util.rememberChatFormatters
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
@@ -112,8 +123,9 @@ import java.io.File
  *
  *   - header: back arrow, note avatar (tappable → panel), title,
  *     ⋮ → panel. NO call icon, NO search magnifier in v1;
- *   - entries render through [NoteMessageItem] (delete only — no
- *     reply, reactions, forward, or retry);
+ *   - entries render through [NoteMessageItem] (delete + copy +
+ *     translate; forward + pin since round 60 — no reply or
+ *     reactions, and no retry);
  *   - the composer is [NoteComposerBar] (no schedule; tap-to-record
  *     voice) with the thread's emoji/GIF/sticker picker panel below
  *     it (round 36 — a GIF or sticker stages through the note
@@ -134,6 +146,14 @@ import java.io.File
 fun NoteThreadScreen(
     onBack: () -> Unit,
     viewModel: NoteThreadViewModel = hiltViewModel(),
+    /**
+     * Round 60 (h) — the forward destinations, mirroring the
+     * thread screen: the caller pops this screen and opens the
+     * picked conversation (or the compose flow). Defaults are
+     * no-ops so existing callers keep compiling.
+     */
+    onForwardToConversation: (Long) -> Unit = {},
+    onForwardToNewContact: () -> Unit = {},
 ) {
     val state by viewModel.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
@@ -146,6 +166,9 @@ fun NoteThreadScreen(
     // jointe) sont resolus a la composition, comme dans BackupScreen.
     val exportSuccessFmt = stringResource(R.string.thread_export_success)
     val openFailedMsg = stringResource(R.string.note_open_failed)
+    // Round 60 (k) — the smart-action failure label, hoisted at
+    // composition like the others above.
+    val noAppLabel = stringResource(R.string.smart_action_no_app)
 
     // The note is gone (deleted from the list while this thread was
     // open, or from its own panel): pop. Gated on `isLoading` so the
@@ -278,6 +301,51 @@ fun NoteThreadScreen(
     var pendingDeleteMessage by remember { mutableStateOf<NoteMessage?>(null) }
     var pendingEditMessage by remember { mutableStateOf<NoteMessage?>(null) }
 
+    // Round 60 (h)/(i)/(k) — the bubble-menu state, mirroring the
+    // thread screen: the forward picker, the phone-number dialog,
+    // and the first-map-tap provider sheet. The smart-action
+    // handler is the thread's exactly (address → provider-gated
+    // directions, everything else → SmartActionIntents.perform,
+    // failure → the "no app" snackbar) — before this round the note
+    // entries carried no toggles at all, so their pills and spans
+    // did nothing and the provider prompt never appeared.
+    var forwardingMessage by remember { mutableStateOf<NoteMessage?>(null) }
+    var pickingPhoneNumber by remember { mutableStateOf<String?>(null) }
+    val mapsProviderState = rememberUpdatedState(state.mapsProvider)
+    val mapsProviderAskedState = rememberUpdatedState(state.mapsProviderAsked)
+    var pendingMapOpen by remember { mutableStateOf<MapOpenRequest?>(null) }
+    fun executeMapOpen(request: MapOpenRequest, provider: MapsProvider): Boolean =
+        when (request) {
+            is MapOpenRequest.OpenDirections ->
+                SmartActionIntents.performDirections(context, request.address, provider)
+        }
+    val onMapOpen: (MapOpenRequest) -> Boolean = { request ->
+        if (
+            shouldShowMapProviderSheet(
+                mapsProviderState.value,
+                mapsProviderAskedState.value,
+            )
+        ) {
+            pendingMapOpen = request
+            true
+        } else {
+            executeMapOpen(request, mapsProviderState.value)
+        }
+    }
+    val onSmartAction: (SmartAction) -> Unit = { action ->
+        if (action is SmartAction.Address) {
+            val opened = onMapOpen(MapOpenRequest.OpenDirections(action.text))
+            if (!opened) {
+                scope.launch { snackbarHost.showSnackbar(noAppLabel) }
+            }
+        } else {
+            val performed = SmartActionIntents.perform(context, action, mapsProviderState.value)
+            if (!performed) {
+                scope.launch { snackbarHost.showSnackbar(noAppLabel) }
+            }
+        }
+    }
+
     val note = state.note
     val openAttachment = rememberNoteAttachmentOpener(
         resolver = viewModel.resolver,
@@ -397,6 +465,27 @@ fun NoteThreadScreen(
                             } else {
                                 null
                             },
+                            // Round 60 (h)/(i) — forward is text-only
+                            // (an attachment points at an encrypted
+                            // file, so staging it would forward
+                            // ciphertext): null when the entry has no
+                            // text, like onCopy/onTranslate.
+                            onForward = if (msg.body.isNotBlank()) {
+                                { forwardingMessage = msg }
+                            } else {
+                                null
+                            },
+                            // Round 60 (h)/(i)/(k) — the pin rides the
+                            // NOTE (not the entry), and the smart
+                            // actions ride the thread's handler. No
+                            // reaction badge in notes (no reactions).
+                            toggles = BubbleMenuToggles(
+                                isPinned = note?.pinned ?: false,
+                                onTogglePin = { viewModel.toggleNotePin() },
+                                onReactionBadgeTap = {},
+                                onSmartAction = onSmartAction,
+                            ),
+                            onPhoneClick = { pickingPhoneNumber = it },
                             downloadStates = state.noteDownloads,
                             onRequestDownload = if (state.isClientMode) {
                                 { id -> viewModel.requestNoteDownload(id) }
@@ -426,6 +515,107 @@ fun NoteThreadScreen(
         viewModel = viewModel,
         onOpenAttachment = openAttachment,
     )
+
+    // Round 60 (h)/(i)/(k) — the bubble-menu sheets, extracted so
+    // the screen stays under the Detekt long-method limit (see
+    // [NoteThreadBubbleSheets], the same split as
+    // [NoteThreadDialogs]).
+    NoteThreadBubbleSheets(
+        forwardingMessage = forwardingMessage,
+        onForwardingMessageChange = { forwardingMessage = it },
+        onForwardToConversation = onForwardToConversation,
+        onForwardToNewContact = onForwardToNewContact,
+        pickingPhoneNumber = pickingPhoneNumber,
+        onPickingPhoneNumberChange = { pickingPhoneNumber = it },
+        pendingMapOpen = pendingMapOpen,
+        onPendingMapOpenChange = { pendingMapOpen = it },
+        mapsProvider = state.mapsProvider,
+        executeMapOpen = ::executeMapOpen,
+        viewModel = viewModel,
+        scope = scope,
+        snackbarHost = snackbarHost,
+        noAppLabel = noAppLabel,
+    )
+}
+
+/**
+ * Round 60 (h)/(i)/(k) — the note thread's bubble-menu sheets,
+ * extracted from [NoteThreadScreen] (the screen's own dialogs live
+ * in [NoteThreadDialogs] for the same reason).
+ *
+ *   - the phone-number dialog, from any entry's text;
+ *   - the forward bottom-sheet: stageForward() posts the payload
+ *     to IncomingShareHolder FIRST, forwardingMessage is cleared
+ *     BEFORE navigation so the sheet dismisses cleanly, and the
+ *     caller's onForwardToConversation does pop+navigate. The
+ *     source here is a note, not a conversation, so there is no
+ *     conversation to exclude (-1L excludes nothing);
+ *   - the first-map-tap sheet: choosing a provider saves it and
+ *     opens the pending map with it; dismissing opens the pending
+ *     map with the current provider and never re-prompts.
+ */
+@Composable
+private fun NoteThreadBubbleSheets(
+    forwardingMessage: NoteMessage?,
+    onForwardingMessageChange: (NoteMessage?) -> Unit,
+    onForwardToConversation: (Long) -> Unit,
+    onForwardToNewContact: () -> Unit,
+    pickingPhoneNumber: String?,
+    onPickingPhoneNumberChange: (String?) -> Unit,
+    pendingMapOpen: MapOpenRequest?,
+    onPendingMapOpenChange: (MapOpenRequest?) -> Unit,
+    mapsProvider: MapsProvider,
+    executeMapOpen: (MapOpenRequest, MapsProvider) -> Boolean,
+    viewModel: NoteThreadViewModel,
+    scope: CoroutineScope,
+    snackbarHost: SnackbarHostState,
+    noAppLabel: String,
+) {
+    pickingPhoneNumber?.let { number ->
+        PhoneActionsDialog(
+            number = number,
+            onDismiss = { onPickingPhoneNumberChange(null) },
+            onSnack = { msg -> scope.launch { snackbarHost.showSnackbar(msg) } },
+        )
+    }
+
+    forwardingMessage?.let { msg ->
+        ForwardMessageSheet(
+            currentConversationId = -1L,
+            onDismiss = { onForwardingMessageChange(null) },
+            onPickConversation = { destId ->
+                viewModel.stageForward(msg)
+                onForwardingMessageChange(null)
+                onForwardToConversation(destId)
+            },
+            onPickNewContact = {
+                viewModel.stageForward(msg)
+                onForwardingMessageChange(null)
+                onForwardToNewContact()
+            },
+        )
+    }
+
+    val pendingMapRequest = pendingMapOpen
+    if (pendingMapRequest != null) {
+        MapProviderSheet(
+            current = mapsProvider,
+            onSelect = { provider ->
+                viewModel.setMapsProvider(provider)
+                onPendingMapOpenChange(null)
+                if (!executeMapOpen(pendingMapRequest, provider)) {
+                    scope.launch { snackbarHost.showSnackbar(noAppLabel) }
+                }
+            },
+            onDismiss = {
+                viewModel.markMapsProviderAsked()
+                onPendingMapOpenChange(null)
+                if (!executeMapOpen(pendingMapRequest, mapsProvider)) {
+                    scope.launch { snackbarHost.showSnackbar(noAppLabel) }
+                }
+            },
+        )
+    }
 }
 
 /**

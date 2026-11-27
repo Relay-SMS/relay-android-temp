@@ -43,12 +43,16 @@ class E2ePeerRepositoryTest {
         attempts: Int = 0,
         windowStartedAt: Long? = null,
         lastProbeAt: Long? = null,
+        retryAttempts: Int = 0,
+        retryWindowStartedAt: Long? = null,
     ) = E2ePeerEntity(
         address = address,
         state = state,
         probeAttempts = attempts,
         windowStartedAt = windowStartedAt,
         lastProbeAt = lastProbeAt,
+        retryAttempts = retryAttempts,
+        retryWindowStartedAt = retryWindowStartedAt,
         updatedAt = now,
     )
 
@@ -58,6 +62,7 @@ class E2ePeerRepositoryTest {
         coEvery { dao.insert(any()) } returns 1L
         coEvery { dao.updateState(any(), any(), any()) } just Runs
         coEvery { dao.recordProbe(any(), any(), any(), any(), any()) } just Runs
+        coEvery { dao.recordRetryProbe(any(), any(), any(), any()) } just Runs
         coEvery { dao.updateKeys(any(), any(), any(), any()) } just Runs
         coEvery { dao.setVerified(any(), any(), any()) } just Runs
         coEvery { dao.recordBundleReply(any(), any(), any()) } just Runs
@@ -399,5 +404,98 @@ class E2ePeerRepositoryTest {
         assertThat(repository.handshakeChannel(address)).isEqualTo(HandshakeChannel.TEXT_SMS)
         dao.peers[address] = dao.peers[address]!!.copy(handshakeChannel = "PIGEON")
         assertThat(repository.handshakeChannel(address)).isNull()
+    }
+
+    // ──────────────────────────── Round 60: the retry allowance ────────────────────────────
+    // The first-hour re-probes have their OWN allowance: a retry bumps
+    // only the retry count, never the 30-day budget — and every probe
+    // opens a fresh one-hour retry window.
+
+    @Test
+    fun `recordRetryProbeSent bumps only the retry count`() = runTest {
+        val dao = daoReturning(
+            peer(
+                state = E2ePeerState.PROBING,
+                attempts = 1,
+                windowStartedAt = now - 6L * 60_000L,
+                lastProbeAt = now - 6L * 60_000L,
+                retryAttempts = 2,
+                retryWindowStartedAt = now - 6L * 60_000L,
+            ),
+        )
+        val repository = E2ePeerRepository(dao)
+
+        repository.recordRetryProbeSent(address, now)
+
+        coVerify(exactly = 1) { dao.recordRetryProbe(address, 3, now, now) }
+        coVerify(exactly = 0) { dao.recordProbe(any(), any(), any(), any(), any()) }
+        coVerify(exactly = 0) { dao.updateState(any(), any(), any()) }
+    }
+
+    @Test
+    fun `recordRetryProbeSent leaves the budget and the window untouched`() = runTest {
+        val dao = FakeE2ePeerDao()
+        val windowStart = now - 6L * 60_000L
+        dao.peers[address] = peer(
+            state = E2ePeerState.PROBING,
+            attempts = 1,
+            windowStartedAt = windowStart,
+            lastProbeAt = windowStart,
+            retryAttempts = 0,
+            retryWindowStartedAt = windowStart,
+        )
+        val repository = E2ePeerRepository(dao)
+
+        repository.recordRetryProbeSent(address, now)
+
+        val row = dao.peers[address]
+        assertThat(row?.retryAttempts).isEqualTo(1)
+        assertThat(row?.probeAttempts).isEqualTo(1)
+        assertThat(row?.windowStartedAt).isEqualTo(windowStart)
+        assertThat(row?.retryWindowStartedAt).isEqualTo(windowStart)
+        assertThat(row?.lastProbeAt).isEqualTo(now)
+        assertThat(row?.state).isEqualTo(E2ePeerState.PROBING)
+    }
+
+    @Test
+    fun `a probe opens a fresh retry window`() = runTest {
+        val dao = FakeE2ePeerDao()
+        dao.peers[address] = peer(
+            state = E2ePeerState.PROBING,
+            attempts = 1,
+            windowStartedAt = now - 2 * MS_PER_DAY,
+            lastProbeAt = now - 2 * MS_PER_DAY,
+            retryAttempts = 2,
+            retryWindowStartedAt = now - 2 * MS_PER_DAY,
+        )
+        val repository = E2ePeerRepository(dao)
+
+        repository.recordProbeSent(address, now)
+
+        val row = dao.peers[address]
+        assertThat(row?.retryAttempts).isEqualTo(0)
+        assertThat(row?.retryWindowStartedAt).isEqualTo(now)
+        assertThat(row?.probeAttempts).isEqualTo(2)
+    }
+
+    @Test
+    fun `resetEncryptionTiming clears the retry allowance`() = runTest {
+        val dao = FakeE2ePeerDao()
+        dao.peers[address] = peer(
+            state = E2ePeerState.PROBING,
+            attempts = 1,
+            windowStartedAt = now - 6L * 60_000L,
+            lastProbeAt = now - 6L * 60_000L,
+            retryAttempts = 2,
+            retryWindowStartedAt = now - 6L * 60_000L,
+        )
+        val repository = E2ePeerRepository(dao)
+
+        repository.resetEncryptionTiming(now)
+
+        val row = dao.peers[address]
+        assertThat(row?.retryAttempts).isEqualTo(0)
+        assertThat(row?.retryWindowStartedAt).isNull()
+        assertThat(row?.state).isEqualTo(E2ePeerState.UNKNOWN)
     }
 }

@@ -713,6 +713,17 @@ data class AdvancedSettings(
      */
     val groupConversationsRepairedV26: Boolean = false,
     /**
+     * Round 60 — the missing-MMS repair ([MissingMmsRepair]) ran
+     * once to completion: MMS the import dropped for having no
+     * parts yet, re-imported from the provider. Set only on a
+     * complete pass; a failed read leaves it unset so the pass
+     * retries at the next cold start. Only runs once the import
+     * itself has run (`mmsImportCompleted`) — on a fresh install
+     * the database is empty and the pass would "complete" having
+     * repaired nothing.
+     */
+    val missingMmsRepairedV60: Boolean = false,
+    /**
      * v1.3.10 — **opt-in** : démarre [com.relay.sms.system.service.KeepAliveService]
      * qui maintient le processus Relay vivant via une notification persistante
      * discrète (canal `IMPORTANCE_MIN`, ne fait ni son ni vibration). Indispensable pour

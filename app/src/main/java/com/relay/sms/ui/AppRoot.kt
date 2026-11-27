@@ -730,6 +730,18 @@ private fun NavGraphBuilder.composeAndNoteThreadDestinations(
         // the screen takes no id parameter.
         NoteThreadScreen(
             onBack = { nav.popBackStack() },
+            // Round 60 (h) — forward to an existing conversation or a
+            // new recipient: pop the note thread first, exactly like
+            // the thread screen's forward (the staged payload is
+            // picked up by the destination thread at hydration).
+            onForwardToConversation = { destId ->
+                nav.popBackStack()
+                nav.navigate(Thread(destId))
+            },
+            onForwardToNewContact = {
+                nav.popBackStack()
+                nav.navigate(Compose())
+            },
         )
     }
     // Feedback round 9 — Compose slides in from the right like the

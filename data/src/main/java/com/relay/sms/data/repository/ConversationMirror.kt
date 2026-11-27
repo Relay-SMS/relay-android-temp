@@ -1596,7 +1596,10 @@ class ConversationMirror @Inject constructor(
                             messageId = insertedId,
                             mimeType = part.contentType,
                             fileName = part.filename ?: "part_${part.partId}",
-                            sizeBytes = 0L,
+                            // Round 60 — the real part size from the
+                            // reader (was a hardcoded 0: every
+                            // re-imported file showed no size).
+                            sizeBytes = part.sizeBytes,
                             // The system keeps the binary payload on disk and serves it through
                             // this URI — no need to copy bytes into our cache. Coil / MediaPlayer
                             // both accept `content://mms/part/…` directly.

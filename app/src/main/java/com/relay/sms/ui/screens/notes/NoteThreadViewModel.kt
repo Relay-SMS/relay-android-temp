@@ -32,6 +32,8 @@ import com.relay.sms.domain.model.Note
 import com.relay.sms.domain.model.NoteMessage
 import com.relay.sms.domain.notes.NoteAttachmentResolver
 import com.relay.sms.domain.repository.NoteRepository
+import com.relay.sms.domain.settings.AppSettingsSource
+import com.relay.sms.domain.settings.MapsProvider
 import com.relay.sms.domain.usecase.ExportNotePdfUseCase
 import com.relay.sms.sync.client.ClientDownloadState
 import com.relay.sms.ui.components.AttachmentKind
@@ -103,6 +105,16 @@ class NoteThreadViewModel @Inject constructor(
      * provides the real holder.
      */
     private val incomingShare: com.relay.sms.system.share.IncomingShareHolder? = null,
+    /**
+     * Round 60 (k) — the maps provider for smart actions in notes
+     * (the same source [ThreadViewModel] reads). Nullable with a
+     * null default so the existing note-thread tests — which
+     * construct the ViewModel by hand — keep compiling untouched;
+     * Hilt always provides the real repository. With no settings
+     * the provider stays SYSTEM_DEFAULT and the provider prompt
+     * never shows (tests).
+     */
+    private val settings: AppSettingsSource? = null,
 ) : ViewModel() {
 
     val noteId: Long = savedStateHandle.get<Long>("noteId") ?: -1L
@@ -148,6 +160,16 @@ class NoteThreadViewModel @Inject constructor(
         val isClientMode: Boolean = false,
         /** Round 36 phase 2 — client mode: the note download states, keyed by local attachment id. */
         val noteDownloads: Map<Long, ClientDownloadState> = emptyMap(),
+        /**
+         * Round 60 (k) — the preferred maps provider for smart
+         * actions, mirrored from the settings like
+         * [ThreadViewModel]'s, so a Get-directions tap in a note
+         * opens the same provider as the thread — and the
+         * first-map-tap sheet appears here too.
+         */
+        val mapsProvider: MapsProvider = MapsProvider.SYSTEM_DEFAULT,
+        /** Round 60 (k) — whether the provider prompt has been shown (or a provider picked). */
+        val mapsProviderAsked: Boolean = false,
     ) {
         /** PDF export needs at least one entry. */
         val canExport: Boolean get() = messages.isNotEmpty()
@@ -258,6 +280,22 @@ class NoteThreadViewModel @Inject constructor(
         // picked this note (new or existing) is consumed once the
         // note hydrates, below.
         consumeIncomingShareIfAny()
+        // Round 60 (k) — the maps provider, from the same settings
+        // snapshot the thread reads (no settings in tests → the
+        // defaults above stand).
+        val settingsSource = settings
+        if (settingsSource != null) {
+            viewModelScope.launch {
+                settingsSource.state.collect { snapshot ->
+                    _state.update {
+                        it.copy(
+                            mapsProvider = snapshot.smartActions.mapsProvider,
+                            mapsProviderAsked = snapshot.smartActions.mapsProviderAsked,
+                        )
+                    }
+                }
+            }
+        }
     }
 
     /** Widens the tail window by one page (the "load older" row). */
@@ -429,6 +467,76 @@ class NoteThreadViewModel @Inject constructor(
     /** Deletes one entry (its attachment rows + files cascade in the repository). */
     fun deleteMessage(messageId: Long) {
         viewModelScope.launch { noteRepo.deleteMessage(messageId) }
+    }
+
+    /**
+     * Round 60 (h) — toggles this note's pin. The pin lives on
+     * the NOTE ([Note.pinned]), not on the entry — the long-press
+     * menu's Pin flips the note the thread belongs to, exactly
+     * like the list row's Pin. Routes through the repository
+     * (which frames it to the hub in client mode).
+     */
+    fun toggleNotePin() {
+        val note = _state.value.note ?: return
+        viewModelScope.launch { noteRepo.setPinned(noteId, !note.pinned) }
+    }
+
+    /**
+     * Round 60 (h) — stages one entry for forwarding to a
+     * conversation. Text only: a note attachment's `localUri`
+     * points at an ENCRYPTED file, so staging it would forward
+     * ciphertext — the screen offers Forward only on entries with
+     * text. The staged payload is consumed by the destination
+     * thread's ViewModel exactly like a thread forward.
+     */
+    fun stageForward(noteMessage: NoteMessage) {
+        val text = noteMessage.body.trim().takeIf { it.isNotBlank() } ?: return
+        val pending = com.relay.sms.system.share.IncomingShareHolder.Pending(
+            uris = emptyList(),
+            mimeType = null,
+            text = text,
+            isForward = true,
+        )
+        if (!pending.isEmpty) incomingShare?.set(pending)
+    }
+
+    /**
+     * Round 60 (k) — the first-map-tap sheet's choice, mirroring
+     * [ThreadViewModel.setMapsProvider]: save the provider and
+     * mark it explicitly chosen, so the sheet never shows again.
+     * No settings (tests) → no-op.
+     */
+    fun setMapsProvider(provider: MapsProvider) {
+        val settingsSource = settings ?: return
+        viewModelScope.launch {
+            settingsSource.update {
+                it.copy(
+                    smartActions = it.smartActions.copy(
+                        mapsProvider = provider,
+                        mapsProviderAsked = true,
+                        mapsProviderUpdatedAt = System.currentTimeMillis(),
+                    ),
+                )
+            }
+        }
+    }
+
+    /**
+     * Round 60 (k) — the first-map-tap sheet dismissed without
+     * choosing, mirroring [ThreadViewModel.markMapsProviderAsked]:
+     * mark the provider as asked (the sheet never re-prompts)
+     * without changing the provider itself. No settings (tests)
+     * → no-op.
+     */
+    fun markMapsProviderAsked() {
+        val settingsSource = settings ?: return
+        viewModelScope.launch {
+            settingsSource.update {
+                it.copy(
+                    smartActions = it.smartActions.copy(mapsProviderAsked = true),
+                )
+            }
+        }
     }
 
     /** Round 36 phase 2 — edits a text entry's body (the repository routes client mode). */

@@ -53,15 +53,20 @@ import javax.inject.Inject
  * E2E groups (design §13) — a group text encrypts when EVERY member is
  * ENCRYPTED + group-capable: the same fragment set fans out to each
  * member as individual SMS (regardless of the group-MMS setting — the
- * router routes encrypted groups to this path), each member's mirror
- * row carries `encrypted = 1` with the plaintext, and the group echo
- * does too. A group that is not fully encrypted sends plain (its
- * members get a background probe); an over-cap or failed encryption
- * fails the send — the group thread gets a FAILED echo, never a plain
- * send. Group MMS and group media stay plain; group reactions encrypt
- * when the group is encrypted (round 54) — a reaction that fails to
- * encrypt fails visibly with NO failed echo (the tapback text must
- * never paint as a bubble).
+ * router routes encrypted groups to this path). Round 60 (r): each
+ * member's mirror row is a HIDDEN tracking sentinel (empty mirror body,
+ * `hidden = 1` — like the reaction sentinels), NOT a visible message:
+ * a 1:1 row carrying the group plaintext rendered as an ordinary sent
+ * 1:1 message in each member's thread, although only ciphertext
+ * fragments of a group message go out to them. The group echo carries
+ * the plaintext with `encrypted = 1` and is the only visible row. A
+ * group that is not fully encrypted sends plain (its members get a
+ * background probe); an over-cap or failed encryption fails the send —
+ * the group thread gets a FAILED echo, never a plain send. Group MMS
+ * and group media stay plain; group reactions encrypt when the group
+ * is encrypted (round 54) — a reaction that fails to encrypt fails
+ * visibly with NO failed echo (the tapback text must never paint as a
+ * bubble).
  */
 class SendSmsUseCase @Inject constructor(
     private val defaultAppManager: DefaultSmsAppChecker,
@@ -284,16 +289,36 @@ class SendSmsUseCase @Inject constructor(
             recipients = recipients,
             sansRemise = "no message dispatched",
             miroir = { r, bloque ->
+                // Round 60 (r) — encrypted group sends: the per-member
+                // rows are delivery-tracking SENTINELS only, not
+                // messages. A 1:1 row carrying the group plaintext
+                // rendered as an ordinary sent 1:1 message in each
+                // member's thread (sender-side only — receivers file
+                // into the group only), although only ciphertext
+                // fragments of a GROUP message ever go out to the
+                // member. So the member rows mirror an empty body
+                // (`""`), exactly like the reaction sentinels: the
+                // real mirror sets `hidden = 1`, skips the
+                // conversation touch (no preview, no sort change),
+                // and the thread / list / search / sync queries all
+                // exclude `hidden = 1` rows. The row id still exists
+                // — the fragment sent/delivery intents track against
+                // it, and a radio failure still fails it — but
+                // nothing about it ever renders. The echo below keeps
+                // the plaintext: it is the only visible row. Plain
+                // group sends are untouched (a real SMS does go to
+                // each member); 1:1 sends are untouched (the row IS
+                // the message); group reactions already pass `""`.
+                val memberMirrorBody = if (groupEncrypted) "" else localMirrorBody
                 if ((e2eEncrypted || groupEncrypted) && !bloque) {
                     // E2E — the mirror row holds the PLAINTEXT with
-                    // `encrypted = 1`; the plaintext NEVER goes into the
-                    // system sent box (the fragment ciphertext rows are
-                    // written by the send step, next to the radio send, so
-                    // the row has no `telephonyUri` — like a group echo).
-                    // Groups: each member's 1:1 row is the per-member
-                    // tracking row for the shared fragment set (design
-                    // §13.4 — the per-member fragment tracking decision
-                    // lives in [sendGroupFragments]).
+                    // `encrypted = 1` — for a 1:1 send. For an
+                    // encrypted GROUP send the row holds `""` instead
+                    // (see above); the plaintext NEVER goes into the
+                    // system sent box either way (the fragment
+                    // ciphertext rows are written by the send step,
+                    // next to the radio send, so the row has no
+                    // `telephonyUri` — like a group echo).
                     mirror.upsertOutgoingSms(
                         address = r.raw,
                         body = finalBody,
@@ -302,7 +327,7 @@ class SendSmsUseCase @Inject constructor(
                         subId = effectiveSubId,
                         initialStatus = MessageStatus.PENDING,
                         replyToMessageId = replyToMessageId,
-                        localMirrorBody = localMirrorBody,
+                        localMirrorBody = memberMirrorBody,
                         clientMessageId = cleSurLigne,
                         encrypted = true,
                     )
@@ -324,7 +349,7 @@ class SendSmsUseCase @Inject constructor(
                         subId = effectiveSubId,
                         initialStatus = MessageStatus.PENDING,
                         replyToMessageId = replyToMessageId,
-                        localMirrorBody = localMirrorBody,
+                        localMirrorBody = memberMirrorBody,
                         clientMessageId = cleSurLigne,
                     )
                 }
@@ -501,29 +526,43 @@ class SendSmsUseCase @Inject constructor(
      * out to ONE member, tracked against that member's mirror row.
      *
      * **Per-member fragment tracking (the open integration
-     * question, decided):** the existing per-recipient 1:1 rows —
-     * the same rows the plain group path already writes ("chaque
-     * ligne d'envoi vit dans la conversation 1-à-1 du
-     * destinataire") — are the tracking rows. Each member's row
-     * carries the plaintext with `encrypted = 1` (exactly like a
-     * 1:1 encrypted row), and its fragments go out through
-     * [SmsSender.sendFragment] tied to that row's id, so the
-     * per-fragment sent/delivery intents update the row and the
-     * delivery receiver holds DELIVERED until ALL of that
-     * member's fragments report — independently per member, since
-     * the tracker is keyed by (message id, attempt). The echo row
-     * in the group thread keeps its existing role: the frozen
-     * whole-send status (SENT when every member's fragments were
-     * accepted by the radio, FAILED otherwise), never updated by
-     * async reports.
+     * question, decided in round 49, REVERSED in round 60):**
+     * round 49 kept the existing per-recipient 1:1 rows — the same
+     * rows the plain group path already writes ("chaque ligne
+     * d'envoi vit dans la conversation 1-à-1 du destinataire") —
+     * as the tracking rows, each carrying the plaintext with
+     * `encrypted = 1` (exactly like a 1:1 encrypted row), so the
+     * per-fragment sent/delivery intents could update the row and
+     * the delivery receiver could hold DELIVERED until ALL of
+     * that member's fragments reported — independently per member,
+     * since the tracker is keyed by (message id, attempt). The
+     * echo row in the group thread kept its existing role: the
+     * frozen whole-send status (SENT when every member's
+     * fragments were accepted by the radio, FAILED otherwise),
+     * never updated by async reports.
      *
-     * The alternative — diagnostic-only sends with no per-member
-     * rows — would have left the group echo as the only row, with
-     * no delivery status at all: a member's radio failure would
-     * be invisible, and the echo could never say who failed. The
-     * 1:1 rows cost nothing new (the plain path writes them
-     * already) and keep delivery status working exactly as it
-     * does for plain group sends.
+     * Round 60 (r) reverses the VISIBLE half of that decision: a
+     * 1:1 row carrying the group plaintext rendered as an ordinary
+     * sent 1:1 message in each member's thread (sender-side only),
+     * although only ciphertext fragments of a GROUP message go out
+     * to the member — the rows misrepresented what happened. The
+     * per-member rows are now HIDDEN tracking sentinels (empty
+     * mirror body, `hidden = 1`, like the reaction sentinels):
+     * the fragment intents still track against the row id, a radio
+     * failure still fails it, and the echo still freezes the
+     * whole-send status — but nothing about the row ever renders
+     * (thread, conversation list, search, export, and sync all
+     * exclude `hidden = 1`). The cost, accepted with the reversal:
+     * per-member DELIVERED ticks are no longer surfaced anywhere
+     * (they were only ever visible in the phantom 1:1 rows); the
+     * echo's SENT/FAILED on radio accept is the delivery signal
+     * the sender sees. The diagnostic-only alternative (no
+     * per-member rows at all) stays rejected for the same reason
+     * as in round 49: a member's radio failure would be invisible,
+     * and the echo could never say who failed — the sentinel
+     * keeps the failure attributable per member (the row status
+     * and the `SendReport.failed` list name the member) without
+     * painting a message.
      *
      * Each fragment is written to the system sent box first (the
      * ciphertext SMS is stored like any SMS, design §3.1). A

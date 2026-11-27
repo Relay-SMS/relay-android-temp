@@ -244,6 +244,6 @@ abstract class AppDatabase : RoomDatabase() {
         //   auteur inconnu, et l'inconnu se lit comme « pas la
         //   mienne » (une réaction d'avant cette version se remplace
         //   mais ne se retire pas d'un tap sur le même emoji).
-        const val SCHEMA_VERSION = 27
+        const val SCHEMA_VERSION = 28
     }
 }

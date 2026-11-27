@@ -1000,6 +1000,29 @@ object Migrations {
         }
     }
 
+    /**
+     * Round 60 — automatic re-probe schedule (design §2.4): two
+     * columns on `e2e_peers` (`retry_attempts`,
+     * `retry_window_started_at`), the retry allowance's own
+     * bookkeeping, deliberately separate from the 30-day probe
+     * budget (`probe_attempts` / `window_started_at`). Strictly
+     * additive: existing peer rows project the defaults (zero
+     * retries spent, no window — the next probe opens a fresh
+     * one-hour window, so a pair already stalled when the app
+     * updates gets its retries from the next probe or thread-open
+     * probe, not from stale state).
+     */
+    val MIGRATION_27_28: Migration = object : Migration(27, 28) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                "ALTER TABLE `e2e_peers` ADD COLUMN `retry_attempts` INTEGER NOT NULL DEFAULT 0",
+            )
+            db.execSQL(
+                "ALTER TABLE `e2e_peers` ADD COLUMN `retry_window_started_at` INTEGER",
+            )
+        }
+    }
+
     /** All migrations registered in [DatabaseFactory]. Append new ones here in version order. */
     val ALL: Array<Migration> = arrayOf(
         MIGRATION_1_2,
@@ -1028,5 +1051,6 @@ object Migrations {
         MIGRATION_24_25,
         MIGRATION_25_26,
         MIGRATION_26_27,
+        MIGRATION_27_28,
     )
 }

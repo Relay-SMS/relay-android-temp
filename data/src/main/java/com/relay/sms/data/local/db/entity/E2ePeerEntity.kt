@@ -68,6 +68,18 @@ import androidx.room.PrimaryKey
  * is deliberately separate from the data-SMS probe budget
  * ([probeAttempts] / [lastProbeAt]), which an automatic fallback
  * never consumes.
+ *
+ * Round 60 (schema v28) — automatic re-probe schedule (design
+ * §2.4): [retryAttempts] counts the re-probes sent inside the
+ * retry window that started at [retryWindowStartedAt] (the epoch
+ * ms of the probe that opened the window — every probe recorded
+ * by `recordProbe` opens a fresh one-hour window with zero
+ * retries spent). The retries have their OWN allowance
+ * ([E2eProbeRetryPolicy.MAX_RETRIES]) and never touch the
+ * 30-day budget ([probeAttempts] / [windowStartedAt]): a retry
+ * bumps only [retryAttempts] (and moves [lastProbeAt], so the
+ * fallback's stall anchor and the 24-hour spacing both read the
+ * latest handshake activity).
  */
 @Entity(tableName = "e2e_peers")
 data class E2ePeerEntity(
@@ -104,6 +116,25 @@ data class E2ePeerEntity(
      * does — an automatic fallback never consumes probe attempts.
      */
     @ColumnInfo(name = "last_auto_fallback_at") val lastAutoFallbackAt: Long? = null,
+    /**
+     * Round 60 — re-probes sent inside the current retry window
+     * (design §2.4): at most
+     * `E2eProbeRetryPolicy.MAX_RETRIES` per window. A retry bumps
+     * only this count — never [probeAttempts] — so the first-hour
+     * retries cannot burn the 30-day probe budget in 30 minutes.
+     * Reset to 0, with a fresh [retryWindowStartedAt], by every
+     * probe the DAO records (see `E2ePeerDao.recordProbe`); cleared
+     * by the timing reset.
+     */
+    @ColumnInfo(name = "retry_attempts", defaultValue = "0") val retryAttempts: Int = 0,
+    /**
+     * Round 60 — epoch ms the current retry window began (the
+     * probe that opened it), null before the first probe. A retry
+     * is due while `now` is inside one hour of this timestamp
+     * (see `E2eProbeRetryPolicy`); after the hour the existing
+     * 24-hour spacing and 30-day budget apply again.
+     */
+    @ColumnInfo(name = "retry_window_started_at") val retryWindowStartedAt: Long? = null,
     /**
      * Round 48 — true once this peer's phone declared it handles
      * encrypted media (the 0x03 capability packet). False by

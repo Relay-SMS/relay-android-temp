@@ -24,8 +24,12 @@ import org.junit.jupiter.api.Test
  * The encrypted-group send path in [SendSmsUseCase] (design §13):
  * a group text encrypts when EVERY member is ENCRYPTED +
  * group-capable — the same fragment set fans out to each member as
- * individual SMS, each member's 1:1 mirror row carries the
- * plaintext with `encrypted = 1`, and the group echo does too.
+ * individual SMS, each member's 1:1 mirror row is a HIDDEN tracking
+ * sentinel (empty mirror body — round 60 (r): a row carrying the
+ * group plaintext rendered as an ordinary sent 1:1 message in each
+ * member's thread, although only ciphertext fragments of a group
+ * message go out to them), and the group echo carries the plaintext
+ * with `encrypted = 1`.
  *
  * The gate is faked here: the real gate ([com.relay.sms.e2e
  * .E2eGroupSessionManager]) is covered by its own tests in the app
@@ -35,7 +39,8 @@ import org.junit.jupiter.api.Test
  * - Encrypted → the same fragments go to every member (each tied
  *   to that member's row id, so delivery tracks per member), the
  *   plain sender is never called, the fragment ciphertexts — not
- *   the plaintext — land in the system sent box, and the
+ *   the plaintext — land in the system sent box, the per-member
+ *   rows mirror an empty body (hidden sentinels), and the
  *   activation notice is recorded.
  * - Plain → the members are probed and the send goes out exactly
  *   as it did before encrypted groups existed.
@@ -202,22 +207,29 @@ class SendSmsGroupE2eTest {
     }
 
     @Test
-    fun `encrypted group mirrors encrypted rows and an encrypted echo`() {
+    fun `encrypted group mirrors hidden tracking rows and an encrypted echo`() {
         val gate = FakeGroupGate(decision = E2eGroupSendGate.Decision.Encrypted)
         val mirror = NoopMirror()
 
         val outcome = sendGroup(groupGate = gate, mirror = mirror)
 
         assertThat(outcome).isInstanceOf(Outcome.Success::class.java)
-        // One 1:1 row per member, each carrying the plaintext WITH
-        // the encrypted flag and no system row (the plaintext never
-        // enters the system sent box).
+        // One 1:1 row per member — but a HIDDEN tracking sentinel,
+        // not a message: the mirror body is empty, so the real
+        // mirror stores `hidden = 1` and the row never renders in
+        // the member's 1:1 thread (round 60 (r) — the plaintext
+        // row painted the group text as a sent 1:1 message). The
+        // row still carries the encrypted flag and no system row
+        // (the plaintext never enters the system sent box), and
+        // its id is what the fragment delivery intents track.
         assertThat(mirror.lignes).hasSize(2)
         assertThat(mirror.lignes.map { it.adresse }).containsExactly(ALICE, BOB)
         assertThat(mirror.lignes.all { it.encrypted }).isTrue()
         assertThat(mirror.lignes.all { it.telephonyUri == null }).isTrue()
+        assertThat(mirror.lignes.all { it.corpsMiroir == "" }).isTrue()
         // The group echo carries the flag too, with the frozen
-        // whole-send status.
+        // whole-send status — and it is the ONLY row carrying the
+        // plaintext.
         assertThat(mirror.echos).hasSize(1)
         assertThat(mirror.echos.single().encrypted).isTrue()
         assertThat(mirror.echos.single().statut).isEqualTo(MessageStatus.SENT)
@@ -246,6 +258,10 @@ class SendSmsGroupE2eTest {
         assertThat(outcome).isInstanceOf(Outcome.Failure::class.java)
         assertThat(mirror.lignes).hasSize(2)
         assertThat(mirror.lignes.all { it.encrypted }).isTrue()
+        // The failed member rows are hidden sentinels too — a
+        // radio failure must not paint the group text into the
+        // 1:1 threads either.
+        assertThat(mirror.lignes.all { it.corpsMiroir == "" }).isTrue()
         assertThat(mirror.statuts.map { it.second })
             .containsExactly(MessageStatus.FAILED, MessageStatus.FAILED)
         // The echo still carries the flag, with the frozen FAILED
@@ -285,12 +301,16 @@ class SendSmsGroupE2eTest {
         assertThat(probeGate.probed).containsExactly(ALICE, BOB)
         // Byte-identical plain behavior: system rows written, plain
         // sender called once per member, mirror rows unencrypted,
-        // echo unencrypted.
+        // echo unencrypted — and the member rows mirror the
+        // plaintext, as before: a real SMS does go to each member,
+        // so the rows are honest (round 60 (r) scopes the hidden
+        // sentinels to encrypted groups only).
         assertThat(recorder.adressesEcrites).containsExactly(ALICE, BOB)
         assertThat(sender.plainSends).containsExactly(BODY, BODY)
         assertThat(sender.fragments).isEmpty()
         assertThat(mirror.lignes).hasSize(2)
         assertThat(mirror.lignes.all { !it.encrypted }).isTrue()
+        assertThat(mirror.lignes.all { it.corpsMiroir == null }).isTrue()
         assertThat(mirror.lignes.all { it.telephonyUri != null }).isTrue()
         assertThat(mirror.echos).hasSize(1)
         assertThat(mirror.echos.single().encrypted).isFalse()
@@ -430,9 +450,12 @@ class SendSmsGroupE2eTest {
         assertThat(sender.plainSends).isEmpty()
         // Per-member rows carry the lock — but NO group echo: a
         // reaction is not a bubble, and the tapback text must never
-        // paint in the group thread.
+        // paint in the group thread. The member rows were already
+        // hidden sentinels (empty mirror body) before round 60 (r)
+        // and stay that way.
         assertThat(mirror.lignes).hasSize(2)
         assertThat(mirror.lignes.all { it.encrypted }).isTrue()
+        assertThat(mirror.lignes.all { it.corpsMiroir == "" }).isTrue()
         assertThat(mirror.echos).isEmpty()
         assertThat(gate.activatedFor).containsExactly(listOf(ALICE, BOB))
     }

@@ -82,11 +82,19 @@ class E2eProbeManagerTest {
         // Round 58 — when true, the manager under test gets a real
         // automatic fallback built from this harness's fakes.
         val withAutoFallback: Boolean = false,
+        // Round 60 — a mock fallback, to observe the fallback
+        // arming on probe-send without WorkManager (the real one
+        // would call WorkManager on a mock Context). Takes
+        // precedence over [withAutoFallback].
+        val fallbackOverride: E2eAutoFallback? = null,
+        // Round 60 — a mock retry scheduler, to observe the
+        // re-probe arming (address + delay) without WorkManager.
+        val retryScheduler: E2eProbeRetryScheduler = mockk(relaxed = true),
     ) {
         val peers = E2ePeerRepository(peerDao)
         val accountManager = E2eAccountManager(accountDao, crypto, fakeKeyManager())
 
-        val autoFallback: E2eAutoFallback? = if (withAutoFallback) {
+        val autoFallback: E2eAutoFallback? = fallbackOverride ?: if (withAutoFallback) {
             E2eAutoFallback(
                 peers = peers,
                 accountManager = lazyOf(accountManager),
@@ -111,6 +119,7 @@ class E2eProbeManagerTest {
             recorder = recorder,
             mediaCapability = mediaCapability,
             autoFallback = autoFallback,
+            retryScheduler = retryScheduler,
         )
 
         fun seedPeer(
@@ -122,6 +131,10 @@ class E2eProbeManagerTest {
             theirCurveKey: String? = null,
             lastBundleReplyAt: Long? = null,
             lastAutoFallbackAt: Long? = null,
+            // Round 60 — the retry allowance: retries spent in the
+            // window that started here (null = never probed).
+            retryAttempts: Int = 0,
+            retryWindowStartedAt: Long? = null,
         ) {
             peerDao.peers[address] = E2ePeerEntity(
                 address = address,
@@ -132,6 +145,8 @@ class E2eProbeManagerTest {
                 theirCurveKey = theirCurveKey,
                 lastBundleReplyAt = lastBundleReplyAt,
                 lastAutoFallbackAt = lastAutoFallbackAt,
+                retryAttempts = retryAttempts,
+                retryWindowStartedAt = retryWindowStartedAt,
                 updatedAt = NOW,
             )
         }
@@ -1272,5 +1287,256 @@ class E2eProbeManagerTest {
 
         assertThat(result).isEqualTo(ProbeResult.Gated(ProbeGate.AlreadyEncrypted))
         coVerify(exactly = 0) { mediaCapability.announceIfNeeded(any(), any(), any()) }
+    }
+
+    // ──────────────────────────── Round 60: the re-probe schedule ────────────────────────────
+    // An unanswered handshake is re-probed every few minutes for the
+    // first hour, from its OWN allowance — never the 30-day budget.
+    // The seed below is the 2026-11-26 stall, six minutes in: one
+    // probe went out, no bundle came back, the 24-hour spacing would
+    // refuse a second probe, and the first retry is due (5 minutes).
+
+    private fun stallSeed(harness: Harness, minutesAgo: Long = 6L) {
+        val probeAt = NOW - minutesAgo * 60_000L
+        harness.seedPeer(
+            state = E2ePeerState.PROBING,
+            attempts = 1,
+            windowStartedAt = probeAt,
+            lastProbeAt = probeAt,
+            retryAttempts = 0,
+            retryWindowStartedAt = probeAt,
+        )
+    }
+
+    @Test
+    fun `a retry goes out when the spacing gate refuses but the retry is due`() = runTest {
+        val harness = Harness(scope = this)
+        stallSeed(harness)
+
+        val sent = harness.manager.retryUnansweredHandshake(ALICE, now = NOW)
+
+        assertThat(sent).isTrue()
+        assertThat(harness.sender.sent).hasSize(1)
+        assertThat(harness.sender.sent.single().address).isEqualTo(ALICE)
+        // The retry allowance, not the budget: one retry spent, the
+        // budget count and window untouched, still PROBING.
+        val peer = harness.peerDao.peers[ALICE]
+        assertThat(peer?.retryAttempts).isEqualTo(1)
+        assertThat(peer?.probeAttempts).isEqualTo(1)
+        assertThat(peer?.windowStartedAt).isEqualTo(NOW - 6L * 60_000L)
+        assertThat(peer?.lastProbeAt).isEqualTo(NOW)
+        assertThat(peer?.state).isEqualTo(E2ePeerState.PROBING)
+    }
+
+    @Test
+    fun `a retry is recorded as a retry in the error log`() = runTest {
+        val harness = Harness(scope = this)
+        stallSeed(harness)
+
+        val result = harness.manager.probeAddressDetailed(
+            ALICE,
+            null,
+            now = NOW,
+            trigger = ProbeTrigger.THREAD_OPEN,
+        )
+
+        assertThat(result).isEqualTo(ProbeResult.Sent(budgetExhausted = false))
+        verify(exactly = 1) {
+            harness.recorder.recordEvent(
+                "e2e-probe-sent",
+                "Automatic probe sent to $ALICE (attempt=1, channel=DATA_SMS, trigger=retry).",
+            )
+        }
+    }
+
+    @Test
+    fun `no retry before the first retry is due`() = runTest {
+        val harness = Harness(scope = this)
+        stallSeed(harness, minutesAgo = 4L)
+
+        val sent = harness.manager.retryUnansweredHandshake(ALICE, now = NOW)
+
+        assertThat(sent).isFalse()
+        assertThat(harness.sender.sent).isEmpty()
+        assertThat(harness.peerDao.peers[ALICE]?.retryAttempts).isEqualTo(0)
+    }
+
+    @Test
+    fun `no retry once the four retries are spent`() = runTest {
+        val harness = Harness(scope = this)
+        val probeAt = NOW - 55L * 60_000L
+        harness.seedPeer(
+            state = E2ePeerState.PROBING,
+            attempts = 1,
+            windowStartedAt = probeAt,
+            lastProbeAt = probeAt,
+            retryAttempts = E2eProbeRetryPolicy.MAX_RETRIES,
+            retryWindowStartedAt = probeAt,
+        )
+
+        val sent = harness.manager.retryUnansweredHandshake(ALICE, now = NOW)
+
+        assertThat(sent).isFalse()
+        assertThat(harness.sender.sent).isEmpty()
+    }
+
+    @Test
+    fun `no retry after the first hour`() = runTest {
+        val harness = Harness(scope = this)
+        stallSeed(harness, minutesAgo = 61L)
+
+        val sent = harness.manager.retryUnansweredHandshake(ALICE, now = NOW)
+
+        assertThat(sent).isFalse()
+        assertThat(harness.sender.sent).isEmpty()
+    }
+
+    @Test
+    fun `no retry once the peer is not relay`() = runTest {
+        val harness = Harness(scope = this)
+        val probeAt = NOW - 6L * 60_000L
+        harness.seedPeer(
+            state = E2ePeerState.NOT_RELAY,
+            attempts = E2ePeerRepository.MAX_PROBE_ATTEMPTS,
+            windowStartedAt = probeAt,
+            lastProbeAt = probeAt,
+            retryAttempts = 0,
+            retryWindowStartedAt = probeAt,
+        )
+
+        val sent = harness.manager.retryUnansweredHandshake(ALICE, now = NOW)
+
+        assertThat(sent).isFalse()
+        assertThat(harness.sender.sent).isEmpty()
+    }
+
+    @Test
+    fun `a retry still respects discovery off`() = runTest {
+        val harness = Harness(
+            scope = this,
+            settings = SettingsWithSubId(CHOSEN_SUB_ID, autoDiscover = false),
+        )
+        stallSeed(harness)
+
+        val sent = harness.manager.retryUnansweredHandshake(ALICE, now = NOW)
+
+        assertThat(sent).isFalse()
+        assertThat(harness.sender.sent).isEmpty()
+    }
+
+    @Test
+    fun `a retry still refuses a blocked number`() = runTest {
+        val harness = Harness(scope = this, blocked = FakeBlockedRepo(setOf(ALICE)))
+        stallSeed(harness)
+
+        val sent = harness.manager.retryUnansweredHandshake(ALICE, now = NOW)
+
+        assertThat(sent).isFalse()
+        assertThat(harness.sender.sent).isEmpty()
+    }
+
+    @Test
+    fun `a failed retry send consumes nothing`() = runTest {
+        val harness = Harness(scope = this)
+        harness.sender.result = false
+        stallSeed(harness)
+
+        val sent = harness.manager.retryUnansweredHandshake(ALICE, now = NOW)
+
+        assertThat(sent).isFalse()
+        assertThat(harness.peerDao.peers[ALICE]?.retryAttempts).isEqualTo(0)
+        assertThat(harness.peerDao.peers[ALICE]?.lastProbeAt).isEqualTo(NOW - 6L * 60_000L)
+    }
+
+    @Test
+    fun `a fresh probe arms the next retry five minutes out`() = runTest {
+        val harness = Harness(scope = this)
+
+        val result = harness.manager.probeAddressDetailed(ALICE, null, now = NOW)
+
+        assertThat(result).isEqualTo(ProbeResult.Sent(budgetExhausted = false))
+        verify(exactly = 1) { harness.retryScheduler.schedule(ALICE, 5L * 60_000L) }
+    }
+
+    @Test
+    fun `a retry arms the next retry in the window`() = runTest {
+        val harness = Harness(scope = this)
+        stallSeed(harness)
+
+        val sent = harness.manager.retryUnansweredHandshake(ALICE, now = NOW)
+
+        assertThat(sent).isTrue()
+        // First retry went out at +6 minutes; the second is due at
+        // +15, so nine minutes from now.
+        verify(exactly = 1) { harness.retryScheduler.schedule(ALICE, 9L * 60_000L) }
+    }
+
+    @Test
+    fun `a probe that spends the last budget slot arms no retry`() = runTest {
+        val harness = Harness(scope = this)
+        val dayAgo = NOW - 25L * 3_600_000L
+        harness.seedPeer(
+            state = E2ePeerState.PROBING,
+            attempts = 2,
+            windowStartedAt = dayAgo,
+            lastProbeAt = dayAgo,
+        )
+
+        val result = harness.manager.probeAddressDetailed(ALICE, null, now = NOW)
+
+        assertThat(result).isEqualTo(ProbeResult.Sent(budgetExhausted = true))
+        assertThat(harness.peerDao.peers[ALICE]?.state).isEqualTo(E2ePeerState.NOT_RELAY)
+        verify(exactly = 0) { harness.retryScheduler.schedule(any(), any()) }
+    }
+
+    @Test
+    fun `a probe send arms the automatic fallback worker`() = runTest {
+        val fallback = mockk<E2eAutoFallback>(relaxed = true)
+        val harness = Harness(scope = this, fallbackOverride = fallback)
+
+        val result = harness.manager.probeAddressDetailed(ALICE, null, now = NOW)
+
+        assertThat(result).isEqualTo(ProbeResult.Sent(budgetExhausted = false))
+        verify(exactly = 1) { fallback.schedule(ALICE) }
+    }
+
+    @Test
+    fun `a retry send arms the automatic fallback worker too`() = runTest {
+        val fallback = mockk<E2eAutoFallback>(relaxed = true)
+        val harness = Harness(scope = this, fallbackOverride = fallback)
+        stallSeed(harness)
+
+        val sent = harness.manager.retryUnansweredHandshake(ALICE, now = NOW)
+
+        assertThat(sent).isTrue()
+        verify(exactly = 1) { fallback.schedule(ALICE) }
+    }
+
+    @Test
+    fun `thread-open sends a due retry`() = runTest {
+        val harness = Harness(scope = this)
+        // Seeded against the REAL wall clock, like the fallback
+        // thread-open test: onThreadOpened evaluates with
+        // System.currentTimeMillis(), so a NOW-relative anchor
+        // would sit in the future.
+        val sixMinutesAgo = System.currentTimeMillis() - 6L * 60_000L
+        harness.seedPeer(
+            state = E2ePeerState.PROBING,
+            attempts = 1,
+            windowStartedAt = sixMinutesAgo,
+            lastProbeAt = sixMinutesAgo,
+            retryAttempts = 0,
+            retryWindowStartedAt = sixMinutesAgo,
+        )
+        coEvery { harness.conversationDao.findById(11L) } returns
+            harness.conversationWith(ALICE)
+
+        harness.manager.onThreadOpened(11L)
+        testScheduler.advanceUntilIdle()
+
+        assertThat(harness.sender.sent).hasSize(1)
+        assertThat(harness.sender.sent.single().address).isEqualTo(ALICE)
+        assertThat(harness.peerDao.peers[ALICE]?.retryAttempts).isEqualTo(1)
+        assertThat(harness.peerDao.peers[ALICE]?.probeAttempts).isEqualTo(1)
     }
 }

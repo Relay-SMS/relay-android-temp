@@ -135,6 +135,16 @@ import java.util.Locale
 private const val SEARCH_FOCUS_RETRY_MS: Long = 100L
 
 /**
+ * Round 60 — the importing group's upward shift (see
+ * [ImportingPlaceholder]): the group is centred in the Scaffold
+ * content area below the TopAppBar (64 dp) + status bar (~28 dp),
+ * so its centre sits ~40-45 dp below the screen centre. Derived
+ * from code, not a device screenshot — the device check confirms
+ * the exact value.
+ */
+private const val IMPORT_GROUP_SHIFT_UP_DP = 40f
+
+/**
  * Client mode C2 — one decision for the row gestures that are
  * Room-only writes (pin / archive / mute / rename, multi-select,
  * vault move): hidden in PanicDecoy, in selection mode, or on a
@@ -2503,7 +2513,14 @@ private fun ImportingPlaceholder(
 ) {
     val cs = MaterialTheme.colorScheme
     Column(
-        modifier = Modifier.fillMaxSize().padding(32.dp),
+        // Round 60 — the whole group shifts up so its VISUAL
+        // centre aligns with the screen centre (see
+        // [IMPORT_GROUP_SHIFT_UP_DP]). Only the group's position
+        // moves: the Figma gaps between the elements are untouched,
+        // and the group stays bottom-heavy by design (the paragraph
+        // is nearly half its height).
+        modifier = Modifier.fillMaxSize().padding(32.dp)
+            .offset(y = -IMPORT_GROUP_SHIFT_UP_DP.dp),
         verticalArrangement = Arrangement.Center,
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {

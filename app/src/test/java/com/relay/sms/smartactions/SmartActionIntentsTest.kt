@@ -169,6 +169,72 @@ class SmartActionIntentsTest {
             .isEqualTo("5466 elam rd, pa 17535")
     }
 
+    // Round 60 — the comma-less shapes the detector's optional tail
+    // commas produce (desktop parity, smartActions.ts): the city
+    // glued to the street, or glued to the state + ZIP.
+    @Test fun `osm strip drops a city glued to the street`() {
+        assertThat(stripLocalityForOsm("5466 Elam Rd Kinzers, PA 17535"))
+            .isEqualTo("5466 Elam Rd, PA 17535")
+        assertThat(stripLocalityForOsm("5466 elam rd kinzers, pa 17535"))
+            .isEqualTo("5466 elam rd, pa 17535")
+    }
+
+    @Test fun `osm strip drops a city glued to the state and zip`() {
+        assertThat(stripLocalityForOsm("5466 Elam Rd, Kinzers PA 17535"))
+            .isEqualTo("5466 Elam Rd, PA 17535")
+        assertThat(stripLocalityForOsm("5466 elam rd, kinzers pa 17535"))
+            .isEqualTo("5466 elam rd, pa 17535")
+    }
+
+    @Test fun `osm strip keeps the street when a street plus city component precedes state and zip`() {
+        assertThat(stripLocalityForOsm("Apt 4, 5466 Elam Rd Kinzers, PA 17535"))
+            .isEqualTo("Apt 4, 5466 Elam Rd, PA 17535")
+    }
+
+    @Test fun `osm strip leaves a comma-less single component unchanged`() {
+        assertThat(stripLocalityForOsm("Kinzers PA 17535")).isEqualTo("Kinzers PA 17535")
+        assertThat(stripLocalityForOsm("5466 Elam Rd Kinzers PA 17535"))
+            .isEqualTo("5466 Elam Rd Kinzers PA 17535")
+    }
+
+    @Test fun `osm directions url strips the comma-less city like desktop`() {
+        // The desktop's example: the same detected span builds this
+        // exact URL on desktop (directionsUrl("osm", …)).
+        assertThat(
+            SmartActionIntents.mapsDirectionsUrl(
+                "5466 Elam Rd Kinzers, PA 17535",
+                MapsProvider.OPENSTREETMAP,
+            ),
+        ).isEqualTo(
+            "https://www.openstreetmap.org/directions?to=5466%20Elam%20Rd%2C%20PA%2017535",
+        )
+        assertThat(
+            SmartActionIntents.mapsDirectionsUrl(
+                "5466 Elam Rd, Kinzers PA 17535",
+                MapsProvider.OPENSTREETMAP,
+            ),
+        ).isEqualTo(
+            "https://www.openstreetmap.org/directions?to=5466%20Elam%20Rd%2C%20PA%2017535",
+        )
+    }
+
+    @Test fun `osm directions url matches the desktop url exactly`() {
+        // Round 60 — parity with the desktop's `directionsUrl("osm",
+        // …)` (smartActions.ts): the same `?to=` form, the same
+        // city strip, the same `%20` encoding. Verified against the
+        // desktop tree: mobile already builds this URL, so no code
+        // change — this test pins the parity so a future drift fails
+        // here instead of on device.
+        assertThat(
+            SmartActionIntents.mapsDirectionsUrl(
+                "5466 elam rd, kinzers, pa 17535",
+                MapsProvider.OPENSTREETMAP,
+            ),
+        ).isEqualTo(
+            "https://www.openstreetmap.org/directions?to=5466%20elam%20rd%2C%20pa%2017535",
+        )
+    }
+
     @Test fun `osm directions url carries the stripped lowercase query`() {
         assertThat(
             SmartActionIntents.mapsDirectionsUrl(

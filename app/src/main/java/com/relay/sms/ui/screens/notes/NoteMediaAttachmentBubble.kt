@@ -19,6 +19,7 @@ import com.relay.sms.domain.model.Message
 import com.relay.sms.domain.model.NoteMessage
 import com.relay.sms.domain.notes.NoteAttachmentResolver
 import com.relay.sms.sync.client.ClientDownloadState
+import com.relay.sms.ui.components.BubbleMenuToggles
 import com.relay.sms.ui.components.MediaAttachmentBubble
 import com.relay.sms.ui.components.MediaPreviewOverrides
 import kotlinx.coroutines.Dispatchers
@@ -52,6 +53,17 @@ fun NoteMediaAttachmentBubble(
     customBubbleColorArgb: Int? = null,
     onDelete: (() -> Unit)? = null,
     onCopy: (() -> Unit)? = null,
+    /**
+     * Round 60 (i) — null when the entry has no text (forward is
+     * text-only: the attachment points at an encrypted file).
+     */
+    onForward: (() -> Unit)? = null,
+    /**
+     * Round 60 (i) — the bubble menu toggles: the note's pin state
+     * + handler, and the smart-action handler. Reply and react
+     * stay null (notes have neither).
+     */
+    toggles: BubbleMenuToggles? = null,
     /** Round 36 phase 2 — client mode: the note download states, keyed by local attachment id. */
     downloadStates: Map<Long, ClientDownloadState> = emptyMap(),
     /** Round 36 phase 2 — client mode: requests one note attachment's bytes, by local id. */
@@ -106,6 +118,8 @@ fun NoteMediaAttachmentBubble(
         onReply = null,
         onReact = null,
         onCopy = onCopy,
+        onForward = onForward,
+        toggles = toggles,
         previewOverrides = overrides,
         customBubbleColorArgb = customBubbleColorArgb,
         downloadStates = downloadStates,

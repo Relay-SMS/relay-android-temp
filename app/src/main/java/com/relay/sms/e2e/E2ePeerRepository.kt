@@ -32,6 +32,14 @@ import javax.inject.Singleton
  * state via [state] and decides. Splitting the two keeps the budget testable in
  * isolation and the policy in one place.
  *
+ * Round 60 — the re-probes inside the first hour after a probe have
+ * their OWN allowance ([E2eProbeRetryPolicy.MAX_RETRIES] per
+ * one-hour window, tracked in `retry_attempts` /
+ * `retry_window_started_at`): [recordRetryProbeSent] bumps only
+ * that count, never the 30-day budget, so the retries cannot burn
+ * the budget in 30 minutes. Every [recordProbeSent] opens a fresh
+ * retry window; the timing reset clears both allowances.
+ *
  * The bundle-reply rate limit (design §2.3, at most one bundle per sender per
  * day) is persisted here too via [recordBundleReply]; the eligibility check
  * lives in [E2eProbePolicy], which reads the stored timestamp.
@@ -74,23 +82,13 @@ class E2ePeerRepository @Inject constructor(
     private val peerDao: E2ePeerDao,
 ) {
 
-    /**
-     * Canonical key for the peer table: [canonicalPhone]
-     * (formatting stripped, NANP country code unified to the
-     * 10-digit form). Idempotent — safe to apply to an
-     * already-canonical address — and safe for an alphanumeric
-     * sender, whose canonical form falls back to the trimmed raw
-     * string.
-     */
-    private fun canonicalAddress(address: String): String = address.canonicalPhone()
-
     /** The peer's row, or null when no exchange has ever started with this address. */
     suspend fun getPeer(address: String): E2ePeerEntity? =
-        peerDao.findByAddress(canonicalAddress(address))
+        peerDao.findByAddress(address.canonicalPhone())
 
     /** The peer's state; UNKNOWN when no row exists (nothing has happened yet). */
     suspend fun state(address: String): E2ePeerState =
-        peerDao.findByAddress(canonicalAddress(address))?.state ?: E2ePeerState.UNKNOWN
+        peerDao.findByAddress(address.canonicalPhone())?.state ?: E2ePeerState.UNKNOWN
 
     /**
      * Live view of one peer's row (null = no exchange has ever started).
@@ -98,7 +96,7 @@ class E2ePeerRepository @Inject constructor(
      * and the details-panel row follow the key exchange live.
      */
     fun observePeer(address: String): Flow<E2ePeerEntity?> =
-        peerDao.observeByAddress(canonicalAddress(address))
+        peerDao.observeByAddress(address.canonicalPhone())
 
     /**
      * Live view of the verified contacts, most recently updated first
@@ -131,7 +129,7 @@ class E2ePeerRepository @Inject constructor(
         address: String,
         now: Long = System.currentTimeMillis(),
     ): E2ePeerEntity {
-        val key = canonicalAddress(address)
+        val key = address.canonicalPhone()
         peerDao.insert(E2ePeerEntity(address = key, updatedAt = now))
         // The insert is IGNORE on conflict, so the row is either the one just
         // inserted or the pre-existing one — re-read to return the real row.
@@ -146,7 +144,7 @@ class E2ePeerRepository @Inject constructor(
         state: E2ePeerState,
         now: Long = System.currentTimeMillis(),
     ) {
-        val key = canonicalAddress(address)
+        val key = address.canonicalPhone()
         getOrCreateUnknown(key, now)
         peerDao.updateState(key, state, now)
     }
@@ -158,7 +156,7 @@ class E2ePeerRepository @Inject constructor(
         theirEdKey: String,
         now: Long = System.currentTimeMillis(),
     ) {
-        val key = canonicalAddress(address)
+        val key = address.canonicalPhone()
         getOrCreateUnknown(key, now)
         peerDao.updateKeys(key, theirCurveKey, theirEdKey, now)
     }
@@ -175,7 +173,7 @@ class E2ePeerRepository @Inject constructor(
         verified: Boolean,
         now: Long = System.currentTimeMillis(),
     ) {
-        val key = canonicalAddress(address)
+        val key = address.canonicalPhone()
         getOrCreateUnknown(key, now)
         peerDao.setVerified(key, verified, now)
     }
@@ -188,7 +186,7 @@ class E2ePeerRepository @Inject constructor(
      * ([E2eMediaGateImpl]) reads this before encrypting any MMS.
      */
     suspend fun isMediaCapable(address: String): Boolean =
-        peerDao.findByAddress(canonicalAddress(address))?.mediaCapable == true
+        peerDao.findByAddress(address.canonicalPhone())?.mediaCapable == true
 
     /**
      * Round 48 — records that this peer declared it handles
@@ -202,7 +200,7 @@ class E2ePeerRepository @Inject constructor(
         capable: Boolean,
         now: Long = System.currentTimeMillis(),
     ) {
-        val key = canonicalAddress(address)
+        val key = address.canonicalPhone()
         getOrCreateUnknown(key, now)
         peerDao.setMediaCapable(key, capable, now)
     }
@@ -215,7 +213,7 @@ class E2ePeerRepository @Inject constructor(
      * this false so the next thread-open retries.
      */
     suspend fun isMediaAnnounced(address: String): Boolean =
-        peerDao.findByAddress(canonicalAddress(address))?.mediaAnnounced == true
+        peerDao.findByAddress(address.canonicalPhone())?.mediaAnnounced == true
 
     /**
      * Round 48 — records that our declaration went out to this
@@ -227,7 +225,7 @@ class E2ePeerRepository @Inject constructor(
         announced: Boolean,
         now: Long = System.currentTimeMillis(),
     ) {
-        val key = canonicalAddress(address)
+        val key = address.canonicalPhone()
         getOrCreateUnknown(key, now)
         peerDao.setMediaAnnounced(key, announced, now)
     }
@@ -241,7 +239,7 @@ class E2ePeerRepository @Inject constructor(
      * before a group may encrypt.
      */
     suspend fun isGroupCapable(address: String): Boolean =
-        peerDao.findByAddress(canonicalAddress(address))?.groupCapable == true
+        peerDao.findByAddress(address.canonicalPhone())?.groupCapable == true
 
     /**
      * Round 49 — records that this peer declared it handles
@@ -255,7 +253,7 @@ class E2ePeerRepository @Inject constructor(
         capable: Boolean,
         now: Long = System.currentTimeMillis(),
     ) {
-        val key = canonicalAddress(address)
+        val key = address.canonicalPhone()
         getOrCreateUnknown(key, now)
         peerDao.setGroupCapable(key, capable, now)
     }
@@ -272,7 +270,7 @@ class E2ePeerRepository @Inject constructor(
      * triggers.
      */
     suspend fun isGroupAnnounced(address: String): Boolean =
-        peerDao.findByAddress(canonicalAddress(address))?.groupAnnounced == true
+        peerDao.findByAddress(address.canonicalPhone())?.groupAnnounced == true
 
     /**
      * Round 49 — records that our declaration went out to this
@@ -284,7 +282,7 @@ class E2ePeerRepository @Inject constructor(
         announced: Boolean,
         now: Long = System.currentTimeMillis(),
     ) {
-        val key = canonicalAddress(address)
+        val key = address.canonicalPhone()
         getOrCreateUnknown(key, now)
         peerDao.setGroupAnnounced(key, announced, now)
     }
@@ -306,7 +304,7 @@ class E2ePeerRepository @Inject constructor(
     data class GroupMediaCapability(val capable: Boolean, val announced: Boolean)
 
     suspend fun groupMediaCapability(address: String): GroupMediaCapability {
-        val row = peerDao.findByAddress(canonicalAddress(address))
+        val row = peerDao.findByAddress(address.canonicalPhone())
         return GroupMediaCapability(
             capable = row?.groupMediaCapable == true,
             announced = row?.groupMediaAnnounced == true,
@@ -331,7 +329,7 @@ class E2ePeerRepository @Inject constructor(
         announced: Boolean? = null,
         now: Long = System.currentTimeMillis(),
     ) {
-        val key = canonicalAddress(address)
+        val key = address.canonicalPhone()
         getOrCreateUnknown(key, now)
         capable?.let { peerDao.setGroupMediaCapable(key, it, now) }
         announced?.let { peerDao.setGroupMediaAnnounced(key, it, now) }
@@ -347,7 +345,7 @@ class E2ePeerRepository @Inject constructor(
      * on both channels, which is always safe.
      */
     suspend fun handshakeChannel(address: String): HandshakeChannel? {
-        val raw = peerDao.findByAddress(canonicalAddress(address))?.handshakeChannel
+        val raw = peerDao.findByAddress(address.canonicalPhone())?.handshakeChannel
             ?: return null
         return runCatching { HandshakeChannel.valueOf(raw) }.getOrNull()
     }
@@ -367,7 +365,7 @@ class E2ePeerRepository @Inject constructor(
         channel: HandshakeChannel,
         now: Long = System.currentTimeMillis(),
     ) {
-        val key = canonicalAddress(address)
+        val key = address.canonicalPhone()
         getOrCreateUnknown(key, now)
         peerDao.setHandshakeChannel(key, channel.name, now)
     }
@@ -386,7 +384,7 @@ class E2ePeerRepository @Inject constructor(
      * the class KDoc).
      */
     suspend fun canProbeReason(address: String, now: Long = System.currentTimeMillis()): ProbeGate? {
-        val peer = peerDao.findByAddress(canonicalAddress(address)) ?: return null
+        val peer = peerDao.findByAddress(address.canonicalPhone()) ?: return null
         val windowStart = peer.windowStartedAt
         if (windowStart == null || now - windowStart >= PROBE_WINDOW_MS) return null
         if (peer.probeAttempts >= MAX_PROBE_ATTEMPTS) return ProbeGate.BudgetExhausted
@@ -402,9 +400,16 @@ class E2ePeerRepository @Inject constructor(
      * Records a probe send: bumps the attempt count (resetting the window when 30
      * days have elapsed) and moves the peer to PROBING. Call AFTER the probe data
      * SMS is sent — a failed send must not consume budget.
+     *
+     * Round 60 — every probe also opens a fresh one-hour retry
+     * window (the DAO resets `retry_attempts` to 0 and restarts
+     * `retry_window_started_at` at the probe time): a new probe
+     * round earns its own re-probes, and the retries themselves
+     * never call this — they call [recordRetryProbeSent], which
+     * leaves the 30-day budget untouched.
      */
     suspend fun recordProbeSent(address: String, now: Long = System.currentTimeMillis()) {
-        val key = canonicalAddress(address)
+        val key = address.canonicalPhone()
         val peer = getOrCreateUnknown(key, now)
         val windowStart = peer.windowStartedAt
         val (attempts, windowStartedAt) =
@@ -418,6 +423,26 @@ class E2ePeerRepository @Inject constructor(
     }
 
     /**
+     * Round 60 — records a re-probe send inside the retry window
+     * (design §2.4): bumps only the retry count (and moves
+     * `lastProbeAt` to the send time). Call AFTER the probe data
+     * SMS is sent — a failed send must not consume the retry
+     * allowance. The 30-day budget is untouched: a retry never
+     * bumps [probeAttempts], never resets [windowStartedAt], and
+     * never flips the peer to NOT_RELAY — the caller
+     * ([E2eProbeManager]) checks the retry gate first
+     * ([E2eProbeRetryPolicy.canRetry]) and keeps the state
+     * PROBING. The peer row must exist (a retry only ever follows
+     * a recorded probe); like [recordProbeSent], this creates it
+     * in UNKNOWN first, so a missing row cannot lose the count.
+     */
+    suspend fun recordRetryProbeSent(address: String, now: Long = System.currentTimeMillis()) {
+        val key = address.canonicalPhone()
+        val peer = getOrCreateUnknown(key, now)
+        peerDao.recordRetryProbe(key, peer.retryAttempts + 1, now, now)
+    }
+
+    /**
      * Records a bundle reply sent to this peer (design §2.3): at most one
      * bundle per sender per day. Call AFTER the bundle SMS is sent — a failed
      * send must not consume the day's reply. The caller checks the rate limit
@@ -425,7 +450,7 @@ class E2ePeerRepository @Inject constructor(
      * (null when no reply was ever sent).
      */
     suspend fun recordBundleReply(address: String, now: Long = System.currentTimeMillis()) {
-        val key = canonicalAddress(address)
+        val key = address.canonicalPhone()
         getOrCreateUnknown(key, now)
         peerDao.recordBundleReply(key, now, now)
     }
@@ -440,7 +465,7 @@ class E2ePeerRepository @Inject constructor(
      * flips the peer to NOT_RELAY.
      */
     suspend fun recordAutoFallback(address: String, now: Long = System.currentTimeMillis()) {
-        val key = canonicalAddress(address)
+        val key = address.canonicalPhone()
         getOrCreateUnknown(key, now)
         peerDao.recordAutoFallback(key, now, now)
     }
@@ -508,7 +533,7 @@ class E2ePeerRepository @Inject constructor(
 
     /** Deletes a peer's row (panic wipe / reset — its sessions are deleted separately). */
     suspend fun deletePeer(address: String) {
-        peerDao.deleteByAddress(canonicalAddress(address))
+        peerDao.deleteByAddress(address.canonicalPhone())
     }
 
     companion object {

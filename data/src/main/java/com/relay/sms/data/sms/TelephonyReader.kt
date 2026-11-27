@@ -578,11 +578,19 @@ class TelephonyReader @Inject constructor(
         return out
     }
 
-    /** One attachment part of an MMS — referenced by its `content://mms/part/{id}` URI. */
+    /**
+     * One attachment part of an MMS — referenced by its `content://mms/part/{id}` URI.
+     *
+     * Round 60 — [sizeBytes] is the part's byte size from the
+     * provider ([partSizeBytes]), 0 when it cannot be read: the
+     * import used to hardcode 0, so every re-imported file showed
+     * no size (and the Files tab hid it outright before round 60).
+     */
     data class MmsPartImport(
         val partId: Long,
         val contentType: String,
         val filename: String?,
+        val sizeBytes: Long = 0L,
     )
 
     /**
@@ -711,6 +719,27 @@ class TelephonyReader @Inject constructor(
         onPage: suspend (List<MmsImportRow>) -> Unit,
     ): Boolean {
         val partsByMid = readMmsPartsBatched(pending.map { it.telephonyId })
+        // Round 60 — a RECENT MMS with no parts at all is an MMS
+        // whose download had not finished when this pass ran (an
+        // unretrieved MMS has zero part rows; a retrieved one always
+        // carries text or media parts). The row is dropped below —
+        // there is no bubble to show — but the pass must NOT call
+        // itself complete: completing would set
+        // `mmsImportCompleted` and no later pass would ever re-read
+        // it (no live receiver watches the system store for a
+        // download finishing), so the message — a voice message, in
+        // the reported case — would stay missing until a reinstall.
+        // Withholding completion makes the next sync re-run the MMS
+        // import, which picks the MMS up once downloaded. Only
+        // recent rows count: an old part-less row is an expired
+        // carrier stub that will never download, and withholding
+        // completion for it would re-walk the MMS table on every
+        // sync forever.
+        val hasRecentZeroPart = partsByMid != null && pending.any { p ->
+            val (text, atts) = partsByMid[p.telephonyId] ?: ("" to emptyList())
+            text.isBlank() && atts.isEmpty() &&
+                p.dateMs >= System.currentTimeMillis() - ZERO_PART_RECENT_WINDOW_MS
+        }
         // Round 50 — resolve this page's thread recipient sets (cached
         // across pages in `recipientsByThread`). A `null` lookup caches
         // as empty: the rows still import (filed 1:1) and the repair
@@ -724,7 +753,7 @@ class TelephonyReader @Inject constructor(
             }
         }
         onPage(flushPendingWithBatchedParts(pending, partsByMid ?: emptyMap(), recipientsByThread))
-        return partsByMid != null
+        return partsByMid != null && !hasRecentZeroPart
     }
 
     private fun flushPendingWithBatchedParts(
@@ -736,7 +765,17 @@ class TelephonyReader @Inject constructor(
         val out = ArrayList<MmsImportRow>(pending.size)
         for (p in pending) {
             val (textBody, attachments) = partsByMid[p.telephonyId] ?: ("" to emptyList())
-            if (textBody.isBlank() && attachments.isEmpty()) continue
+            if (textBody.isBlank() && attachments.isEmpty()) {
+                // Round 60 — logged, not silent: this is the drop
+                // that used to lose voice messages permanently (see
+                // `flushPending` — the pass stays incomplete while
+                // the row is recent, so it is retried next sync).
+                Timber.w(
+                    "TelephonyReader: MMS %d skipped (no parts — not yet downloaded?)",
+                    p.telephonyId,
+                )
+                continue
+            }
             out += MmsImportRow(
                 telephonyId = p.telephonyId,
                 threadId = p.threadId,
@@ -794,6 +833,7 @@ class TelephonyReader @Inject constructor(
                             partId = partId,
                             contentType = ct,
                             filename = c.getString(3),
+                            sizeBytes = partSizeBytes(partId),
                         )
                     }
                 }
@@ -850,6 +890,7 @@ class TelephonyReader @Inject constructor(
                         partId = partId,
                         contentType = ct,
                         filename = c.getString(2),
+                        sizeBytes = partSizeBytes(partId),
                     )
                 }
             }
@@ -857,7 +898,36 @@ class TelephonyReader @Inject constructor(
         return text.toString() to atts
     }
 
+    /**
+     * Round 60 — one MMS part's byte size, without reading its
+     * bytes: `openFileDescriptor` + `statSize` on the part URI.
+     * The `content://mms/part` table carries no size column (AOSP
+     * exposes `_id, mid, seq, ct, name, chset, cd, fn, cid, cl,
+     * ctt_s, ctt_t, text, _data` — no length), and `_data` is not
+     * reliably readable, so the fd's stat is the size source. 0
+     * when the fd cannot be opened or reports no size (fail-soft:
+     * a missing size must never fail the import — the row imports
+     * with size 0 exactly like before).
+     */
+    private fun partSizeBytes(partId: Long): Long = runCatching {
+        resolver.openFileDescriptor(
+            Uri.parse("content://mms/part/$partId"),
+            "r",
+        )?.use { fd ->
+            fd.statSize.takeIf { it >= 0L } ?: 0L
+        } ?: 0L
+    }.getOrDefault(0L)
+
     companion object {
+        /**
+         * Round 60 — how long a part-less MMS counts as "still
+         * downloading" (see `flushPending`): a recent one holds
+         * the import incomplete so the next sync retries it; an
+         * older one is an expired carrier stub. 7 days covers a
+         * download racing the import plus a long offline stretch.
+         */
+        internal const val ZERO_PART_RECENT_WINDOW_MS: Long = 7L * 24L * 60L * 60L * 1000L
+
         /**
          * v1.28.9 (audit de cohérence du 2026-09-14, C2) — la partie est-elle du texte que le fournisseur
          * range dans sa colonne `text` ? `PduPersister` n'y met que `text/plain` et `text/html` ; tout autre
