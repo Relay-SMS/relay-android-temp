@@ -7,6 +7,7 @@
 
 package com.relay.sms.e2e
 
+import android.content.Context
 import com.google.common.truth.Truth.assertThat
 import com.relay.sms.data.local.db.dao.ConversationDao
 import com.relay.sms.data.local.db.entity.ConversationEntity
@@ -78,9 +79,26 @@ class E2eProbeManagerTest {
         // invisible to the existing assertions.
         val mediaCapability: E2eMediaCapabilityManager = mockk(relaxed = true),
         scope: CoroutineScope,
+        // Round 58 — when true, the manager under test gets a real
+        // automatic fallback built from this harness's fakes.
+        val withAutoFallback: Boolean = false,
     ) {
         val peers = E2ePeerRepository(peerDao)
         val accountManager = E2eAccountManager(accountDao, crypto, fakeKeyManager())
+
+        val autoFallback: E2eAutoFallback? = if (withAutoFallback) {
+            E2eAutoFallback(
+                peers = peers,
+                accountManager = lazyOf(accountManager),
+                dataSmsSender = sender,
+                settings = settings,
+                blockedRepo = blocked,
+                recorder = recorder,
+                context = mockk<Context>(relaxed = true),
+            )
+        } else {
+            null
+        }
 
         val manager = E2eProbeManager(
             conversationDao = conversationDao,
@@ -92,6 +110,7 @@ class E2eProbeManagerTest {
             scope = scope,
             recorder = recorder,
             mediaCapability = mediaCapability,
+            autoFallback = autoFallback,
         )
 
         fun seedPeer(
@@ -100,6 +119,9 @@ class E2eProbeManagerTest {
             attempts: Int = 0,
             windowStartedAt: Long? = null,
             lastProbeAt: Long? = null,
+            theirCurveKey: String? = null,
+            lastBundleReplyAt: Long? = null,
+            lastAutoFallbackAt: Long? = null,
         ) {
             peerDao.peers[address] = E2ePeerEntity(
                 address = address,
@@ -107,6 +129,9 @@ class E2eProbeManagerTest {
                 probeAttempts = attempts,
                 windowStartedAt = windowStartedAt,
                 lastProbeAt = lastProbeAt,
+                theirCurveKey = theirCurveKey,
+                lastBundleReplyAt = lastBundleReplyAt,
+                lastAutoFallbackAt = lastAutoFallbackAt,
                 updatedAt = NOW,
             )
         }
@@ -184,6 +209,45 @@ class E2eProbeManagerTest {
 
         assertThat(harness.sender.sent).hasSize(1)
         assertThat(harness.sender.sent.single().address).isEqualTo(ALICE)
+    }
+
+    @Test
+    fun `onThreadOpened evaluates the automatic fallback for a stalled peer`() = runTest {
+        val harness = Harness(scope = this, withAutoFallback = true)
+        // The last probe went out 2 hours ago: the automatic probe
+        // is gated by the 24-hour interval, but the fallback's
+        // 10-second stall has passed — and their keys prove they run
+        // Relay (the 2026-11-26 stall, on the evidence side).
+        // Seeded against the REAL wall clock, not the test NOW:
+        // onThreadOpened evaluates with System.currentTimeMillis(),
+        // so a NOW-relative anchor would sit in the future and read
+        // as "not stalled yet".
+        val twoHoursAgo = System.currentTimeMillis() - 2L * 3_600_000L
+        harness.seedPeer(
+            state = E2ePeerState.PROBING,
+            // One probe sent 2 hours ago: the window is open and the
+            // 24-hour interval gates a second probe — without the
+            // window, canProbe allows immediately.
+            attempts = 1,
+            windowStartedAt = twoHoursAgo,
+            theirCurveKey = "curve",
+            lastProbeAt = twoHoursAgo,
+            lastBundleReplyAt = twoHoursAgo,
+        )
+        coEvery { harness.conversationDao.findById(11L) } returns
+            harness.conversationWith(ALICE)
+
+        harness.manager.onThreadOpened(11L)
+        testScheduler.advanceUntilIdle()
+
+        // The data-SMS probe was gated (24-hour interval); the
+        // fallback fired instead, as a regular SMS.
+        assertThat(harness.sender.sent).isEmpty()
+        assertThat(harness.sender.sentTexts).hasSize(1)
+        val sent = harness.sender.sentTexts.single()
+        assertThat(sent.address).isEqualTo(ALICE)
+        assertThat(sent.kind).isEqualTo(DataSmsKind.AUTO_FALLBACK)
+        assertThat(sent.text).startsWith(E2eHandshakeSms.MAGIC)
     }
 
     // ──────────────────────────── Eligibility ────────────────────────────

@@ -906,16 +906,22 @@ class ThreadViewModel @Inject constructor(
                     }
                 }
             }
-            // E2E — probe on thread open (design §2.4): opening a 1:1
-            // thread is intent to talk, so the key exchange starts here
-            // and the first message is usually encrypted already. Once
-            // per ViewModel (the row re-emits on every message). Hub
-            // mode only: a linked device holds no identity keys and
-            // must never probe. The manager gates the rest itself
-            // (probeable number, budget, state). The four-way gate
-            // reads as one named condition (and keeps the `if` under
-            // Detekt's complexity ceiling).
-            val e2eShouldProbe = conv != null && !conv.isGroup && !e2eProbeOnOpenDone &&
+            // E2E — probe on thread open (design §2.4): opening a
+            // thread is intent to talk, so the key exchange starts
+            // here and the first message is usually encrypted
+            // already. Once per ViewModel (the row re-emits on every
+            // message). Hub mode only: a linked device holds no
+            // identity keys and must never probe. A 1:1 thread
+            // probes its peer; a group thread probes each member
+            // who is not already ENCRYPTED (round 58 — group
+            // encryption rides on the pairwise sessions, so a
+            // member whose 1:1 handshake never started blocks the
+            // group, and the open is the moment to start it). The
+            // manager dispatches on the conversation and gates the
+            // rest itself (probeable number, budget, state). The
+            // three-way gate reads as one named condition (and
+            // keeps the `if` under Detekt's complexity ceiling).
+            val e2eShouldProbe = conv != null && !e2eProbeOnOpenDone &&
                 settings.state.value.mode != DeviceMode.CLIENT
             if (e2eShouldProbe) {
                 e2eProbeOnOpenDone = true
@@ -929,13 +935,15 @@ class ThreadViewModel @Inject constructor(
             // under round 46 never got its second ACTIVATED pill
             // (round 47's recordActivated only runs on a new bundle
             // or encrypted message), so its latest pill still says
-            // "Encryption ended" while encryption is working. Same
-            // once-per-ViewModel, 1:1-only, hub-only gate as the
-            // probe above — a linked device holds no peer rows of
-            // its own and receives its notices from the hub. The
-            // backfill itself is self-limiting (after the insert
-            // the latest notice is ACTIVATED), so the guard only
-            // stops the redundant reads on later row emissions.
+            // "Encryption ended" while encryption is working. The
+            // backfill itself stays 1:1-only (it reads the single
+            // peer row), on the same once-per-ViewModel, hub-only
+            // gate as the probe above — a linked device holds no
+            // peer rows of its own and receives its notices from
+            // the hub. The backfill itself is self-limiting (after
+            // the insert the latest notice is ACTIVATED), so the
+            // guard only stops the redundant reads on later row
+            // emissions.
             val e2eShouldBackfill = conv != null && !conv.isGroup &&
                 !e2eBackfillOnOpenDone &&
                 settings.state.value.mode != DeviceMode.CLIENT

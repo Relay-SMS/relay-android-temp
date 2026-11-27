@@ -983,6 +983,23 @@ object Migrations {
         }
     }
 
+    /**
+     * Round 58 — gated automatic `RLYH:` fallback (design §2.4):
+     * one nullable column on `e2e_peers`
+     * (`last_auto_fallback_at`), the epoch ms of the last
+     * automatic fallback probe sent to the peer. Strictly
+     * additive: existing peer rows project NULL = no fallback
+     * ever sent, so the fallback's own cap (one per 24 hours)
+     * starts unspent for every peer.
+     */
+    val MIGRATION_26_27: Migration = object : Migration(26, 27) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(
+                "ALTER TABLE `e2e_peers` ADD COLUMN `last_auto_fallback_at` INTEGER",
+            )
+        }
+    }
+
     /** All migrations registered in [DatabaseFactory]. Append new ones here in version order. */
     val ALL: Array<Migration> = arrayOf(
         MIGRATION_1_2,
@@ -1010,5 +1027,6 @@ object Migrations {
         MIGRATION_23_24,
         MIGRATION_24_25,
         MIGRATION_25_26,
+        MIGRATION_26_27,
     )
 }

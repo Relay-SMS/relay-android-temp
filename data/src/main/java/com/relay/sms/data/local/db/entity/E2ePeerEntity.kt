@@ -58,6 +58,16 @@ import androidx.room.PrimaryKey
  * combined packet when any flag is unset. The group bit alone no
  * longer implies group media: a round-49 build is group-capable
  * but never group-media-capable.
+ *
+ * Round 58 (schema v27) — gated automatic `RLYH:` fallback
+ * (design §2.4): [lastAutoFallbackAt] is the epoch ms of the last
+ * automatic fallback probe sent to this peer (a regular-SMS
+ * `RLYH:` probe, sent only when the peer provably runs Relay and
+ * the data-SMS handshake is stalled), null when none was ever
+ * sent. The fallback's own cap (one per 24 hours) reads it — it
+ * is deliberately separate from the data-SMS probe budget
+ * ([probeAttempts] / [lastProbeAt]), which an automatic fallback
+ * never consumes.
  */
 @Entity(tableName = "e2e_peers")
 data class E2ePeerEntity(
@@ -85,6 +95,15 @@ data class E2ePeerEntity(
     @ColumnInfo(name = "window_started_at") val windowStartedAt: Long? = null,
     /** Epoch ms of the last bundle reply sent to this peer, null if never replied. */
     @ColumnInfo(name = "last_bundle_reply_at") val lastBundleReplyAt: Long? = null,
+    /**
+     * Round 58 — epoch ms of the last AUTOMATIC fallback probe sent
+     * to this peer (a regular-SMS `RLYH:` probe, only ever sent when
+     * the peer provably runs Relay and the data-SMS handshake is
+     * stalled), null if none was ever sent. The fallback's own cap
+     * (one per 24 hours) reads it; the data-SMS probe budget never
+     * does — an automatic fallback never consumes probe attempts.
+     */
+    @ColumnInfo(name = "last_auto_fallback_at") val lastAutoFallbackAt: Long? = null,
     /**
      * Round 48 — true once this peer's phone declared it handles
      * encrypted media (the 0x03 capability packet). False by

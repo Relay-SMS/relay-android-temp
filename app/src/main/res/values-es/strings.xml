@@ -5,7 +5,7 @@
     <string name="app_name">Relay</string>
 
     <!-- v1.3.7 — First-launch splash screen (animated logo + tagline). -->
-    <string name="splash_tagline">La app que no lee sus mensajes y respeta su privacidad.</string>
+    <string name="splash_tagline">Mensajería privada y sin anuncios. Sin rastreadores ni analíticas. Sus mensajes siguen siendo suyos.</string>
     <string name="splash_logo_content_description">Logotipo de Relay</string>
     <string name="splash_skip_hint">Toque la pantalla para continuar</string>
     <string name="splash_skip_label">Omitir la pantalla de inicio</string>

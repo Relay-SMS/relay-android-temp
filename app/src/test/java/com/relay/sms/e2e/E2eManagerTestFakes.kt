@@ -147,6 +147,13 @@ internal class FakeE2ePeerDao : E2ePeerDao {
         }
     }
 
+    // Round 58 — automatic fallback cap column.
+    override suspend fun recordAutoFallback(address: String, lastAutoFallbackAt: Long, updatedAt: Long) {
+        peers[address]?.let {
+            peers[address] = it.copy(lastAutoFallbackAt = lastAutoFallbackAt, updatedAt = updatedAt)
+        }
+    }
+
     // Round 48 — media capability columns.
     override suspend fun setMediaCapable(address: String, mediaCapable: Boolean, updatedAt: Long) {
         peers[address]?.let {
@@ -202,6 +209,9 @@ internal class FakeE2ePeerDao : E2ePeerDao {
                 windowStartedAt = null,
                 lastProbeAt = null,
                 lastBundleReplyAt = null,
+                // Round 58 — mirrors the DAO's UPDATE: the
+                // automatic fallback's own cap clears too.
+                lastAutoFallbackAt = null,
                 state = if (peer.state == E2ePeerState.ENCRYPTED) {
                     E2ePeerState.ENCRYPTED
                 } else {

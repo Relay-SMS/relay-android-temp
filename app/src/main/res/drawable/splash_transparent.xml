@@ -5,6 +5,14 @@
   un drawable transparent, le cercle reste invisible et seul le `windowSplashScreenBackground`
   (couleur unie) flashe brièvement avant que l'Activity ne prenne la main. La Compose
   SplashScreen (fade-in première ouverture) reste responsable du logo carré + texte.
+
+  Round 58 — remis en service comme `windowSplashScreenAnimatedIcon` dans les
+  deux `Theme.Relay.Splash` : à la première ouverture, le logo statique du
+  splash système apparaissait puis l'animation Lottie — deux logos d'affilée.
+  Maintenant seul le fond flashe et le premier (et unique) logo est l'animation.
+  Un conditionnel par lancement (transparent à la 1ʳᵉ ouverture, logo ensuite)
+  est impossible : l'icône est résolue depuis le thème statique du manifeste
+  par le système avant tout code applicatif.
 -->
 <shape xmlns:android="http://schemas.android.com/apk/res/android"
     android:shape="rectangle">

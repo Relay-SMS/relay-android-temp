@@ -15,6 +15,7 @@ import androidx.lifecycle.viewModelScope
 import com.relay.sms.core.crypto.wipe
 import com.relay.sms.data.blocking.BlockedNumbersImporter
 import com.relay.sms.data.local.datastore.SettingsRepository
+import com.relay.sms.data.local.datastore.SplashShownStore
 import com.relay.sms.data.sms.DefaultSmsAppManager
 import com.relay.sms.domain.repository.ConversationRepository
 import com.relay.sms.domain.settings.AppSettings
@@ -274,6 +275,11 @@ class SettingsViewModel @Inject constructor(
      */
     fun resetAll() = viewModelScope.launch {
         settings.update { AppSettings(security = it.security) }
+        // Round 58 — the synchronous splash mirror follows the
+        // DataStore flag: without this clear the next launch would
+        // show the loading logo before the first-open intro (a
+        // double logo).
+        SplashShownStore.clear(context)
     }
 
     /**

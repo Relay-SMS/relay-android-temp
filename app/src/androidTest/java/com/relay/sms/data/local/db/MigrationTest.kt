@@ -1513,4 +1513,37 @@ class MigrationTest {
             assertThat(c.getInt(1)).isEqualTo(1)
         }
     }
+
+    @Test
+    fun migrate26To27_addsAutoFallbackColumn_nullOnExistingRows() {
+        helper.createDatabase(TEST_DB, 26).use { db ->
+            db.execSQL(
+                "INSERT INTO e2e_peers (address, state, updated_at) " +
+                    "VALUES ('6108423232', 'PROBING', 1000)",
+            )
+        }
+
+        val db = helper.runMigrationsAndValidate(TEST_DB, 27, true, Migrations.MIGRATION_26_27)
+
+        // La ligne existante survit ; sa colonne auto-fallback
+        // projette NULL = aucun fallback envoyé, donc le plafond
+        // part non consommé.
+        db.query(
+            "SELECT last_auto_fallback_at FROM e2e_peers WHERE address = '6108423232'",
+        ).use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.isNull(0)).isTrue()
+        }
+
+        // La nouvelle colonne s'écrit et se relit.
+        db.execSQL(
+            "UPDATE e2e_peers SET last_auto_fallback_at = 2000 WHERE address = '6108423232'",
+        )
+        db.query(
+            "SELECT last_auto_fallback_at FROM e2e_peers WHERE address = '6108423232'",
+        ).use { c ->
+            assertThat(c.moveToFirst()).isTrue()
+            assertThat(c.getLong(0)).isEqualTo(2000L)
+        }
+    }
 }

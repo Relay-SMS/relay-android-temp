@@ -100,6 +100,16 @@ enum class DataSmsKind(val failureTag: String) {
     BUNDLE("e2e-bundle-send"),
 
     /**
+     * Round 58 — an automatic fallback probe (a regular-SMS
+     * `RLYH:` probe sent by [E2eAutoFallback] when the data-SMS
+     * handshake with a peer that provably runs Relay is stalled).
+     * The same wire format as a manual probe, but its own kind so
+     * a failed or accepted fallback send is separable from an
+     * ordinary probe in the error log.
+     */
+    AUTO_FALLBACK("e2e-auto-fallback-send"),
+
+    /**
      * Round 54 — one fragment of a group media key message (an
      * `RLY1:` fragment of a GROUP_MEDIA_KEY payload, regular SMS
      * only). Unlike [MEDIA_KEY], the fragments are built by the

@@ -10,6 +10,7 @@ package com.relay.sms
 
 import android.Manifest
 import android.content.ContentResolver
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -32,6 +33,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.repeatOnLifecycle
 import com.relay.sms.data.local.datastore.SettingsRepository
+import com.relay.sms.data.local.datastore.SplashShownStore
 import com.relay.sms.domain.settings.AppSettings
 import com.relay.sms.domain.settings.DeviceMode
 import com.relay.sms.ownnumber.OwnNumberAutoFill
@@ -43,6 +45,8 @@ import com.relay.sms.system.notifications.SafetyCallIntentToken
 import com.relay.sms.system.notifications.SafetyCallWarningNotifier
 import com.relay.sms.system.share.IncomingShareHolder
 import com.relay.sms.ui.AppRoot
+import com.relay.sms.ui.screens.splash.LoadingLogo
+import com.relay.sms.ui.screens.splash.shouldShowLoadingLogo
 import com.relay.sms.ui.security.keepSelectedTextInApp
 import com.relay.sms.ui.theme.RelayTheme
 import dagger.hilt.android.AndroidEntryPoint
@@ -270,13 +274,18 @@ class MainActivity : FragmentActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        // v1.24.0 SEC-CRIT — the splash also covers the one-shot database repair
-        // ([LegacyZeroKeyRekey]). On the single launch that rebuilds a legacy zero-key database
-        // that work takes seconds; showing an empty conversation list meanwhile would look like
-        // data loss. `settled` flips even when the repair fails, so this can never pin the splash.
-        installSplashScreen().setKeepOnScreenCondition {
-            initialSettings.value == null || !databaseRepairState.settled.value
-        }
+        // Round 58 — the loading-logo swap: the system splash no longer
+        // waits for the settings read + database repair. It used to
+        // (v1.24.0 SEC-CRIT) so the one-shot zero-key rebuild — seconds
+        // on that single launch — would not show an empty conversation
+        // list (which would look like data loss). The loading screen
+        // below replaces it: while `initialSettings` is null or the
+        // repair is unsettled, the Compose tree shows the animated
+        // logo (later opens) or a plain background (first open), and
+        // `AppRoot` still refuses to compose the list until
+        // `databaseReady` — so the empty list never appears, and the
+        // splash simply fades on the first frame.
+        installSplashScreen()
         // Hilt injects @Inject lateinit properties inside super.onCreate via the @AndroidEntryPoint
         // bytecode transform. We must call super FIRST before touching `settings` or `appLock`.
         super.onCreate(savedInstanceState)
@@ -300,9 +309,22 @@ class MainActivity : FragmentActivity() {
 
         enableEdgeToEdge()
 
-        // Resolve the initial AppSettings asynchronously. The splash screen stays visible until
-        // `initialSettings` flips to a non-null value (see `setKeepOnScreenCondition` above), so
-        // there is no visual flash to default theme / accent during the read.
+        // Round 58 — the loading-logo swap: whether the first-open
+        // intro has already been shown, read SYNCHRONOUSLY (see
+        // `SplashShownStore` — the DataStore flag cannot answer
+        // before the first frame, and the loading window IS that
+        // read). Constant for this activity's lifetime: the flag is
+        // only written once the intro is dismissed, which happens
+        // after loading completes.
+        val splashShownStore = SplashShownStore(
+            getSharedPreferences(SplashShownStore.PREFS_NAME, Context.MODE_PRIVATE),
+        )
+        val splashAlreadyShown = splashShownStore.isShown
+
+        // Resolve the initial AppSettings asynchronously. The loading
+        // screen below covers the read (animated logo on later opens,
+        // plain background on the first), so there is no visual flash
+        // to default theme / accent during it.
         lifecycleScope.launch {
             // v1.28.3 (F31a) — `first()` sur un flux qui se TERMINE SANS EMETTRE leve une
             // `NoSuchElementException`, et rien ne l'attrapait : le lancement se soldait par un
@@ -320,6 +342,38 @@ class MainActivity : FragmentActivity() {
                 .onFailure { timber.log.Timber.w(it, "Reglages illisibles au lancement — theme par defaut") }
                 .getOrNull()
                 ?: AppSettings()
+            // Round 58 — the cold-start permission dialogs must not fire
+            // while the first-open splash is still playing: the splash
+            // only dismisses on tap/back, and the dialogs stacked over
+            // the logo animation so the user missed it entirely. Wait
+            // for the splash flag (written by
+            // SplashViewModel.markShown() on dismiss); on later opens
+            // it is already true and this returns immediately.
+            // Fail-open: if the settings read fails, ask as before
+            // rather than never asking. Cancellation is rethrown, never
+            // swallowed: this runs in lifecycleScope and the activity
+            // may be destroyed while waiting for the tap.
+            val splashShown = try {
+                settings.flow.first { it.advanced.splashShown }
+                // Round 58 — the loading-logo swap: record the intro
+                // as shown in the synchronous mirror. This is the
+                // write site (not `SplashViewModel.markShown`, which
+                // only writes the DataStore flag): this coroutine
+                // already waits for exactly that flag, so on every
+                // cold start it re-syncs the mirror — if the two ever
+                // diverge (a process death between the two writes),
+                // the next launch heals it. Written ONLY when the
+                // flag was actually observed `true`: on a read failure
+                // the catch below must NOT mark it shown, or a
+                // first-open intro would be preceded by the loading
+                // logo.
+                splashShownStore.setShown()
+                true
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Exception) {
+                true
+            }
             // v1.3.10 — fail-safe contre le bug Samsung One UI Android 10
             // où GRANTED_BY_ROLE ne grant pas les permissions runtime
             // critiques malgré que Relay soit role holder. On demande
@@ -329,9 +383,11 @@ class MainActivity : FragmentActivity() {
             // Client mode — the request waits for this settings read so
             // the mode is the stored one, not the default: a linked
             // device is only asked for notifications.
-            requestMissingCriticalPermissionsIfAny(
-                initialSettings.value?.mode ?: DeviceMode.HUB,
-            )
+            if (splashShown) {
+                requestMissingCriticalPermissionsIfAny(
+                    initialSettings.value?.mode ?: DeviceMode.HUB,
+                )
+            }
         }
 
         // The actual lock-state resolution still happens lazily — receivers / services call
@@ -393,14 +449,31 @@ class MainActivity : FragmentActivity() {
         )
 
         setContent {
-            // While the async settings read is in flight, `initialSettings.value` is null and
-            // the splash screen masks the Compose tree. We render the defaults under the splash
-            // so the first composition is ready the moment the splash clears.
-            val seed = initialSettings.collectAsStateWithLifecycle().value ?: AppSettings()
+            // Round 58 — the loading-logo swap: the system splash no
+            // longer masks the Compose tree (see `installSplashScreen`
+            // above), so while the async settings read is in flight
+            // (`initialSettings` null) or the one-shot database
+            // repair is unsettled, this renders the loading screen:
+            // the animated logo on later opens, a plain background
+            // on the first open (a logo there would precede the
+            // intro — a double logo). The defaults are still rendered
+            // under it so the first composition is ready the moment
+            // loading completes.
+            val initial = initialSettings.collectAsStateWithLifecycle().value
+            val seed = initial ?: AppSettings()
             val current by settings.flow.collectAsStateWithLifecycle(initialValue = seed)
+            val repairSettled by databaseRepairState.settled.collectAsStateWithLifecycle()
+            val isLoading = initial == null || !repairSettled
             RelayTheme(appearance = current.appearance) {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    AppRoot()
+                    if (shouldShowLoadingLogo(isLoading, splashAlreadyShown)) {
+                        LoadingLogo()
+                    } else if (!isLoading) {
+                        AppRoot()
+                    }
+                    // First open while loading: nothing renders here —
+                    // the bare surface background is the loading
+                    // screen (a logo would precede the intro).
                     // v1.4.1 — the v1.3.10 [OemKeepAliveOnboarding] auto-popup was removed
                     // here because it surprised users on Xiaomi / Redmi who tapped "Activer"
                     // without realising it would create a permanent system notification

@@ -297,8 +297,23 @@ fun ConversationsScreen(
     // triggers no telephony sync (its messages arrive from the hub).
     // The mode is a key too, so a switch back to hub re-runs the
     // permission + import trigger.
-    androidx.compose.runtime.LaunchedEffect(state.isDefaultSmsApp, state.settings.mode) {
-        if (state.isDefaultSmsApp && state.settings.mode != DeviceMode.CLIENT) {
+    // Round 58 — the permission dialogs must not fire while the first-open
+    // splash is still playing: this screen composes underneath the splash
+    // overlay, so the request stacked over the logo animation and the user
+    // missed it. Gate on the splash flag (written by
+    // SplashViewModel.markShown() on tap/back); it is a key too, so the
+    // effect re-runs when the splash is dismissed. The re-grant paths are
+    // unaffected: the GRANTED_BY_ROLE else-branch below still calls
+    // requestSyncNow() once the gate opens, and the ON_RESUME re-check
+    // below still re-runs the import after a grant from Settings.
+    androidx.compose.runtime.LaunchedEffect(
+        state.isDefaultSmsApp,
+        state.settings.mode,
+        state.settings.advanced.splashShown,
+    ) {
+        if (state.isDefaultSmsApp && state.settings.mode != DeviceMode.CLIENT &&
+            state.settings.advanced.splashShown
+        ) {
             val needed = listOf(
                 android.Manifest.permission.READ_SMS,
                 android.Manifest.permission.RECEIVE_SMS,

@@ -112,6 +112,12 @@ class E2eHandshakeHandler @Inject constructor(
     // handler tests — which construct the handler by hand — keep
     // compiling untouched; Hilt always provides the real notifier.
     private val activatedNotifier: com.relay.sms.system.notifications.E2eActivatedNotifier? = null,
+    // Round 58 — the gated automatic `RLYH:` fallback
+    // ([E2eAutoFallback]): armed when a bundle reply is sent (see
+    // [handleProbe]) or a bundle arrives without a session (see
+    // [handleBundle]). Same nullable-default precedent as the
+    // notifier above; Hilt always provides the real fallback.
+    private val autoFallback: E2eAutoFallback? = null,
 ) {
 
     /**
@@ -360,6 +366,13 @@ class E2eHandshakeHandler @Inject constructor(
         // failed send must not consume the day's reply.
         if (!sent) return false
         peers.recordBundleReply(address, now)
+        // Round 58 — the automatic fallback: a bundle reply means
+        // their probe reached us and we answered, so if the session
+        // never establishes (their data SMS drop), the fallback
+        // fires ~10 seconds from now. Arming is the handler's job
+        // because only it knows a bundle reply went out; the worker
+        // re-checks the gate at run time before sending anything.
+        autoFallback?.schedule(address)
         // Handing a key out published the whole batch: top the pool
         // back up (and re-save the Account pickle).
         account.generateOneTimeKeys()
@@ -436,6 +449,17 @@ class E2eHandshakeHandler @Inject constructor(
                 "Outbound session creation failed for $address " +
                     "(${it.javaClass.simpleName}); peer stays ${peer?.state ?: "unknown"}.",
             )
+            // Round 58 — the automatic fallback: their bundle
+            // arrived (proof they run Relay — the keys are in the
+            // peer row) but no session could be created, so the
+            // handshake is stalled with the evidence already in
+            // place. Arm the 10-second check: the fallback probe
+            // (regular SMS) can restart the exchange where data
+            // SMS failed. Not armed on account-load failure (the
+            // account itself is broken, so no probe could be sent)
+            // or on a duplicate bundle (the session already
+            // exists).
+            autoFallback?.schedule(address)
             Timber.w(it, "E2E: outbound session creation failed")
             return false
         }

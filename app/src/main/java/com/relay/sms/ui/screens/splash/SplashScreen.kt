@@ -91,6 +91,13 @@ import java.util.concurrent.atomic.AtomicBoolean
  * timer, et l'utilisateur atterrissait sur la liste sans avoir pu taper —
  * le splash ne part plus que sur tap ou retour, jamais tout seul.
  *
+ * Round 58 — les dialogues de permission attendent la sortie du splash
+ * (cf. `MainActivity` + `ConversationsScreen`) : ils s'empilaient sur
+ * l'animation du logo et l'utilisateur la ratait entièrement. Le gap
+ * logo→"Relay" passe de 24 dp à 12 dp (demande utilisatrice), et l'icône
+ * du splash système redevient transparente (`splash_transparent.xml`) :
+ * à la première ouverture, seul le fond flashe avant l'animation.
+ *
  * **Couleur du logo** : l'animation d'origine est d'un blanc fixe ; le blanc
  * est invisible sur le thème clair (surface ≈ blanche), donc une seconde
  * variante existe : `relay_splash_logo_light.json`, copie exacte du fichier
@@ -306,7 +313,10 @@ fun SplashScreen(
                         contentDescription = logoDescription
                     },
             )
-            Spacer(modifier = Modifier.height(24.dp))
+            // Round 58 (Kristin, device test) — the logo→"Relay" gap was
+            // too wide; halved from 24 dp to 12 dp. The 12 dp spacer
+            // below ("Relay"→tagline) is unchanged.
+            Spacer(modifier = Modifier.height(12.dp))
             Text(
                 text = stringResource(R.string.app_name),
                 style = MaterialTheme.typography.headlineMedium.copy(fontWeight = FontWeight.SemiBold),
@@ -359,10 +369,12 @@ private const val HINT_FINAL_ALPHA = 0.6f
 // canvas 500×500 (mesuré dans animation.json, image finale) ; l'ancienne
 // marque statique avait ~120 dp de présence. La boîte fait 240 dp et le
 // contenu rendu est agrandi par `lottieMarkScale` pour retrouver ces 120 dp.
-private const val LOTTIE_BOX_DP = 240f
-private const val LOTTIE_MARK_FRACTION = 107f / 500f
-private const val LOTTIE_TARGET_MARK_DP = 120f
-private val LOTTIE_MARK_SCALE =
+// Round 58 — `internal`, pas `private` : `LoadingLogo` partage la même
+// boîte et la même échelle (une seule source de vérité pour la taille).
+internal const val LOTTIE_BOX_DP = 240f
+internal const val LOTTIE_MARK_FRACTION = 107f / 500f
+internal const val LOTTIE_TARGET_MARK_DP = 120f
+internal val LOTTIE_MARK_SCALE =
     lottieMarkScale(LOTTIE_BOX_DP, LOTTIE_MARK_FRACTION, LOTTIE_TARGET_MARK_DP)
 
 /**

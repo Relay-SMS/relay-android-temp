@@ -419,6 +419,21 @@ class E2ePeerRepository @Inject constructor(
         peerDao.recordBundleReply(key, now, now)
     }
 
+    /**
+     * Round 58 — records an automatic fallback probe sent to this
+     * peer (a regular-SMS `RLYH:` probe). Call AFTER the radio
+     * accepted the send — a failed send must not consume the
+     * fallback's own cap (one per 24 hours, read from this
+     * timestamp). The data-SMS probe budget is untouched: an
+     * automatic fallback never consumes probe attempts and never
+     * flips the peer to NOT_RELAY.
+     */
+    suspend fun recordAutoFallback(address: String, now: Long = System.currentTimeMillis()) {
+        val key = canonicalAddress(address)
+        getOrCreateUnknown(key, now)
+        peerDao.recordAutoFallback(key, now, now)
+    }
+
     /** Verified contacts, most recently updated first (Settings → Verified contacts). */
     suspend fun verifiedPeers(): List<E2ePeerEntity> = peerDao.verifiedPeers()
 
@@ -431,9 +446,12 @@ class E2ePeerRepository @Inject constructor(
      * away instead of waiting out the 24-hour bundle rate limit
      * or the 30-day probe window. Keys, sessions, verified flags
      * and ENCRYPTED states are untouched — a working pair stays
-     * encrypted and verified. The reset runs on THIS phone only:
-     * the partner pair's blocker is the partner's bundle rate
-     * limit, so the reset must be run on that phone too.
+     * encrypted and verified. Round 58 — the automatic fallback's
+     * own cap (last fallback time) is cleared too: otherwise a
+     * reset would leave the fallback gated for 24 hours and the
+     * re-test could not exercise it. The reset runs on THIS phone
+     * only: the partner pair's blocker is the partner's bundle
+     * rate limit, so the reset must be run on that phone too.
      */
     suspend fun resetEncryptionTiming(now: Long = System.currentTimeMillis()) {
         peerDao.resetTiming(now)

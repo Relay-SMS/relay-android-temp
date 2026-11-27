@@ -57,6 +57,7 @@ class E2eHandshakeHandlerTest {
         blocked: Set<String> = emptySet(),
         cryptoOverride: E2eCrypto? = null,
         accountManagerOverride: dagger.Lazy<E2eAccountManager>? = null,
+        autoFallback: E2eAutoFallback? = null,
     ) {
         val aliceCrypto = FakeE2eCrypto("alice")
         val bobCrypto = FakeE2eCrypto("bob")
@@ -105,6 +106,7 @@ class E2eHandshakeHandlerTest {
             recorder = recorder,
             mediaCapability = mediaCapability,
             groupSessions = groupSessions,
+            autoFallback = autoFallback,
         )
 
         init {
@@ -173,6 +175,30 @@ class E2eHandshakeHandlerTest {
             b64.encodeToString(harness.bobCrypto.identityKeys().ed25519),
         )
         assertThat(peer?.lastBundleReplyAt).isEqualTo(NOW)
+    }
+
+    @Test
+    fun `a bundle reply arms the automatic fallback check`() = runTest {
+        val autoFallback = mockk<E2eAutoFallback>(relaxed = true)
+        val harness = Harness(autoFallback = autoFallback)
+
+        val handled = harness.handler.handleDataSms(BOB, harness.probeFrom(harness.bobCrypto), 3, NOW)
+
+        assertThat(handled).isTrue()
+        assertThat(harness.sender.sent).hasSize(1)
+        verify(exactly = 1) { autoFallback.schedule(BOB) }
+    }
+
+    @Test
+    fun `a failed bundle reply does not arm the automatic fallback check`() = runTest {
+        val autoFallback = mockk<E2eAutoFallback>(relaxed = true)
+        val harness = Harness(autoFallback = autoFallback)
+        harness.sender.result = false
+
+        val handled = harness.handler.handleDataSms(BOB, harness.probeFrom(harness.bobCrypto), 3, NOW)
+
+        assertThat(handled).isFalse()
+        verify(exactly = 0) { autoFallback.schedule(any()) }
     }
 
     @Test

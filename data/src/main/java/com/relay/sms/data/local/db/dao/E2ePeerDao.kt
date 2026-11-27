@@ -223,6 +223,22 @@ interface E2ePeerDao {
     suspend fun recordBundleReply(address: String, lastBundleReplyAt: Long, updatedAt: Long)
 
     /**
+     * Round 58 — records an automatic fallback probe sent to this
+     * peer (a regular-SMS `RLYH:` probe). The caller checks the
+     * fallback's own cap first (one per 24 hours, read from this
+     * column); this only persists the send time. Targeted UPDATE,
+     * like the other peer writes.
+     */
+    @Query(
+        """
+        UPDATE e2e_peers
+           SET last_auto_fallback_at = :lastAutoFallbackAt, updated_at = :updatedAt
+         WHERE address = :address
+        """,
+    )
+    suspend fun recordAutoFallback(address: String, lastAutoFallbackAt: Long, updatedAt: Long)
+
+    /**
      * Round 43 — testing/diagnostic reset (Settings → Advanced):
      * clears the probe-budget and bundle-reply timing for EVERY
      * peer (attempt counts, window starts, last-probe and
@@ -242,6 +258,7 @@ interface E2ePeerDao {
         UPDATE e2e_peers
            SET probe_attempts = 0, window_started_at = NULL,
                last_probe_at = NULL, last_bundle_reply_at = NULL,
+               last_auto_fallback_at = NULL,
                state = CASE WHEN state = 'ENCRYPTED' THEN 'ENCRYPTED' ELSE 'UNKNOWN' END,
                updated_at = :updatedAt
         """,

@@ -10,16 +10,25 @@
 
     <!-- Splash screen (androidx.core.splashscreen compat for API 26-30) -->
     <!--
-        Round 41 — the splash shows just the logo, centred, on the theme
-        background (no blue fill): the mark is brand blue in light mode
-        and white in dark mode (drawable-night). The Android 12 splash
-        masks the icon to a 192dp circle (2/3 of the 288dp icon), so the
-        mark in ic_splash_logo is sized to fit inside it. Replaces the
-        v1.14.7 transparent icon (splash_transparent.xml, now unused).
+        Round 58 — the OS splash icon is transparent again (v1.14.7
+        splash_transparent.xml): on first load the user used to see the
+        static logo here and THEN the animated Lottie in the Compose
+        splash — two logos in a row, which reads as a glitch. Now only
+        the theme background flashes, and the first (and only) logo is
+        the animation. A per-launch conditional (transparent on first
+        load, logo afterwards) is not possible: the icon is resolved
+        from this static manifest theme by the system before any app
+        code runs, so later cold starts show the background flash too
+        instead of the logo. The static drawable stays in the tree
+        (ic_splash_logo.xml) — it is no longer referenced by the
+        theme. (Round 41 had put the logo here, replacing the v1.14.7
+        transparent icon; the Android 12 splash masks the icon to a
+        192dp circle, so the mark in ic_splash_logo was sized to fit
+        inside it.)
     -->
     <style name="Theme.Relay.Splash" parent="Theme.SplashScreen">
         <item name="windowSplashScreenBackground">@color/md_theme_light_background</item>
-        <item name="windowSplashScreenAnimatedIcon">@drawable/ic_splash_logo</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/splash_transparent</item>
         <item name="postSplashScreenTheme">@style/Theme.Relay</item>
         <item name="android:windowLightStatusBar" tools:targetApi="m">true</item>
     </style>

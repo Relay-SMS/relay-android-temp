@@ -7,7 +7,9 @@
 
 package com.relay.sms.e2e
 
+import com.relay.sms.core.ext.canonicalPhone
 import com.relay.sms.data.local.db.dao.ConversationDao
+import com.relay.sms.data.sms.SimSelfNumber
 import com.relay.sms.di.ApplicationScope
 import com.relay.sms.domain.model.PhoneAddress
 import com.relay.sms.domain.repository.BlockedNumberRepository
@@ -26,11 +28,15 @@ import com.relay.sms.data.local.db.entity.E2ePeerState as StoredPeerState
  * "Relay to Relay auto-encrypts".
  *
  * A probe is a 70-byte data SMS carrying our identity keys. It goes out
- * on two triggers — opening a 1:1 thread ([onThreadOpened]) and sending
- * a 1:1 message ([probeForSend]) — for a peer in state UNKNOWN,
- * PROBING, or NOT_RELAY, gated by the probe budget (at most 3 attempts
- * per 30 days, at least 24 hours apart, owned by
- * [E2ePeerRepository]) and by eligibility ([E2eProbePolicy]: 1:1 only,
+ * on three triggers — opening a 1:1 thread ([onThreadOpened]) and sending
+ * a 1:1 message ([probeForSend]) — plus, since round 58, opening a
+ * GROUP thread ([onThreadOpened] group branch, [probeGroupMembers]):
+ * group encryption rides on the pairwise sessions, so each member who
+ * is not already ENCRYPTED gets one probe through the same per-address
+ * path (same budget, toggle, blocked/invalid gates). The probe is for
+ * a peer in state UNKNOWN, PROBING, or NOT_RELAY, gated by the probe
+ * budget (at most 3 attempts per 30 days, at least 24 hours apart,
+ * owned by [E2ePeerRepository]) and by eligibility ([E2eProbePolicy]:
  * real phone number, not blocked).
  *
  * On the state gate: the design's trigger text names UNKNOWN /
@@ -136,9 +142,10 @@ import com.relay.sms.data.local.db.entity.E2ePeerState as StoredPeerState
  *
  * All entry points are fire-and-forget (non-suspend, own scope): a
  * probe must never delay opening a thread or sending a message. The
- * suspend cores ([probeConversation], [probeAddress]) are the testable
- * surface. Probes serialize on one mutex: a thread-open racing a send
- * must not spend two attempts on the same peer.
+ * suspend cores ([probeConversation], [probeAddress],
+ * [probeGroupMembers]) are the testable surface. Probes serialize on
+ * one mutex: a thread-open racing a send must not spend two attempts
+ * on the same peer.
  *
  * The account manager is taken lazily: resolving it provisions
  * [E2eCrypto] (the first native call loads the crypto library, and
@@ -211,6 +218,9 @@ enum class ProbeTrigger(val label: String) {
     /** Opening a 1:1 thread ([E2eProbeManager.onThreadOpened]). */
     THREAD_OPEN("thread-open"),
 
+    /** Opening a group thread ([E2eProbeManager.probeGroupMembers]). */
+    GROUP_THREAD_OPEN("group-thread-open"),
+
     /** Sending a 1:1 message ([E2eProbeManager.probeForSend]). */
     SEND("send"),
 
@@ -232,6 +242,20 @@ class E2eProbeManager @Inject constructor(
     @ApplicationScope private val scope: CoroutineScope,
     private val recorder: E2eFailureRecorder,
     private val mediaCapability: E2eMediaCapabilityManager,
+    // Round 58 — the gated automatic `RLYH:` fallback
+    // ([E2eAutoFallback]): the thread-open evaluation backstop
+    // (see [onThreadOpened]). Nullable with a null default so the
+    // existing manager tests — which construct the manager by hand
+    // — keep compiling untouched; Hilt always provides the real
+    // fallback.
+    private val autoFallback: E2eAutoFallback? = null,
+    // Round 58 — group-thread probing ([probeGroupMembers]) needs
+    // our own number to exclude it from the member list (settings
+    // first, SIM fallback — the same order as
+    // [E2eGroupSessionManager.ownNumber]). Nullable with a null
+    // default, same reason as [autoFallback]; Hilt always
+    // provides the real one.
+    private val simSelfNumber: SimSelfNumber? = null,
 ) {
     private val probeMutex = Mutex()
 
@@ -247,15 +271,125 @@ class E2eProbeManager @Inject constructor(
     }
 
     /**
-     * Thread-open trigger (design §2.4): opening a 1:1 thread is intent
+     * Thread-open trigger (design §2.4): opening a thread is intent
      * to talk, so the session is usually live by the time the user hits
      * send. Called by the thread ViewModel; non-suspend by contract.
+     * The ViewModel gates it once per ViewModel and hub-only; this
+     * function dispatches on the conversation: a 1:1 thread probes
+     * its single peer ([probeConversation]), a group thread probes
+     * each member who is not already ENCRYPTED ([probeGroupMembers])
+     * — group encryption rides on the pairwise sessions, so a
+     * member whose 1:1 handshake never started blocks the group,
+     * and the group open is the moment to start it. Probing a
+     * group never probes our own number (see [probeGroupMembers]).
+     *
+     * Round 58 — the same open also evaluates the automatic
+     * fallback gate ([checkAutoFallback]): the backstop for a pair
+     * already stalled when the app updates (no new bundle reply
+     * will arm a worker for them) and for a worker that skipped
+     * as "not stalled yet" (a data-SMS probe sent after it was
+     * armed). The fallback check never logs a skip — it runs on
+     * every open — only a send is recorded. For a group the
+     * fallback is evaluated per member ([checkAutoFallbackForGroup]).
      */
     fun onThreadOpened(conversationId: Long) {
         scope.launch {
-            runCatching { probeConversation(conversationId, trigger = ProbeTrigger.THREAD_OPEN) }
-                .onFailure { Timber.w(it, "E2E: probe on thread open failed") }
+            val conversation =
+                runCatching { conversationDao.findById(conversationId) }.getOrNull()
+            val addresses = conversation?.let {
+                PhoneAddress.list(it.addressesCsv).map { address -> address.raw }
+            }.orEmpty()
+            if (addresses.size > 1) {
+                runCatching { probeGroupMembers(addresses) }
+                    .onFailure { Timber.w(it, "E2E: group probe on thread open failed") }
+                runCatching { checkAutoFallbackForGroup(addresses) }
+                    .onFailure { Timber.w(it, "E2E: auto fallback check on group thread open failed") }
+            } else {
+                runCatching { probeConversation(conversationId, trigger = ProbeTrigger.THREAD_OPEN) }
+                    .onFailure { Timber.w(it, "E2E: probe on thread open failed") }
+                runCatching { checkAutoFallback(conversationId) }
+                    .onFailure { Timber.w(it, "E2E: auto fallback check on thread open failed") }
+            }
         }
+    }
+
+    /**
+     * Round 58 — group-thread probing (design §2.4): probes every
+     * member of [addresses] through the same per-address core as a
+     * 1:1 probe ([probeAddressDetailed]), so every gate applies per
+     * member exactly as it does for 1:1 probes — the probe budget,
+     * the discovery toggle, blocked/invalid-address gates, and the
+     * already-ENCRYPTED skip (which still runs the round-48
+     * media-capability announcement for that member). One probe per
+     * member: the list is deduped by canonical address, and our own
+     * number is excluded (the thread's addresses should not hold
+     * it — see [E2eGroupStateProvider] — but the exclusion is the
+     * guard if it ever does). Members are probed in list order,
+     * serially under the probe mutex; one member's gate or send
+     * failure never stops the others.
+     */
+    suspend fun probeGroupMembers(
+        addresses: List<String>,
+        now: Long = System.currentTimeMillis(),
+    ) {
+        val own = ownNumber()
+        val subId = runCatching { settings.hydratedOrNull()?.sending?.defaultSubId }
+            .getOrNull()
+        addresses
+            .distinctBy { it.canonicalPhone() }
+            .filter { own == null || it.canonicalPhone() != own }
+            .forEach { address ->
+                probeAddressDetailed(
+                    address,
+                    subId,
+                    now = now,
+                    trigger = ProbeTrigger.GROUP_THREAD_OPEN,
+                )
+            }
+    }
+
+    /**
+     * Our own number (canonical), from settings first, then the
+     * SIM — the same order as [E2eGroupSessionManager.ownNumber].
+     * Null when neither knows it: the exclusion in
+     * [probeGroupMembers] then skips nothing, and the thread's
+     * addresses are the members by construction.
+     */
+    private suspend fun ownNumber(): String? {
+        val fromSettings = settings.hydratedOrNull()?.sending?.userMsisdn
+            ?.takeIf { it.isNotBlank() }?.canonicalPhone()
+        if (fromSettings != null) return fromSettings
+        return simSelfNumber?.ownNumber(null)?.takeIf { it.isNotBlank() }?.canonicalPhone()
+    }
+
+    /**
+     * Round 58 — the automatic fallback backstop (design §2.4):
+     * resolves the conversation to its single 1:1 address and
+     * evaluates the fallback gate ([E2eAutoFallback.maybeSend]).
+     * Groups and missing conversations are skipped silently (the
+     * fallback is 1:1 only), and a null [autoFallback] — the
+     * hand-constructed tests — skips the check entirely.
+     */
+    private suspend fun checkAutoFallback(conversationId: Long) {
+        val fallback = autoFallback ?: return
+        val conversation = conversationDao.findById(conversationId) ?: return
+        val address = PhoneAddress.list(conversation.addressesCsv).map { it.raw }.singleOrNull()
+            ?: return
+        fallback.maybeSend(address)
+    }
+
+    /**
+     * Round 58 — the group form of [checkAutoFallback]: evaluates
+     * the fallback gate per member address. The fallback's evidence
+     * and stall are per peer, so a stalled group-member handshake
+     * is rescued exactly like a 1:1 one. Our own number, if
+     * present, skips harmlessly (no peer row, no evidence — the
+     * gate refuses it); a null [autoFallback] skips the check
+     * entirely.
+     */
+    private suspend fun checkAutoFallbackForGroup(addresses: List<String>) {
+        val fallback = autoFallback ?: return
+        addresses.forEach { address -> fallback.maybeSend(address) }
     }
 
     /**

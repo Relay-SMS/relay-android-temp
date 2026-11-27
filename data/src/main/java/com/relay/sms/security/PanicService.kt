@@ -10,6 +10,7 @@ package com.relay.sms.security
 
 import com.relay.sms.core.crypto.KeystoreManager
 import com.relay.sms.data.local.datastore.SecurityStore
+import com.relay.sms.data.local.datastore.SplashShownStore
 import com.relay.sms.data.local.db.AppDatabase
 import com.relay.sms.data.local.db.DatabaseKeyManager
 import com.relay.sms.data.local.db.dao.ConversationDao
@@ -242,7 +243,14 @@ class PanicService @Inject constructor(
             echecs++
             Timber.w(it, "wipe: magasin securise")
         }
-        runCatching { settings.update { AppSettings() } }.onFailure {
+        runCatching {
+            settings.update { AppSettings() }
+            // Round 58 — the synchronous splash mirror follows the
+            // DataStore flag: without this clear the next launch
+            // would show the loading logo before the first-open
+            // intro (a double logo).
+            SplashShownStore.clear(context)
+        }.onFailure {
             echecs++
             Timber.w(it, "wipe: settings")
         }
@@ -342,7 +350,12 @@ class PanicService @Inject constructor(
             echecs++
             Timber.w(it, "decoy wipe: files")
         }
-        runCatching { settings.update { AppSettings(security = it.security) } }.onFailure {
+        runCatching {
+            settings.update { AppSettings(security = it.security) }
+            // Round 58 — the synchronous splash mirror follows the
+            // DataStore flag (see `purgeTotale` above).
+            SplashShownStore.clear(context)
+        }.onFailure {
             echecs++
             Timber.w(it, "decoy wipe: settings")
         }
