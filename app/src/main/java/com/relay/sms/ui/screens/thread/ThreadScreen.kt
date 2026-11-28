@@ -147,6 +147,7 @@ import com.google.accompanist.permissions.ExperimentalPermissionsApi
 import com.google.accompanist.permissions.PermissionStatus
 import com.google.accompanist.permissions.rememberPermissionState
 import com.relay.sms.R
+import com.relay.sms.core.ext.canonicalPhone
 import com.relay.sms.core.ext.formatPhoneNumberForDisplay
 import com.relay.sms.core.result.AppError
 import com.relay.sms.data.local.db.entity.E2ePeerState
@@ -3986,6 +3987,32 @@ private fun computeBurstPosition(
 }
 
 /**
+ * Round 61 — does this message start a new SENDER run (for the group sender
+ * label only)? [computeBurstPosition] groups by direction, so consecutive
+ * incoming messages from two different people are one burst and only its
+ * first bubble gets a label — on a receiving phone the thread then reads as
+ * if one person wrote everything (round-60 device test: "Right" looked like
+ * Kristin's, "Yay!" had no name). A message starts a sender run when the
+ * previous message is from a different sender (canonical address — the same
+ * number in +1 / no-+1 form is one sender), a different direction, another
+ * day, or outside [BURST_GAP_MS]: the same join rule as the shape burst,
+ * plus the address. Outgoing messages all carry the same (own) address, so
+ * the user's own runs behave exactly as before. This gates the LABEL only —
+ * the timestamp rule ([isLastOfSenderRun]) and the bubble shape
+ * ([computeBurstPosition]) deliberately stay direction-based.
+ */
+internal fun isFirstOfSenderRun(
+    prev: com.relay.sms.domain.model.Message?,
+    current: com.relay.sms.domain.model.Message,
+): Boolean {
+    if (prev == null) return true
+    return prev.address.canonicalPhone() != current.address.canonicalPhone() ||
+        prev.isOutgoing != current.isOutgoing ||
+        !sameDay(prev.date, current.date) ||
+        current.date - prev.date > BURST_GAP_MS
+}
+
+/**
  * Centered day pill between bursts on the very first message and on every day boundary.
  * Relay UI refresh: a quiet pill on the surface fill, 13sp secondary text, generous
  * vertical air — no dividers above or below.
@@ -4361,17 +4388,15 @@ private fun ThreadMessageItem(
             // (structural list equals: a re-mapped identical list keeps it).
             val mediaAttachments = remember(msg.attachments) { msg.attachments.filter { !it.isAudio } }
             val mediaAttachment = mediaAttachments.firstOrNull()
-            // v1.3.3 #7 — étiquette d'expéditeur uniquement sur la 1ʳᵉ bulle d'un burst (Solo ou First)
-            // pour ne pas surcharger visuellement les suites consécutives du même expéditeur.
+            // v1.3.3 #7 — étiquette d'expéditeur uniquement sur la 1ʳᵉ bulle d'une suite du
+            // même expéditeur, pour ne pas surcharger visuellement les suites consécutives.
             // Relay — uniquement dans les groupes : en 1:1, l'expéditeur est évident et
-            // l'étiquette ne fait que du bruit. Le suffixe SIM (ci-dessous) est conservé : il ne
-            // s'applique que quand une étiquette existe, donc uniquement en groupe.
-            val baseSenderLabel: String? = if (
-                isGroup && (
-                    burstPosition == BurstPosition.Solo ||
-                        burstPosition == BurstPosition.First
-                )
-            ) {
+            // l'étiquette ne fait que du bruit. Round 61 — la suite est celle de
+            // l'EXPÉDITEUR ([isFirstOfSenderRun]), pas du burst de direction : en groupe,
+            // deux messages entrants consécutifs de deux personnes différentes partageaient
+            // un seul burst, donc un seul nom. Le suffixe SIM (ci-dessous) est conservé : il
+            // ne s'applique que quand une étiquette existe, donc uniquement en groupe.
+            val baseSenderLabel: String? = if (isGroup && isFirstOfSenderRun(prev, msg)) {
                 if (msg.isOutgoing) {
                     stringResource(R.string.bubble_sender_self)
                 } else {

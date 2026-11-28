@@ -323,9 +323,12 @@ fun SplashScreen(
                     },
             )
             // Round 58 (Kristin, device test) — the logo→"Relay" gap was
-            // too wide; halved from 24 dp to 12 dp. The 12 dp spacer
-            // below ("Relay"→tagline) is unchanged.
-            Spacer(modifier = Modifier.height(12.dp))
+            // too wide; halved from 24 dp to 12 dp. Round 61 — measured
+            // exactly 44 px on her screenshot (her 44 px target) but it
+            // still read too wide, so the spacer drops 12 dp → 4 dp
+            // (≈ 8 px smaller on device). The 12 dp spacer below
+            // ("Relay"→tagline) is unchanged.
+            Spacer(modifier = Modifier.height(4.dp))
             Text(
                 text = stringResource(R.string.app_name),
                 style = MaterialTheme.typography.headlineMedium.copy(fontWeight = FontWeight.SemiBold),
